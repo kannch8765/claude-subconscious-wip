@@ -320,57 +320,81 @@ generate IDs and timestamps
 reject invented or inaccessible evidence
 perform source idempotency and duplicate checks
 append an auditable storage event
-return the accepted canonical memory_id
 record the outcome against the active transcript batch_id
 ```
 
-The memory agent must not receive direct SQL, filesystem, or unrestricted JSON mutation tools for authoritative memory.
-
-## 8. Trusted transcript-batch acknowledgement
-
-A completed Letta SDK session is not by itself proof that relationship-memory processing succeeded.
-
-Before sending a transcript batch, the adopted worker must create a stable `batch_id` and a trusted pending batch record. The memory backend records tool outcomes against that `batch_id`. After the session stream ends, trusted worker code finalizes the batch as exactly one of:
+Each completed `memory_remember` call must return exactly one business outcome:
 
 ```text
 accepted
-no_memory_required
-retryable_rejection
-permanent_rejection
+duplicate
+permanently_rejected
+retryable_failed
 ```
 
 Definitions:
 
 ```text
 accepted
-one or more memory writes were accepted and no retryable backend failure remains
+the proposal is valid, its evidence is resolvable, and a new canonical memory
+record was durably committed; return the new canonical memory_id
 
-no_memory_required
-the session completed normally, no memory write was accepted or rejected,
-and trusted finalization observed no attempted relationship-memory mutation
+duplicate
+the same source-idempotency key was already handled; do not create another
+record and return the existing canonical memory_id when available
 
-retryable_rejection
-at least one proposal failed because of a transient storage, dependency,
-or evidence-access error
+permanently_rejected
+the proposal violates schema or authority rules and unchanged replay cannot
+succeed; durably record a rejection code and reason
 
-permanent_rejection
-one or more proposals were rejected for invalid schema, invented or inaccessible
-evidence, forbidden fields, or another non-transient contract violation,
-and no corrected proposal was accepted in the same batch
+retryable_failed
+the proposal may be valid, but a transient storage, dependency, transaction,
+or tool-transport failure prevented a durable terminal result
+```
+
+A schema or evidence rejection is a successful execution of the custom tool with a `permanently_rejected` business outcome. It is not disguised as a Letta transport failure. A transient inability to produce a durable result returns `retryable_failed` or causes the Letta session itself to fail.
+
+The memory agent may inspect the returned outcome, correct a permanently rejected proposal, or make another tool call before ending the same Letta turn. The memory agent must not receive direct SQL, filesystem, or unrestricted JSON mutation tools for authoritative memory.
+
+## 8. Trusted transcript-batch completion
+
+A completed Letta SDK session is not by itself proof that relationship-memory processing reached durable terminal outcomes.
+
+Before sending a transcript batch, the adopted worker must create a stable `batch_id` and a trusted pending batch record. Because the custom tools execute through trusted local adapter code, the backend records each `memory_remember` outcome against that `batch_id` when the tool call completes. The worker must not infer outcomes by parsing agent prose.
+
+After the session stream ends, trusted worker code finalizes the batch as exactly one of:
+
+```text
+completed
+retryable_failure
+```
+
+Definitions:
+
+```text
+completed
+the Letta session completed normally and every attempted memory mutation has
+a durable terminal outcome: accepted, duplicate, or permanently_rejected;
+zero attempted memory mutations is also completed and is reported as
+no_memory_required detail
+
+retryable_failure
+the Letta session failed, or at least one memory_remember call returned
+retryable_failed; the batch remains pending for replay
 ```
 
 Cursor rule:
 
 ```text
-accepted             → advance source cursor
-no_memory_required   → advance source cursor
-retryable_rejection  → do not advance source cursor
-permanent_rejection  → do not advance source cursor
+completed          → advance source cursor
+retryable_failure  → do not advance source cursor
 ```
 
-The first scaffold does not define automated quarantine or maximum-retry policy. It must surface unresolved rejected batches for later correction rather than silently consuming their source messages.
+A mixed batch containing accepted writes and permanently rejected proposals is `completed`: accepted records remain committed, permanent rejections remain in the durable rejection journal, and the source cursor advances. A mixed batch containing any `retryable_failed` outcome is `retryable_failure`: the source cursor does not advance, and accepted records are protected from duplication by source idempotency when the batch is replayed.
 
-The acknowledgement journal is narrow adoption glue. It must wrap the existing worker cursor lifecycle rather than replacing the transcript scanner or worker architecture.
+The first scaffold does not define automated quarantine or maximum-retry policy. Permanent rejections must be inspectable but must not poison the transcript cursor. Retryable failures must remain visible for later replay rather than being silently consumed.
+
+The batch-completion journal is narrow adoption glue. It must wrap the existing worker cursor lifecycle rather than replacing the transcript scanner or worker architecture.
 
 ## 9. Projection model
 
@@ -387,7 +411,7 @@ The projection renderer must be deterministic and must not invoke an LLM.
 Recommended lifecycle:
 
 ```text
-acknowledged memory-agent run finishes
+completed memory-agent run finishes
 → canonical revision changed
 → trusted background renderer reads active records
 → renderer rebuilds affected Markdown projection
@@ -420,8 +444,8 @@ Changes to existing upstream hooks, scripts, and agent configuration must be lim
 attach relationship-memory custom tools to the adopted agent
 remove default Markdown mutation tools from the adopted agent
 replace conflicting Markdown-mutation instructions
-create and finalize trusted batch acknowledgements
-trigger projection synchronization after an acknowledged run
+create and finalize trusted batch-completion records
+trigger projection synchronization after a completed run
 ```
 
 The upstream hook lifecycle, transcript parser, worker scheduling, agent identity, and Letta conversation behavior must not be redesigned in the scaffold.
@@ -465,8 +489,12 @@ PASS evidence binds to a real fixture message ID
 PASS the authoritative quote is resolved by the backend
 PASS linked records use accepted canonical memory IDs
 PASS replaying the same source batch does not create duplicate records
-PASS accepted and no_memory_required acknowledgements advance the cursor
-PASS retryable_rejection and permanent_rejection do not advance the cursor
+PASS accepted, duplicate, and permanently_rejected tool outcomes are durable terminal results
+PASS retryable_failed is the only non-terminal memory_remember business outcome
+PASS a completed batch, including no_memory_required, advances the cursor
+PASS accepted write + permanently_rejected proposal finalizes as completed and advances the cursor
+PASS accepted write + retryable_failed proposal finalizes as retryable_failure and does not advance the cursor
+PASS replay after retryable_failure does not duplicate previously accepted records
 PASS deterministic renderer produces a read-only projection
 PASS canonical records remain authoritative if the projection is deleted
 PASS existing upstream tests remain green
@@ -483,7 +511,7 @@ PASS a compatible official Letta runtime loads the reconfigured adopted agent
 PASS the explicitly selected model can call memory_search
 PASS the explicitly selected model can call memory_remember
 PASS the local client-side tool result returns through the real Letta tool-call loop
-PASS the sanitized run receives an accepted or no_memory_required batch acknowledgement
+PASS the sanitized run reaches a completed batch result without retryable_failure
 ```
 
 The Owner canary is not part of the first repository implementation acceptance. It requires separate authorization, an explicitly selected model, isolated sanitized data, and Owner-controlled credentials and runtime configuration.
