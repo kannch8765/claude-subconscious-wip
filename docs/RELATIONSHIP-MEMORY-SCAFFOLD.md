@@ -565,3 +565,363 @@ After repository acceptance and independent review, follow-up work may be split 
 ```
 
 None of these follow-up items are authorized by this documentation-only task.
+
+## 17. Reference classification key
+
+The implementation references below are normative traceability aids for the first scaffold. They identify the concrete adopted seams and do not expand task scope.
+
+```text
+ADOPTED
+use the referenced capability substantially as provided; do not reimplement it
+
+ADAPTED
+preserve the referenced lifecycle or component, with only the narrow changes authorized by this contract
+
+NEW NARROW GLUE
+new local code required only to connect adopted components or enforce this contract
+
+NOT ADOPTED
+reviewed for comparison or design provenance, but not imported as a runtime, dependency, storage layer, or authorization to expand scope
+```
+
+Architecture references are informative unless a specific surface is separately classified as `ADOPTED` or `ADAPTED`. Listing a repository here does not authorize adding it as a dependency.
+
+## 18. Implementation references
+
+Reference retrieval date:
+
+```text
+2026-08-07
+```
+
+### 18.1 Claude Subconscious
+
+```text
+repository:
+letta-ai/claude-subconscious
+
+exact adopted upstream commit:
+365e7e6e0d788f9f6d5c3066d1421474653081cc
+
+local fork:
+kannch8765/claude-subconscious-wip
+```
+
+Concrete implementation seams:
+
+#### `hooks/hooks.json`
+
+```text
+classification:
+ADOPTED
+
+adopted surface:
+Claude Code hook events, detached invocation lifecycle, and existing entrypoint routing
+
+not authorized:
+new hook architecture, second transcript consumer, or parallel relationship-memory lifecycle
+```
+
+#### `scripts/transcript_utils.ts`
+
+```text
+classification:
+ADOPTED
+
+adopted surface:
+transcript parsing, incremental source selection, and existing cursor-oriented message extraction
+
+not authorized:
+replacement transcript parser or a separate relationship-memory scanner
+```
+
+#### `scripts/conversation_utils.ts`
+
+```text
+classification:
+ADOPTED
+
+adopted surface:
+session-to-conversation identity and restoration behavior
+
+not authorized:
+second Letta conversation topology for the same transcript stream
+```
+
+#### `scripts/send_worker_sdk.ts`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+existing detached worker, Letta Code SDK session lifecycle, stream consumption, and source cursor ownership
+
+narrow adaptation:
+expose memory_search and memory_remember through the adopted client-tool boundary;
+collect trusted local tool outcomes by batch_id;
+advance the cursor only after completed batch finalization;
+hold the cursor on unresolved retryable_failure
+
+not authorized:
+replacement worker runtime, replacement scheduler, or agent-prose parsing as acknowledgement
+```
+
+#### `scripts/pretool_sync.ts`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+existing pre-tool synchronization and Claude Code injection timing
+
+narrow adaptation:
+read relationship-memory projections as generated read-only context instead of treating mutable Markdown as authority
+```
+
+#### `scripts/sync_letta_memory.ts`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+trusted Letta block synchronization boundary
+
+narrow adaptation:
+synchronize deterministic projections derived from canonical records;
+do not ingest agent-authored Markdown as authoritative relationship memory
+```
+
+#### `Subconscious.af`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+the same adopted Subconscious agent identity and runtime role
+
+narrow adaptation:
+remove or deny vanilla Markdown memory mutation tools;
+attach memory_search and memory_remember;
+replace instructions that require forbidden mutation tools;
+expose generated relationship-memory blocks as read-only
+
+not authorized:
+second relationship-memory agent, second runtime, or wholesale replacement of the agent harness
+```
+
+### 18.2 Letta runtime and official SDK/API references
+
+The official compatible Letta runtime remains external to this repository.
+
+```text
+reference repository:
+letta-ai/letta
+
+reference snapshot commit:
+ff19ffeafeb54bd2a7dc5d4a552f10191732a235
+
+classification:
+ADOPTED AS EXTERNAL RUNTIME
+NOT MODIFIED OR COPIED
+```
+
+#### Client-side custom-tool execution
+
+```text
+reference:
+https://docs.letta.com/guides/agents/tool-execution-client-side/
+
+classification:
+ADOPTED
+
+adopted surface:
+client_tools schema handoff, local execution, tool-result return, and continuation of the same agent run
+
+new narrow glue:
+local relationship-memory handlers and trusted batch outcome recording
+```
+
+#### Agent tool configuration
+
+```text
+references:
+https://docs.letta.com/api/typescript/resources/agents/subresources/tools
+https://docs.letta.com/api/python/resources/agents/subresources/tools
+
+classification:
+ADOPTED
+
+adopted surface:
+inspect, attach, detach, and verify the configured agent tool surface
+
+not adopted:
+default mutable Markdown memory tools as the authority for relationship memory
+```
+
+#### Read-only memory blocks
+
+```text
+reference:
+https://docs.letta.com/guides/core-concepts/memory/memory-blocks
+
+classification:
+ADOPTED
+
+adopted surface:
+read-only blocks as agent-visible context that the agent cannot mutate
+```
+
+#### Trusted block update
+
+```text
+references:
+https://docs.letta.com/api/typescript/resources/agents/subresources/blocks/methods/update
+https://docs.letta.com/api/resources/blocks/methods/update/
+
+classification:
+ADOPTED
+
+adopted surface:
+trusted client update of deterministic generated projections
+
+new narrow glue:
+projection renderer, revision check, and synchronization trigger
+```
+
+### 18.3 New narrow glue owned by this fork
+
+The following capabilities do not come from an architecture reference and must remain narrow:
+
+```text
+schema_version 1 validators for the four authorized memory kinds
+canonical record and evidence store
+memory_search and memory_remember handlers
+source-idempotency keys
+per-call business outcomes:
+  accepted
+  duplicate
+  permanently_rejected
+  retryable_failed
+trusted batch journal:
+  completed
+  retryable_failure
+deterministic Markdown projection renderer
+projection revision tracking
+```
+
+These additions must connect to the adopted worker and Letta tool loop. They do not authorize a new agent runtime, message bus, workflow engine, or general memory platform.
+
+## 19. Architecture references and non-adopted alternatives
+
+These repositories preserve design provenance. They are not implementation dependencies for the first scaffold.
+
+### 19.1 Mem0
+
+```text
+repository:
+mem0ai/mem0
+
+reference snapshot commit:
+4a0a9a92a641b5da75023eca596a758a4f7ae101
+
+classification:
+ADAPTED AS DESIGN REFERENCE
+NOT ADOPTED AS RUNTIME
+```
+
+Borrowed design ideas:
+
+```text
+atomic memory records rather than one mutable memory document
+explicit search-before-write behavior
+durable memory identity
+separation between memory operations and application conversation flow
+```
+
+Explicitly not adopted:
+
+```text
+Mem0 runtime
+Mem0 storage adapters
+Mem0 extraction pipeline
+Mem0 dependency graph
+Mem0's complete lifecycle or deletion semantics
+```
+
+### 19.2 LangMem
+
+```text
+repository:
+langchain-ai/langmem
+
+reference snapshot commit:
+7c7ebf36b5e1697001f92eed77c43e3d541decd7
+
+classification:
+ADAPTED AS DESIGN REFERENCE
+NOT ADOPTED AS RUNTIME
+```
+
+Borrowed design ideas:
+
+```text
+developer-defined typed memory schemas
+different payload shapes for different memory kinds
+explicit memory tools rather than unrestricted document mutation
+```
+
+Explicitly not adopted:
+
+```text
+LangGraph runtime
+LangMem manager
+LangMem store integration
+LangMem background execution framework
+```
+
+### 19.3 Letta AI Memory SDK
+
+```text
+repository:
+letta-ai/ai-memory-sdk
+
+reference snapshot commit:
+4494e00410469082bf298b8b03b7c9f93e244f14
+
+classification:
+REFERENCE ONLY
+NOT ADOPTED
+```
+
+Useful comparison points:
+
+```text
+one persistent memory agent associated with a subject
+application-driven message submission to a background learning run
+reuse of Letta's persistent agent runtime
+```
+
+Explicitly not adopted:
+
+```text
+AI Memory SDK wrapper as the product integration layer
+mutable Letta blocks as the canonical relationship-memory authority
+its application-controlled ingestion contract in place of Claude Subconscious hooks and cursor lifecycle
+```
+
+### 19.4 Reference precedence
+
+When references differ or evolve, implementation decisions follow this order:
+
+```text
+1. this scaffold contract
+2. the frozen Claude Subconscious implementation seam at the exact adopted commit
+3. current official Letta SDK/API documentation for the pinned compatible runtime
+4. architecture references, which are informative only
+```
+
+A future dependency or API upgrade must record a new exact reference snapshot and independently verify that the adopted seams still hold. It must not silently reinterpret this contract from a newer upstream implementation.
