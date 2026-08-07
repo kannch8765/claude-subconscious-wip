@@ -182,6 +182,55 @@ describe('batch completion and cursor', () => {
     expect(mixed.finalizeBatch('mixed', true)).toBe('completed');
   });
 
+  it('holds when an accepted memory is persisted but both accepted and retryable outcome commits fail', () => {
+    const rt = runtime(tempDir(), (phase) => phase === 'outcome_commit');
+    rt.store.beginBatch('outcome-accepted', '2026-01-01T00:00:00.000Z');
+
+    const result = rt.remember('outcome-accepted', personal());
+    expect(result.outcome).toBe('retryable_failed');
+    expect(rt.store.listMemories()).toHaveLength(1);
+    expect(rt.store.listOutcomes()).toHaveLength(0);
+
+    expect(rt.finalizeBatch('outcome-accepted', true)).toBe('retryable_failure');
+    expect(cursorShouldAdvance('retryable_failure')).toBe(false);
+    expect(rt.store.listBatches().at(-1)?.detail).toBeUndefined();
+  });
+
+  it('holds when a permanent rejection cannot be durably journaled', () => {
+    const rt = runtime(tempDir(), (phase) => phase === 'outcome_commit');
+    rt.store.beginBatch('outcome-rejection', '2026-01-01T00:00:00.000Z');
+
+    const result = rt.remember('outcome-rejection', personal({ participants: ['third_party'] }));
+    expect(result.outcome).toBe('retryable_failed');
+    expect(rt.store.listMemories()).toHaveLength(0);
+    expect(rt.store.listOutcomes()).toHaveLength(0);
+
+    expect(rt.finalizeBatch('outcome-rejection', true)).toBe('retryable_failure');
+    expect(cursorShouldAdvance('retryable_failure')).toBe(false);
+  });
+
+  it('holds when duplicate journaling fails and replay does not duplicate canonical memory', () => {
+    let failOutcome = false;
+    const rt = runtime(tempDir(), (phase) => failOutcome && phase === 'outcome_commit');
+
+    rt.store.beginBatch('duplicate-source', '2026-01-01T00:00:00.000Z');
+    const accepted = rt.remember('duplicate-source', personal());
+    expect(accepted.outcome).toBe('accepted');
+    expect(rt.store.listMemories()).toHaveLength(1);
+
+    rt.store.beginBatch('duplicate-retry', '2026-01-01T00:00:01.000Z');
+    failOutcome = true;
+    const retryable = rt.remember('duplicate-retry', personal());
+    expect(retryable.outcome).toBe('retryable_failed');
+    expect(rt.store.listMemories()).toHaveLength(1);
+    expect(rt.finalizeBatch('duplicate-retry', true)).toBe('retryable_failure');
+    expect(cursorShouldAdvance('retryable_failure')).toBe(false);
+
+    failOutcome = false;
+    expect(rt.remember('duplicate-retry', personal())).toEqual({ outcome: 'duplicate', memory_id: accepted.memory_id });
+    expect(rt.store.listMemories()).toHaveLength(1);
+  });
+
   it('holds on retryable failure and replay does not duplicate an accepted record', () => {
     let fail = false;
     const dir = tempDir();

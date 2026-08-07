@@ -28,6 +28,8 @@ export interface RememberResult {
 }
 
 export class RelationshipMemoryRuntime {
+  private readonly retryableBatches = new Set<string>();
+
   constructor(
     readonly store: RelationshipMemoryStore,
     readonly messages: Map<string, CanonicalMessage>,
@@ -72,7 +74,7 @@ export class RelationshipMemoryRuntime {
         recorded_at: now,
       };
       try { this.store.appendOutcome(outcome); }
-      catch { return { outcome: 'retryable_failed', reason: 'Failed to durably record permanent rejection.' }; }
+      catch { return this.retryableFailure(batchId, 'Failed to durably record permanent rejection.'); }
       return { outcome: outcome.outcome, rejection_code: outcome.rejection_code, reason: outcome.reason };
     }
 
@@ -114,7 +116,7 @@ export class RelationshipMemoryRuntime {
         this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'accepted', memory_id: recoveredMemory.memory_id, recorded_at: now });
         return { outcome: 'duplicate', memory_id: recoveredMemory.memory_id };
       } catch {
-        return { outcome: 'retryable_failed', reason: 'Canonical memory exists but terminal recovery is not durable yet.' };
+        return this.retryableFailure(batchId, 'Canonical memory exists but terminal recovery is not durable yet.');
       }
     }
 
@@ -124,7 +126,7 @@ export class RelationshipMemoryRuntime {
         this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'duplicate', memory_id: semanticDuplicate.memory_id, recorded_at: now });
         return { outcome: 'duplicate', memory_id: semanticDuplicate.memory_id };
       } catch {
-        return { outcome: 'retryable_failed', reason: 'Failed to durably record duplicate outcome.' };
+        return this.retryableFailure(batchId, 'Failed to durably record duplicate outcome.');
       }
     }
 
@@ -162,8 +164,13 @@ export class RelationshipMemoryRuntime {
       const reason = error instanceof Error ? error.message : String(error);
       try { this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now }); }
       catch { /* caller still receives the only non-terminal business result */ }
-      return { outcome: 'retryable_failed', reason };
+      return this.retryableFailure(batchId, reason);
     }
+  }
+
+  private retryableFailure(batchId: string, reason: string): RememberResult {
+    this.retryableBatches.add(batchId);
+    return { outcome: 'retryable_failed', reason };
   }
 
   private persistPermanent(batchId: string, sourceKey: string, code: string, reason: string, now: string): RememberResult {
@@ -171,7 +178,7 @@ export class RelationshipMemoryRuntime {
       this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });
       return { outcome: 'permanently_rejected', rejection_code: code, reason };
     } catch {
-      return { outcome: 'retryable_failed', reason: 'Failed to durably record permanent rejection.' };
+      return this.retryableFailure(batchId, 'Failed to durably record permanent rejection.');
     }
   }
 
@@ -180,7 +187,7 @@ export class RelationshipMemoryRuntime {
     const outcomes = this.store.listOutcomes().filter((item) => item.batch_id === batchId);
     const latestBySource = new Map<string, RememberOutcome>();
     for (const outcome of outcomes) latestBySource.set(outcome.source_key, outcome);
-    const retryable = !sessionSucceeded || [...latestBySource.values()].some((item) => item.outcome === 'retryable_failed');
+    const retryable = !sessionSucceeded || this.retryableBatches.has(batchId) || [...latestBySource.values()].some((item) => item.outcome === 'retryable_failed');
     const status: BatchCompletion = retryable ? 'retryable_failure' : 'completed';
     this.store.finalizeBatch({
       batch_id: batchId,
