@@ -1,0 +1,50 @@
+name: relationship memory R2 exact-head CI
+
+on:
+  push:
+    branches:
+      - ci/relationship-memory-02
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relationship-memory-02-ci
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: npm ci + npm test (exact Task 086 R2 head)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TARGET_SHA: 63c7a8ac65e5c13bdf6e28590eb471fcdf323887
+    steps:
+      - name: Checkout exact Task 086 R2 head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          echo "expected=${TARGET_SHA}"
+          echo "actual=${actual}"
+          test "${actual}" = "${TARGET_SHA}"
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install exact lockfile dependencies
+        run: npm ci
+
+      - name: Run repository tests
+        run: npm test
