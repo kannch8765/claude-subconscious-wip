@@ -208,6 +208,8 @@ captured_at
 
 The backend resolves `quote`, `role`, conversation identity, and source time from the referenced canonical message. The model cannot submit or overwrite authoritative quote text.
 
+For historical relationship-memory ingestion, the conversational source and quote authority are the Claude Code transcript JSONL records themselves. Trusted repository code parses complete transcript records and uses the adopted transcript content-extraction seam to construct relationship-memory `CanonicalMessage` values. A metadata-only analytics record is not sufficient evidence authority for relationship memory.
+
 ### 6.3 Kind-specific payloads
 
 #### `personal_experience`
@@ -558,11 +560,53 @@ After repository acceptance and independent review, follow-up work may be split 
 
 ```text
 1. Owner canary with an explicitly selected model and isolated data
-2. historical backfill wrapper over canonical CCDK batches
+2. direct Claude Code transcript JSONL historical ingestion
 3. reinforcement and relationship-evolution tools
 4. current-prompt query-aware recall
 5. dual-channel injection of distilled memory and raw user quotes
 ```
+
+### 16.1 Historical source boundary
+
+The historical relationship-memory data path is frozen as:
+
+```text
+Claude Code transcript JSONL
+→ transcript discovery / incremental read
+→ adopted transcript content extraction
+→ relationship-memory CanonicalMessage values
+→ relationship-memory worker / tools
+```
+
+Historical conversational source:
+
+```text
+Claude Code transcript JSONL
+```
+
+Raw quote/content authority:
+
+```text
+direct transcript extraction through adopted repository seams
+```
+
+Claude Code Data Kit (CCDK) canonical records are not relationship-memory historical input. Relationship memory has no CCDK package, runtime, store, service, or publication-state dependency. Historical recovery must continue to work from authorized transcript JSONL even when CCDK is absent.
+
+The adopted `scripts/transcript_utils.ts` seam already provides the message shape and semantic content extraction needed to recover user and assistant text. `relationship-memory/src/adapter/index.ts` already converts those extracted transcript messages into trusted `CanonicalMessage` values while preserving transcript message UUIDs, roles, quotes, and source timestamps.
+
+What remains for a future historical-ingestion task is only the direct-JSONL incremental/resumable outer seam around that adopted semantic extraction. The current `readTranscript()` helper reads a selected file from the beginning and does not define historical file discovery, durable byte-offset resume checkpoints, or replacement/truncation generations. A future implementation may therefore need narrow behavior for:
+
+```text
+discovering transcript JSONL files deterministically
+committing only complete newline-terminated records
+resuming from durable byte offsets
+detecting truncation or replacement before reusing a checkpoint
+maintaining stable source identity and replacement generations
+idempotent replay / dedupe when record processing succeeds before checkpoint commit
+bounded batch boundaries aligned with durable batch finalization
+```
+
+These are scanner/checkpoint concerns, not a new transcript semantic model or general ingestion framework. The future implementation should reuse the adopted transcript message/content extraction and relationship-memory canonicalization rather than introduce CCDK as an intermediary.
 
 None of these follow-up items are authorized by this documentation-only task.
 
@@ -629,10 +673,16 @@ classification:
 ADOPTED
 
 adopted surface:
-transcript parsing, incremental source selection, and existing cursor-oriented message extraction
+Claude Code transcript message shape, JSONL record parsing, and semantic content extraction for text / thinking / tool blocks
+
+historical relationship-memory use:
+reuse the adopted content extraction for user / assistant conversational text and authoritative quotes
+
+not provided by this seam:
+transcript-tree discovery, durable byte-offset checkpoints, partial-final-line commit policy, truncation/replacement generations, or replay checkpoint durability
 
 not authorized:
-replacement transcript parser or a separate relationship-memory scanner
+replacement semantic transcript model or an unrelated parallel transcript consumer
 ```
 
 #### `scripts/conversation_utils.ts`
@@ -814,6 +864,46 @@ projection revision tracking
 ```
 
 These additions must connect to the adopted worker and Letta tool loop. They do not authorize a new agent runtime, message bus, workflow engine, or general memory platform.
+
+### 18.4 Claude Code Data Kit historical-ingestion comparison
+
+The historical-source survey also inspected the available public WIP implementation for comparison only:
+
+```text
+repository:
+kannch8765/claude-code-data-kit-wip
+
+inspected candidate head:
+072eb7b44e9258f3974f301c9242c587d6bff5fd
+
+relevant files:
+src/claude_code_data_kit/collectors/transcript.py
+src/claude_code_data_kit/transcript_ingest.py
+src/claude_code_data_kit/store.py
+
+classification:
+INFORMATIVE / ADAPTED IMPLEMENTATION REFERENCE ONLY
+NOT A HISTORICAL DATA SOURCE
+NOT A PACKAGE DEPENDENCY
+NOT A RUNTIME DEPENDENCY
+NOT A STORE OR SERVICE DEPENDENCY
+```
+
+The CCDK transcript adapter intentionally does not preserve raw conversational text in its canonical records. It records metadata such as message identity, role, content type, content length, model, and usage; its implementation explicitly states that raw text, thinking blocks, tool inputs, and tool results are never returned. Therefore CCDK canonical records cannot provide relationship-memory quote authority and must not sit between transcript JSONL and relationship-memory canonical messages.
+
+The CCDK incremental ingestor is useful only as design provenance for scanner mechanics that relationship memory may narrowly adapt in its own direct-JSONL path. Observed reference ideas include:
+
+```text
+deterministic recursive .jsonl discovery
+byte-offset resume checkpoints
+leaving a non-newline-terminated final record uncommitted for replay
+source identity plus replacement/truncation generation reset
+prefix/tail checkpoint fingerprints before trusting a prior offset
+append/dedupe before advancing durable source state
+bounded line batches
+```
+
+These ideas do not authorize importing CCDK modules, consuming CCDK canonical records, sharing its store, or requiring CCDK publication/runtime availability. Any future adoption must remain narrow glue around the repository's adopted transcript extraction seam.
 
 ## 19. Architecture references and non-adopted alternatives
 
