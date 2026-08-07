@@ -58,11 +58,7 @@ export class RelationshipMemoryRuntime {
       if (previous.outcome === 'accepted' || previous.outcome === 'duplicate') {
         return { outcome: 'duplicate', ...(previous.memory_id ? { memory_id: previous.memory_id } : {}) };
       }
-      return {
-        outcome: 'permanently_rejected',
-        rejection_code: previous.rejection_code,
-        reason: previous.reason,
-      };
+      return { outcome: 'permanently_rejected', rejection_code: previous.rejection_code, reason: previous.reason };
     }
 
     const validation = validateProposal(rawProposal);
@@ -114,8 +110,6 @@ export class RelationshipMemoryRuntime {
         captured_at: message.captured_at,
       }));
       try {
-        // Repair any evidence rows left behind by an interrupted prior commit before
-        // restoring a durable terminal outcome for this exact source key.
         this.store.appendMemory(recoveredMemory, recoveredEvidence);
         this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'accepted', memory_id: recoveredMemory.memory_id, recorded_at: now });
         return { outcome: 'duplicate', memory_id: recoveredMemory.memory_id };
@@ -166,11 +160,8 @@ export class RelationshipMemoryRuntime {
       return { outcome: 'accepted', memory_id: memoryId };
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
-      try {
-        this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now });
-      } catch {
-        // If even the retryable journal cannot be written, the caller still receives a non-terminal result.
-      }
+      try { this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now }); }
+      catch { /* caller still receives the only non-terminal business result */ }
       return { outcome: 'retryable_failed', reason };
     }
   }
@@ -207,19 +198,48 @@ export function cursorShouldAdvance(completion: BatchCompletion): boolean {
 }
 
 export function memoryRememberToolSchema(): Record<string, unknown> {
-  return {
+  const string = { type: 'string', minLength: 1 };
+  const strings = { type: 'array', uniqueItems: true, items: string };
+  const common = {
+    schema_version: { type: 'integer', enum: [1] },
+    summary: string,
+    participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
+    evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },
+    linked_memory_ids: strings,
+  };
+  const variant = (kind: MemoryKind, requiredPayload: string[], optionalPayload: string[], payloadProperties: Record<string, unknown>) => ({
     type: 'object',
     additionalProperties: false,
     required: ['schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload'],
     properties: {
-      schema_version: { type: 'integer', enum: [1] },
-      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke'] },
-      summary: { type: 'string', minLength: 1 },
-      participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
-      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } },
-      payload: { type: 'object' },
-      linked_memory_ids: { type: 'array', uniqueItems: true, items: { type: 'string', minLength: 1 } },
+      ...common,
+      kind: { type: 'string', enum: [kind] },
+      payload: {
+        type: 'object',
+        additionalProperties: false,
+        required: requiredPayload,
+        properties: Object.fromEntries([...requiredPayload, ...optionalPayload].map((key) => [key, payloadProperties[key]])),
+      },
     },
+  });
+  return {
+    oneOf: [
+      variant('personal_experience', ['title', 'experience'], ['time_text', 'places', 'themes', 'emotional_tone', 'why_memorable', 'recall_triggers'], {
+        title: string, experience: string, time_text: string, places: strings, themes: strings,
+        emotional_tone: string, why_memorable: string, recall_triggers: strings,
+      }),
+      variant('shared_experience', ['title', 'event', 'shared_meaning'], ['symbols', 'recall_triggers'], {
+        title: string, event: string, shared_meaning: string, symbols: strings, recall_triggers: strings,
+      }),
+      variant('relationship_event', ['event', 'meaning'], ['prior_context', 'resulting_change'], {
+        event: string, meaning: string, prior_context: string, resulting_change: string,
+      }),
+      variant('inside_joke', ['name', 'meaning', 'trigger_phrases'], ['origin', 'callbacks', 'tone'], {
+        name: string, meaning: string,
+        trigger_phrases: { type: 'array', minItems: 1, uniqueItems: true, items: string },
+        origin: string, callbacks: strings, tone: string,
+      }),
+    ],
   };
 }
 
