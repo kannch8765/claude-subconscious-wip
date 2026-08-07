@@ -101,6 +101,29 @@ export class RelationshipMemoryRuntime {
       payload: proposal.payload,
       linked_memory_ids: proposal.linked_memory_ids ?? [],
     });
+
+    const recoveredMemory = this.store.getMemoryBySourceKey(sourceKey);
+    if (recoveredMemory) {
+      const recoveredEvidence: EvidenceRecord[] = evidenceMessages.map((message) => ({
+        evidence_id: stableId('ev', { memory_id: recoveredMemory.memory_id, message_id: message.message_id }),
+        memory_id: recoveredMemory.memory_id,
+        conversation_id: message.conversation_id,
+        message_id: message.message_id,
+        role: message.role,
+        quote: message.quote,
+        captured_at: message.captured_at,
+      }));
+      try {
+        // Repair any evidence rows left behind by an interrupted prior commit before
+        // restoring a durable terminal outcome for this exact source key.
+        this.store.appendMemory(recoveredMemory, recoveredEvidence);
+        this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'accepted', memory_id: recoveredMemory.memory_id, recorded_at: now });
+        return { outcome: 'duplicate', memory_id: recoveredMemory.memory_id };
+      } catch {
+        return { outcome: 'retryable_failed', reason: 'Canonical memory exists but terminal recovery is not durable yet.' };
+      }
+    }
+
     const semanticDuplicate = this.store.getMemoryByDedupeKey(dedupeKey);
     if (semanticDuplicate) {
       try {
@@ -108,16 +131,6 @@ export class RelationshipMemoryRuntime {
         return { outcome: 'duplicate', memory_id: semanticDuplicate.memory_id };
       } catch {
         return { outcome: 'retryable_failed', reason: 'Failed to durably record duplicate outcome.' };
-      }
-    }
-
-    const recoveredMemory = this.store.getMemoryBySourceKey(sourceKey);
-    if (recoveredMemory) {
-      try {
-        this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'accepted', memory_id: recoveredMemory.memory_id, recorded_at: now });
-        return { outcome: 'duplicate', memory_id: recoveredMemory.memory_id };
-      } catch {
-        return { outcome: 'retryable_failed', reason: 'Canonical memory exists but terminal outcome recovery is not durable yet.' };
       }
     }
 
