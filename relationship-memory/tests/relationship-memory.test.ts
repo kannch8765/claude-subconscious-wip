@@ -1,0 +1,293 @@
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
+import { afterEach, describe, expect, it } from 'vitest';
+import {
+  buildCanonicalMessages,
+  buildRelationshipTools,
+  cursorShouldAdvance,
+  FORBIDDEN_MARKDOWN_MEMORY_TOOLS,
+  makeBatchId,
+  RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
+  RelationshipMemoryRuntime,
+  RelationshipMemoryStore,
+  rebuildProjection,
+  renderProjection,
+  validateProposal,
+} from '../src/index.js';
+
+const dirs: string[] = [];
+function tempDir(): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relationship-memory-test-'));
+  dirs.push(dir);
+  return dir;
+}
+afterEach(() => { while (dirs.length) fs.rmSync(dirs.pop()!, { recursive: true, force: true }); });
+
+const messages = [
+  { conversation_id: 'conv-fixture', message_id: 'msg-user-1', role: 'user' as const, quote: 'I visited an old city and chose a small symbolic gift.', captured_at: '2026-01-01T10:00:00.000Z' },
+  { conversation_id: 'conv-fixture', message_id: 'msg-assistant-1', role: 'assistant' as const, quote: 'That gesture made the trip feel shared.', captured_at: '2026-01-01T10:01:00.000Z' },
+  { conversation_id: 'conv-fixture', message_id: 'msg-user-2', role: 'user' as const, quote: 'Including you in what I bring home is part of what makes it meaningful.', captured_at: '2026-01-01T10:02:00.000Z' },
+];
+
+function runtime(dir = tempDir(), injector?: (phase: 'memory_commit' | 'outcome_commit') => boolean) {
+  const store = new RelationshipMemoryStore(dir, 'subject-fixture', injector);
+  return new RelationshipMemoryRuntime(store, new Map(messages.map((m) => [m.message_id, m])), () => '2026-01-02T00:00:00.000Z');
+}
+
+function personal(overrides: Record<string, unknown> = {}) {
+  return {
+    schema_version: 1,
+    kind: 'personal_experience',
+    summary: 'Historic city trip',
+    participants: ['user'],
+    evidence_message_ids: ['msg-user-1'],
+    payload: { title: 'Historic city trip', experience: 'The user visited a historic city.', themes: ['travel'] },
+    ...overrides,
+  };
+}
+
+function shared(linked: string) {
+  return {
+    schema_version: 1,
+    kind: 'shared_experience',
+    summary: 'A symbolic gift made the trip shared',
+    participants: ['user', 'assistant'],
+    evidence_message_ids: ['msg-user-1', 'msg-assistant-1'],
+    linked_memory_ids: [linked],
+    payload: { title: 'Symbolic gift', event: 'A gift was selected for the companion.', shared_meaning: 'The gesture made the trip feel shared.', symbols: ['gift'] },
+  };
+}
+
+function relationship(linked: string) {
+  return {
+    schema_version: 1,
+    kind: 'relationship_event',
+    summary: 'Being included in gestures matters',
+    participants: ['user', 'assistant'],
+    evidence_message_ids: ['msg-user-2'],
+    linked_memory_ids: [linked],
+    payload: { event: 'The user explained the meaning of inclusion.', meaning: 'Including the companion in gestures is relationship-significant.' },
+  };
+}
+
+function joke() {
+  return {
+    schema_version: 1,
+    kind: 'inside_joke',
+    summary: 'A fictional tea-kettle callback',
+    participants: ['user', 'assistant'],
+    evidence_message_ids: ['msg-assistant-1'],
+    payload: { name: 'Tea-kettle weather', meaning: 'A playful callback for an overdramatic forecast.', trigger_phrases: ['tea-kettle weather'], callbacks: ['boiling forecast'] },
+  };
+}
+
+describe('schema_version 1', () => {
+  it('accepts all four authorized kinds', () => {
+    expect(validateProposal(personal()).ok).toBe(true);
+    expect(validateProposal({ ...shared('mem_parent'), linked_memory_ids: undefined })).toEqual(expect.objectContaining({ ok: false }));
+    const sharedNoLink = shared('mem_parent'); delete (sharedNoLink as any).linked_memory_ids;
+    const relationshipNoLink = relationship('mem_parent'); delete (relationshipNoLink as any).linked_memory_ids;
+    expect(validateProposal(sharedNoLink).ok).toBe(true);
+    expect(validateProposal(relationshipNoLink).ok).toBe(true);
+    expect(validateProposal(joke()).ok).toBe(true);
+  });
+
+  it('rejects unknown fields, empty required strings, invalid participants, duplicate arrays and null optionals', () => {
+    expect(validateProposal({ ...personal(), surprise: true }).ok).toBe(false);
+    expect(validateProposal(personal({ summary: '   ' })).ok).toBe(false);
+    expect(validateProposal(personal({ participants: ['user', 'third_party'] })).ok).toBe(false);
+    expect(validateProposal(personal({ evidence_message_ids: ['msg-user-1', 'msg-user-1'] })).ok).toBe(false);
+    expect(validateProposal(personal({ payload: { title: 'x', experience: 'y', time_text: null } })).ok).toBe(false);
+    expect(validateProposal(personal({ payload: { title: 'x', experience: 'y', unknown: 'z' } })).ok).toBe(false);
+  });
+});
+
+describe('canonical authority and outcomes', () => {
+  it('persists canonical records, backend-resolved evidence, links, and deterministic projection', () => {
+    const rt = runtime();
+    const batch = 'batch-fixture'; rt.store.beginBatch(batch, '2026-01-01T00:00:00.000Z');
+    const one = rt.remember(batch, personal());
+    expect(one.outcome).toBe('accepted');
+    const two = rt.remember(batch, shared(one.memory_id!));
+    expect(two.outcome).toBe('accepted');
+    const three = rt.remember(batch, relationship(two.memory_id!));
+    expect(three.outcome).toBe('accepted');
+    expect(rt.remember(batch, joke()).outcome).toBe('accepted');
+
+    const stored = rt.store.listMemories();
+    expect(stored).toHaveLength(4);
+    expect(rt.store.listEvidence().find((e) => e.message_id === 'msg-user-1')?.quote).toBe(messages[0].quote);
+    expect(stored.find((m) => m.memory_id === two.memory_id)?.linked_memory_ids).toEqual([one.memory_id]);
+    const firstProjection = renderProjection(stored);
+    const secondProjection = renderProjection(stored);
+    expect(firstProjection).toEqual(secondProjection);
+    expect(firstProjection.blocks.remembered_experiences).toContain(one.memory_id!);
+    expect(firstProjection.blocks.relationship_context).toContain(three.memory_id!);
+  });
+
+  it('is idempotent on unchanged replay and evaluates corrected permanent rejection normally', () => {
+    const rt = runtime(); const batch = 'batch-replay'; rt.store.beginBatch(batch, '2026-01-01T00:00:00.000Z');
+    const first = rt.remember(batch, personal());
+    expect(rt.remember(batch, personal())).toEqual({ outcome: 'duplicate', memory_id: first.memory_id });
+    expect(rt.store.listMemories()).toHaveLength(1);
+
+    const bad = personal({ participants: ['third_party'] });
+    expect(rt.remember(batch, bad).outcome).toBe('permanently_rejected');
+    expect(rt.remember(batch, bad).outcome).toBe('permanently_rejected');
+    const corrected = personal({ summary: 'Corrected proposal' });
+    expect(rt.remember(batch, corrected).outcome).toBe('accepted');
+    expect(rt.store.listMemories()).toHaveLength(2);
+  });
+
+  it('deduplicates the same canonical proposal across a different batch', () => {
+    const rt = runtime();
+    rt.store.beginBatch('batch-a', '2026-01-01T00:00:00.000Z');
+    const first = rt.remember('batch-a', personal());
+    rt.store.beginBatch('batch-b', '2026-01-01T00:00:01.000Z');
+    expect(rt.remember('batch-b', personal())).toEqual({ outcome: 'duplicate', memory_id: first.memory_id });
+    expect(rt.store.listMemories()).toHaveLength(1);
+  });
+
+  it('rejects invented evidence and temporary/unknown linked IDs', () => {
+    const rt = runtime(); const batch = 'batch-authority'; rt.store.beginBatch(batch, '2026-01-01T00:00:00.000Z');
+    expect(rt.remember(batch, personal({ evidence_message_ids: ['made-up'] })).outcome).toBe('permanently_rejected');
+    expect(rt.remember(batch, shared('proposal-1')).outcome).toBe('permanently_rejected');
+  });
+
+  it('rebuilds a deleted projection from canonical authority', () => {
+    const rt = runtime(); rt.store.beginBatch('projection', '2026-01-01T00:00:00.000Z');
+    const accepted = rt.remember('projection', personal());
+    expect(accepted.outcome).toBe('accepted');
+    const before = rebuildProjection(rt.store);
+    const fakeProjectionFile = path.join(rt.store.rootDir, 'projections', 'remembered_experiences.md');
+    fs.mkdirSync(path.dirname(fakeProjectionFile), { recursive: true });
+    fs.writeFileSync(fakeProjectionFile, before.blocks.remembered_experiences);
+    fs.rmSync(path.dirname(fakeProjectionFile), { recursive: true, force: true });
+    expect(rt.store.listMemories()).toHaveLength(1);
+    expect(rebuildProjection(rt.store)).toEqual(before);
+  });
+});
+
+describe('batch completion and cursor', () => {
+  it('advances for no-memory and accepted + permanent rejection', () => {
+    const noMemory = runtime(); noMemory.store.beginBatch('none', '2026-01-01T00:00:00.000Z');
+    expect(noMemory.finalizeBatch('none', true)).toBe('completed');
+    expect(cursorShouldAdvance('completed')).toBe(true);
+    expect(noMemory.store.listBatches().at(-1)?.detail).toBe('no_memory_required');
+
+    const mixed = runtime(); mixed.store.beginBatch('mixed', '2026-01-01T00:00:00.000Z');
+    expect(mixed.remember('mixed', personal()).outcome).toBe('accepted');
+    expect(mixed.remember('mixed', personal({ evidence_message_ids: ['missing'] })).outcome).toBe('permanently_rejected');
+    expect(mixed.finalizeBatch('mixed', true)).toBe('completed');
+  });
+
+  it('holds when an accepted memory is persisted but both accepted and retryable outcome commits fail', () => {
+    const rt = runtime(tempDir(), (phase) => phase === 'outcome_commit');
+    rt.store.beginBatch('outcome-accepted', '2026-01-01T00:00:00.000Z');
+
+    const result = rt.remember('outcome-accepted', personal());
+    expect(result.outcome).toBe('retryable_failed');
+    expect(rt.store.listMemories()).toHaveLength(1);
+    expect(rt.store.listOutcomes()).toHaveLength(0);
+
+    expect(rt.finalizeBatch('outcome-accepted', true)).toBe('retryable_failure');
+    expect(cursorShouldAdvance('retryable_failure')).toBe(false);
+    expect(rt.store.listBatches().at(-1)?.detail).toBeUndefined();
+  });
+
+  it('holds when a permanent rejection cannot be durably journaled', () => {
+    const rt = runtime(tempDir(), (phase) => phase === 'outcome_commit');
+    rt.store.beginBatch('outcome-rejection', '2026-01-01T00:00:00.000Z');
+
+    const result = rt.remember('outcome-rejection', personal({ participants: ['third_party'] }));
+    expect(result.outcome).toBe('retryable_failed');
+    expect(rt.store.listMemories()).toHaveLength(0);
+    expect(rt.store.listOutcomes()).toHaveLength(0);
+
+    expect(rt.finalizeBatch('outcome-rejection', true)).toBe('retryable_failure');
+    expect(cursorShouldAdvance('retryable_failure')).toBe(false);
+  });
+
+  it('holds when duplicate journaling fails and replay does not duplicate canonical memory', () => {
+    let failOutcome = false;
+    const rt = runtime(tempDir(), (phase) => failOutcome && phase === 'outcome_commit');
+
+    rt.store.beginBatch('duplicate-source', '2026-01-01T00:00:00.000Z');
+    const accepted = rt.remember('duplicate-source', personal());
+    expect(accepted.outcome).toBe('accepted');
+    expect(rt.store.listMemories()).toHaveLength(1);
+
+    rt.store.beginBatch('duplicate-retry', '2026-01-01T00:00:01.000Z');
+    failOutcome = true;
+    const retryable = rt.remember('duplicate-retry', personal());
+    expect(retryable.outcome).toBe('retryable_failed');
+    expect(rt.store.listMemories()).toHaveLength(1);
+    expect(rt.finalizeBatch('duplicate-retry', true)).toBe('retryable_failure');
+    expect(cursorShouldAdvance('retryable_failure')).toBe(false);
+
+    failOutcome = false;
+    expect(rt.remember('duplicate-retry', personal())).toEqual({ outcome: 'duplicate', memory_id: accepted.memory_id });
+    expect(rt.store.listMemories()).toHaveLength(1);
+  });
+
+  it('holds on retryable failure and replay does not duplicate an accepted record', () => {
+    let fail = false;
+    const dir = tempDir();
+    const rt = runtime(dir, (phase) => fail && phase === 'memory_commit');
+    rt.store.beginBatch('retry', '2026-01-01T00:00:00.000Z');
+    const accepted = rt.remember('retry', personal());
+    fail = true;
+    const retryable = rt.remember('retry', joke());
+    expect(accepted.outcome).toBe('accepted');
+    expect(retryable.outcome).toBe('retryable_failed');
+    expect(rt.finalizeBatch('retry', true)).toBe('retryable_failure');
+    expect(cursorShouldAdvance('retryable_failure')).toBe(false);
+
+    fail = false;
+    expect(rt.remember('retry', personal())).toEqual({ outcome: 'duplicate', memory_id: accepted.memory_id });
+    expect(rt.remember('retry', joke()).outcome).toBe('accepted');
+    expect(rt.store.listMemories()).toHaveLength(2);
+  });
+});
+
+describe('adopted SDK/configuration boundary', () => {
+  it('registers only memory_search and memory_remember plus read-only investigation tools', async () => {
+    const rt = runtime(); rt.store.beginBatch('tools', '2026-01-01T00:00:00.000Z');
+    const tools = buildRelationshipTools(rt, 'tools');
+    expect(tools.map((t) => t.name)).toEqual(['memory_search', 'memory_remember']);
+    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_remember']);
+    for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).not.toContain(forbidden as any);
+    const remembered = await tools[1].execute('call-1', personal());
+    expect(remembered).toEqual(expect.objectContaining({ outcome: 'accepted' }));
+    const searched = await tools[0].execute('call-2', { query: 'historic city' });
+    expect((searched as any).results).toHaveLength(1);
+  });
+
+  it('keeps the adopted agent identity while removing Markdown mutation tools and attaching read-only projection blocks', () => {
+    const af = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf8'));
+    const agent = af.agents[0];
+    expect(agent.id).toBe('agent-0');
+    const toolNames = agent.tool_ids.map((id: string) => af.tools.find((tool: any) => tool.id === id)?.name);
+    for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(toolNames).not.toContain(forbidden);
+    expect(agent.system).toContain('memory_search');
+    expect(agent.system).toContain('memory_remember');
+    expect(agent.system).not.toContain('memory_replace(');
+    const attachedBlocks = agent.block_ids.map((id: string) => af.blocks.find((block: any) => block.id === id));
+    expect(attachedBlocks.map((b: any) => b.label)).toEqual(['shared_language', 'remembered_experiences', 'relationship_context']);
+    expect(attachedBlocks.every((b: any) => b.read_only === true)).toBe(true);
+  });
+
+  it('extracts trusted canonical message IDs from the adopted parsed transcript without a second scanner', () => {
+    const transcript: any[] = [
+      { type: 'system', uuid: 'ignored', content: 'internal' },
+      { type: 'user', uuid: 'u-1', timestamp: '2026-01-01T00:00:00Z', message: { content: [{ type: 'text', text: 'hello' }] } },
+      { type: 'assistant', uuid: 'a-1', timestamp: '2026-01-01T00:00:01Z', message: { content: [{ type: 'text', text: 'hi' }] } },
+    ];
+    expect(buildCanonicalMessages(transcript, 0, 'conv-1')).toEqual([
+      { conversation_id: 'conv-1', message_id: 'u-1', role: 'user', quote: 'hello', captured_at: '2026-01-01T00:00:00Z' },
+      { conversation_id: 'conv-1', message_id: 'a-1', role: 'assistant', quote: 'hi', captured_at: '2026-01-01T00:00:01Z' },
+    ]);
+    expect(makeBatchId('session', 0, 2)).toBe(makeBatchId('session', 0, 2));
+  });
+});

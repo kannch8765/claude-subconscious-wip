@@ -39,12 +39,10 @@ import {
   readTranscript,
   formatMessagesForLetta,
 } from './transcript_utils.js';
+import { buildCanonicalMessages, makeBatchId } from '../relationship-memory/src/adapter/index.js';
 
-// ESM-compatible __dirname
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-// Configuration
 const TEMP_STATE_DIR = getTempStateDir();
 const LOG_FILE = path.join(TEMP_STATE_DIR, 'send_messages.log');
 
@@ -56,53 +54,32 @@ interface HookInput {
   hook_event_name?: string;
 }
 
-/**
- * Ensure temp log directory exists
- */
 function ensureLogDir(): void {
-  if (!fs.existsSync(TEMP_STATE_DIR)) {
-    fs.mkdirSync(TEMP_STATE_DIR, { recursive: true });
-  }
+  if (!fs.existsSync(TEMP_STATE_DIR)) fs.mkdirSync(TEMP_STATE_DIR, { recursive: true });
 }
 
-/**
- * Log message to file
- */
 function log(message: string): void {
   ensureLogDir();
   const timestamp = new Date().toISOString();
-  const logLine = `[${timestamp}] ${message}\n`;
-  fs.appendFileSync(LOG_FILE, logLine);
+  fs.appendFileSync(LOG_FILE, `[${timestamp}] ${message}\n`);
 }
 
-/**
- * Read hook input from stdin
- */
 async function readHookInput(): Promise<HookInput> {
   return new Promise((resolve, reject) => {
     let data = '';
     process.stdin.setEncoding('utf8');
     process.stdin.on('readable', () => {
       let chunk;
-      while ((chunk = process.stdin.read()) !== null) {
-        data += chunk;
-      }
+      while ((chunk = process.stdin.read()) !== null) data += chunk;
     });
     process.stdin.on('end', () => {
-      try {
-        resolve(JSON.parse(data));
-      } catch (e) {
-        reject(new Error(`Failed to parse hook input: ${e}`));
-      }
+      try { resolve(JSON.parse(data)); }
+      catch (e) { reject(new Error(`Failed to parse hook input: ${e}`)); }
     });
     process.stdin.on('error', reject);
   });
 }
 
-
-/**
- * Main function
- */
 async function main(): Promise<void> {
   log('='.repeat(60));
   log('send_messages_to_letta.ts started');
@@ -113,12 +90,8 @@ async function main(): Promise<void> {
     log('Mode is off, exiting');
     process.exit(0);
   }
-  
-  // Get environment variables
   const apiKey = process.env.LETTA_API_KEY;
-
   log(`LETTA_API_KEY: ${apiKey ? 'set (' + apiKey.substring(0, 10) + '...)' : 'NOT SET'}`);
-
   if (!apiKey) {
     log('ERROR: LETTA_API_KEY not set');
     console.error('Error: LETTA_API_KEY must be set');
@@ -126,10 +99,8 @@ async function main(): Promise<void> {
   }
 
   try {
-    // Get agent ID (from env, saved config, or auto-import)
     const agentId = await getAgentId(apiKey, log);
     log(`Using agent: ${agentId}`);
-    // Read hook input
     log('Reading hook input from stdin...');
     const hookInput = await readHookInput();
     log(`Hook input received:`);
@@ -138,24 +109,20 @@ async function main(): Promise<void> {
     log(`  stop_hook_active: ${hookInput.stop_hook_active}`);
     log(`  hook_event_name: ${hookInput.hook_event_name}`);
     log(`  cwd: ${hookInput.cwd}`);
-    
-    // Prevent infinite loops if stop hook is already active
+
     if (hookInput.stop_hook_active) {
       log('Stop hook already active, exiting to prevent loop');
       process.exit(0);
     }
 
-    // Read transcript
     log(`Reading transcript from: ${hookInput.transcript_path}`);
     const messages = await readTranscript(hookInput.transcript_path, log);
     log(`Found ${messages.length} messages in transcript`);
-    
     if (messages.length === 0) {
       log('No messages found, exiting');
       process.exit(0);
     }
 
-    // Log message types found
     const typeCounts: Record<string, number> = {};
     for (const msg of messages) {
       const key = msg.type || msg.role || 'unknown';
@@ -163,25 +130,17 @@ async function main(): Promise<void> {
     }
     log(`Message types: ${JSON.stringify(typeCounts)}`);
 
-    // Load sync state (from durable storage)
     const state = loadSyncState(hookInput.cwd, hookInput.session_id, log);
-    
-    // Format new messages
     const newMessages = formatMessagesForLetta(messages, state.lastProcessedIndex, log);
-    
     if (newMessages.length === 0) {
       log('No new messages to send after formatting');
       process.exit(0);
     }
 
-    // Get or create conversation for this session
     const conversationId = await getOrCreateConversation(apiKey, agentId, hookInput.session_id, hookInput.cwd, state, log);
     log(`Using conversation: ${conversationId}`);
-
-    // Save state now (with conversation ID) so it persists even if worker fails
     saveSyncState(hookInput.cwd, state, log);
 
-    // Build the message payload (same format as sendBatchToConversation)
     const transcriptEntries = newMessages.map(m => {
       const role = m.role === 'user' ? 'user' : m.role === 'assistant' ? 'claude_code' : 'system';
       const escaped = m.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -206,12 +165,14 @@ Write your response as if speaking directly to Claude Code.
 </instructions>
 </claude_code_session_update>`;
 
-    // Send via Letta Code SDK (Sub gets client-side tools)
     const sdkToolsMode = getSdkToolsMode();
     log(`SDK tools mode: ${sdkToolsMode}`);
-
     const payloadFile = path.join(TEMP_STATE_DIR, `payload-${hookInput.session_id}-${Date.now()}.json`);
     const stateFile = getSyncStateFile(hookInput.cwd, hookInput.session_id);
+
+    const batchId = makeBatchId(hookInput.session_id, state.lastProcessedIndex, messages.length - 1);
+    const canonicalMessages = buildCanonicalMessages(messages, state.lastProcessedIndex, conversationId);
+    log(`Relationship-memory batch: ${batchId} (${canonicalMessages.length} canonical evidence messages)`);
 
     const sdkPayload = {
       agentId,
@@ -222,6 +183,8 @@ Write your response as if speaking directly to Claude Code.
       newLastProcessedIndex: messages.length - 1,
       cwd: hookInput.cwd,
       sdkToolsMode,
+      batchId,
+      canonicalMessages,
     };
     fs.writeFileSync(payloadFile, JSON.stringify(sdkPayload), 'utf-8');
     log(`Wrote SDK payload to ${payloadFile}`);
@@ -229,19 +192,14 @@ Write your response as if speaking directly to Claude Code.
     const workerScript = path.join(__dirname, 'send_worker_sdk.ts');
     const child = spawnSilentWorker(workerScript, payloadFile, hookInput.cwd);
     log(`Spawned SDK worker (PID: ${child.pid})`);
-
     log('Hook completed (worker running in background)');
-
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     log(`ERROR: ${errorMessage}`);
-    if (error instanceof Error && error.stack) {
-      log(`Stack trace: ${error.stack}`);
-    }
+    if (error instanceof Error && error.stack) log(`Stack trace: ${error.stack}`);
     console.error(`Error sending messages to Letta: ${errorMessage}`);
     process.exit(1);
   }
 }
 
-// Run main function
 main();
