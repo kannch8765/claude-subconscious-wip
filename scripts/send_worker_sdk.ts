@@ -13,7 +13,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { CanonicalMessage } from '../relationship-memory/src/schema/index.js';
-import { buildRelationshipTools, createRuntime, FORBIDDEN_MARKDOWN_MEMORY_TOOLS, RELATIONSHIP_ALLOWED_CLIENT_TOOLS } from '../relationship-memory/src/adapter/index.js';
+import { appendCanonicalEvidenceCatalog, buildRelationshipTools, createRuntime, FORBIDDEN_MARKDOWN_MEMORY_TOOLS, RELATIONSHIP_ALLOWED_CLIENT_TOOLS } from '../relationship-memory/src/adapter/index.js';
 import { cursorShouldAdvance } from '../relationship-memory/src/tools/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
@@ -89,8 +89,9 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     log(`  allowedTools: ${RELATIONSHIP_ALLOWED_CLIENT_TOOLS.join(', ')}`);
 
     session = resumeSession(payload.conversationId, sessionOptions);
-    log(`Sending message (${payload.message.length} chars)...`);
-    await session.send(payload.message);
+    const observerMessage = appendCanonicalEvidenceCatalog(payload.message, payload.canonicalMessages);
+    log(`Sending message (${observerMessage.length} chars, ${payload.canonicalMessages.length} trusted evidence choices)...`);
+    await session.send(observerMessage);
 
     let assistantResponse = '';
     let messageCount = 0;

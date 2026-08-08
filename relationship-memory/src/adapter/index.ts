@@ -43,6 +43,25 @@ export function buildCanonicalMessages(
   return result;
 }
 
+function escapeWorkerXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+export function appendCanonicalEvidenceCatalog(
+  workerMessage: string,
+  canonicalMessages: CanonicalMessage[],
+): string {
+  const entries = canonicalMessages.map((message) =>
+    `  <evidence message_id="${escapeWorkerXml(message.message_id)}" role="${escapeWorkerXml(message.role)}">${escapeWorkerXml(message.quote)}</evidence>`,
+  ).join('\n');
+  return `${workerMessage}\n\n<relationship_memory_evidence_catalog>\n${entries}\n</relationship_memory_evidence_catalog>`;
+}
+
 export function makeBatchId(sessionId: string, startIndex: number, endIndex: number): string {
   return stableId('batch', { session_id: sessionId, start_index: startIndex + 1, end_index: endIndex });
 }

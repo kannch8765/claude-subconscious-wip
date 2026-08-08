@@ -205,48 +205,63 @@ export function cursorShouldAdvance(completion: BatchCompletion): boolean {
 }
 
 export function memoryRememberToolSchema(): Record<string, unknown> {
+  // Letta Code SDK 0.1.11 only forwards selected top-level JSON-schema fields
+  // for external tools, so a top-level `oneOf` is invisible to the model. Keep
+  // the authoritative kind-specific contract in validateProposal(), while this
+  // SDK-facing schema exposes the complete proposal vocabulary as one object.
   const string = { type: 'string', minLength: 1 };
   const strings = { type: 'array', uniqueItems: true, items: string };
-  const common = {
-    schema_version: { type: 'integer', enum: [1] },
-    summary: string,
-    participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
-    evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },
-    linked_memory_ids: strings,
-  };
-  const variant = (kind: MemoryKind, requiredPayload: string[], optionalPayload: string[], payloadProperties: Record<string, unknown>) => ({
+  return {
     type: 'object',
     additionalProperties: false,
     required: ['schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload'],
     properties: {
-      ...common,
-      kind: { type: 'string', enum: [kind] },
+      schema_version: { type: 'integer', enum: [1], description: 'Relationship-memory proposal schema version; must be 1.' },
+      kind: {
+        type: 'string',
+        enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke'],
+        description: 'Canonical relationship-memory kind. payload fields must match this kind exactly.',
+      },
+      summary: string,
+      participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
+      evidence_message_ids: {
+        type: 'array', minItems: 1, uniqueItems: true, items: string,
+        description: 'Exact message_id values copied from the current-batch relationship-memory evidence catalog.',
+      },
+      linked_memory_ids: strings,
       payload: {
         type: 'object',
         additionalProperties: false,
-        required: requiredPayload,
-        properties: Object.fromEntries([...requiredPayload, ...optionalPayload].map((key) => [key, payloadProperties[key]])),
+        description: [
+          'Kind-specific payload. Trusted validation remains authoritative.',
+          'personal_experience requires title, experience; optional time_text, places, themes, emotional_tone, why_memorable, recall_triggers.',
+          'shared_experience requires title, event, shared_meaning; optional symbols, recall_triggers.',
+          'relationship_event requires event, meaning; optional prior_context, resulting_change.',
+          'inside_joke requires name, meaning, trigger_phrases; optional origin, callbacks, tone.',
+        ].join(' '),
+        properties: {
+          title: string,
+          experience: string,
+          time_text: string,
+          places: strings,
+          themes: strings,
+          emotional_tone: string,
+          why_memorable: string,
+          recall_triggers: strings,
+          event: string,
+          shared_meaning: string,
+          symbols: strings,
+          meaning: string,
+          prior_context: string,
+          resulting_change: string,
+          name: string,
+          trigger_phrases: { type: 'array', minItems: 1, uniqueItems: true, items: string },
+          origin: string,
+          callbacks: strings,
+          tone: string,
+        },
       },
     },
-  });
-  return {
-    oneOf: [
-      variant('personal_experience', ['title', 'experience'], ['time_text', 'places', 'themes', 'emotional_tone', 'why_memorable', 'recall_triggers'], {
-        title: string, experience: string, time_text: string, places: strings, themes: strings,
-        emotional_tone: string, why_memorable: string, recall_triggers: strings,
-      }),
-      variant('shared_experience', ['title', 'event', 'shared_meaning'], ['symbols', 'recall_triggers'], {
-        title: string, event: string, shared_meaning: string, symbols: strings, recall_triggers: strings,
-      }),
-      variant('relationship_event', ['event', 'meaning'], ['prior_context', 'resulting_change'], {
-        event: string, meaning: string, prior_context: string, resulting_change: string,
-      }),
-      variant('inside_joke', ['name', 'meaning', 'trigger_phrases'], ['origin', 'callbacks', 'tone'], {
-        name: string, meaning: string,
-        trigger_phrases: { type: 'array', minItems: 1, uniqueItems: true, items: string },
-        origin: string, callbacks: strings, tone: string,
-      }),
-    ],
   };
 }
 
