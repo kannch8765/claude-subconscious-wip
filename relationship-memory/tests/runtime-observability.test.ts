@@ -78,6 +78,24 @@ describe('runtime observability abstraction', () => {
     expect(JSON.stringify(timeline)).not.toContain('SECRET');
   });
 
+  it('maps approval request messages into the compact tool timeline without raw arguments', async () => {
+    const transport = new FixtureTransport({
+      '/runs/r-approval/steps': [
+        {id:'s-approval',run_id:'r-approval',status:'success',stop_reason:'requires_approval'},
+      ],
+      '/steps/s-approval/messages': [
+        {message_type:'approval_request_message',run_id:'r-approval',tool_call:{name:'write_memory',arguments:'{\"secret\":\"DO NOT EXPOSE\"}',tool_call_id:'tc-approval'}},
+      ],
+    });
+    const timeline = await getRunTimeline(transport,'r-approval');
+    expect(timeline).toEqual([
+      expect.objectContaining({kind:'step',stepId:'s-approval',stopReason:'requires_approval'}),
+      expect.objectContaining({kind:'tool',stepId:'s-approval',toolName:'write_memory',toolCallId:'tc-approval',detailAvailable:true}),
+    ]);
+    expect(JSON.stringify(timeline)).not.toContain('DO NOT EXPOSE');
+    expect(JSON.stringify(timeline)).not.toContain('arguments');
+  });
+
   it('reports transport failure explicitly as unreachable', async () => {
     const transport = new FixtureTransport({ '/agents/agent-a': new LettaReadError('unreachable','connection refused') });
     const result = await getAgentRuntimeOverview(transport,'agent-a');

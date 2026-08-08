@@ -285,7 +285,7 @@ export async function getRunTimeline(transport: LettaReadTransport, runId: strin
     const messages = Array.isArray(messagesRaw) ? messagesRaw.map(asRecord) : [];
     const toolById = new Map<string, ToolTimelineItem>();
     for (const message of messages) {
-      if (message.message_type === 'tool_call_message') {
+      if (message.message_type === 'tool_call_message' || message.message_type === 'approval_request_message') {
         for (const call of extractToolCalls(message)) {
           const id = maybeString(call.tool_call_id);
           if (!id) continue;
