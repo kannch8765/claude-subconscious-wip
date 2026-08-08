@@ -284,6 +284,8 @@ function extractToolReturns(message: Record<string, any>): Array<Record<string, 
   return [];
 }
 
+export * from './opencode-provider-usage.js';
+
 export async function getRunTimeline(transport: LettaReadTransport, runId: string): Promise<RunTimelineItem[]> {
   const stepsRaw = await transport.getJson(`/runs/${runId}/steps`);
   const steps = Array.isArray(stepsRaw) ? stepsRaw.map(asRecord) : [];
