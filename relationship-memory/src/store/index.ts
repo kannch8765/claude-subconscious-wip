@@ -6,6 +6,7 @@ import type {
   CanonicalMemoryRecord,
   EvidenceRecord,
   RememberOutcome,
+  OwnerRevisionRecord,
 } from '../schema/index.js';
 
 export type StorePhase = 'memory_commit' | 'outcome_commit';
@@ -56,6 +57,7 @@ export class RelationshipMemoryStore {
   listEvidence(): EvidenceRecord[] { return readJsonl<EvidenceRecord>(this.file('evidence.jsonl')); }
   listOutcomes(): RememberOutcome[] { return readJsonl<RememberOutcome>(this.file('outcomes.jsonl')); }
   listBatches(): BatchRecord[] { return readJsonl<BatchRecord>(this.file('batches.jsonl')); }
+  listOwnerRevisions(): OwnerRevisionRecord[] { return readJsonl<OwnerRevisionRecord>(this.file('owner-revisions.jsonl')); }
 
   getMemory(memoryId: string): CanonicalMemoryRecord | undefined {
     return this.listMemories().find((item) => item.memory_id === memoryId);
@@ -79,6 +81,8 @@ export class RelationshipMemoryStore {
     const existingEvidence = new Set(this.listEvidence().map((item) => item.evidence_id));
     for (const item of evidence) if (!existingEvidence.has(item.evidence_id)) appendJsonl(this.file('evidence.jsonl'), item);
   }
+
+  appendOwnerRevision(record: OwnerRevisionRecord): void { appendJsonl(this.file('owner-revisions.jsonl'), record); }
 
   appendOutcome(outcome: RememberOutcome): void {
     if (this.failureInjector?.('outcome_commit')) throw new Error('injected outcome commit failure');

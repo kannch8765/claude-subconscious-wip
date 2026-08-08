@@ -213,3 +213,31 @@ export function validateProposal(input: unknown): ValidationResult {
     },
   };
 }
+
+export type OwnerRevisionAction = 'revise' | 'deactivate' | 'restore';
+
+export interface OwnerSemanticContent {
+  kind: MemoryKind;
+  summary: string;
+  participants: ParticipantRole[];
+  payload: Record<string, unknown>;
+  linked_memory_ids?: string[];
+}
+
+export interface OwnerRevisionRecord {
+  schema_version: 1;
+  revision_id: string;
+  subject_id: string;
+  memory_id: string;
+  action: OwnerRevisionAction;
+  recorded_at: string;
+  note?: string;
+  replacement?: OwnerSemanticContent;
+}
+
+export interface EffectiveMemoryRecord extends Omit<CanonicalMemoryRecord, 'status'> {
+  status: 'active' | 'inactive';
+  owner_corrected: boolean;
+  latest_revision_id?: string;
+  latest_revision_at?: string;
+}
