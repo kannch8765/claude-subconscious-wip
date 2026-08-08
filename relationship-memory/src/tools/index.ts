@@ -2,6 +2,7 @@ import type {
   BatchCompletion,
   CanonicalMessage,
   CanonicalMemoryRecord,
+  EffectiveMemoryRecord,
   EvidenceRecord,
   MemoryKind,
   ParticipantRole,
@@ -9,6 +10,7 @@ import type {
 } from '../schema/index.js';
 import { validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
+import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 
 export interface SearchQuery {
   kind?: MemoryKind;
@@ -36,10 +38,10 @@ export class RelationshipMemoryRuntime {
     readonly now: () => string = () => new Date().toISOString(),
   ) {}
 
-  memorySearch(query: SearchQuery): CanonicalMemoryRecord[] {
+  memorySearch(query: SearchQuery): EffectiveMemoryRecord[] {
     const needle = query.query?.trim().toLowerCase();
     const trigger = query.trigger?.trim().toLowerCase();
-    return this.store.listMemories().filter((memory) => {
+    return new RelationshipMemoryOwnerControlPlane(this.store).search({ active: true }).filter((memory) => {
       if (query.kind && memory.kind !== query.kind) return false;
       if (query.participant && !memory.participants.includes(query.participant)) return false;
       if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
