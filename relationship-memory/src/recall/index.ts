@@ -216,6 +216,8 @@ export class RelationshipMemoryRecallSession {
   readonly transcriptRoots: string[];
   private readonly sources = new Map<string, SourceEntry>();
   private delivered?: RecallResult;
+  private readonly deliveryPromise: Promise<RecallResult>;
+  private resolveDelivery!: (result: RecallResult) => void;
   private closedReason?: 'timeout' | 'cancelled' | 'failed';
 
   constructor(options: {
@@ -225,6 +227,7 @@ export class RelationshipMemoryRecallSession {
     transcriptRoots?: string[];
   }) {
     this.recallId = options.recallId || `recall_${crypto.randomUUID()}`;
+    this.deliveryPromise = new Promise<RecallResult>((resolve) => { this.resolveDelivery = resolve; });
     // ensureRoot=false is important: recall must not create or append store files.
     this.store = new RelationshipMemoryStore(options.rootDir, options.subjectId, undefined, false);
     this.transcriptRoots = options.transcriptRoots ?? transcriptRootsFromEnvironment();
@@ -232,6 +235,7 @@ export class RelationshipMemoryRecallSession {
 
   get isClosed(): boolean { return Boolean(this.delivered || this.closedReason); }
   get delivery(): RecallResult | undefined { return this.delivered; }
+  waitForDelivery(): Promise<RecallResult> { return this.deliveryPromise; }
 
   close(reason: 'timeout' | 'cancelled' | 'failed'): void {
     if (!this.delivered && !this.closedReason) this.closedReason = reason;
@@ -421,6 +425,7 @@ export class RelationshipMemoryRecallSession {
       source_refs: sourceRefs,
       sources: summaries,
     };
+    this.resolveDelivery(this.delivered);
     return this.delivered;
   }
 }
@@ -537,13 +542,21 @@ export async function executeRecall(options: {
   });
   const controller = new AbortController();
   let externalCancelled = false;
-  const onExternalAbort = () => { externalCancelled = true; controller.abort(options.signal?.reason); };
+  const onExternalAbort = () => {
+    externalCancelled = true;
+    session.close('cancelled');
+    controller.abort(options.signal?.reason);
+  };
   if (options.signal?.aborted) onExternalAbort();
   else options.signal?.addEventListener('abort', onExternalAbort, { once: true });
 
   let timeoutHandle: NodeJS.Timeout | undefined;
   const timeout = new Promise<'timeout'>((resolve) => {
-    timeoutHandle = setTimeout(() => { controller.abort(new Error('recall deadline exceeded')); resolve('timeout'); }, timeoutMs);
+    timeoutHandle = setTimeout(() => {
+      session.close('timeout');
+      controller.abort(new Error('recall deadline exceeded'));
+      resolve('timeout');
+    }, timeoutMs);
   });
   let cancelRaceResolve: (() => void) | undefined;
   const cancelled = new Promise<'cancelled'>((resolve) => {
@@ -551,6 +564,7 @@ export async function executeRecall(options: {
     if (options.signal?.aborted) cancelRaceResolve();
     else options.signal?.addEventListener('abort', cancelRaceResolve, { once: true });
   });
+  const delivered = session.waitForDelivery().then(() => 'delivered' as const);
   let modelFailureReason = '';
   const model = (async (): Promise<'model_done' | 'model_failed'> => {
     try { await options.runModel(session, query, controller.signal); return 'model_done'; }
@@ -558,13 +572,18 @@ export async function executeRecall(options: {
   })();
 
   try {
-    const winner = await Promise.race([model, timeout, cancelled]);
+    // Successful deliver_recall is itself terminal. Do not keep an accepted
+    // delivery inside the deadline while the model runner unwinds or performs
+    // best-effort transport cleanup.
+    const winner = await Promise.race([delivered, model, timeout, cancelled]);
+    // A delivery accepted before a competing timeout/cancel signal is the
+    // terminal result, even if that competing promise wins microtask ordering.
+    if (session.delivery) return session.delivery;
+    if (winner === 'delivered') return session.delivery!;
     if (winner === 'timeout') {
-      session.close('timeout');
       return { status: 'timeout', recall_id: session.recallId, reason: `Recall exceeded its ${timeoutMs} ms inner deadline.` };
     }
     if (winner === 'cancelled' || externalCancelled) {
-      session.close('cancelled');
       return { status: 'cancelled', recall_id: session.recallId, reason: 'Recall was cancelled before terminal delivery.' };
     }
     if (session.delivery) return session.delivery;

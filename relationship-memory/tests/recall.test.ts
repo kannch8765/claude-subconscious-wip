@@ -146,6 +146,36 @@ describe('assistant relationship-memory recall core', () => {
     ]);
   });
 
+  it('keeps an accepted terminal delivery even when the model runner outlives the deadline', async () => {
+    const root = temp('rm-recall-delivered-before-timeout-');
+    const result = await executeRecall({
+      query: 'Return the accepted answer', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 100,
+      async runModel(session) {
+        session.deliver({ recall_id: session.recallId, answer: 'accepted before cleanup', source_refs: [] });
+        await new Promise((resolve) => setTimeout(resolve, 180));
+      },
+    });
+    expect(result).toEqual(expect.objectContaining({
+      status: 'ok', answer: 'accepted before cleanup', source_refs: [],
+    }));
+  });
+
+  it('keeps an accepted terminal delivery when cancellation arrives during model cleanup', async () => {
+    const root = temp('rm-recall-delivered-before-cancel-');
+    const controller = new AbortController();
+    const result = await executeRecall({
+      query: 'Return the accepted answer', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 5_000, signal: controller.signal,
+      async runModel(session) {
+        session.deliver({ recall_id: session.recallId, answer: 'accepted before cancel', source_refs: [] });
+        controller.abort();
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      },
+    });
+    expect(result).toEqual(expect.objectContaining({
+      status: 'ok', answer: 'accepted before cancel', source_refs: [],
+    }));
+  });
+
   it('returns an explicit timeout and rejects a late delivery after the deadline', async () => {
     const root = temp('rm-recall-timeout-');
     seedRelationshipMemory(root);
