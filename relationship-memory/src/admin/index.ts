@@ -251,3 +251,5 @@ export async function composeSubconsciousAdminSnapshot(
 ): Promise<SubconsciousAdminSnapshot> {
   return new SubconsciousAdminReadModel(dependencies).snapshot(options);
 }
+
+export * from './http.js';
