@@ -6,3 +6,4 @@ export * from './adapter/index.js';
 export * from './owner/index.js';
 
 export * from './observability/index.js';
+export * from './admin/index.js';
