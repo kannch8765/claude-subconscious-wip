@@ -3,11 +3,13 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  appendCanonicalEvidenceCatalog,
   buildCanonicalMessages,
   buildRelationshipTools,
   cursorShouldAdvance,
   FORBIDDEN_MARKDOWN_MEMORY_TOOLS,
   makeBatchId,
+  memoryRememberToolSchema,
   RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
@@ -248,6 +250,74 @@ describe('batch completion and cursor', () => {
     expect(rt.remember('retry', personal())).toEqual({ outcome: 'duplicate', memory_id: accepted.memory_id });
     expect(rt.remember('retry', joke()).outcome).toBe('accepted');
     expect(rt.store.listMemories()).toHaveLength(2);
+  });
+});
+
+describe('observer contract correction', () => {
+  it('exposes an SDK-0.1.11-compatible top-level proposal schema for all four frozen kinds', () => {
+    const schema = memoryRememberToolSchema() as any;
+    // SDK 0.1.11 preserves these top-level fields for external tools.
+    const sdkVisible = Object.fromEntries(
+      ['type', 'properties', 'required', 'additionalProperties', 'description']
+        .filter((key) => key in schema)
+        .map((key) => [key, schema[key]]),
+    ) as any;
+
+    expect(sdkVisible.type).toBe('object');
+    expect(sdkVisible.required).toEqual(['schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload']);
+    expect(Object.keys(sdkVisible.properties)).toEqual(expect.arrayContaining([
+      'schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload', 'linked_memory_ids',
+    ]));
+    expect(sdkVisible.properties.kind.enum).toEqual([
+      'personal_experience', 'shared_experience', 'relationship_event', 'inside_joke',
+    ]);
+    expect(Object.keys(sdkVisible.properties.payload.properties)).toEqual(expect.arrayContaining([
+      'title', 'experience', 'event', 'shared_meaning', 'meaning', 'name', 'trigger_phrases',
+    ]));
+    expect(sdkVisible.properties.payload.description).toContain('personal_experience requires title, experience');
+    expect(sdkVisible.properties.payload.description).toContain('shared_experience requires title, event, shared_meaning');
+    expect(sdkVisible.properties.payload.description).toContain('relationship_event requires event, meaning');
+    expect(sdkVisible.properties.payload.description).toContain('inside_joke requires name, meaning, trigger_phrases');
+
+    // Model-facing compatibility must not weaken trusted validation.
+    expect(validateProposal({ ...personal(), unexpected: true }).ok).toBe(false);
+    expect(validateProposal(personal({ payload: { title: 'x', experience: 'y', event: 'wrong-kind field' } })).ok).toBe(false);
+  });
+
+  it('appends exact current-batch canonical evidence IDs, roles, and safely escaped quotes', () => {
+    const canonical = [
+      { ...messages[0], message_id: 'msg-&-"-1', quote: '<gift> & "shared"' },
+      messages[1],
+    ];
+    const observerMessage = appendCanonicalEvidenceCatalog('<claude_code_session_update>fixture</claude_code_session_update>', canonical);
+
+    expect(observerMessage).toContain('<relationship_memory_evidence_catalog>');
+    expect(observerMessage).toContain('message_id="msg-&amp;-&quot;-1" role="user"');
+    expect(observerMessage).toContain('&lt;gift&gt; &amp; &quot;shared&quot;');
+    expect(observerMessage).toContain(`message_id="${messages[1].message_id}" role="assistant"`);
+    expect(observerMessage).not.toContain(messages[2].message_id);
+  });
+
+  it('uses the same canonical messages for observer choices and trusted evidence authority', () => {
+    const canonical = messages.slice(0, 2);
+    const observerMessage = appendCanonicalEvidenceCatalog('fixture', canonical);
+    const store = new RelationshipMemoryStore(tempDir(), 'subject-fixture');
+    const rt = new RelationshipMemoryRuntime(store, new Map(canonical.map((message) => [message.message_id, message])), () => '2026-01-02T00:00:00.000Z');
+    store.beginBatch('same-authority', '2026-01-01T00:00:00.000Z');
+
+    expect(observerMessage).toContain(messages[0].message_id);
+    expect(rt.remember('same-authority', personal()).outcome).toBe('accepted');
+    expect(rt.store.listEvidence()[0]).toEqual(expect.objectContaining({
+      message_id: messages[0].message_id,
+      role: messages[0].role,
+      quote: messages[0].quote,
+    }));
+
+    expect(observerMessage).not.toContain(messages[2].message_id);
+    expect(rt.remember('same-authority', personal({
+      summary: 'Out-of-batch evidence must fail',
+      evidence_message_ids: [messages[2].message_id],
+    }))).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unresolvable_evidence' }));
   });
 });
 
