@@ -1,4 +1,4 @@
-import type { LettaReadTransport } from './index.js';
+import { mapUsage, type LettaReadTransport } from './index.js';
 
 export type PromptCacheTelemetryQuality = 'covered' | 'uncovered' | 'ineligible' | 'invalid';
 
@@ -56,38 +56,6 @@ type RawRecord = Record<string, unknown>;
 
 const asRecord = (value: unknown): RawRecord => value && typeof value === 'object' ? value as RawRecord : {};
 const maybeString = (value: unknown): string | undefined => typeof value === 'string' ? value : undefined;
-const finiteNumber = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
-
-function firstNumber(...values: unknown[]): number | undefined {
-  for (const value of values) {
-    const parsed = finiteNumber(value);
-    if (parsed !== undefined) return parsed;
-  }
-  return undefined;
-}
-
-function rawUsageFields(raw: RawRecord) {
-  const usage = asRecord(raw.usage);
-  const directDetails = asRecord(raw.prompt_tokens_details);
-  const usageDetails = asRecord(usage.prompt_tokens_details);
-  return {
-    promptTokens: firstNumber(raw.prompt_tokens, usage.prompt_tokens),
-    cachedInputTokens: firstNumber(
-      raw.cached_input_tokens,
-      usage.cached_input_tokens,
-      directDetails.cached_tokens,
-      directDetails.cache_read_tokens,
-      usageDetails.cached_tokens,
-      usageDetails.cache_read_tokens,
-    ),
-    cacheWriteTokens: firstNumber(
-      raw.cache_write_tokens,
-      usage.cache_write_tokens,
-      directDetails.cache_creation_tokens,
-      usageDetails.cache_creation_tokens,
-    ),
-  };
-}
 
 export function mapPromptCacheStepSample(
   raw: unknown,
@@ -97,7 +65,7 @@ export function mapPromptCacheStepSample(
   const stepId = maybeString(step.id);
   if (!stepId) throw new Error('Letta step is missing id');
 
-  const { promptTokens, cachedInputTokens, cacheWriteTokens } = rawUsageFields(step);
+  const { promptTokens, cachedInputTokens, cacheWriteTokens } = mapUsage(step);
   const base: PromptCacheStepSample = {
     stepId,
     runId: maybeString(step.run_id) ?? parent.runId,

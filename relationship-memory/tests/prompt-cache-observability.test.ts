@@ -4,6 +4,7 @@ import {
   collectAgentPromptCacheEffectiveness,
   groupPromptCacheByConversation,
   mapPromptCacheStepSample,
+  mapUsage,
   type LettaReadTransport,
   type PromptCacheRunSummary,
 } from '../src/observability/index.js';
@@ -19,6 +20,28 @@ class FixtureTransport implements LettaReadTransport {
 }
 
 describe('prompt cache effectiveness abstraction', () => {
+  it('derives prompt-cache tokens from the canonical mapUsage semantics', () => {
+    const raw = {
+      id: 's-canonical',
+      usage: {
+        prompt_tokens: 120,
+        completion_tokens: 7,
+        total_tokens: 127,
+        prompt_tokens_details: { cache_read_tokens: 90, cache_creation_tokens: 4 },
+      },
+    };
+    const canonical = mapUsage(raw);
+    const sample = mapPromptCacheStepSample(raw, { runId: 'r-canonical' });
+    expect(canonical).toMatchObject({ promptTokens: 120, cachedInputTokens: 90, cacheWriteTokens: 4 });
+    expect(sample).toMatchObject({
+      promptTokens: canonical.promptTokens,
+      cachedInputTokens: canonical.cachedInputTokens,
+      cacheWriteTokens: canonical.cacheWriteTokens,
+      cachedInputRatio: 0.75,
+      telemetryQuality: 'covered',
+    });
+  });
+
   it('preserves an observed zero cache read and produces ratio zero', () => {
     const sample = mapPromptCacheStepSample(
       { id: 's0', run_id: 'r0', prompt_tokens: 100, cached_input_tokens: 0 },
