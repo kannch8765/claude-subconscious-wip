@@ -170,15 +170,32 @@ export function mapContextMetrics(raw: unknown): ContextMetrics {
 
 export function mapUsage(raw: unknown): TokenUsage {
   const u = asRecord(raw);
+  const nested = asRecord(u.usage);
   const promptDetails = asRecord(u.prompt_tokens_details);
+  const nestedPromptDetails = asRecord(nested.prompt_tokens_details);
   const completionDetails = asRecord(u.completion_tokens_details);
+  const nestedCompletionDetails = asRecord(nested.completion_tokens_details);
   return compactUsage({
-    promptTokens: maybeNumber(u.prompt_tokens),
-    completionTokens: maybeNumber(u.completion_tokens),
-    totalTokens: maybeNumber(u.total_tokens),
-    cachedInputTokens: maybeNumber(u.cached_input_tokens) ?? maybeNumber(promptDetails.cached_tokens) ?? maybeNumber(promptDetails.cache_read_tokens),
-    cacheWriteTokens: maybeNumber(u.cache_write_tokens) ?? maybeNumber(promptDetails.cache_creation_tokens),
-    reasoningTokens: maybeNumber(u.reasoning_tokens) ?? maybeNumber(completionDetails.reasoning_tokens),
+    promptTokens: maybeNumber(u.prompt_tokens) ?? maybeNumber(nested.prompt_tokens),
+    completionTokens: maybeNumber(u.completion_tokens) ?? maybeNumber(nested.completion_tokens),
+    totalTokens: maybeNumber(u.total_tokens) ?? maybeNumber(nested.total_tokens),
+    cachedInputTokens:
+      maybeNumber(u.cached_input_tokens) ??
+      maybeNumber(nested.cached_input_tokens) ??
+      maybeNumber(promptDetails.cached_tokens) ??
+      maybeNumber(promptDetails.cache_read_tokens) ??
+      maybeNumber(nestedPromptDetails.cached_tokens) ??
+      maybeNumber(nestedPromptDetails.cache_read_tokens),
+    cacheWriteTokens:
+      maybeNumber(u.cache_write_tokens) ??
+      maybeNumber(nested.cache_write_tokens) ??
+      maybeNumber(promptDetails.cache_creation_tokens) ??
+      maybeNumber(nestedPromptDetails.cache_creation_tokens),
+    reasoningTokens:
+      maybeNumber(u.reasoning_tokens) ??
+      maybeNumber(nested.reasoning_tokens) ??
+      maybeNumber(completionDetails.reasoning_tokens) ??
+      maybeNumber(nestedCompletionDetails.reasoning_tokens),
   });
 }
 
@@ -306,3 +323,5 @@ export async function getRunTimeline(transport: LettaReadTransport, runId: strin
   }
   return timeline;
 }
+
+export * from './prompt-cache.js';

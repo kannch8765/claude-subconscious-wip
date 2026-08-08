@@ -51,6 +51,16 @@ describe('runtime observability abstraction', () => {
     expect(mapUsage({ prompt_tokens:10 })).toEqual({ promptTokens:10 });
   });
 
+  it('maps nested usage wrappers through the same canonical usage mapper', () => {
+    expect(mapUsage({ usage: {
+      prompt_tokens:20,
+      completion_tokens:5,
+      total_tokens:25,
+      prompt_tokens_details:{cache_read_tokens:12,cache_creation_tokens:3},
+      completion_tokens_details:{reasoning_tokens:2},
+    } })).toEqual({ promptTokens:20, completionTokens:5, totalTokens:25, cachedInputTokens:12, cacheWriteTokens:3, reasoningTokens:2 });
+  });
+
   it('maps recent run stop reasons, metrics, and exact usage', async () => {
     const transport = new FixtureTransport({ '/runs/': [
       { id:'r1',agent_id:'agent-a',conversation_id:'c1',status:'completed',stop_reason:'end_turn',ttft_ns:11,total_duration_ns:22 },
