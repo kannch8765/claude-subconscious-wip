@@ -2,7 +2,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
 import { extractAllContent } from '../../../scripts/transcript_utils.js';
-import type { CanonicalMessage, ParticipantRole } from '../schema/index.js';
+import type { AssistantRememberIntentRecord, CanonicalMessage, ParticipantRole } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
 import { memoryRememberToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
@@ -62,6 +62,21 @@ export function appendCanonicalEvidenceCatalog(
   return `${workerMessage}\n\n<relationship_memory_evidence_catalog>\n${entries}\n</relationship_memory_evidence_catalog>`;
 }
 
+export function appendTrustedRelationshipCatalog(
+  workerMessage: string,
+  canonicalMessages: CanonicalMessage[],
+  assistantIntents: AssistantRememberIntentRecord[],
+): string {
+  const withEvidence = appendCanonicalEvidenceCatalog(workerMessage, canonicalMessages);
+  const entries = assistantIntents.map((intent) => [
+    `  <assistant_remember_intent intent_id="${escapeWorkerXml(intent.intent_id)}" subject_id="${escapeWorkerXml(intent.subject_id)}" session_id="${escapeWorkerXml(intent.session_id)}" assistant_message_id="${escapeWorkerXml(intent.assistant_message_id)}" tool_use_id="${escapeWorkerXml(intent.tool_use_id)}" captured_at="${escapeWorkerXml(intent.captured_at)}">`,
+    `    <memory>${escapeWorkerXml(intent.memory.text)}</memory>`,
+    `    <feel>${escapeWorkerXml(intent.feel.text)}</feel>`,
+    '  </assistant_remember_intent>',
+  ].join('\n')).join('\n');
+  return `${withEvidence}\n\n<assistant_remember_intent_catalog trusted="true">\n${entries}\n</assistant_remember_intent_catalog>`;
+}
+
 export function makeBatchId(sessionId: string, startIndex: number, endIndex: number): string {
   return stableId('batch', { session_id: sessionId, start_index: startIndex + 1, end_index: endIndex });
 }
@@ -70,9 +85,15 @@ export function createRuntime(
   canonicalMessages: CanonicalMessage[],
   subjectId: string,
   rootDir = relationshipMemoryRoot(),
+  assistantIntents: AssistantRememberIntentRecord[] = [],
 ): RelationshipMemoryRuntime {
   const store = new RelationshipMemoryStore(rootDir, subjectId);
-  return new RelationshipMemoryRuntime(store, new Map(canonicalMessages.map((m) => [m.message_id, m])));
+  return new RelationshipMemoryRuntime(
+    store,
+    new Map(canonicalMessages.map((m) => [m.message_id, m])),
+    () => new Date().toISOString(),
+    new Map(assistantIntents.map((intent) => [intent.intent_id, intent])),
+  );
 }
 
 export function buildRelationshipTools(
@@ -83,13 +104,13 @@ export function buildRelationshipTools(
   return [
     {
       label: 'memory_search', name: 'memory_search',
-      description: 'Search canonical relationship-memory records before proposing a new record.',
+      description: 'Search canonical relationship-memory records, including linked assistant remember memory/feel provenance, before proposing a new record.',
       parameters: memorySearchToolSchema(),
       async execute(_toolCallId, args) { return wrapResult({ results: runtime.memorySearch((args ?? {}) as never) }); },
     },
     {
       label: 'memory_remember', name: 'memory_remember',
-      description: 'Propose one schema-version-1 relationship memory bound to trusted transcript evidence.',
+      description: 'Propose one schema-version-1 relationship memory bound to trusted transcript evidence. When processing a trusted assistant remember intent, copy its assistant_intent_id; never invent or rewrite feel text.',
       parameters: memoryRememberToolSchema(),
       async execute(_toolCallId, args) { return wrapResult(runtime.remember(batchId, args)); },
     },

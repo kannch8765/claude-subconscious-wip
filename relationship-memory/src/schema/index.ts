@@ -9,6 +9,7 @@ export type MemoryKind = (typeof MEMORY_KINDS)[number];
 export type ParticipantRole = 'user' | 'assistant';
 export type RememberOutcomeKind = 'accepted' | 'duplicate' | 'permanently_rejected' | 'retryable_failed';
 export type BatchCompletion = 'completed' | 'retryable_failure';
+export type AssistantIntentOutcomeKind = RememberOutcomeKind;
 
 export interface CanonicalMessage {
   conversation_id: string;
@@ -26,6 +27,30 @@ export interface MemoryProposalV1 {
   evidence_message_ids: string[];
   payload: Record<string, unknown>;
   linked_memory_ids?: string[];
+  assistant_intent_id?: string;
+}
+
+export interface AssistantRememberIntentRecord {
+  schema_version: 1;
+  intent_id: string;
+  subject_id: string;
+  session_id: string;
+  assistant_message_id: string;
+  tool_use_id: string;
+  tool_name: string;
+  memory: { text: string };
+  feel: { text: string };
+  captured_at: string;
+}
+
+export interface AssistantIntentOutcome {
+  intent_id: string;
+  batch_id: string;
+  outcome: AssistantIntentOutcomeKind;
+  memory_id?: string;
+  rejection_code?: string;
+  reason?: string;
+  recorded_at: string;
 }
 
 export interface CanonicalMemoryRecord {
@@ -80,7 +105,7 @@ export interface ValidationResult {
 }
 
 const commonKeys = new Set([
-  'schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload', 'linked_memory_ids',
+  'schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload', 'linked_memory_ids', 'assistant_intent_id',
 ]);
 const forbiddenAuthorityKeys = new Set([
   'memory_id', 'subject_id', 'status', 'observed_at', 'created_at', 'conversation_id', 'role', 'quote', 'captured_at',
@@ -157,6 +182,13 @@ export function validateProposal(input: unknown): ValidationResult {
   const evidenceIds = cleanStringArray(input.evidence_message_ids, true);
   if (!evidenceIds) return reject('invalid_evidence_message_ids', 'evidence_message_ids must be a non-empty unique string array.');
 
+  let assistantIntentId: string | undefined;
+  if ('assistant_intent_id' in input) {
+    const cleaned = cleanString(input.assistant_intent_id);
+    if (!cleaned) return reject('invalid_assistant_intent_id', 'assistant_intent_id must be a non-empty string when present.');
+    assistantIntentId = cleaned;
+  }
+
   let linkedMemoryIds: string[] | undefined;
   if ('linked_memory_ids' in input) {
     const cleaned = cleanStringArray(input.linked_memory_ids);
@@ -210,6 +242,7 @@ export function validateProposal(input: unknown): ValidationResult {
       evidence_message_ids: evidenceIds,
       payload,
       ...(linkedMemoryIds ? { linked_memory_ids: linkedMemoryIds } : {}),
+      ...(assistantIntentId ? { assistant_intent_id: assistantIntentId } : {}),
     },
   };
 }
