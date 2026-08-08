@@ -46,11 +46,11 @@ export class RelationshipMemoryStore {
   readonly subjectId: string;
   readonly failureInjector?: FailureInjector;
 
-  constructor(rootDir: string, subjectId: string, failureInjector?: FailureInjector) {
+  constructor(rootDir: string, subjectId: string, failureInjector?: FailureInjector, ensureRoot = true) {
     this.rootDir = rootDir;
     this.subjectId = subjectId;
     this.failureInjector = failureInjector;
-    ensureDir(rootDir);
+    if (ensureRoot) ensureDir(rootDir);
   }
 
   private file(name: string): string { return path.join(this.rootDir, name); }

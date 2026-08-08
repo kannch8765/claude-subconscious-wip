@@ -531,6 +531,17 @@ async function importDefaultAgent(apiKey: string): Promise<string> {
   return agentId;
 }
 
+export function getConfiguredAgentIdReadOnly(): string {
+  const envAgentId = process.env.LETTA_AGENT_ID;
+  if (envAgentId) {
+    if (!isValidAgentId(envAgentId)) throw new Error(getInvalidAgentIdMessage(envAgentId));
+    return envAgentId;
+  }
+  const config = readConfig();
+  if (config.agentId && isValidAgentId(config.agentId)) return config.agentId;
+  throw new Error('No existing Letta agent is configured for read-only recall. Set LETTA_AGENT_ID or initialize Subconscious first.');
+}
+
 /**
  * Get or create agent ID
  * 
