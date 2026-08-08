@@ -157,9 +157,19 @@ The isolated store contains mutually consistent canonical files:
 ```text
 memories.jsonl: 2 accepted canonical memories
 outcomes.jsonl: accepted outcomes for both memories, plus later duplicate replay outcome
-batches.jsonl: live pending/completed pair plus replay pending/completed pair
 evidence.jsonl: authoritative user/assistant transcript evidence for both accepted memories
 ```
+
+`batches.jsonl` contains four terminal batch pairs:
+
+```text
+batch_3eae16a75706f77e67b8c16d   pending -> completed
+batch_replay_1786187634977       pending -> completed
+batch_d4c7dc034543282c494b2b24   pending -> completed (detail=no_memory_required)
+batch_f12ae9329dd59253f4bd7f4f   pending -> completed (detail=no_memory_required)
+```
+
+The latter two recall-related batches finalized at `2026-08-08T11:14:42.354Z` and `2026-08-08T11:15:54.373Z`. They created no additional memories and no additional accepted/duplicate outcomes; their terminal `no_memory_required` result is consistent with recall activity that consumed projected canonical memory without proposing new relationship records.
 
 The live memory IDs referenced by outcomes and evidence all resolve to the two canonical records above.
 
@@ -215,17 +225,36 @@ No second canonical memory was created for the same proposal.
 
 ## Fresh full-mode recall
 
-**Not re-proven in this post-publication run.**
+**PASS — independently retained Task 093B artifacts prove a fresh `LETTA_MODE=full` read path.**
 
-After all mandatory write/projection/search/duplicate evidence had been captured, Haru VPS MCP's workspace backend became unavailable while the gateway health endpoint still reported healthy. Two attempts to start the separate fresh `LETTA_MODE=full` Claude Code recall session could therefore not be executed through the task's VPS control channel.
+A separate fresh recall session was launched with:
 
-This is recorded as an infrastructure interruption, not as a successful read-path claim and not as a relationship-memory product failure. The prior canary had already proven full-mode recall, but this artifact deliberately does not promote that prior result into a fresh 093B PASS claim.
+```text
+HOME: /srv/haru-mcp-workspace/task-093b/recall/home
+LETTA_MODE: full
+LETTA_AGENT_ID: agent-8c9329b5-63e0-4a45-98e4-1770a61521df
+Claude Code session: fbc71d74-6560-458d-876c-da043f7ebf58
+```
+
+The recall HOME/project contained no local relationship-memory JSONL files. The published plugin path injected the canonical projected Letta blocks into the fresh Claude session through `UserPromptSubmit`; the injected projection contained both accepted canonical memory IDs and the `moonlit-tangerine-6612` trigger.
+
+The natural recall query was:
+
+```text
+moonlit-tangerine-6612 是什么来着？
+```
+
+The assistant correctly recalled that `moonlit-tangerine-6612` / “月下蜜橘” was the shared code phrase for the night the published relationship-memory chain was finally made to work without the temporary shim. No local relationship-memory file was available to supply that answer, so this is a fresh full-mode projection-read proof for Task 093B.
+
+A later Haru VPS MCP workspace-backend interruption occurred after the recall artifacts had already been retained. The gateway health endpoint remained healthy. That later control-plane interruption is therefore only a non-product infrastructure note and does not weaken the completed full-mode recall proof.
 
 ## Non-blocking environment notes
 
 The successful interactive run displayed non-blocking `SessionStart:startup hook error` notices during startup. `UserPromptSubmit` still succeeded against the fresh Letta agent, the interactive model turn completed normally, the canonical async Stop hook registered, the detached relationship-memory path produced accepted records, the batch completed, the cursor advanced, and projection/search/replay all succeeded.
 
-A separate first launch used an incompletely initialized fresh Claude HOME and therefore showed Claude Code `Not logged in`; it was abandoned before becoming the passing canary. The passing run used a second fresh HOME/session with the previously proven API-key approval marker only. No old transcript, relationship-memory files, or durable cursor state were reused.
+A separate first launch used an incompletely initialized fresh Claude HOME and therefore showed Claude Code `Not logged in`; it was abandoned before becoming the passing canary. The passing write run used a second fresh HOME/session with the previously proven API-key approval marker only. No old transcript, relationship-memory files, or durable cursor state were reused.
+
+After the successful fresh full-mode recall artifacts had already been retained, the Haru VPS MCP workspace backend later became unavailable while gateway health still reported healthy. This was a later control-plane interruption only; it did not prevent or invalidate the already completed recall session described above.
 
 ## Verdict
 
@@ -239,7 +268,7 @@ CURSOR_ADVANCE_AFTER_COMPLETION = PASS
 PROJECTION_SYNC = PASS
 TRUSTED_SEARCH = PASS
 DUPLICATE_REPLAY_SAFETY = PASS
-FRESH_FULL_MODE_RECALL_093B = NOT_REPROVEN (VPS control-plane interruption)
+FRESH_FULL_MODE_RECALL_093B = PASS
 ```
 
-The key Task 093B claim is closed: exact published main `496ccf83f10a1fddd0980ae498b206b21cfe84a1`, with no transient relationship-memory code shim, completed the live accepted-write chain and produced authoritative durable evidence, terminal batch state, safe cursor advancement, projection/search visibility, and duplicate safety.
+The key Task 093B claim is closed: exact published main `496ccf83f10a1fddd0980ae498b206b21cfe84a1`, with no transient relationship-memory code shim, completed the live accepted-write chain and produced authoritative durable evidence, terminal batch state, safe cursor advancement, projection/search visibility, duplicate safety, and fresh full-mode recall from canonical projected memory.
