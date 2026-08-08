@@ -99,6 +99,13 @@ function parseNonNegativeInteger(value: string, column: string, rowNumber: numbe
   return parsed;
 }
 
+function addSafeAggregate(current: number, value: number, field: string): number {
+  if (value > Number.MAX_SAFE_INTEGER - current) {
+    throw new OpenCodeUsageError('invalid_csv', `Malformed OpenCode usage CSV: aggregate ${field} exceeds safe integer range`);
+  }
+  return current + value;
+}
+
 export function aggregateOpenCodeUsageCsv(csv: string, request: OpenCodeUsageExportRequest, observedAt = new Date().toISOString()): OpenCodeUsageAggregate {
   if (csv.trim() === '') {
     return { status:'success', provider:'opencode-console', endpoint:OPENCODE_USAGE_EXPORT_PATH, range:request.range, scope:request.scope, windowSemantics:'console_export_midnight_utc', rowCount:0, inputTokens:0, outputTokens:0, totalTokens:0, reasoningTokens:0, cacheReadTokens:0, cacheWrite5mTokens:0, cacheWrite1hTokens:0, costMicroCents:0, observedAt };
@@ -112,14 +119,20 @@ export function aggregateOpenCodeUsageCsv(csv: string, request: OpenCodeUsageExp
     const rowNumber = index + 1;
     if (cells.length !== headers.length) throw new OpenCodeUsageError('invalid_csv', `Malformed OpenCode usage CSV: data row ${rowNumber} has ${cells.length} columns; expected ${headers.length}`);
     const numeric = (column: typeof REQUIRED_COLUMNS[number]) => parseNonNegativeInteger(cells[indexes[column]], column, rowNumber);
-    inputTokens += numeric('input_tokens'); outputTokens += numeric('output_tokens'); reasoningTokens += numeric('reasoning_tokens'); cacheReadTokens += numeric('cache_read_tokens');
-    cacheWrite5mTokens += numeric('cache_write_5m_tokens'); cacheWrite1hTokens += numeric('cache_write_1h_tokens'); costMicroCents += numeric('cost_micro_cents');
+    inputTokens = addSafeAggregate(inputTokens, numeric('input_tokens'), 'input_tokens');
+    outputTokens = addSafeAggregate(outputTokens, numeric('output_tokens'), 'output_tokens');
+    reasoningTokens = addSafeAggregate(reasoningTokens, numeric('reasoning_tokens'), 'reasoning_tokens');
+    cacheReadTokens = addSafeAggregate(cacheReadTokens, numeric('cache_read_tokens'), 'cache_read_tokens');
+    cacheWrite5mTokens = addSafeAggregate(cacheWrite5mTokens, numeric('cache_write_5m_tokens'), 'cache_write_5m_tokens');
+    cacheWrite1hTokens = addSafeAggregate(cacheWrite1hTokens, numeric('cache_write_1h_tokens'), 'cache_write_1h_tokens');
+    costMicroCents = addSafeAggregate(costMicroCents, numeric('cost_micro_cents'), 'cost_micro_cents');
     const createdAt = cells[indexes.created_at];
     if (!createdAt || Number.isNaN(Date.parse(createdAt))) throw new OpenCodeUsageError('invalid_csv', `Malformed OpenCode usage CSV: created_at at data row ${rowNumber} is invalid`);
     earliestCreatedAt = earliestCreatedAt === undefined || createdAt < earliestCreatedAt ? createdAt : earliestCreatedAt;
     latestCreatedAt = latestCreatedAt === undefined || createdAt > latestCreatedAt ? createdAt : latestCreatedAt;
   });
-  return { status:'success', provider:'opencode-console', endpoint:OPENCODE_USAGE_EXPORT_PATH, range:request.range, scope:request.scope, windowSemantics:'console_export_midnight_utc', rowCount:rows.length-1, inputTokens, outputTokens, totalTokens:inputTokens+outputTokens, reasoningTokens, cacheReadTokens, cacheWrite5mTokens, cacheWrite1hTokens, costMicroCents, ...(earliestCreatedAt?{earliestCreatedAt}:{}), ...(latestCreatedAt?{latestCreatedAt}:{}), observedAt };
+  const totalTokens = addSafeAggregate(inputTokens, outputTokens, 'total_tokens');
+  return { status:'success', provider:'opencode-console', endpoint:OPENCODE_USAGE_EXPORT_PATH, range:request.range, scope:request.scope, windowSemantics:'console_export_midnight_utc', rowCount:rows.length-1, inputTokens, outputTokens, totalTokens, reasoningTokens, cacheReadTokens, cacheWrite5mTokens, cacheWrite1hTokens, costMicroCents, ...(earliestCreatedAt?{earliestCreatedAt}:{}), ...(latestCreatedAt?{latestCreatedAt}:{}), observedAt };
 }
 
 export function projectOpenCodeUsageToProviderSlot(aggregate: OpenCodeUsageAggregate): ProviderUsageSlot {

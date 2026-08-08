@@ -49,6 +49,17 @@ describe('OpenCode Console provider usage adapter', () => {
     expect(result).toMatchObject({availability:'unavailable',error:{kind:'invalid_csv'},providerUsage:{quality:'unavailable'}});
   });
 
+  it('rejects safe row values whose aggregate or derived total would exceed safe integer precision', async () => {
+    const max = String(Number.MAX_SAFE_INTEGER);
+    const inputOverflow = `${HEADER}\n1,synthetic@example.invalid,fixture,tests,opencode,deepseek-v4-flash,${max},0,0,0,0,0,disabled,,,fixture,free,0,2026-08-08T00:01:00Z\n2,synthetic@example.invalid,fixture,tests,opencode,deepseek-v4-flash,1,0,0,0,0,0,disabled,,,fixture,free,0,2026-08-08T00:02:00Z\n`;
+    expect(() => aggregateOpenCodeUsageCsv(inputOverflow,{range:'7d',scope:'organization'})).toThrow(/aggregate input_tokens exceeds safe integer range/);
+    const observed = await observeOpenCodeUsage(new CsvTransport(inputOverflow),{range:'7d',scope:'organization'});
+    expect(observed).toMatchObject({availability:'unavailable',error:{kind:'invalid_csv'},providerUsage:{quality:'unavailable'}});
+
+    const totalOverflow = `${HEADER}\n1,synthetic@example.invalid,fixture,tests,opencode,deepseek-v4-flash,${max},1,0,0,0,0,disabled,,,fixture,free,0,2026-08-08T00:01:00Z\n`;
+    expect(() => aggregateOpenCodeUsageCsv(totalOverflow,{range:'7d',scope:'organization'})).toThrow(/aggregate total_tokens exceeds safe integer range/);
+  });
+
   it('projects provider-reported Console windows, never Go quota semantics', () => {
     for (const range of ['24h','7d','30d'] as const) {
       const a = aggregateOpenCodeUsageCsv(CSV,{range,scope:'organization'},'2026-08-08T05:00:00Z'); const slot = projectOpenCodeUsageToProviderSlot(a);
