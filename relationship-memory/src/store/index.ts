@@ -2,6 +2,8 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import type {
+  AssistantIntentOutcome,
+  AssistantRememberIntentRecord,
   BatchRecord,
   CanonicalMemoryRecord,
   EvidenceRecord,
@@ -9,7 +11,7 @@ import type {
   OwnerRevisionRecord,
 } from '../schema/index.js';
 
-export type StorePhase = 'memory_commit' | 'outcome_commit';
+export type StorePhase = 'memory_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
 export type FailureInjector = (phase: StorePhase) => boolean;
 
 function ensureDir(dir: string): void {
@@ -58,6 +60,17 @@ export class RelationshipMemoryStore {
   listOutcomes(): RememberOutcome[] { return readJsonl<RememberOutcome>(this.file('outcomes.jsonl')); }
   listBatches(): BatchRecord[] { return readJsonl<BatchRecord>(this.file('batches.jsonl')); }
   listOwnerRevisions(): OwnerRevisionRecord[] { return readJsonl<OwnerRevisionRecord>(this.file('owner-revisions.jsonl')); }
+  listAssistantIntents(): AssistantRememberIntentRecord[] { return readJsonl<AssistantRememberIntentRecord>(this.file('assistant-intents.jsonl')); }
+  listAssistantIntentOutcomes(): AssistantIntentOutcome[] { return readJsonl<AssistantIntentOutcome>(this.file('assistant-intent-outcomes.jsonl')); }
+
+  getAssistantIntent(intentId: string): AssistantRememberIntentRecord | undefined {
+    return this.listAssistantIntents().find((item) => item.intent_id === intentId);
+  }
+
+  getTerminalAssistantIntentOutcome(intentId: string, batchId?: string): AssistantIntentOutcome | undefined {
+    return [...this.listAssistantIntentOutcomes()].reverse().find((item) =>
+      item.intent_id === intentId && (!batchId || item.batch_id === batchId) && item.outcome !== 'retryable_failed');
+  }
 
   getMemory(memoryId: string): CanonicalMemoryRecord | undefined {
     return this.listMemories().find((item) => item.memory_id === memoryId);
@@ -83,6 +96,19 @@ export class RelationshipMemoryStore {
   }
 
   appendOwnerRevision(record: OwnerRevisionRecord): void { appendJsonl(this.file('owner-revisions.jsonl'), record); }
+
+  appendAssistantIntent(record: AssistantRememberIntentRecord): void {
+    if (this.failureInjector?.('intent_commit')) throw new Error('injected intent commit failure');
+    const existing = this.getAssistantIntent(record.intent_id);
+    if (!existing) { appendJsonl(this.file('assistant-intents.jsonl'), record); return; }
+    if (stableJson(existing) !== stableJson(record)) throw new Error(`assistant intent identity collision: ${record.intent_id}`);
+  }
+
+  appendAssistantIntentOutcome(record: AssistantIntentOutcome): void {
+    if (this.failureInjector?.('intent_outcome_commit')) throw new Error('injected intent outcome commit failure');
+    const duplicate = this.listAssistantIntentOutcomes().some((item) => stableJson(item) === stableJson(record));
+    if (!duplicate) appendJsonl(this.file('assistant-intent-outcomes.jsonl'), record);
+  }
 
   appendOutcome(outcome: RememberOutcome): void {
     if (this.failureInjector?.('outcome_commit')) throw new Error('injected outcome commit failure');

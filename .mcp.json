@@ -1,0 +1,10 @@
+{
+  "relationship-memory-intent": {
+    "command": "node",
+    "args": [
+      "${CLAUDE_PLUGIN_ROOT}/hooks/silent-npx.cjs",
+      "tsx",
+      "${CLAUDE_PLUGIN_ROOT}/scripts/remember_intent_mcp.ts"
+    ]
+  }
+}

@@ -39,7 +39,9 @@ import {
   readTranscript,
   formatMessagesForLetta,
 } from './transcript_utils.js';
-import { buildCanonicalMessages, makeBatchId } from '../relationship-memory/src/adapter/index.js';
+import { buildCanonicalMessages, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
+import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
+import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -90,17 +92,7 @@ async function main(): Promise<void> {
     log('Mode is off, exiting');
     process.exit(0);
   }
-  const apiKey = process.env.LETTA_API_KEY;
-  log(`LETTA_API_KEY: ${apiKey ? 'set (' + apiKey.substring(0, 10) + '...)' : 'NOT SET'}`);
-  if (!apiKey) {
-    log('ERROR: LETTA_API_KEY not set');
-    console.error('Error: LETTA_API_KEY must be set');
-    process.exit(1);
-  }
-
   try {
-    const agentId = await getAgentId(apiKey, log);
-    log(`Using agent: ${agentId}`);
     log('Reading hook input from stdin...');
     const hookInput = await readHookInput();
     log(`Hook input received:`);
@@ -131,11 +123,32 @@ async function main(): Promise<void> {
     log(`Message types: ${JSON.stringify(typeCounts)}`);
 
     const state = loadSyncState(hookInput.cwd, hookInput.session_id, log);
+
+    // Persist first-party assistant remember intent before any Letta/model dependency.
+    // Replays are idempotent because identity is bound to the real transcript tool_use.
+    const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
+    const intentStore = new RelationshipMemoryStore(relationshipMemoryRoot(), subjectId);
+    const assistantIntents = persistAssistantRememberIntents(
+      intentStore,
+      extractAssistantRememberIntents(messages, state.lastProcessedIndex, hookInput.session_id, subjectId),
+    );
+    log(`Persisted/verified ${assistantIntents.length} trusted assistant remember intent(s)`);
+
     const newMessages = formatMessagesForLetta(messages, state.lastProcessedIndex, log);
     if (newMessages.length === 0) {
       log('No new messages to send after formatting');
       process.exit(0);
     }
+
+    const apiKey = process.env.LETTA_API_KEY;
+    log(`LETTA_API_KEY: ${apiKey ? 'set' : 'NOT SET'}`);
+    if (!apiKey) {
+      log('ERROR: LETTA_API_KEY not set after trusted intent extraction');
+      console.error('Error: LETTA_API_KEY must be set');
+      process.exit(1);
+    }
+    const agentId = await getAgentId(apiKey, log);
+    log(`Using agent: ${agentId}`);
 
     const conversationId = await getOrCreateConversation(apiKey, agentId, hookInput.session_id, hookInput.cwd, state, log);
     log(`Using conversation: ${conversationId}`);
@@ -185,6 +198,7 @@ Write your response as if speaking directly to Claude Code.
       sdkToolsMode,
       batchId,
       canonicalMessages,
+      assistantIntents,
     };
     fs.writeFileSync(payloadFile, JSON.stringify(sdkPayload), 'utf-8');
     log(`Wrote SDK payload to ${payloadFile}`);

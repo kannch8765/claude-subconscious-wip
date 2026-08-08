@@ -12,10 +12,11 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import type { CanonicalMessage } from '../relationship-memory/src/schema/index.js';
-import { appendCanonicalEvidenceCatalog, buildRelationshipTools, createRuntime, FORBIDDEN_MARKDOWN_MEMORY_TOOLS, RELATIONSHIP_ALLOWED_CLIENT_TOOLS } from '../relationship-memory/src/adapter/index.js';
+import type { AssistantRememberIntentRecord, CanonicalMessage } from '../relationship-memory/src/schema/index.js';
+import { appendTrustedRelationshipCatalog, buildRelationshipTools, createRuntime, FORBIDDEN_MARKDOWN_MEMORY_TOOLS, relationshipMemoryRoot, RELATIONSHIP_ALLOWED_CLIENT_TOOLS } from '../relationship-memory/src/adapter/index.js';
 import { cursorShouldAdvance } from '../relationship-memory/src/tools/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
+import { stableJson } from '../relationship-memory/src/store/index.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
@@ -33,6 +34,7 @@ interface SdkPayload {
   sdkToolsMode: 'off' | 'read-only' | 'full';
   batchId: string;
   canonicalMessages: CanonicalMessage[];
+  assistantIntents: AssistantRememberIntentRecord[];
 }
 
 function log(message: string): void {
@@ -57,7 +59,8 @@ async function syncProjectionBlocks(apiKey: string, agentId: string, runtime: Re
 
 async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable_failure'> {
   const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
-  const runtime = createRuntime(payload.canonicalMessages, subjectId);
+  const assistantIntents = payload.assistantIntents ?? [];
+  const runtime = createRuntime(payload.canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
   runtime.store.beginBatch(payload.batchId, new Date().toISOString());
 
   let session: any = null;
@@ -89,8 +92,15 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     log(`  allowedTools: ${RELATIONSHIP_ALLOWED_CLIENT_TOOLS.join(', ')}`);
 
     session = resumeSession(payload.conversationId, sessionOptions);
-    const observerMessage = appendCanonicalEvidenceCatalog(payload.message, payload.canonicalMessages);
-    log(`Sending message (${observerMessage.length} chars, ${payload.canonicalMessages.length} trusted evidence choices)...`);
+    const durableAssistantIntents = assistantIntents.map((intent) => {
+      const stored = runtime.store.getAssistantIntent(intent.intent_id);
+      if (!stored || stableJson(stored) !== stableJson(intent)) {
+        throw new Error(`Trusted assistant intent payload/store mismatch: ${intent.intent_id}`);
+      }
+      return stored;
+    });
+    const observerMessage = appendTrustedRelationshipCatalog(payload.message, payload.canonicalMessages, durableAssistantIntents);
+    log(`Sending message (${observerMessage.length} chars, ${payload.canonicalMessages.length} trusted evidence choices, ${durableAssistantIntents.length} trusted assistant intents)...`);
     await session.send(observerMessage);
 
     let assistantResponse = '';
