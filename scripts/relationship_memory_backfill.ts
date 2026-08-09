@@ -10,7 +10,7 @@ import {
   type HistoricalBatch,
 } from '../relationship-memory/src/backfill/index.js';
 import { relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
-import { validateBackfillSnapshot } from '../relationship-memory/src/backfill/snapshot.js';
+import { resolveBackfillTranscriptInput } from '../relationship-memory/src/backfill/snapshot.js';
 
 interface Args {
   transcript?: string;
@@ -55,9 +55,7 @@ function parseArgs(argv: string[]): Args {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const transcript = args.snapshotManifest
-    ? validateBackfillSnapshot(path.resolve(args.snapshotManifest)).transcriptPath
-    : path.resolve(args.transcript!);
+  const transcript = resolveBackfillTranscriptInput({ transcript: args.transcript, snapshotManifest: args.snapshotManifest });
   const statePath = path.resolve(args.state!);
   const rootDir = path.resolve(args.root ?? relationshipMemoryRoot());
   const cwd = path.resolve(args.cwd ?? process.cwd());
