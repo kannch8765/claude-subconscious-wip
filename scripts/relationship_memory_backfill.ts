@@ -10,9 +10,11 @@ import {
   type HistoricalBatch,
 } from '../relationship-memory/src/backfill/index.js';
 import { relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
+import { validateBackfillSnapshot } from '../relationship-memory/src/backfill/snapshot.js';
 
 interface Args {
   transcript?: string;
+  snapshotManifest?: string;
   state?: string;
   root?: string;
   cwd?: string;
@@ -22,7 +24,7 @@ interface Args {
 }
 
 function usage(): never {
-  console.error('Usage: npx tsx scripts/relationship_memory_backfill.ts --transcript <file-or-root> --state <checkpoint.json> [--root <relationship-memory-dir>] [--cwd <dir>] [--max-batches N] [--max-records N] [--max-bytes N]');
+  console.error('Usage: npx tsx scripts/relationship_memory_backfill.ts (--snapshot-manifest <manifest.json> | --transcript <file-or-root>) --state <checkpoint.json> [--root <relationship-memory-dir>] [--cwd <dir>] [--max-batches N] [--max-records N] [--max-bytes N]');
   process.exit(2);
 }
 
@@ -38,6 +40,7 @@ function parseArgs(argv: string[]): Args {
     const flag = argv[i];
     const value = argv[i + 1];
     if (flag === '--transcript') { result.transcript = value; i += 1; }
+    else if (flag === '--snapshot-manifest') { result.snapshotManifest = value; i += 1; }
     else if (flag === '--state') { result.state = value; i += 1; }
     else if (flag === '--root') { result.root = value; i += 1; }
     else if (flag === '--cwd') { result.cwd = value; i += 1; }
@@ -46,13 +49,15 @@ function parseArgs(argv: string[]): Args {
     else if (flag === '--max-bytes') { result.maxBytes = positive(value, flag); i += 1; }
     else usage();
   }
-  if (!result.transcript || !result.state) usage();
+  if ((!result.transcript && !result.snapshotManifest) || (result.transcript && result.snapshotManifest) || !result.state) usage();
   return result;
 }
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const transcript = path.resolve(args.transcript!);
+  const transcript = args.snapshotManifest
+    ? validateBackfillSnapshot(path.resolve(args.snapshotManifest)).transcriptPath
+    : path.resolve(args.transcript!);
   const statePath = path.resolve(args.state!);
   const rootDir = path.resolve(args.root ?? relationshipMemoryRoot());
   const cwd = path.resolve(args.cwd ?? process.cwd());
