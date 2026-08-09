@@ -7,6 +7,7 @@ import { extractAllContent, type TranscriptMessage } from '../../../scripts/tran
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, MemoryKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
+import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
 export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
@@ -220,18 +221,24 @@ export class RelationshipMemoryRecallSession {
   private readonly deliveryPromise: Promise<RecallResult>;
   private resolveDelivery!: (result: RecallResult) => void;
   private closedReason?: 'timeout' | 'cancelled' | 'failed';
+  private readonly semanticRetriever?: SemanticRetriever;
 
   constructor(options: {
     recallId?: string;
     rootDir: string;
     subjectId: string;
     transcriptRoots?: string[];
+    semanticRetriever?: SemanticRetriever;
   }) {
     this.recallId = options.recallId || `recall_${crypto.randomUUID()}`;
     this.deliveryPromise = new Promise<RecallResult>((resolve) => { this.resolveDelivery = resolve; });
     // ensureRoot=false is important: recall must not create or append store files.
     this.store = new RelationshipMemoryStore(options.rootDir, options.subjectId, undefined, false);
     this.transcriptRoots = options.transcriptRoots ?? transcriptRootsFromEnvironment();
+    if (options.semanticRetriever) this.semanticRetriever = options.semanticRetriever;
+    else {
+      try { this.semanticRetriever = createSemanticRetrieverFromEnvironment(options.rootDir); } catch { this.semanticRetriever = undefined; }
+    }
   }
 
   get isClosed(): boolean { return Boolean(this.delivered || this.closedReason); }
@@ -266,41 +273,90 @@ export class RelationshipMemoryRecallSession {
     return intents.sort((a, b) => a.captured_at.localeCompare(b.captured_at) || a.intent_id.localeCompare(b.intent_id));
   }
 
-  relationshipMemorySearch(input: RelationshipMemorySearchInput = {}): { results: unknown[] } {
-    this.assertOpen();
-    const limit = boundedLimit(input.limit, 8, 20);
+  private relationshipSearchCandidates(input: RelationshipMemorySearchInput): Array<
+    { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string; lexicalScore: number }
+    | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string; lexicalScore: number }
+  > {
     const owner = new RelationshipMemoryOwnerControlPlane(this.store);
-    const memoryCandidates = owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) });
-    const ranked: Array<{ kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; score: number } | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; score: number }> = [];
-    for (const memory of memoryCandidates) {
+    const candidates: Array<
+      { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string; lexicalScore: number }
+      | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string; lexicalScore: number }
+    > = [];
+    for (const memory of owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) })) {
       if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;
       const intents = this.linkedAssistantIntents(memory.memory_id);
-      const score = textScore(stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: intents.map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text })) }), input.query);
-      if (score > 0) ranked.push({ kind: 'memory', memory, intents, score });
+      const text = semanticText(memory.kind, memory.summary, memory.participants, memory.payload, intents.map((intent) => [intent.memory.text, intent.feel.text]));
+      candidates.push({ kind: 'memory', memory, intents, text, lexicalScore: lexicalTextScore(text, input.query) });
     }
     if (!input.kind) {
       for (const entity of this.store.listEntities()) {
         if (!inTimeWindow(entity.observed_at, input.time_start, input.time_end)) continue;
-        const score = textScore(stableJson({ canonical_name: entity.canonical_name, aliases: entity.aliases, description: entity.description }), input.query);
-        if (score > 0) ranked.push({ kind: 'entity', entity, score });
+        const text = semanticText(entity.canonical_name, entity.aliases, entity.entity_type, entity.description);
+        candidates.push({ kind: 'entity', entity, text, lexicalScore: lexicalTextScore(text, input.query) });
       }
     }
+    return candidates;
+  }
+
+  private renderRelationshipSearchResults(
+    ranked: Array<
+      { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; score: number }
+      | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; score: number }
+    >,
+    limit: number,
+  ): { results: unknown[] } {
     ranked.sort((a, b) => b.score - a.score || (b.kind === 'memory' ? b.memory.observed_at : b.entity.observed_at).localeCompare(a.kind === 'memory' ? a.memory.observed_at : a.entity.observed_at));
     return { results: ranked.slice(0, limit).map((item) => {
       if (item.kind === 'entity') {
         const entity = item.entity;
         const sourceRef = this.register('entity_identity', { entity_id: entity.entity_id, source_key: entity.source_key }, { entity_id: entity.entity_id, observed_at: entity.observed_at });
-        const evidence = this.store.listEntityEvidence().filter((item) => item.entity_id === entity.entity_id);
+        const evidence = this.store.listEntityEvidence().filter((entry) => entry.entity_id === entity.entity_id);
         return {
           source_ref: sourceRef, record_type: 'entity_identity', entity_id: entity.entity_id, canonical_name: entity.canonical_name, aliases: entity.aliases,
           entity_type: entity.entity_type, description: entity.description, observed_at: entity.observed_at,
-          evidence_ids: evidence.map((item) => item.evidence_id), evidence_message_ids: evidence.map((item) => item.message_id),
+          evidence_ids: evidence.map((entry) => entry.evidence_id), evidence_message_ids: evidence.map((entry) => entry.message_id),
         };
       }
       const { memory, intents } = item;
       const sourceRef = this.register('relationship_memory', { memory_id: memory.memory_id, latest_revision_id: memory.latest_revision_id }, { memory_id: memory.memory_id, observed_at: memory.observed_at });
       return { source_ref: sourceRef, record_type: 'relationship_memory', memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary, participants: memory.participants, payload: memory.payload, observed_at: memory.observed_at, owner_corrected: memory.owner_corrected, assistant_intents: intents.map((intent) => ({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text, captured_at: intent.captured_at })) };
     }) };
+  }
+
+  relationshipMemorySearch(input: RelationshipMemorySearchInput = {}): { results: unknown[] } {
+    this.assertOpen();
+    const limit = boundedLimit(input.limit, 8, 20);
+    const ranked = this.relationshipSearchCandidates(input)
+      .filter((item) => item.lexicalScore > 0)
+      .map((item) => item.kind === 'memory'
+        ? { kind: 'memory' as const, memory: item.memory, intents: item.intents, score: item.lexicalScore }
+        : { kind: 'entity' as const, entity: item.entity, score: item.lexicalScore });
+    return this.renderRelationshipSearchResults(ranked, limit);
+  }
+
+  async relationshipMemorySearchHybrid(input: RelationshipMemorySearchInput = {}): Promise<{ results: unknown[] }> {
+    this.assertOpen();
+    const query = input.query?.trim();
+    if (!this.semanticRetriever || !query) return this.relationshipMemorySearch(input);
+    const limit = boundedLimit(input.limit, 8, 20);
+    const candidates = this.relationshipSearchCandidates(input);
+    const documents = candidates.map((item) => ({
+      id: item.kind === 'memory' ? `memory:${item.memory.memory_id}` : `entity:${item.entity.entity_id}`,
+      text: item.text,
+    }));
+    try {
+      const semantic = await this.semanticRetriever.rank(documents, query);
+      this.assertOpen();
+      const ranked = candidates.map((item, index) => {
+        const score = hybridScore(item.lexicalScore, semantic.get(documents[index].id));
+        return item.kind === 'memory'
+          ? { kind: 'memory' as const, memory: item.memory, intents: item.intents, score }
+          : { kind: 'entity' as const, entity: item.entity, score };
+      });
+      return this.renderRelationshipSearchResults(ranked, limit);
+    } catch {
+      return this.relationshipMemorySearch(input);
+    }
   }
 
   async transcriptSearch(input: TranscriptSearchInput = {}): Promise<{ results: unknown[] }> {
@@ -477,7 +533,7 @@ export function buildRecallTools(session: RelationshipMemoryRecallSession, wrapR
       label: 'relationship_memory_search', name: 'relationship_memory_search',
       description: 'Read-only search over the effective active canonical relationship-memory view, including trusted linked assistant remember memory/feel provenance.',
       parameters: relationshipMemorySearchToolSchema(),
-      async execute(_toolCallId, args) { return wrapResult(session.relationshipMemorySearch((args ?? {}) as RelationshipMemorySearchInput)); },
+      async execute(_toolCallId, args) { return wrapResult(await session.relationshipMemorySearchHybrid((args ?? {}) as RelationshipMemorySearchInput)); },
     },
     {
       label: 'transcript_search', name: 'transcript_search',
