@@ -151,6 +151,25 @@ export class RelationshipMemoryRuntime {
       if (!message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${messageId}`, now);
       evidenceMessages.push(message);
     }
+    const recovered = this.store.getEntityBySourceKey(sourceKey);
+    if (recovered) {
+      const recoveredEvidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({
+        evidence_id: stableId('entity_ev', { entity_id: recovered.entity_id, message_id: message.message_id }),
+        entity_id: recovered.entity_id,
+        conversation_id: message.conversation_id,
+        message_id: message.message_id,
+        role: message.role,
+        quote: message.quote,
+        captured_at: message.captured_at,
+      }));
+      try {
+        this.store.appendEntity(recovered, recoveredEvidence);
+      } catch (error) {
+        return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now);
+      }
+      return this.entityOutcome(batchId, sourceKey, 'duplicate', recovered.entity_id, now);
+    }
+
     const aliases = proposal.aliases.map(normalizeEntityAlias);
     const collisions = this.store.listEntities().filter((entity) => entity.aliases.some((alias) => aliases.includes(normalizeEntityAlias(alias))));
     if (collisions.length > 0) {
@@ -164,8 +183,6 @@ export class RelationshipMemoryRuntime {
       if (!sameIdentity) return this.entityPermanent(batchId, sourceKey, 'alias_collision', `Alias already belongs to canonical entity ${existing.canonical_name}.`, now);
       return this.entityOutcome(batchId, sourceKey, 'duplicate', existing.entity_id, now);
     }
-    const recovered = this.store.getEntityBySourceKey(sourceKey);
-    if (recovered) return this.entityOutcome(batchId, sourceKey, 'duplicate', recovered.entity_id, now);
     const entityId = stableId('entity', { subject_id: this.store.subjectId, canonical_name: normalizeEntityAlias(proposal.canonical_name) });
     const entity: EntityIdentityRecord = {
       schema_version: 1, entity_id: entityId, subject_id: this.store.subjectId, canonical_name: proposal.canonical_name, aliases: proposal.aliases,

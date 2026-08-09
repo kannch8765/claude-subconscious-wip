@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { RelationshipMemoryRecallSession, RelationshipMemoryRuntime, RelationshipMemoryStore, validateProposal } from '../src/index.js';
+import { normalizeEntityAlias, RelationshipMemoryRecallSession, RelationshipMemoryRuntime, RelationshipMemoryStore, stableId, validateProposal } from '../src/index.js';
 
 const dirs: string[] = [];
 function tempDir(): string { const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'relationship-semantic-context-')); dirs.push(dir); return dir; }
@@ -93,6 +93,34 @@ describe('Task 093M semantic context foundation', () => {
     expect(rt.store.listEntities()).toHaveLength(1);
     const searched = rt.entitySearch({ query: 'GPT' });
     expect(searched[0]).toEqual(expect.objectContaining({ canonical_name: '晴', evidence_message_ids: ['identity'] }));
+  });
+
+  it('repairs trusted entity evidence before terminal replay after a partial entity commit', () => {
+    const dir = tempDir();
+    const store = new RelationshipMemoryStore(dir, 'semantic-subject');
+    const batchId = 'entity-partial-write';
+    const proposal = { schema_version: 1, canonical_name: '晴', aliases: ['晴', 'GPT'], entity_type: 'assistant', description: 'GPT 侧的助手身份', evidence_message_ids: ['identity'] };
+    const sourceKey = stableId('entity_src', { batch_id: batchId, proposal });
+    const entityId = stableId('entity', { subject_id: 'semantic-subject', canonical_name: normalizeEntityAlias('晴') });
+    store.beginBatch(batchId, '2026-08-09T10:04:00Z');
+    store.appendEntity({
+      schema_version: 1, entity_id: entityId, subject_id: 'semantic-subject', canonical_name: '晴', aliases: ['晴', 'GPT'],
+      entity_type: 'assistant', description: 'GPT 侧的助手身份', observed_at: messages[4].captured_at, created_at: '2026-08-09T11:00:00.000Z', source_key: sourceKey,
+    }, []);
+    store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason: 'simulated interruption after entity row', recorded_at: '2026-08-09T11:00:00.001Z' });
+    expect(store.listEntities()).toHaveLength(1);
+    expect(store.listEntityEvidence()).toHaveLength(0);
+
+    const replay = new RelationshipMemoryRuntime(store, new Map(messages.map((m) => [m.message_id, m])), () => '2026-08-09T11:01:00.000Z', new Map(), true);
+    const result = replay.rememberEntity(batchId, proposal);
+    expect(result).toEqual({ outcome: 'duplicate', entity_id: entityId });
+    expect(store.listEntities()).toHaveLength(1);
+    expect(store.listEntityEvidence()).toEqual([{
+      evidence_id: stableId('entity_ev', { entity_id: entityId, message_id: 'identity' }), entity_id: entityId,
+      conversation_id: messages[4].conversation_id, message_id: 'identity', role: 'user', quote: messages[4].quote, captured_at: messages[4].captured_at,
+    }]);
+    expect(store.listEntityOutcomes().at(-1)).toEqual(expect.objectContaining({ outcome: 'duplicate', entity_id: entityId }));
+    expect(replay.finalizeBatch(batchId, true)).toBe('completed');
   });
 
   it('recovers an entity batch after a transient entity commit failure', () => {
