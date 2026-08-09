@@ -34,7 +34,7 @@
     "backfill": "tsx scripts/relationship_memory_backfill.ts"
   },
   "dependencies": {
-    "@letta-ai/letta-code-sdk": "^0.1.0",
+    "@letta-ai/letta-code-sdk": "0.1.12",
     "tsx": "^4.7.0"
   },
   "devDependencies": {
