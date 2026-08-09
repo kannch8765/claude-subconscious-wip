@@ -6,16 +6,31 @@ import { buildCanonicalMessages } from '../adapter/index.js';
 import { stableId } from '../store/index.js';
 import { formatMessagesForLetta, type TranscriptMessage } from '../../../scripts/transcript_utils.js';
 
-export interface BackfillAnchor {
+export interface BackfillChunkDigest {
   offset: number;
   length: number;
   sha256: string;
 }
 
+export interface BackfillFileIdentity {
+  dev: string;
+  ino: string;
+  size: number;
+  mtime_ns: string;
+  ctime_ns: string;
+}
+
+export interface BackfillIntegrityValidation {
+  identity: BackfillFileIdentity;
+  next_offset: number;
+}
+
 export interface BackfillSourceState {
   generation: number;
   committed_offset: number;
-  anchors: BackfillAnchor[];
+  integrity_chunks: BackfillChunkDigest[];
+  checkpoint_identity?: BackfillFileIdentity;
+  integrity_validation?: BackfillIntegrityValidation;
   last_batch_id?: string;
   reset_reason?: 'truncated' | 'checkpoint_mismatch';
   blocked?: { kind: 'malformed_jsonl' | 'oversized_record' | 'runtime_failure' | 'retryable_batch'; offset: number };
@@ -52,6 +67,7 @@ export interface RunBackfillOptions {
   maxBatches?: number;
   maxRecordsPerBatch?: number;
   maxBatchBytes?: number;
+  maxIntegrityValidationBytes?: number;
   processor: BackfillBatchProcessor;
 }
 
@@ -75,7 +91,8 @@ interface ReadBatchResult {
 const DEFAULT_MAX_RECORDS = 40;
 const DEFAULT_MAX_BATCH_BYTES = 2 * 1024 * 1024;
 const READ_CHUNK = 64 * 1024;
-const ANCHOR_SIZE = 4096;
+const INTEGRITY_CHUNK_SIZE = 1024 * 1024;
+const DEFAULT_INTEGRITY_VALIDATION_BYTES = 8 * 1024 * 1024;
 
 function sha256(buffer: Buffer): string {
   return crypto.createHash('sha256').update(buffer).digest('hex');
@@ -143,61 +160,168 @@ function readAt(file: string, offset: number, length: number): Buffer {
   }
 }
 
-function anchorOffsets(committedOffset: number): number[] {
-  if (committedOffset <= 0) return [];
-  const maxStart = Math.max(0, committedOffset - ANCHOR_SIZE);
-  const candidates = [
-    0,
-    Math.floor(committedOffset / 3),
-    Math.floor((committedOffset * 2) / 3),
-    maxStart,
-  ].map((offset) => Math.max(0, Math.min(maxStart, offset)));
-  return [...new Set(candidates)].sort((a, b) => a - b);
+function fileIdentity(file: string): BackfillFileIdentity {
+  const stat = fs.statSync(file, { bigint: true });
+  return {
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    size: Number(stat.size),
+    mtime_ns: stat.mtimeNs.toString(),
+    ctime_ns: stat.ctimeNs.toString(),
+  };
 }
 
-export function checkpointAnchors(file: string, committedOffset: number): BackfillAnchor[] {
-  return anchorOffsets(committedOffset).map((offset) => {
-    const length = Math.min(ANCHOR_SIZE, committedOffset - offset);
-    const content = readAt(file, offset, length);
-    return { offset, length: content.length, sha256: sha256(content) };
-  });
+function sameFileObject(left: BackfillFileIdentity, right: BackfillFileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
 }
 
-function checkpointIsValid(file: string, source: BackfillSourceState): boolean {
-  if (source.committed_offset === 0) return true;
-  const stat = fs.statSync(file);
-  if (stat.size < source.committed_offset) return false;
-  return source.anchors.every((anchor) => {
-    const content = readAt(file, anchor.offset, anchor.length);
-    return content.length === anchor.length && sha256(content) === anchor.sha256;
-  });
+function sameFileIdentity(left: BackfillFileIdentity, right: BackfillFileIdentity): boolean {
+  return sameFileObject(left, right)
+    && left.size === right.size
+    && left.mtime_ns === right.mtime_ns
+    && left.ctime_ns === right.ctime_ns;
 }
 
-function normalizeSourceState(file: string, state: BackfillState): BackfillSourceState {
-  const existing = state.sources[file] ?? { generation: 1, committed_offset: 0, anchors: [] };
-  const stat = fs.statSync(file);
-  let resetReason: BackfillSourceState['reset_reason'];
-  if (stat.size < existing.committed_offset) resetReason = 'truncated';
-  else if (!checkpointIsValid(file, existing)) resetReason = 'checkpoint_mismatch';
-  if (!resetReason) {
-    state.sources[file] = existing;
-    return existing;
+function integrityCoverageIsValid(source: BackfillSourceState): boolean {
+  if (source.committed_offset === 0) return source.integrity_chunks.length === 0;
+  let expectedOffset = 0;
+  for (const chunk of source.integrity_chunks) {
+    if (chunk.offset !== expectedOffset || chunk.length <= 0 || chunk.length > INTEGRITY_CHUNK_SIZE) return false;
+    expectedOffset += chunk.length;
   }
+  return expectedOffset === source.committed_offset;
+}
+
+function extendIntegrityChunks(
+  file: string,
+  chunks: BackfillChunkDigest[],
+  previousOffset: number,
+  committedOffset: number,
+): BackfillChunkDigest[] {
+  if (committedOffset === 0) return [];
+  const rebuildFrom = Math.floor(previousOffset / INTEGRITY_CHUNK_SIZE) * INTEGRITY_CHUNK_SIZE;
+  const kept = chunks.filter((chunk) => chunk.offset + chunk.length <= rebuildFrom);
+  const rebuilt: BackfillChunkDigest[] = [];
+  for (let offset = rebuildFrom; offset < committedOffset; offset += INTEGRITY_CHUNK_SIZE) {
+    const length = Math.min(INTEGRITY_CHUNK_SIZE, committedOffset - offset);
+    const content = readAt(file, offset, length);
+    if (content.length !== length) throw new Error(`Transcript changed while checkpointing at byte ${offset}.`);
+    rebuilt.push({ offset, length, sha256: sha256(content) });
+  }
+  return [...kept, ...rebuilt];
+}
+
+function resetSourceState(
+  state: BackfillState,
+  file: string,
+  existing: BackfillSourceState,
+  identity: BackfillFileIdentity,
+  resetReason: NonNullable<BackfillSourceState['reset_reason']>,
+): BackfillSourceState {
   const reset: BackfillSourceState = {
     generation: existing.generation + 1,
     committed_offset: 0,
-    anchors: [],
+    integrity_chunks: [],
+    checkpoint_identity: identity,
     reset_reason: resetReason,
   };
   state.sources[file] = reset;
   return reset;
 }
 
+interface NormalizedSourceState {
+  source: BackfillSourceState;
+  changed: boolean;
+  validationPending: boolean;
+}
+
+function normalizeSourceState(
+  file: string,
+  state: BackfillState,
+  maxValidationBytes: number,
+): NormalizedSourceState {
+  const identity = fileIdentity(file);
+  const current = state.sources[file];
+  if (!current) {
+    const created: BackfillSourceState = {
+      generation: 1,
+      committed_offset: 0,
+      integrity_chunks: [],
+      checkpoint_identity: identity,
+    };
+    state.sources[file] = created;
+    return { source: created, changed: true, validationPending: false };
+  }
+
+  // R1 state used sparse anchors. Treat any committed checkpoint without complete
+  // chunk coverage as untrusted and restart it rather than silently upgrading it.
+  if (!Array.isArray(current.integrity_chunks)) current.integrity_chunks = [];
+
+  if (identity.size < current.committed_offset) {
+    return { source: resetSourceState(state, file, current, identity, 'truncated'), changed: true, validationPending: false };
+  }
+  if (!integrityCoverageIsValid(current)) {
+    return { source: resetSourceState(state, file, current, identity, 'checkpoint_mismatch'), changed: true, validationPending: false };
+  }
+  if (current.committed_offset === 0) {
+    const changed = !current.checkpoint_identity || !sameFileIdentity(current.checkpoint_identity, identity)
+      || current.integrity_validation !== undefined;
+    current.checkpoint_identity = identity;
+    delete current.integrity_validation;
+    return { source: current, changed, validationPending: false };
+  }
+  if (current.checkpoint_identity && !sameFileObject(current.checkpoint_identity, identity)) {
+    return { source: resetSourceState(state, file, current, identity, 'checkpoint_mismatch'), changed: true, validationPending: false };
+  }
+  if (current.checkpoint_identity && sameFileIdentity(current.checkpoint_identity, identity)) {
+    if (current.integrity_validation) {
+      delete current.integrity_validation;
+      return { source: current, changed: true, validationPending: false };
+    }
+    return { source: current, changed: false, validationPending: false };
+  }
+
+  let validation = current.integrity_validation;
+  if (!validation || !sameFileIdentity(validation.identity, identity)) {
+    validation = { identity, next_offset: 0 };
+    current.integrity_validation = validation;
+  }
+
+  let validatedBytes = 0;
+  let nextOffset = validation.next_offset;
+  for (const chunk of current.integrity_chunks) {
+    if (chunk.offset < nextOffset) continue;
+    if (validatedBytes > 0 && validatedBytes + chunk.length > maxValidationBytes) break;
+    const content = readAt(file, chunk.offset, chunk.length);
+    if (content.length !== chunk.length || sha256(content) !== chunk.sha256) {
+      return { source: resetSourceState(state, file, current, identity, 'checkpoint_mismatch'), changed: true, validationPending: false };
+    }
+    validatedBytes += chunk.length;
+    nextOffset = chunk.offset + chunk.length;
+    validation.next_offset = nextOffset;
+  }
+
+  if (nextOffset < current.committed_offset) {
+    return { source: current, changed: true, validationPending: true };
+  }
+
+  current.checkpoint_identity = identity;
+  delete current.integrity_validation;
+  return { source: current, changed: true, validationPending: false };
+}
+
 function parseLine(line: Buffer, lineOffset: number): TranscriptMessage | { malformedOffset: number } {
   const text = line.toString('utf8').trim();
   if (!text) return {} as TranscriptMessage;
-  try { return JSON.parse(text) as TranscriptMessage; }
-  catch { return { malformedOffset: lineOffset }; }
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      return { malformedOffset: lineOffset };
+    }
+    return parsed as TranscriptMessage;
+  } catch {
+    return { malformedOffset: lineOffset };
+  }
 }
 
 function readRecordBatch(file: string, startOffset: number, maxRecords: number, maxBytes: number): ReadBatchResult {
@@ -287,6 +411,7 @@ export async function runHistoricalBackfill(options: RunBackfillOptions): Promis
   const maxBatches = Math.max(1, options.maxBatches ?? 1);
   const maxRecords = Math.max(1, options.maxRecordsPerBatch ?? DEFAULT_MAX_RECORDS);
   const maxBytes = Math.max(1024, options.maxBatchBytes ?? DEFAULT_MAX_BATCH_BYTES);
+  const maxValidationBytes = Math.max(INTEGRITY_CHUNK_SIZE, options.maxIntegrityValidationBytes ?? DEFAULT_INTEGRITY_VALIDATION_BYTES);
   const sources = discoverTranscriptSources(options.transcriptPath);
   const state = loadBackfillState(options.statePath);
   let batchesProcessed = 0;
@@ -296,9 +421,16 @@ export async function runHistoricalBackfill(options: RunBackfillOptions): Promis
   for (const sourcePath of sources) {
     if (batchesProcessed >= maxBatches) break;
     sourcesVisited += 1;
-    const before = state.sources[sourcePath];
-    const source = normalizeSourceState(sourcePath, state);
-    if (!before || source !== before) saveBackfillState(options.statePath, state);
+    const normalized = normalizeSourceState(sourcePath, state, maxValidationBytes);
+    const source = normalized.source;
+    if (normalized.changed) saveBackfillState(options.statePath, state);
+    if (normalized.validationPending) {
+      return {
+        status: batchesProcessed > 0 ? 'completed' : 'no-op', batchesProcessed, sourcesVisited,
+        detail: 'checkpoint integrity validation pending; rerun to continue bounded verification', sourcePath,
+        offset: source.integrity_validation?.next_offset,
+      };
+    }
 
     while (batchesProcessed < maxBatches) {
       const start = source.committed_offset;
@@ -345,8 +477,11 @@ export async function runHistoricalBackfill(options: RunBackfillOptions): Promis
         };
       }
 
+      const previousOffset = source.committed_offset;
+      source.integrity_chunks = extendIntegrityChunks(sourcePath, source.integrity_chunks, previousOffset, next.endOffset);
       source.committed_offset = next.endOffset;
-      source.anchors = checkpointAnchors(sourcePath, source.committed_offset);
+      source.checkpoint_identity = fileIdentity(sourcePath);
+      delete source.integrity_validation;
       source.last_batch_id = batch.batchId;
       delete source.reset_reason;
       delete source.blocked;

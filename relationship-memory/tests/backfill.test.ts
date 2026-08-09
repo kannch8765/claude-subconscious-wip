@@ -135,7 +135,7 @@ describe('relationship-memory historical backfill', () => {
     expect(proc.seen[0].canonicalMessages[0].message_id).toBe('u9');
   });
 
-  it('detects same-size checkpoint anchor replacement', async () => {
+  it('detects same-size checkpoint replacement', async () => {
     const root = temp(), state = path.join(root, 'state.json'), store = path.join(root, 'store'), transcript = path.join(root, 'one.jsonl');
     const original = line(message('user', 'u1', 'AAAA'));
     fs.writeFileSync(transcript, original);
@@ -147,6 +147,70 @@ describe('relationship-memory historical backfill', () => {
     await runHistoricalBackfill({ transcriptPath: transcript, statePath: state, processor: proc.processor });
     expect(loadBackfillState(state).sources[path.resolve(transcript)].generation).toBe(2);
     expect(proc.seen[0].startOffset).toBe(0);
+  });
+
+  it('fails safe when loading an R1 sparse-anchor checkpoint', async () => {
+    const root = temp(), state = path.join(root, 'state.json'), transcript = path.join(root, 'one.jsonl');
+    const content = line(message('user', 'u1', 'legacy checkpoint'));
+    fs.writeFileSync(transcript, content);
+    saveBackfillState(state, {
+      schema_version: 1,
+      backfill_session_id: 'legacy-r1',
+      sources: {
+        [path.resolve(transcript)]: {
+          generation: 1, committed_offset: Buffer.byteLength(content),
+          anchors: [{ offset: 0, length: Math.min(4096, Buffer.byteLength(content)), sha256: 'legacy' }],
+        } as never,
+      },
+    });
+    const seen: HistoricalBatch[] = [];
+    const result = await runHistoricalBackfill({
+      transcriptPath: transcript, statePath: state, processor: async (batch) => { seen.push(batch); return { completion: 'completed' }; },
+    });
+    expect(result.status).toBe('completed');
+    const source = loadBackfillState(state).sources[path.resolve(transcript)];
+    expect(source.generation).toBe(2);
+    expect(seen[0].startOffset).toBe(0);
+    expect(seen[0].canonicalMessages[0].message_id).toBe('u1');
+  });
+
+  it('detects a rewritten middle committed prefix before processing an appended tail', async () => {
+    const root = temp(), state = path.join(root, 'state.json'), transcript = path.join(root, 'large.jsonl');
+    const records: string[] = [];
+    for (let i = 0; i < 18_000; i += 1) {
+      records.push(line(message('user', `u${i}`, `payload-${i}-${'A'.repeat(120)}`)));
+    }
+    const original = records.join('');
+    expect(Buffer.byteLength(original)).toBeGreaterThan(2 * 1024 * 1024);
+    fs.writeFileSync(transcript, original);
+    await runHistoricalBackfill({
+      transcriptPath: transcript, statePath: state, maxBatches: 2, maxRecordsPerBatch: 20_000, maxBatchBytes: 8 * 1024 * 1024,
+      processor: async () => ({ completion: 'completed' }),
+    });
+    const before = loadBackfillState(state).sources[path.resolve(transcript)];
+    expect(before.committed_offset).toBe(Buffer.byteLength(original));
+    expect(before.integrity_chunks.length).toBeGreaterThan(2);
+
+    const changed = Buffer.from(original);
+    const middle = Math.floor(changed.length / 2);
+    const changeAt = changed.indexOf('A'.charCodeAt(0), middle);
+    expect(changeAt).toBeGreaterThanOrEqual(middle);
+    changed[changeAt] = 'B'.charCodeAt(0);
+    fs.writeFileSync(transcript, changed);
+    fs.appendFileSync(transcript, line(message('assistant', 'tail', 'new tail')));
+
+    const seen: HistoricalBatch[] = [];
+    const result = await runHistoricalBackfill({
+      transcriptPath: transcript, statePath: state, maxBatches: 1, maxRecordsPerBatch: 20_000, maxBatchBytes: 8 * 1024 * 1024,
+      processor: async (batch) => { seen.push(batch); return { completion: 'completed' }; },
+    });
+    expect(result.status).toBe('completed');
+    const after = loadBackfillState(state).sources[path.resolve(transcript)];
+    expect(after.generation).toBe(before.generation + 1);
+    expect(seen[0].generation).toBe(after.generation);
+    expect(seen[0].startOffset).toBe(0);
+    expect(seen[0].canonicalMessages[0].message_id).toBe('u0');
+    expect(seen[0].canonicalMessages.some((item) => item.message_id === 'tail')).toBe(true);
   });
 
   it('replay after durable finalization before checkpoint persistence is idempotent', async () => {
@@ -161,6 +225,24 @@ describe('relationship-memory historical backfill', () => {
     const second = await runHistoricalBackfill({ transcriptPath: transcript, statePath: state, processor: retry.processor });
     expect(second.status).toBe('completed');
     expect(new RelationshipMemoryStore(store, 'subject').listMemories()).toHaveLength(1);
+  });
+
+  it('routes syntactically valid non-object JSONL values through malformed failure with byte offsets', async () => {
+    for (const bad of [null, 7, 'primitive', [message('user', 'nested', 'array')]]) {
+      const root = temp(), state = path.join(root, 'state.json'), transcript = path.join(root, 'one.jsonl');
+      const first = line(message('user', 'u1', 'valid before bad'));
+      fs.writeFileSync(transcript, first + line(bad) + line(message('assistant', 'a1', 'later')));
+      const result = await runHistoricalBackfill({
+        transcriptPath: transcript, statePath: state, maxRecordsPerBatch: 10,
+        processor: async () => ({ completion: 'completed' }),
+      });
+      expect(result).toMatchObject({
+        status: 'blocked-failure', detail: 'malformed JSONL record', offset: Buffer.byteLength(first),
+      });
+      const source = loadBackfillState(state).sources[path.resolve(transcript)];
+      expect(source.committed_offset).toBe(0);
+      expect(source.blocked).toEqual({ kind: 'malformed_jsonl', offset: Buffer.byteLength(first) });
+    }
   });
 
   it('malformed record and provider failure hold checkpoint with explicit failure', async () => {
