@@ -323,6 +323,24 @@ export class RelationshipMemoryRuntime {
     }
   }
 
+  private originalMemoryEvidenceIds(memory: CanonicalMemoryRecord): Set<string> | undefined {
+    const evidence = this.store.listEvidence().filter((item) => item.memory_id === memory.memory_id);
+    for (let length = 1; length <= evidence.length; length += 1) {
+      const prefix = evidence.slice(0, length);
+      const dedupeKey = stableId('dedupe', {
+        subject_id: memory.subject_id,
+        kind: memory.kind,
+        summary: memory.summary,
+        participants: memory.participants,
+        evidence_message_ids: prefix.map((item) => item.message_id),
+        payload: memory.payload,
+        linked_memory_ids: memory.linked_memory_ids ?? [],
+      });
+      if (dedupeKey === memory.dedupe_key) return new Set(prefix.map((item) => item.evidence_id));
+    }
+    return undefined;
+  }
+
   reinforce(batchId: string, input: ReinforceInput): RememberResult {
     const now = this.now();
     const memoryId = typeof input?.memory_id === 'string' ? input.memory_id.trim() : '';
@@ -345,10 +363,14 @@ export class RelationshipMemoryRuntime {
       if (!message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${id}`, now);
       messages.push(message);
     }
-    const existingEvidenceIds = new Set(
-      this.store.listEvidence().filter((item) => item.memory_id === memoryId).map((item) => item.evidence_id),
-    );
-    const newMessages = messages.filter((message) => !existingEvidenceIds.has(stableId('ev', { memory_id: memoryId, message_id: message.message_id })));
+    const originalEvidenceIds = this.originalMemoryEvidenceIds(memory);
+    if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now);
+    const completedEvidenceIds = new Set(originalEvidenceIds);
+    for (const reinforcement of this.store.listReinforcements()) {
+      if (reinforcement.memory_id !== memoryId) continue;
+      for (const evidenceId of reinforcement.evidence_ids) completedEvidenceIds.add(evidenceId);
+    }
+    const newMessages = messages.filter((message) => !completedEvidenceIds.has(stableId('ev', { memory_id: memoryId, message_id: message.message_id })));
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now);
     const newMessageIds = newMessages.map((message) => message.message_id).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({

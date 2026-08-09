@@ -15,6 +15,7 @@ import {
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
   rebuildProjection,
+  stableId,
   renderProjection,
   validateProposal,
 } from '../src/index.js';
@@ -418,6 +419,32 @@ describe('reinforcement and linking foundation', () => {
     expect(rt.reinforce('reinforce-old-plus-untrusted', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-1', 'not-in-batch'] }))
       .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unresolvable_evidence' }));
     expect(rt.store.listReinforcements()).toHaveLength(0);
+  });
+
+  it('repairs a crash after reinforcement evidence append but before the reinforcement row', () => {
+    const rt = runtime();
+    rt.store.beginBatch('seed-half-commit', '2026-01-01T00:00:00.000Z');
+    const original = rt.remember('seed-half-commit', personal());
+    const evidenceId = stableId('ev', { memory_id: original.memory_id!, message_id: 'msg-user-2' });
+    fs.appendFileSync(path.join(rt.store.rootDir, 'evidence.jsonl'), `${JSON.stringify({
+      evidence_id: evidenceId,
+      memory_id: original.memory_id!,
+      conversation_id: messages[2].conversation_id,
+      message_id: messages[2].message_id,
+      role: messages[2].role,
+      quote: messages[2].quote,
+      captured_at: messages[2].captured_at,
+    })}\n`);
+    expect(rt.store.listEvidence().filter((item) => item.evidence_id === evidenceId)).toHaveLength(1);
+    expect(rt.store.listReinforcements()).toHaveLength(0);
+
+    rt.store.beginBatch('repair-half-commit', '2026-01-01T00:00:01.000Z');
+    expect(rt.reinforce('repair-half-commit', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] }))
+      .toEqual({ outcome: 'accepted', memory_id: original.memory_id });
+    expect(rt.store.listEvidence().filter((item) => item.evidence_id === evidenceId)).toHaveLength(1);
+    expect(rt.store.listReinforcements()).toHaveLength(1);
+    expect(rt.store.listReinforcements()[0].evidence_ids).toEqual([evidenceId]);
+    expect(rt.finalizeBatch('repair-half-commit', true)).toBe('completed');
   });
 
   it('cross-batch replay of the same trusted evidence remains one durable reinforcement', () => {
