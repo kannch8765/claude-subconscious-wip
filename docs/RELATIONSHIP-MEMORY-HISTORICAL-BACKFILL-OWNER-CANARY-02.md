@@ -82,7 +82,7 @@ status                      active   (all 5)
 participants                [user, assistant]   (all 5)
 ```
 
-Each memory carried a structured payload with `name`/`event`, `meaning`, `trigger_phrases`, `origin`, `callbacks` and `tone`. The single `relationship_event` additionally carried `prior_context` and `resulting_change`, correctly framing the episode as the origin point of a recurring ritual rather than as an isolated event. Two of the four `inside_joke` records concern intimate context and their content is deliberately withheld from this evidence document.
+The four `inside_joke` records carried structured payloads with `name`, `meaning`, `trigger_phrases`, `origin`, `callbacks`, and `tone`. The single `relationship_event` carried `event`, `meaning`, `prior_context`, and `resulting_change`, correctly framing the episode as the origin point of a recurring ritual rather than as an isolated event.
 
 Classification quality was accurate: recurring private phrases were filed as `inside_joke`, and the one episode with lasting relational consequence was filed as `relationship_event`.
 

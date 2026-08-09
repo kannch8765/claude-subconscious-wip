@@ -107,7 +107,7 @@ Terminal decision was `completed` with `no_memory_required`. This is a normal ob
 
 ```text
 file              before                          after
-batches.jsonl     1068 B  b7075192ae40c6a0   →    1374 B  2fbb475d60fb553f   (+1 record)
+batches.jsonl     1068 B  b7075192ae40c6a0   →    1374 B  2fbb475d60fb553f   (+2 rows: pending, completed)
 memories.jsonl    2644 B  8cedb7745dfcf642   →    2644 B  8cedb7745dfcf642   (unchanged)
 evidence.jsonl    3392 B  eb26fcd5922f05e5   →    3392 B  eb26fcd5922f05e5   (unchanged)
 outcomes.jsonl     582 B  8d2811723a5c34fd   →     582 B  8d2811723a5c34fd   (unchanged)
@@ -151,7 +151,7 @@ memory link          0
 outcomes recorded    0
 ```
 
-The observer spent 51 seconds on 20 messages before returning `no_memory_required`. The batch window corresponds to the beginning of the transcript file, which is dominated by session-start hook injections, recall payloads and system scaffolding rather than relationship content. Declining to synthesize memories from that window is the desired conservative behaviour.
+The observer spent 51 seconds on 20 trusted evidence messages before returning `no_memory_required`. The batch covered the beginning of the transcript. The observer made a terminal `no_memory_required` decision and produced no canonical memories. This is consistent with the intended conservative behaviour: a historical batch may complete without forcing a memory write.
 
 ## Errors
 
