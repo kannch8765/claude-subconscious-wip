@@ -7,11 +7,12 @@ import type {
   BatchRecord,
   CanonicalMemoryRecord,
   EvidenceRecord,
+  ReinforcementRecord,
   RememberOutcome,
   OwnerRevisionRecord,
 } from '../schema/index.js';
 
-export type StorePhase = 'memory_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
+export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
 export type FailureInjector = (phase: StorePhase) => boolean;
 
 function ensureDir(dir: string): void {
@@ -57,6 +58,7 @@ export class RelationshipMemoryStore {
 
   listMemories(): CanonicalMemoryRecord[] { return readJsonl<CanonicalMemoryRecord>(this.file('memories.jsonl')); }
   listEvidence(): EvidenceRecord[] { return readJsonl<EvidenceRecord>(this.file('evidence.jsonl')); }
+  listReinforcements(): ReinforcementRecord[] { return readJsonl<ReinforcementRecord>(this.file('reinforcements.jsonl')); }
   listOutcomes(): RememberOutcome[] { return readJsonl<RememberOutcome>(this.file('outcomes.jsonl')); }
   listBatches(): BatchRecord[] { return readJsonl<BatchRecord>(this.file('batches.jsonl')); }
   listOwnerRevisions(): OwnerRevisionRecord[] { return readJsonl<OwnerRevisionRecord>(this.file('owner-revisions.jsonl')); }
@@ -93,6 +95,15 @@ export class RelationshipMemoryStore {
     if (!this.getMemory(record.memory_id)) appendJsonl(this.file('memories.jsonl'), record);
     const existingEvidence = new Set(this.listEvidence().map((item) => item.evidence_id));
     for (const item of evidence) if (!existingEvidence.has(item.evidence_id)) appendJsonl(this.file('evidence.jsonl'), item);
+  }
+
+  appendReinforcement(record: ReinforcementRecord, evidence: EvidenceRecord[]): void {
+    if (this.failureInjector?.('reinforcement_commit')) throw new Error('injected reinforcement commit failure');
+    const existing = this.listReinforcements().find((item) => item.reinforcement_id === record.reinforcement_id);
+    if (existing && (existing.memory_id !== record.memory_id || stableJson(existing.evidence_ids) !== stableJson(record.evidence_ids))) throw new Error(`reinforcement identity collision: ${record.reinforcement_id}`);
+    const existingEvidence = new Set(this.listEvidence().map((item) => item.evidence_id));
+    for (const item of evidence) if (!existingEvidence.has(item.evidence_id)) appendJsonl(this.file('evidence.jsonl'), item);
+    if (!existing) appendJsonl(this.file('reinforcements.jsonl'), record);
   }
 
   appendOwnerRevision(record: OwnerRevisionRecord): void { appendJsonl(this.file('owner-revisions.jsonl'), record); }

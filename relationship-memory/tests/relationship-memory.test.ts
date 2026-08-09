@@ -10,6 +10,7 @@ import {
   FORBIDDEN_MARKDOWN_MEMORY_TOOLS,
   makeBatchId,
   memoryRememberToolSchema,
+  memoryReinforceToolSchema,
   RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
@@ -32,7 +33,7 @@ const messages = [
   { conversation_id: 'conv-fixture', message_id: 'msg-user-2', role: 'user' as const, quote: 'Including you in what I bring home is part of what makes it meaningful.', captured_at: '2026-01-01T10:02:00.000Z' },
 ];
 
-function runtime(dir = tempDir(), injector?: (phase: 'memory_commit' | 'outcome_commit') => boolean) {
+function runtime(dir = tempDir(), injector?: (phase: 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit') => boolean) {
   const store = new RelationshipMemoryStore(dir, 'subject-fixture', injector);
   return new RelationshipMemoryRuntime(store, new Map(messages.map((m) => [m.message_id, m])), () => '2026-01-02T00:00:00.000Z');
 }
@@ -325,10 +326,10 @@ describe('adopted SDK/configuration boundary', () => {
   it('registers only memory_search and memory_remember plus read-only investigation tools', async () => {
     const rt = runtime(); rt.store.beginBatch('tools', '2026-01-01T00:00:00.000Z');
     const tools = buildRelationshipTools(rt, 'tools');
-    expect(tools.map((t) => t.name)).toEqual(['memory_search', 'memory_remember']);
-    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_remember']);
+    expect(tools.map((t) => t.name)).toEqual(['memory_search', 'memory_reinforce', 'memory_remember']);
+    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember']);
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).not.toContain(forbidden as any);
-    const remembered = await tools[1].execute('call-1', personal());
+    const remembered = await tools[2].execute('call-1', personal());
     expect(remembered).toEqual(expect.objectContaining({ outcome: 'accepted' }));
     const searched = await tools[0].execute('call-2', { query: 'historic city' });
     expect((searched as any).results).toHaveLength(1);
@@ -342,6 +343,8 @@ describe('adopted SDK/configuration boundary', () => {
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(toolNames).not.toContain(forbidden);
     expect(agent.system).toContain('memory_search');
     expect(agent.system).toContain('memory_remember');
+    expect(agent.system).toContain('memory_reinforce');
+    expect(agent.system).toContain('Lexical or topical similarity alone');
     expect(agent.system).not.toContain('memory_replace(');
     const attachedBlocks = agent.block_ids.map((id: string) => af.blocks.find((block: any) => block.id === id));
     expect(attachedBlocks.map((b: any) => b.label)).toEqual(['shared_language', 'remembered_experiences', 'relationship_context']);
@@ -359,5 +362,89 @@ describe('adopted SDK/configuration boundary', () => {
       { conversation_id: 'conv-1', message_id: 'a-1', role: 'assistant', quote: 'hi', captured_at: '2026-01-01T00:00:01Z' },
     ]);
     expect(makeBatchId('session', 0, 2)).toBe(makeBatchId('session', 0, 2));
+  });
+});
+
+
+describe('reinforcement and linking foundation', () => {
+  it('reinforces an existing memory with trusted current-batch evidence without creating another memory', () => {
+    const rt = runtime();
+    rt.store.beginBatch('reinforce-a', '2026-01-01T00:00:00.000Z');
+    const original = rt.remember('reinforce-a', personal());
+    const observedAt = rt.store.getMemory(original.memory_id!)!.observed_at;
+    const result = rt.reinforce('reinforce-a', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] });
+    expect(result).toEqual({ outcome: 'accepted', memory_id: original.memory_id });
+    expect(rt.store.listMemories()).toHaveLength(1);
+    expect(rt.store.listReinforcements()).toHaveLength(1);
+    const reinforcement = rt.store.listReinforcements()[0];
+    expect(reinforcement.memory_id).toBe(original.memory_id);
+    expect(reinforcement.latest_evidence_at).toBe(messages[2].captured_at);
+    expect(rt.store.listEvidence().find((e) => e.evidence_id === reinforcement.evidence_ids[0])).toEqual(expect.objectContaining({ message_id: 'msg-user-2', quote: messages[2].quote }));
+    expect(rt.store.getMemory(original.memory_id!)!.observed_at).toBe(observedAt);
+  });
+
+  it('cross-batch replay of the same trusted evidence remains one durable reinforcement', () => {
+    const rt = runtime();
+    rt.store.beginBatch('reinforce-first', '2026-01-01T00:00:00.000Z');
+    const original = rt.remember('reinforce-first', personal());
+    expect(rt.reinforce('reinforce-first', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] }).outcome).toBe('accepted');
+    rt.store.beginBatch('reinforce-second', '2026-01-01T00:00:01.000Z');
+    expect(rt.reinforce('reinforce-second', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] })).toEqual({ outcome: 'duplicate', memory_id: original.memory_id });
+    expect(rt.store.listReinforcements()).toHaveLength(1);
+    expect(rt.store.listEvidence().filter((e) => e.message_id === 'msg-user-2')).toHaveLength(1);
+  });
+
+  it('replay is idempotent and search exposes bounded derived reinforcement metadata', () => {
+    const rt = runtime(); rt.store.beginBatch('reinforce-replay', '2026-01-01T00:00:00.000Z');
+    const original = rt.remember('reinforce-replay', personal());
+    expect(rt.reinforce('reinforce-replay', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] }).outcome).toBe('accepted');
+    expect(rt.reinforce('reinforce-replay', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] })).toEqual({ outcome: 'duplicate', memory_id: original.memory_id });
+    expect(rt.store.listReinforcements()).toHaveLength(1);
+    expect(rt.store.listEvidence().filter((e) => e.message_id === 'msg-user-2')).toHaveLength(1);
+    expect(rt.memorySearch({ query: 'historic city' })[0]).toEqual(expect.objectContaining({ reinforcement_count: 1, reinforcement_evidence_count: 1, latest_reinforcement_at: messages[2].captured_at }));
+  });
+
+  it('rejects unknown memory and unknown/out-of-batch evidence without ledger corruption', () => {
+    const rt = runtime(); rt.store.beginBatch('reinforce-invalid', '2026-01-01T00:00:00.000Z');
+    expect(rt.reinforce('reinforce-invalid', { memory_id: 'mem-missing', evidence_message_ids: ['msg-user-2'] })).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unknown_memory' }));
+    const original = rt.remember('reinforce-invalid', personal());
+    expect(rt.reinforce('reinforce-invalid', { memory_id: original.memory_id!, evidence_message_ids: ['not-in-batch'] })).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unresolvable_evidence' }));
+    expect(rt.store.listReinforcements()).toHaveLength(0);
+  });
+
+  it('persistence failure keeps the batch retryable and a fresh retry succeeds without duplicate provenance', () => {
+    const dir = tempDir();
+    let fail = false;
+    const first = runtime(dir, (phase) => fail && phase === 'reinforcement_commit');
+    first.store.beginBatch('reinforce-retry', '2026-01-01T00:00:00.000Z');
+    const original = first.remember('reinforce-retry', personal());
+    fail = true;
+    expect(first.reinforce('reinforce-retry', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] }).outcome).toBe('retryable_failed');
+    expect(first.finalizeBatch('reinforce-retry', true)).toBe('retryable_failure');
+    expect(first.store.listReinforcements()).toHaveLength(0);
+
+    const retry = runtime(dir);
+    expect(retry.reinforce('reinforce-retry', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] }).outcome).toBe('accepted');
+    expect(retry.store.listReinforcements()).toHaveLength(1);
+    expect(retry.store.listEvidence().filter((e) => e.message_id === 'msg-user-2')).toHaveLength(1);
+  });
+
+  it('keeps related-but-distinct and highly similar dated episodes as explicit new linked memories', () => {
+    const rt = runtime(); rt.store.beginBatch('distinct', '2026-01-01T00:00:00.000Z');
+    const first = rt.remember('distinct', personal({ summary: 'Ramen on July 13', payload: { title: 'Ramen lunch July 13', experience: 'The user ate ramen on July 13.', time_text: '2026-07-13' } }));
+    const second = rt.remember('distinct', personal({ summary: 'Ramen on July 14', evidence_message_ids: ['msg-user-2'], linked_memory_ids: [first.memory_id!], payload: { title: 'Ramen lunch July 14', experience: 'The user ate ramen again on July 14.', time_text: '2026-07-14' } }));
+    expect(first.outcome).toBe('accepted');
+    expect(second.outcome).toBe('accepted');
+    expect(second.memory_id).not.toBe(first.memory_id);
+    expect(rt.store.listMemories()).toHaveLength(2);
+    expect(rt.store.getMemory(second.memory_id!)?.linked_memory_ids).toEqual([first.memory_id]);
+    expect(rt.store.listReinforcements()).toHaveLength(0);
+  });
+
+  it('publishes a narrow trusted memory_reinforce tool schema', () => {
+    const schema = memoryReinforceToolSchema() as any;
+    expect(schema.required).toEqual(['memory_id', 'evidence_message_ids']);
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties.evidence_message_ids.minItems).toBe(1);
   });
 });
