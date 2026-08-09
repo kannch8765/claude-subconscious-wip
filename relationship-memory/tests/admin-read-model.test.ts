@@ -192,6 +192,7 @@ describe('Subconscious admin read-model composition', () => {
         shared_experience: 0,
         relationship_event: 1,
         inside_joke: 1,
+        user_preference: 0,
       },
       ownerRevisionCount: 2,
       latestOwnerRevisionAt: '2026-08-08T12:00:00Z',

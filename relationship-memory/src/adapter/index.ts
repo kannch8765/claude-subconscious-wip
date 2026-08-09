@@ -4,12 +4,12 @@ import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
 import { extractAllContent } from '../../../scripts/transcript_utils.js';
 import type { AssistantRememberIntentRecord, CanonicalMessage, ParticipantRole } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
-import { memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
+import { entityRememberToolSchema, entitySearchToolSchema, memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
 
 export interface RelationshipTool {
   label: string;
-  name: 'memory_search' | 'memory_remember' | 'memory_reinforce';
+  name: 'memory_search' | 'memory_remember' | 'memory_reinforce' | 'entity_search' | 'entity_remember';
   description: string;
   parameters: Record<string, unknown>;
   execute(toolCallId: string, args: unknown): Promise<unknown>;
@@ -93,6 +93,7 @@ export function createRuntime(
     new Map(canonicalMessages.map((m) => [m.message_id, m])),
     () => new Date().toISOString(),
     new Map(assistantIntents.map((intent) => [intent.intent_id, intent])),
+    true,
   );
 }
 
@@ -104,26 +105,38 @@ export function buildRelationshipTools(
   return [
     {
       label: 'memory_search', name: 'memory_search',
-      description: 'Search canonical relationship-memory records, including bounded reinforcement metadata and linked assistant remember provenance, before choosing whether to reinforce or create.',
+      description: 'Search canonical relationship-memory records, including bounded reinforcement metadata and linked assistant remember provenance, before choosing whether to reinforce or create. For new trusted evidence that explicitly repeats an existing durable user preference, a search hit is not terminal: follow with memory_reinforce.',
       parameters: memorySearchToolSchema(),
       async execute(_toolCallId, args) { return wrapResult({ results: runtime.memorySearch((args ?? {}) as never) }); },
     },
     {
+      label: 'entity_search', name: 'entity_search',
+      description: 'Search first-class canonical entity identities by canonical name, exact/normalized alias, or description before proposing an identity.',
+      parameters: entitySearchToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult({ results: runtime.entitySearch((args ?? {}) as never) }); },
+    },
+    {
+      label: 'entity_remember', name: 'entity_remember',
+      description: 'Propose one evidence-backed first-class entity identity. Preserve literal aliases, use a perspective-neutral Chinese description, and search aliases first.',
+      parameters: entityRememberToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(runtime.rememberEntity(batchId, args)); },
+    },
+    {
       label: 'memory_reinforce', name: 'memory_reinforce',
-      description: 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying episode/event. Do not use lexical similarity alone to decide sameness.',
+      description: 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying episode/event or stable preference. Explicit repeated durable-preference evidence should be bound here rather than treated as no_memory_required. Do not use lexical similarity alone to decide sameness.',
       parameters: memoryReinforceToolSchema(),
       async execute(_toolCallId, args) { return wrapResult(runtime.reinforce(batchId, args as never)); },
     },
     {
       label: 'memory_remember', name: 'memory_remember',
-      description: 'Propose one schema-version-1 relationship memory bound to trusted transcript evidence. When processing a trusted assistant remember intent, copy its assistant_intent_id; never invent or rewrite feel text.',
+      description: 'Propose one schema-version-1 relationship memory bound to trusted transcript evidence, including a new explicit durable user_preference when search finds no same preference. When processing a trusted assistant remember intent, copy its assistant_intent_id; never invent or rewrite feel text.',
       parameters: memoryRememberToolSchema(),
       async execute(_toolCallId, args) { return wrapResult(runtime.remember(batchId, args)); },
     },
   ];
 }
 
-export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = ['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember'] as const;
+export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = ['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember'] as const;
 export const FORBIDDEN_MARKDOWN_MEMORY_TOOLS = ['memory', 'memory_insert', 'memory_replace', 'memory_rethink'] as const;
 
 export function readProjectionBlocks(rootDir = relationshipMemoryRoot()): Array<{ label: string; value: string }> {

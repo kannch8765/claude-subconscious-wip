@@ -39,7 +39,7 @@ export function renderProjection(
   const render = (memory: CanonicalMemoryRecord | EffectiveMemoryRecord) => renderMemory(memory, assistantProvenance.get(memory.memory_id) ?? []);
   const sharedLanguage = sorted.filter((m) => m.kind === 'inside_joke').map(render);
   const experiences = sorted.filter((m) => m.kind === 'personal_experience' || m.kind === 'shared_experience').map(render);
-  const relationship = sorted.filter((m) => m.kind === 'relationship_event').map(render);
+  const relationship = sorted.filter((m) => m.kind === 'relationship_event' || m.kind === 'user_preference').map(render);
   const blocks = {
     shared_language: ['# Shared language', ...sharedLanguage].join('\n'),
     remembered_experiences: ['# Remembered experiences', ...experiences].join('\n'),

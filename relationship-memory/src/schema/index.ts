@@ -3,6 +3,7 @@ export const MEMORY_KINDS = [
   'shared_experience',
   'relationship_event',
   'inside_joke',
+  'user_preference',
 ] as const;
 
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
@@ -10,6 +11,8 @@ export type ParticipantRole = 'user' | 'assistant';
 export type RememberOutcomeKind = 'accepted' | 'duplicate' | 'permanently_rejected' | 'retryable_failed';
 export type BatchCompletion = 'completed' | 'retryable_failure';
 export type AssistantIntentOutcomeKind = RememberOutcomeKind;
+export const ENTITY_TYPES = ['user', 'assistant', 'other'] as const;
+export type EntityType = (typeof ENTITY_TYPES)[number];
 
 export interface CanonicalMessage {
   conversation_id: string;
@@ -28,6 +31,55 @@ export interface MemoryProposalV1 {
   payload: Record<string, unknown>;
   linked_memory_ids?: string[];
   assistant_intent_id?: string;
+}
+
+export interface EntityIdentityProposalV1 {
+  schema_version: 1;
+  canonical_name: string;
+  aliases: string[];
+  entity_type: EntityType;
+  description: string;
+  evidence_message_ids: string[];
+}
+
+export interface EntityIdentityRecord {
+  schema_version: 1;
+  entity_id: string;
+  subject_id: string;
+  canonical_name: string;
+  aliases: string[];
+  entity_type: EntityType;
+  description: string;
+  observed_at: string;
+  created_at: string;
+  source_key: string;
+}
+
+export interface EntityEvidenceRecord {
+  evidence_id: string;
+  entity_id: string;
+  conversation_id: string;
+  message_id: string;
+  role: ParticipantRole;
+  quote: string;
+  captured_at: string;
+}
+
+export interface EntityOutcome {
+  batch_id: string;
+  source_key: string;
+  outcome: RememberOutcomeKind;
+  entity_id?: string;
+  rejection_code?: string;
+  reason?: string;
+  recorded_at: string;
+}
+
+export interface EntityValidationResult {
+  ok: boolean;
+  proposal?: EntityIdentityProposalV1;
+  code?: string;
+  reason?: string;
 }
 
 export interface AssistantRememberIntentRecord {
@@ -142,6 +194,11 @@ const payloadKeys: Record<MemoryKind, { required: string[]; optional: string[]; 
     arrays: ['trigger_phrases', 'callbacks'],
     nonEmptyArrays: ['trigger_phrases'],
   },
+  user_preference: {
+    required: ['topic', 'preference'],
+    optional: ['context', 'reason', 'recall_triggers'],
+    arrays: ['recall_triggers'],
+  },
 };
 
 function plainObject(value: unknown): value is Record<string, unknown> {
@@ -168,11 +225,38 @@ function cleanStringArray(value: unknown, requireNonEmpty = false): string[] | n
   return cleaned;
 }
 
+export function normalizeEntityAlias(value: string): string {
+  return value.normalize('NFKC').trim().toLocaleLowerCase('en-US');
+}
+
+function containsHan(value: string): boolean {
+  return /\p{Script=Han}/u.test(value);
+}
+
+const semanticProseFields: Record<MemoryKind, string[]> = {
+  personal_experience: ['experience', 'emotional_tone', 'why_memorable'],
+  shared_experience: ['event', 'shared_meaning'],
+  relationship_event: ['event', 'meaning', 'prior_context', 'resulting_change'],
+  inside_joke: ['meaning', 'origin', 'tone'],
+  user_preference: ['preference', 'context', 'reason'],
+};
+
+function validateChineseSemanticProse(kind: MemoryKind, summary: string, payload: Record<string, unknown>): ValidationResult | null {
+  if (!containsHan(summary)) return reject('non_chinese_semantic_prose', 'summary must contain Chinese semantic prose for DS-authored canonical writes.');
+  for (const field of semanticProseFields[kind]) {
+    const value = payload[field];
+    if (typeof value === 'string' && value.trim() && !containsHan(value)) {
+      return reject('non_chinese_semantic_prose', `${kind}.${field} must contain Chinese semantic prose for DS-authored canonical writes.`);
+    }
+  }
+  return null;
+}
+
 function reject(code: string, reason: string): ValidationResult {
   return { ok: false, code, reason };
 }
 
-export function validateProposal(input: unknown): ValidationResult {
+export function validateProposal(input: unknown, options: { requireChineseSemanticProse?: boolean } = {}): ValidationResult {
   if (!plainObject(input)) return reject('invalid_schema', 'Proposal must be an object.');
   for (const key of Object.keys(input)) {
     if (!commonKeys.has(key)) return reject('unknown_field', `Unknown proposal field: ${key}`);
@@ -242,6 +326,11 @@ export function validateProposal(input: unknown): ValidationResult {
     }
   }
 
+  if (options.requireChineseSemanticProse) {
+    const languageFailure = validateChineseSemanticProse(kind, summary, payload);
+    if (languageFailure) return languageFailure;
+  }
+
   return {
     ok: true,
     proposal: {
@@ -255,6 +344,37 @@ export function validateProposal(input: unknown): ValidationResult {
       ...(assistantIntentId ? { assistant_intent_id: assistantIntentId } : {}),
     },
   };
+}
+
+export function validateEntityIdentityProposal(
+  input: unknown,
+  options: { requireChineseSemanticProse?: boolean } = {},
+): EntityValidationResult {
+  if (!plainObject(input)) return { ok: false, code: 'invalid_schema', reason: 'Entity identity proposal must be an object.' };
+  const allowed = new Set(['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description', 'evidence_message_ids']);
+  for (const key of Object.keys(input)) if (!allowed.has(key)) return { ok: false, code: 'unknown_field', reason: `Unknown entity identity field: ${key}` };
+  if (input.schema_version !== 1) return { ok: false, code: 'invalid_schema_version', reason: 'schema_version must be literal 1.' };
+  const canonicalName = cleanString(input.canonical_name);
+  if (!canonicalName) return { ok: false, code: 'invalid_canonical_name', reason: 'canonical_name must be a non-empty string.' };
+  if (!ENTITY_TYPES.includes(input.entity_type as EntityType)) return { ok: false, code: 'invalid_entity_type', reason: 'entity_type must be user, assistant, or other.' };
+  const description = cleanString(input.description);
+  if (!description) return { ok: false, code: 'invalid_description', reason: 'description must be a non-empty string.' };
+  if (options.requireChineseSemanticProse && !containsHan(description)) {
+    return { ok: false, code: 'non_chinese_semantic_prose', reason: 'entity description must contain Chinese semantic prose for DS-authored canonical writes.' };
+  }
+  const rawAliases = cleanStringArray(input.aliases, true);
+  if (!rawAliases) return { ok: false, code: 'invalid_aliases', reason: 'aliases must be a non-empty unique string array.' };
+  const aliases: string[] = [];
+  const seen = new Set<string>();
+  for (const value of [canonicalName, ...rawAliases]) {
+    const normalized = normalizeEntityAlias(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    aliases.push(value);
+  }
+  const evidenceIds = cleanStringArray(input.evidence_message_ids, true);
+  if (!evidenceIds) return { ok: false, code: 'invalid_evidence_message_ids', reason: 'evidence_message_ids must be a non-empty unique string array.' };
+  return { ok: true, proposal: { schema_version: 1, canonical_name: canonicalName, aliases, entity_type: input.entity_type as EntityType, description, evidence_message_ids: evidenceIds } };
 }
 
 export type OwnerRevisionAction = 'revise' | 'deactivate' | 'restore';

@@ -270,7 +270,7 @@ describe('observer contract correction', () => {
       'schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload', 'linked_memory_ids',
     ]));
     expect(sdkVisible.properties.kind.enum).toEqual([
-      'personal_experience', 'shared_experience', 'relationship_event', 'inside_joke',
+      'personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference',
     ]);
     expect(Object.keys(sdkVisible.properties.payload.properties)).toEqual(expect.arrayContaining([
       'title', 'experience', 'event', 'shared_meaning', 'meaning', 'name', 'trigger_phrases',
@@ -323,13 +323,13 @@ describe('observer contract correction', () => {
 });
 
 describe('adopted SDK/configuration boundary', () => {
-  it('registers only memory_search and memory_remember plus read-only investigation tools', async () => {
+  it('registers memory and entity semantic tools plus read-only investigation tools', async () => {
     const rt = runtime(); rt.store.beginBatch('tools', '2026-01-01T00:00:00.000Z');
     const tools = buildRelationshipTools(rt, 'tools');
-    expect(tools.map((t) => t.name)).toEqual(['memory_search', 'memory_reinforce', 'memory_remember']);
-    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember']);
+    expect(tools.map((t) => t.name)).toEqual(['memory_search', 'entity_search', 'entity_remember', 'memory_reinforce', 'memory_remember']);
+    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember']);
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).not.toContain(forbidden as any);
-    const remembered = await tools[2].execute('call-1', personal());
+    const remembered = await tools.find((tool) => tool.name === 'memory_remember')!.execute('call-1', personal());
     expect(remembered).toEqual(expect.objectContaining({ outcome: 'accepted' }));
     const searched = await tools[0].execute('call-2', { query: 'historic city' });
     expect((searched as any).results).toHaveLength(1);

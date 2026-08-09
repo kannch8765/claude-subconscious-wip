@@ -8,13 +8,14 @@ import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, MemoryKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 
-export type RecallSourceKind = 'relationship_memory' | 'transcript_search' | 'transcript_read';
+export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
 
 export interface RecallSourceSummary {
   source_ref: string;
   kind: RecallSourceKind;
   memory_id?: string;
+  entity_id?: string;
   observed_at?: string;
   transcript_time?: string;
   transcript_role?: 'user' | 'assistant';
@@ -269,44 +270,37 @@ export class RelationshipMemoryRecallSession {
     this.assertOpen();
     const limit = boundedLimit(input.limit, 8, 20);
     const owner = new RelationshipMemoryOwnerControlPlane(this.store);
-    const candidates = owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) });
-    const ranked: Array<{ memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; score: number }> = [];
-    for (const memory of candidates) {
+    const memoryCandidates = owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) });
+    const ranked: Array<{ kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; score: number } | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; score: number }> = [];
+    for (const memory of memoryCandidates) {
       if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;
       const intents = this.linkedAssistantIntents(memory.memory_id);
-      const score = textScore(stableJson({
-        summary: memory.summary,
-        payload: memory.payload,
-        assistant_intents: intents.map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text })),
-      }), input.query);
-      if (score <= 0) continue;
-      ranked.push({ memory, intents, score });
+      const score = textScore(stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: intents.map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text })) }), input.query);
+      if (score > 0) ranked.push({ kind: 'memory', memory, intents, score });
     }
-    ranked.sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at) || a.memory.memory_id.localeCompare(b.memory.memory_id));
-    return {
-      results: ranked.slice(0, limit).map(({ memory, intents }) => {
-        const sourceRef = this.register('relationship_memory', { memory_id: memory.memory_id, latest_revision_id: memory.latest_revision_id }, {
-          memory_id: memory.memory_id,
-          observed_at: memory.observed_at,
-        });
+    if (!input.kind) {
+      for (const entity of this.store.listEntities()) {
+        if (!inTimeWindow(entity.observed_at, input.time_start, input.time_end)) continue;
+        const score = textScore(stableJson({ canonical_name: entity.canonical_name, aliases: entity.aliases, description: entity.description }), input.query);
+        if (score > 0) ranked.push({ kind: 'entity', entity, score });
+      }
+    }
+    ranked.sort((a, b) => b.score - a.score || (b.kind === 'memory' ? b.memory.observed_at : b.entity.observed_at).localeCompare(a.kind === 'memory' ? a.memory.observed_at : a.entity.observed_at));
+    return { results: ranked.slice(0, limit).map((item) => {
+      if (item.kind === 'entity') {
+        const entity = item.entity;
+        const sourceRef = this.register('entity_identity', { entity_id: entity.entity_id, source_key: entity.source_key }, { entity_id: entity.entity_id, observed_at: entity.observed_at });
+        const evidence = this.store.listEntityEvidence().filter((item) => item.entity_id === entity.entity_id);
         return {
-          source_ref: sourceRef,
-          memory_id: memory.memory_id,
-          kind: memory.kind,
-          summary: memory.summary,
-          participants: memory.participants,
-          payload: memory.payload,
-          observed_at: memory.observed_at,
-          owner_corrected: memory.owner_corrected,
-          assistant_intents: intents.map((intent) => ({
-            intent_id: intent.intent_id,
-            memory: intent.memory.text,
-            feel: intent.feel.text,
-            captured_at: intent.captured_at,
-          })),
+          source_ref: sourceRef, record_type: 'entity_identity', entity_id: entity.entity_id, canonical_name: entity.canonical_name, aliases: entity.aliases,
+          entity_type: entity.entity_type, description: entity.description, observed_at: entity.observed_at,
+          evidence_ids: evidence.map((item) => item.evidence_id), evidence_message_ids: evidence.map((item) => item.message_id),
         };
-      }),
-    };
+      }
+      const { memory, intents } = item;
+      const sourceRef = this.register('relationship_memory', { memory_id: memory.memory_id, latest_revision_id: memory.latest_revision_id }, { memory_id: memory.memory_id, observed_at: memory.observed_at });
+      return { source_ref: sourceRef, record_type: 'relationship_memory', memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary, participants: memory.participants, payload: memory.payload, observed_at: memory.observed_at, owner_corrected: memory.owner_corrected, assistant_intents: intents.map((intent) => ({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text, captured_at: intent.captured_at })) };
+    }) };
   }
 
   async transcriptSearch(input: TranscriptSearchInput = {}): Promise<{ results: unknown[] }> {
@@ -435,7 +429,7 @@ export function relationshipMemorySearchToolSchema(): Record<string, unknown> {
     type: 'object', additionalProperties: false,
     properties: {
       query: { type: 'string', minLength: 1 },
-      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke'] },
+      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'] },
       time_start: { type: 'string', description: 'Optional ISO-compatible lower time bound.' },
       time_end: { type: 'string', description: 'Optional ISO-compatible upper time bound.' },
       limit: { type: 'integer', minimum: 1, maximum: 20 },
