@@ -109,3 +109,23 @@ export function validateBackfillSnapshot(
 
   return { manifestPath, snapshotDir, transcriptPath, manifest };
 }
+
+export interface BackfillTranscriptInput {
+  transcript?: string;
+  snapshotManifest?: string;
+}
+
+export function resolveBackfillTranscriptInput(
+  input: BackfillTranscriptInput,
+  options: BackfillSnapshotValidationOptions = {},
+): string {
+  if ((!input.transcript && !input.snapshotManifest) || (input.transcript && input.snapshotManifest)) {
+    fail('exactly one transcript source must be supplied');
+  }
+  if (input.snapshotManifest) return validateBackfillSnapshot(path.resolve(input.snapshotManifest), options).transcriptPath;
+  const transcriptPath = path.resolve(input.transcript!);
+  if (transcriptPath === '/root' || transcriptPath.startsWith('/root/')) {
+    fail('direct /root transcript access is disabled; export an immutable owner snapshot and use --snapshot-manifest');
+  }
+  return transcriptPath;
+}
