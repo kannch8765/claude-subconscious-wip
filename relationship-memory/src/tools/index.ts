@@ -41,6 +41,10 @@ export interface RememberResult {
   reason?: string;
 }
 
+function boundedSearchLimit(value: number | undefined): number {
+  return Math.max(1, Math.min(value ?? 8, 20));
+}
+
 function rawAssistantIntentId(value: unknown): string | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
   const candidate = (value as Record<string, unknown>).assistant_intent_id;
@@ -98,7 +102,8 @@ export class RelationshipMemoryRuntime {
 
   async memorySearchHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
     const semanticQuery = query.query?.trim();
-    if (!this.semanticRetriever || !semanticQuery) return this.memorySearch(query);
+    const limit = boundedSearchLimit(query.limit);
+    if (!this.semanticRetriever || !semanticQuery) return this.memorySearch(query).slice(0, limit);
     const candidates = this.memorySearch({ ...query, query: undefined });
     const documents = candidates.map((memory) => {
       const linkedIntents = this.linkedAssistantIntents(memory.memory_id).map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text }));
@@ -113,10 +118,10 @@ export class RelationshipMemoryRuntime {
         memory,
         score: hybridScore(lexicalTextScore(documents[index].text, semanticQuery), semantic.get(documents[index].id)),
       })).sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
-        .slice(0, Math.max(1, Math.min(query.limit ?? 8, 20)))
+        .slice(0, limit)
         .map((item) => item.memory);
     } catch {
-      return this.memorySearch(query);
+      return this.memorySearch(query).slice(0, limit);
     }
   }
 
@@ -139,7 +144,8 @@ export class RelationshipMemoryRuntime {
 
   async entitySearchHybrid(query: EntitySearchQuery = {}): Promise<EntitySearchResult[]> {
     const semanticQuery = query.query?.trim();
-    if (!this.semanticRetriever || !semanticQuery) return this.entitySearch(query);
+    const limit = boundedSearchLimit(query.limit);
+    if (!this.semanticRetriever || !semanticQuery) return this.entitySearch(query).slice(0, limit);
     const candidates = this.entitySearch({});
     const documents = candidates.map((entity) => ({
       id: `entity:${entity.entity_id}`,
@@ -151,10 +157,10 @@ export class RelationshipMemoryRuntime {
         entity,
         score: hybridScore(lexicalTextScore(documents[index].text, semanticQuery), semantic.get(documents[index].id)),
       })).sort((a, b) => b.score - a.score || b.entity.observed_at.localeCompare(a.entity.observed_at))
-        .slice(0, Math.max(1, Math.min(query.limit ?? 8, 20)))
+        .slice(0, limit)
         .map((item) => item.entity);
     } catch {
-      return this.entitySearch(query);
+      return this.entitySearch(query).slice(0, limit);
     }
   }
 
@@ -222,7 +228,7 @@ export class RelationshipMemoryRuntime {
     const collisions = this.store.listEntities().filter((entity) => entity.aliases.some((alias) => aliases.includes(normalizeEntityAlias(alias))));
     if (collisions.length > 0) {
       const existing = collisions[0];
-      if (collisions.some((entity) => entity.entity_id !== existing.entity_id)) return this.entityPermanent(batchId, sourceKey, 'alias_collision', 'Alias set maps to multiple existing entity identities.', now);
+      if (collisions.some((entity) => entity.entity_id !== existing.entity_id)) return this.entityPermanent(batchId, sourceKey, 'alias_collision', 'Alias set maps to multiple existing entity identities.');
       const existingAliases = new Set(existing.aliases.map(normalizeEntityAlias));
       const proposalNames = new Set([normalizeEntityAlias(proposal.canonical_name), ...aliases]);
       const sameIdentity = existing.entity_type === proposal.entity_type

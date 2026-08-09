@@ -73,6 +73,27 @@ function seedRuntime(root: string, retriever?: SemanticRetriever): { runtime: Re
   return { runtime, memoryId: remembered.memory_id!, entityId: entity.entity_id! };
 }
 
+function addFallbackMatches(runtime: RelationshipMemoryRuntime): void {
+  runtime.store.beginBatch('fallback-second', '2026-07-21T12:00:00.000Z');
+  expect(runtime.remember('fallback-second', {
+    schema_version: 1,
+    kind: 'shared_experience',
+    summary: '另一段旅行礼物记忆',
+    participants: ['user', 'assistant'],
+    evidence_message_ids: ['gift-evidence'],
+    payload: { title: '旅行礼物续篇', event: '另一段与旅行礼物有关的事件', shared_meaning: '用于验证多个 lexical 候选的 limit' },
+  }).outcome).toBe('accepted');
+  expect(runtime.rememberEntity('fallback-second', {
+    schema_version: 1,
+    canonical_name: '琥珀',
+    aliases: ['琥珀', 'Claude'],
+    entity_type: 'assistant',
+    description: 'Claude 侧的助手身份',
+    evidence_message_ids: ['identity-evidence'],
+  }).outcome).toBe('accepted');
+  runtime.finalizeBatch('fallback-second', true);
+}
+
 describe('relationship-memory semantic retrieval foundation', () => {
   it('keeps the vector index derivative, caches unchanged documents, and refreshes changed text', async () => {
     const root = temp('rm-semantic-index-');
@@ -153,5 +174,20 @@ describe('relationship-memory semantic retrieval foundation', () => {
     const failing: SemanticRetriever = { async rank() { throw new Error('provider down'); } };
     const seeded = seedRuntime(temp('rm-semantic-fallback-'), failing).runtime;
     expect((await seeded.memorySearchHybrid({ query: '京都礼物' }))[0]).toEqual(expect.objectContaining({ summary: expect.stringContaining('京都礼物') }));
+  });
+
+  it('honors public result limits on provider-failure, no-provider, and blank-query lexical fallback', async () => {
+    const failing: SemanticRetriever = { async rank() { throw new Error('provider down'); } };
+    const degraded = seedRuntime(temp('rm-semantic-limit-failure-'), failing).runtime;
+    addFallbackMatches(degraded);
+    expect(await degraded.memorySearchHybrid({ query: '礼物', limit: 1 })).toHaveLength(1);
+    expect(await degraded.entitySearchHybrid({ query: '助手身份', limit: 1 })).toHaveLength(1);
+
+    const lexicalOnly = seedRuntime(temp('rm-semantic-limit-disabled-')).runtime;
+    addFallbackMatches(lexicalOnly);
+    expect(await lexicalOnly.memorySearchHybrid({ query: '礼物', limit: 1 })).toHaveLength(1);
+    expect(await lexicalOnly.entitySearchHybrid({ query: '助手身份', limit: 1 })).toHaveLength(1);
+    expect(await lexicalOnly.memorySearchHybrid({ limit: 1 })).toHaveLength(1);
+    expect(await lexicalOnly.entitySearchHybrid({ limit: 1 })).toHaveLength(1);
   });
 });
