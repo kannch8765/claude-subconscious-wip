@@ -30,7 +30,8 @@
     "sync": "tsx scripts/sync_letta_memory.ts",
     "send": "tsx scripts/send_messages_to_letta.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "backfill": "tsx scripts/relationship_memory_backfill.ts"
   },
   "dependencies": {
     "@letta-ai/letta-code-sdk": "^0.1.0",
