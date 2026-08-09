@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { validateBackfillSnapshot } from '../src/backfill/snapshot.js';
+import { resolveBackfillTranscriptInput, validateBackfillSnapshot } from '../src/backfill/snapshot.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -45,6 +45,10 @@ describe('backfill snapshot authority boundary', () => {
     const result = validateBackfillSnapshot(f.manifest, { expectedOwnerUid: f.uid });
     expect(result.transcriptPath).toBe(f.transcript);
     expect(result.manifest.source_path).toBe('/root/.claude/projects/example.jsonl');
+  });
+
+  it('refuses direct /root transcript access so privileged history must cross the snapshot boundary', () => {
+    expect(() => resolveBackfillTranscriptInput({ transcript: '/root/.claude/projects/private.jsonl' })).toThrow(/direct \/root transcript access is disabled/);
   });
 
   it('rejects a writable transcript before hashing or backfill', () => {
