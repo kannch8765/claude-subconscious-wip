@@ -228,7 +228,7 @@ export class RelationshipMemoryRuntime {
     const collisions = this.store.listEntities().filter((entity) => entity.aliases.some((alias) => aliases.includes(normalizeEntityAlias(alias))));
     if (collisions.length > 0) {
       const existing = collisions[0];
-      if (collisions.some((entity) => entity.entity_id !== existing.entity_id)) return this.entityPermanent(batchId, sourceKey, 'alias_collision', 'Alias set maps to multiple existing entity identities.');
+      if (collisions.some((entity) => entity.entity_id !== existing.entity_id)) return this.entityPermanent(batchId, sourceKey, 'alias_collision', 'Alias set maps to multiple existing entity identities.', now);
       const existingAliases = new Set(existing.aliases.map(normalizeEntityAlias));
       const proposalNames = new Set([normalizeEntityAlias(proposal.canonical_name), ...aliases]);
       const sameIdentity = existing.entity_type === proposal.entity_type
