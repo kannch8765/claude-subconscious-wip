@@ -383,6 +383,43 @@ describe('reinforcement and linking foundation', () => {
     expect(rt.store.getMemory(original.memory_id!)!.observed_at).toBe(observedAt);
   });
 
+  it('treats evidence already bound by the canonical memory as a duplicate no-op', () => {
+    const rt = runtime();
+    rt.store.beginBatch('seed-evidence', '2026-01-01T00:00:00.000Z');
+    const original = rt.remember('seed-evidence', personal());
+    expect(rt.store.listEvidence().filter((e) => e.memory_id === original.memory_id)).toHaveLength(1);
+
+    rt.store.beginBatch('reinforce-old-evidence', '2026-01-01T00:00:01.000Z');
+    expect(rt.reinforce('reinforce-old-evidence', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-1'] }))
+      .toEqual({ outcome: 'duplicate', memory_id: original.memory_id });
+    expect(rt.store.listReinforcements()).toHaveLength(0);
+    expect(rt.store.listEvidence().filter((e) => e.memory_id === original.memory_id)).toHaveLength(1);
+  });
+
+  it('reinforces only the genuinely new subset when requested evidence mixes old and new', () => {
+    const rt = runtime();
+    rt.store.beginBatch('seed-mixed-evidence', '2026-01-01T00:00:00.000Z');
+    const original = rt.remember('seed-mixed-evidence', personal());
+
+    rt.store.beginBatch('reinforce-mixed-evidence', '2026-01-01T00:00:01.000Z');
+    expect(rt.reinforce('reinforce-mixed-evidence', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-1', 'msg-user-2'] }))
+      .toEqual({ outcome: 'accepted', memory_id: original.memory_id });
+    const reinforcement = rt.store.listReinforcements()[0];
+    expect(reinforcement.evidence_ids).toHaveLength(1);
+    expect(rt.store.listEvidence().find((e) => e.evidence_id === reinforcement.evidence_ids[0]))
+      .toEqual(expect.objectContaining({ message_id: 'msg-user-2' }));
+    expect(rt.store.listEvidence().filter((e) => e.memory_id === original.memory_id)).toHaveLength(2);
+  });
+
+  it('still rejects an untrusted evidence id before filtering an already-bound trusted id', () => {
+    const rt = runtime();
+    rt.store.beginBatch('reinforce-old-plus-untrusted', '2026-01-01T00:00:00.000Z');
+    const original = rt.remember('reinforce-old-plus-untrusted', personal());
+    expect(rt.reinforce('reinforce-old-plus-untrusted', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-1', 'not-in-batch'] }))
+      .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unresolvable_evidence' }));
+    expect(rt.store.listReinforcements()).toHaveLength(0);
+  });
+
   it('cross-batch replay of the same trusted evidence remains one durable reinforcement', () => {
     const rt = runtime();
     rt.store.beginBatch('reinforce-first', '2026-01-01T00:00:00.000Z');

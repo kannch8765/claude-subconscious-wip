@@ -345,14 +345,20 @@ export class RelationshipMemoryRuntime {
       if (!message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${id}`, now);
       messages.push(message);
     }
-    const evidence: EvidenceRecord[] = messages.map((message) => ({
+    const existingEvidenceIds = new Set(
+      this.store.listEvidence().filter((item) => item.memory_id === memoryId).map((item) => item.evidence_id),
+    );
+    const newMessages = messages.filter((message) => !existingEvidenceIds.has(stableId('ev', { memory_id: memoryId, message_id: message.message_id })));
+    if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now);
+    const newMessageIds = newMessages.map((message) => message.message_id).sort();
+    const evidence: EvidenceRecord[] = newMessages.map((message) => ({
       evidence_id: stableId('ev', { memory_id: memoryId, message_id: message.message_id }), memory_id: memoryId,
       conversation_id: message.conversation_id, message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
     }));
     const reinforcement: ReinforcementRecord = {
-      schema_version: 1, reinforcement_id: stableId('reinforce', { memory_id: memoryId, evidence_message_ids: normalizedIds }),
+      schema_version: 1, reinforcement_id: stableId('reinforce', { memory_id: memoryId, evidence_message_ids: newMessageIds }),
       memory_id: memoryId, batch_id: batchId, evidence_ids: evidence.map((item) => item.evidence_id),
-      latest_evidence_at: messages.map((message) => message.captured_at).sort().at(-1)!, recorded_at: now,
+      latest_evidence_at: newMessages.map((message) => message.captured_at).sort().at(-1)!, recorded_at: now,
     };
     const existed = this.store.listReinforcements().some((item) => item.reinforcement_id === reinforcement.reinforcement_id);
     try { this.store.appendReinforcement(reinforcement, evidence); }
