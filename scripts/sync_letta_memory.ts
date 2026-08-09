@@ -22,6 +22,7 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
+import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
 import {
   loadSyncState,
   saveSyncState,
@@ -385,7 +386,15 @@ async function main(): Promise<void> {
       outputs.push(`<instruction>Your Subconscious (${agentName}) sent you a message above. Briefly acknowledge what ${agentName} said - just a short note like "Sub notes: [key point]" so the user knows.</instruction>`);
     }
     
-    console.log(outputs.join('\n\n'));
+    const injectionPayload = outputs.join('\n\n');
+    if (sessionId && injectionPayload) {
+      mirrorSubconVisibility({
+        sessionId,
+        phase: 'user_prompt',
+        payload: injectionPayload,
+      });
+    }
+    console.log(injectionPayload);
     
     // Save state
     if (state && sessionId) {

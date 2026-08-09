@@ -17,6 +17,7 @@
 import * as fs from 'fs';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
+import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
 import {
   loadSyncState,
@@ -349,6 +350,11 @@ async function main(): Promise<void> {
       },
     };
 
+    mirrorSubconVisibility({
+      sessionId: hookInput.session_id,
+      phase: 'pre_tool',
+      payload: contextWithInstruction,
+    });
     console.log(JSON.stringify(output));
     
   } catch (error) {
