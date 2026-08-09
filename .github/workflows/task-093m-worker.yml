@@ -47,7 +47,85 @@ jobs:
           s=s.replace("export interface RememberResult {\n  outcome: RememberOutcome['outcome'];\n  memory_id?: string;", "export interface RememberResult {\n  outcome: RememberOutcome['outcome'];\n  memory_id?: string;\n  entity_id?: string;")
           s=s.replace("    readonly trustedAssistantIntents: Map<string, AssistantRememberIntentRecord> = new Map(),\n  ) {}", "    readonly trustedAssistantIntents: Map<string, AssistantRememberIntentRecord> = new Map(),\n    readonly requireChineseSemanticProse = false,\n  ) {}")
           marker="  private trustedIntent(intentId: string | undefined): AssistantRememberIntentRecord | undefined {"
-          insert="""  entitySearch(query: EntitySearchQuery = {}): EntityIdentityRecord[] {\n    const needle = query.query?.trim();\n    if (!needle) return this.store.listEntities();\n    const normalized = normalizeEntityAlias(needle);\n    return this.store.listEntities().filter((entity) => {\n      if (entity.aliases.some((alias) => normalizeEntityAlias(alias) === normalized)) return true;\n      return stableJson({ canonical_name: entity.canonical_name, aliases: entity.aliases, description: entity.description }).toLowerCase().includes(needle.toLowerCase());\n    });\n  }\n\n  private entityRetryable(batchId: string, sourceKey: string, reason: string, now: string): RememberResult {\n    this.retryableBatches.add(batchId);\n    try { this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now }); } catch { }\n    return { outcome: 'retryable_failed', reason };\n  }\n\n  private entityPermanent(batchId: string, sourceKey: string, code: string, reason: string, now: string): RememberResult {\n    try {\n      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });\n      return { outcome: 'permanently_rejected', rejection_code: code, reason };\n    } catch {\n      return this.entityRetryable(batchId, sourceKey, 'Failed to durably record entity rejection.', now);\n    }\n  }\n\n  private entityOutcome(batchId: string, sourceKey: string, outcome: 'accepted' | 'duplicate', entityId: string, now: string): RememberResult {\n    try {\n      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome, entity_id: entityId, recorded_at: now });\n      return { outcome, entity_id: entityId };\n    } catch (error) {\n      return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now);\n    }\n  }\n\n  rememberEntity(batchId: string, rawProposal: unknown): RememberResult {\n    const now = this.now();\n    const sourceKey = stableId('entity_src', { batch_id: batchId, proposal: rawProposal });\n    const previous = this.store.getTerminalEntityOutcome(sourceKey);\n    if (previous) {\n      if ((previous.outcome === 'accepted' || previous.outcome === 'duplicate') && previous.entity_id) return { outcome: 'duplicate', entity_id: previous.entity_id };\n      return { outcome: previous.outcome, rejection_code: previous.rejection_code, reason: previous.reason };\n    }\n    const validation = validateEntityIdentityProposal(rawProposal, { requireChineseSemanticProse: this.requireChineseSemanticProse });\n    if (!validation.ok || !validation.proposal) return this.entityPermanent(batchId, sourceKey, validation.code ?? 'invalid_schema', validation.reason ?? 'Invalid entity proposal.', now);\n    const proposal = validation.proposal;\n    const evidenceMessages: CanonicalMessage[] = [];\n    for (const messageId of proposal.evidence_message_ids) {\n      const message = this.messages.get(messageId);\n      if (!message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${messageId}`, now);\n      evidenceMessages.push(message);\n    }\n    const aliases = proposal.aliases.map(normalizeEntityAlias);\n    const collisions = this.store.listEntities().filter((entity) => entity.aliases.some((alias) => aliases.includes(normalizeEntityAlias(alias))));\n    if (collisions.length > 0) {\n      const existing = collisions[0];\n      if (collisions.some((entity) => entity.entity_id !== existing.entity_id)) return this.entityPermanent(batchId, sourceKey, 'alias_collision', 'Alias set maps to multiple existing entity identities.', now);\n      const sameIdentity = existing.entity_type === proposal.entity_type\n        && normalizeEntityAlias(existing.canonical_name) === normalizeEntityAlias(proposal.canonical_name)\n        && stableJson(existing.aliases.map(normalizeEntityAlias).sort()) === stableJson(aliases.slice().sort())\n        && existing.description === proposal.description;\n      if (!sameIdentity) return this.entityPermanent(batchId, sourceKey, 'alias_collision', `Alias already belongs to canonical entity ${existing.canonical_name}.`, now);\n      return this.entityOutcome(batchId, sourceKey, 'duplicate', existing.entity_id, now);\n    }\n    const recovered = this.store.getEntityBySourceKey(sourceKey);\n    if (recovered) return this.entityOutcome(batchId, sourceKey, 'duplicate', recovered.entity_id, now);\n    const entityId = stableId('entity', { subject_id: this.store.subjectId, canonical_name: normalizeEntityAlias(proposal.canonical_name) });\n    const entity: EntityIdentityRecord = {\n      schema_version: 1, entity_id: entityId, subject_id: this.store.subjectId, canonical_name: proposal.canonical_name, aliases: proposal.aliases,\n      entity_type: proposal.entity_type, description: proposal.description, observed_at: evidenceMessages.map((m) => m.captured_at).sort()[0] ?? now, created_at: now, source_key: sourceKey,\n    };\n    const evidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({\n      evidence_id: stableId('entity_ev', { entity_id: entityId, message_id: message.message_id }), entity_id: entityId, conversation_id: message.conversation_id,\n      message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,\n    }));\n    try { this.store.appendEntity(entity, evidence); } catch (error) { return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }\n    return this.entityOutcome(batchId, sourceKey, 'accepted', entityId, now);\n  }\n\n"""
+          insert="""  entitySearch(query: EntitySearchQuery = {}): EntityIdentityRecord[] {
+    const needle = query.query?.trim();
+    if (!needle) return this.store.listEntities();
+    const normalized = normalizeEntityAlias(needle);
+    return this.store.listEntities().filter((entity) => {
+      if (entity.aliases.some((alias) => normalizeEntityAlias(alias) === normalized)) return true;
+      return stableJson({ canonical_name: entity.canonical_name, aliases: entity.aliases, description: entity.description }).toLowerCase().includes(needle.toLowerCase());
+    });
+  }
+
+  private entityRetryable(batchId: string, sourceKey: string, reason: string, now: string): RememberResult {
+    this.retryableBatches.add(batchId);
+    try { this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now }); } catch { }
+    return { outcome: 'retryable_failed', reason };
+  }
+
+  private entityPermanent(batchId: string, sourceKey: string, code: string, reason: string, now: string): RememberResult {
+    try {
+      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });
+      return { outcome: 'permanently_rejected', rejection_code: code, reason };
+    } catch {
+      return this.entityRetryable(batchId, sourceKey, 'Failed to durably record entity rejection.', now);
+    }
+  }
+
+  private entityOutcome(batchId: string, sourceKey: string, outcome: 'accepted' | 'duplicate', entityId: string, now: string): RememberResult {
+    try {
+      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome, entity_id: entityId, recorded_at: now });
+      return { outcome, entity_id: entityId };
+    } catch (error) {
+      return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now);
+    }
+  }
+
+  rememberEntity(batchId: string, rawProposal: unknown): RememberResult {
+    const now = this.now();
+    const sourceKey = stableId('entity_src', { batch_id: batchId, proposal: rawProposal });
+    const previous = this.store.getTerminalEntityOutcome(sourceKey);
+    if (previous) {
+      if ((previous.outcome === 'accepted' || previous.outcome === 'duplicate') && previous.entity_id) return { outcome: 'duplicate', entity_id: previous.entity_id };
+      return { outcome: previous.outcome, rejection_code: previous.rejection_code, reason: previous.reason };
+    }
+    const validation = validateEntityIdentityProposal(rawProposal, { requireChineseSemanticProse: this.requireChineseSemanticProse });
+    if (!validation.ok || !validation.proposal) return this.entityPermanent(batchId, sourceKey, validation.code ?? 'invalid_schema', validation.reason ?? 'Invalid entity proposal.', now);
+    const proposal = validation.proposal;
+    const evidenceMessages: CanonicalMessage[] = [];
+    for (const messageId of proposal.evidence_message_ids) {
+      const message = this.messages.get(messageId);
+      if (!message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${messageId}`, now);
+      evidenceMessages.push(message);
+    }
+    const aliases = proposal.aliases.map(normalizeEntityAlias);
+    const collisions = this.store.listEntities().filter((entity) => entity.aliases.some((alias) => aliases.includes(normalizeEntityAlias(alias))));
+    if (collisions.length > 0) {
+      const existing = collisions[0];
+      if (collisions.some((entity) => entity.entity_id !== existing.entity_id)) return this.entityPermanent(batchId, sourceKey, 'alias_collision', 'Alias set maps to multiple existing entity identities.', now);
+      const sameIdentity = existing.entity_type === proposal.entity_type
+        && normalizeEntityAlias(existing.canonical_name) === normalizeEntityAlias(proposal.canonical_name)
+        && stableJson(existing.aliases.map(normalizeEntityAlias).sort()) === stableJson(aliases.slice().sort())
+        && existing.description === proposal.description;
+      if (!sameIdentity) return this.entityPermanent(batchId, sourceKey, 'alias_collision', `Alias already belongs to canonical entity ${existing.canonical_name}.`, now);
+      return this.entityOutcome(batchId, sourceKey, 'duplicate', existing.entity_id, now);
+    }
+    const recovered = this.store.getEntityBySourceKey(sourceKey);
+    if (recovered) return this.entityOutcome(batchId, sourceKey, 'duplicate', recovered.entity_id, now);
+    const entityId = stableId('entity', { subject_id: this.store.subjectId, canonical_name: normalizeEntityAlias(proposal.canonical_name) });
+    const entity: EntityIdentityRecord = {
+      schema_version: 1, entity_id: entityId, subject_id: this.store.subjectId, canonical_name: proposal.canonical_name, aliases: proposal.aliases,
+      entity_type: proposal.entity_type, description: proposal.description, observed_at: evidenceMessages.map((m) => m.captured_at).sort()[0] ?? now, created_at: now, source_key: sourceKey,
+    };
+    const evidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({
+      evidence_id: stableId('entity_ev', { entity_id: entityId, message_id: message.message_id }), entity_id: entityId, conversation_id: message.conversation_id,
+      message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
+    }));
+    try { this.store.appendEntity(entity, evidence); } catch (error) { return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }
+    return this.entityOutcome(batchId, sourceKey, 'accepted', entityId, now);
+  }
+
+"""
           if marker not in s: raise SystemExit('tools insertion marker missing')
           s=s.replace(marker,insert+marker)
           s=s.replace("    const validation = validateProposal(rawProposal);", "    const validation = validateProposal(rawProposal, { requireChineseSemanticProse: this.requireChineseSemanticProse });")
@@ -58,7 +136,27 @@ jobs:
           s=s.replace("          'inside_joke requires name, meaning, trigger_phrases; optional origin, callbacks, tone.',", "          'inside_joke requires name, meaning, trigger_phrases; optional origin, callbacks, tone.',\n          'user_preference requires topic, preference; optional context, reason, recall_triggers.',\n          'For DS-authored new writes, summary and narrative semantic prose must be Chinese; literal names, aliases, trigger tokens, code, provider names, paths, URLs, and trusted evidence stay source-faithful.',")
           s=s.replace("          tone: string,\n", "          tone: string,\n          topic: string,\n          preference: string,\n          context: string,\n          reason: string,\n")
           marker="export function memoryReinforceToolSchema(): Record<string, unknown> {"
-          insert="""export function entitySearchToolSchema(): Record<string, unknown> {\n  return { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1 } } };\n}\n\nexport function entityRememberToolSchema(): Record<string, unknown> {\n  const string = { type: 'string', minLength: 1 };\n  return {\n    type: 'object', additionalProperties: false,\n    required: ['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description', 'evidence_message_ids'],\n    properties: {\n      schema_version: { type: 'integer', enum: [1] },\n      canonical_name: string,\n      aliases: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Literal names/aliases; preserve source spelling such as GPT, ChatGPT, Claude, Claude Code.' },\n      entity_type: { type: 'string', enum: ['user', 'assistant', 'other'] },\n      description: { type: 'string', minLength: 1, description: 'Perspective-neutral Chinese semantic description. Do not write fragile second-person identity such as 琥珀 = 你.' },\n      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },\n    },\n  };\n}\n\n"""
+          insert="""export function entitySearchToolSchema(): Record<string, unknown> {
+  return { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1 } } };
+}
+
+export function entityRememberToolSchema(): Record<string, unknown> {
+  const string = { type: 'string', minLength: 1 };
+  return {
+    type: 'object', additionalProperties: false,
+    required: ['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description', 'evidence_message_ids'],
+    properties: {
+      schema_version: { type: 'integer', enum: [1] },
+      canonical_name: string,
+      aliases: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Literal names/aliases; preserve source spelling such as GPT, ChatGPT, Claude, Claude Code.' },
+      entity_type: { type: 'string', enum: ['user', 'assistant', 'other'] },
+      description: { type: 'string', minLength: 1, description: 'Perspective-neutral Chinese semantic description. Do not write fragile second-person identity such as 琥珀 = 你.' },
+      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },
+    },
+  };
+}
+
+"""
           s=s.replace(marker,insert+marker)
           s=s.replace("description: 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying episode/event. Do not use lexical similarity alone to decide sameness.'", "description: 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying memory or stable preference. Do not use lexical similarity alone to decide sameness.'")
           p.write_text(s)
@@ -68,8 +166,22 @@ jobs:
           s=s.replace("import { memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';", "import { entityRememberToolSchema, entitySearchToolSchema, memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';")
           s=s.replace("  name: 'memory_search' | 'memory_remember' | 'memory_reinforce';", "  name: 'memory_search' | 'memory_remember' | 'memory_reinforce' | 'entity_search' | 'entity_remember';")
           s=s.replace("    new Map(assistantIntents.map((intent) => [intent.intent_id, intent])),\n  );", "    new Map(assistantIntents.map((intent) => [intent.intent_id, intent])),\n    true,\n  );")
-          needle="""    {\n      label: 'memory_reinforce', name: 'memory_reinforce',\n"""
-          insert="""    {\n      label: 'entity_search', name: 'entity_search',\n      description: 'Search first-class canonical entity identities by canonical name, exact/normalized alias, or description before proposing an identity.',\n      parameters: entitySearchToolSchema(),\n      async execute(_toolCallId, args) { return wrapResult({ results: runtime.entitySearch((args ?? {}) as never) }); },\n    },\n    {\n      label: 'entity_remember', name: 'entity_remember',\n      description: 'Propose one evidence-backed first-class entity identity. Preserve literal aliases, use a perspective-neutral Chinese description, and search aliases first.',\n      parameters: entityRememberToolSchema(),\n      async execute(_toolCallId, args) { return wrapResult(runtime.rememberEntity(batchId, args)); },\n    },\n"""
+          needle="""    {
+      label: 'memory_reinforce', name: 'memory_reinforce',
+"""
+          insert="""    {
+      label: 'entity_search', name: 'entity_search',
+      description: 'Search first-class canonical entity identities by canonical name, exact/normalized alias, or description before proposing an identity.',
+      parameters: entitySearchToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult({ results: runtime.entitySearch((args ?? {}) as never) }); },
+    },
+    {
+      label: 'entity_remember', name: 'entity_remember',
+      description: 'Propose one evidence-backed first-class entity identity. Preserve literal aliases, use a perspective-neutral Chinese description, and search aliases first.',
+      parameters: entityRememberToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(runtime.rememberEntity(batchId, args)); },
+    },
+"""
           s=s.replace(needle,insert+needle)
           s=s.replace("export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = ['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember'] as const;", "export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = ['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember'] as const;")
           p.write_text(s)
@@ -80,7 +192,38 @@ jobs:
           s=s.replace("  memory_id?: string;\n", "  memory_id?: string;\n  entity_id?: string;\n",1)
           start=s.index("  relationshipMemorySearch(input: RelationshipMemorySearchInput = {}): { results: unknown[] } {")
           end=s.index("\n  async transcriptSearch", start)
-          new_func="""  relationshipMemorySearch(input: RelationshipMemorySearchInput = {}): { results: unknown[] } {\n    this.assertOpen();\n    const limit = boundedLimit(input.limit, 8, 20);\n    const owner = new RelationshipMemoryOwnerControlPlane(this.store);\n    const memoryCandidates = owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) });\n    const ranked: Array<{ kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; score: number } | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; score: number }> = [];\n    for (const memory of memoryCandidates) {\n      if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;\n      const intents = this.linkedAssistantIntents(memory.memory_id);\n      const score = textScore(stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: intents.map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text })) }), input.query);\n      if (score > 0) ranked.push({ kind: 'memory', memory, intents, score });\n    }\n    if (!input.kind) {\n      for (const entity of this.store.listEntities()) {\n        if (!inTimeWindow(entity.observed_at, input.time_start, input.time_end)) continue;\n        const score = textScore(stableJson({ canonical_name: entity.canonical_name, aliases: entity.aliases, description: entity.description }), input.query);\n        if (score > 0) ranked.push({ kind: 'entity', entity, score });\n      }\n    }\n    ranked.sort((a, b) => b.score - a.score || (b.kind === 'memory' ? b.memory.observed_at : b.entity.observed_at).localeCompare(a.kind === 'memory' ? a.memory.observed_at : a.entity.observed_at));\n    return { results: ranked.slice(0, limit).map((item) => {\n      if (item.kind === 'entity') {\n        const entity = item.entity;\n        const sourceRef = this.register('entity_identity', { entity_id: entity.entity_id, source_key: entity.source_key }, { entity_id: entity.entity_id, observed_at: entity.observed_at });\n        return { source_ref: sourceRef, record_type: 'entity_identity', entity_id: entity.entity_id, canonical_name: entity.canonical_name, aliases: entity.aliases, entity_type: entity.entity_type, description: entity.description, observed_at: entity.observed_at };\n      }\n      const { memory, intents } = item;\n      const sourceRef = this.register('relationship_memory', { memory_id: memory.memory_id, latest_revision_id: memory.latest_revision_id }, { memory_id: memory.memory_id, observed_at: memory.observed_at });\n      return { source_ref: sourceRef, record_type: 'relationship_memory', memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary, participants: memory.participants, payload: memory.payload, observed_at: memory.observed_at, owner_corrected: memory.owner_corrected, assistant_intents: intents.map((intent) => ({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text, captured_at: intent.captured_at })) };\n    }) };\n  }\n"""
+          new_func="""  relationshipMemorySearch(input: RelationshipMemorySearchInput = {}): { results: unknown[] } {
+    this.assertOpen();
+    const limit = boundedLimit(input.limit, 8, 20);
+    const owner = new RelationshipMemoryOwnerControlPlane(this.store);
+    const memoryCandidates = owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) });
+    const ranked: Array<{ kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; score: number } | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; score: number }> = [];
+    for (const memory of memoryCandidates) {
+      if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;
+      const intents = this.linkedAssistantIntents(memory.memory_id);
+      const score = textScore(stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: intents.map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text })) }), input.query);
+      if (score > 0) ranked.push({ kind: 'memory', memory, intents, score });
+    }
+    if (!input.kind) {
+      for (const entity of this.store.listEntities()) {
+        if (!inTimeWindow(entity.observed_at, input.time_start, input.time_end)) continue;
+        const score = textScore(stableJson({ canonical_name: entity.canonical_name, aliases: entity.aliases, description: entity.description }), input.query);
+        if (score > 0) ranked.push({ kind: 'entity', entity, score });
+      }
+    }
+    ranked.sort((a, b) => b.score - a.score || (b.kind === 'memory' ? b.memory.observed_at : b.entity.observed_at).localeCompare(a.kind === 'memory' ? a.memory.observed_at : a.entity.observed_at));
+    return { results: ranked.slice(0, limit).map((item) => {
+      if (item.kind === 'entity') {
+        const entity = item.entity;
+        const sourceRef = this.register('entity_identity', { entity_id: entity.entity_id, source_key: entity.source_key }, { entity_id: entity.entity_id, observed_at: entity.observed_at });
+        return { source_ref: sourceRef, record_type: 'entity_identity', entity_id: entity.entity_id, canonical_name: entity.canonical_name, aliases: entity.aliases, entity_type: entity.entity_type, description: entity.description, observed_at: entity.observed_at };
+      }
+      const { memory, intents } = item;
+      const sourceRef = this.register('relationship_memory', { memory_id: memory.memory_id, latest_revision_id: memory.latest_revision_id }, { memory_id: memory.memory_id, observed_at: memory.observed_at });
+      return { source_ref: sourceRef, record_type: 'relationship_memory', memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary, participants: memory.participants, payload: memory.payload, observed_at: memory.observed_at, owner_corrected: memory.owner_corrected, assistant_intents: intents.map((intent) => ({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text, captured_at: intent.captured_at })) };
+    }) };
+  }
+"""
           s=s[:start]+new_func+s[end:]
           s=s.replace("enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke']", "enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference']")
           p.write_text(s)
@@ -92,13 +235,26 @@ jobs:
           p=Path('Subconscious.af')
           s=p.read_text()
           old="Relationship memory has exactly four schema-version-1 kinds: personal_experience, shared_experience, relationship_event, and inside_joke. Ordinary transcript evidence remains observer-originated: decide whether a relationship memory is warranted and use memory_search before choosing an action when related memory may exist."
-          new="Relationship memory has five schema-version-1 kinds: personal_experience, shared_experience, relationship_event, inside_joke, and user_preference. Explicit durable user preferences belong in user_preference; do not infer preferences merely from repeated episodes, and do not force dated one-off events into user_preference. First-class stable identities use entity_search and entity_remember rather than a memory kind: search canonical names/aliases first, preserve literal aliases such as GPT, ChatGPT, Claude, and Claude Code, and describe identities in perspective-neutral Chinese rather than fragile second-person wording. Ordinary transcript evidence remains observer-originated: decide whether a relationship memory or identity is warranted and search before choosing an action when related canonical state may exist."
+          new="Relationship memory has five schema-version-1 kinds: personal_experience, shared_experience, relationship_event, inside_joke, and user_preference. Explicit durable user preferences belong in user_preference; do not infer preferences merely from repeated episodes, and do not force dated one-off events into user_preference. First-class stable identities use entity_search and entity_remember rather than a memory kind: search canonical names/aliases first, preserve literal aliases such as GPT, ChatGPT, Claude, and Claude Code, and describe identities in perspective-neutral Chinese rather than fragile second-person wording. Ordinary transcript evidence remains observer-originated: decide whether a relationship memory or identity is warranted and use memory_search / entity_search before choosing an action when related canonical state may exist."
           if old not in s: raise SystemExit('Subconscious observer contract marker missing')
           s=s.replace(old,new)
           old2="Canonical records and bound evidence are authoritative. The blocks shared_language, remembered_experiences, and relationship_context are deterministic read-only projections."
           new2="For every newly proposed canonical relationship memory, write DS-authored semantic prose in Chinese even when source evidence is English, Japanese, or mixed-language. This includes summary and narrative/descriptive payload prose. For entity identities, description must be Chinese semantic prose. Preserve source-faithful literal fields unchanged: trusted evidence quotes, names/aliases, IDs, enum/schema keys, tool/provider names, code, paths, URLs, and the exact backend-owned assistant remember intent memory.text and feel.text. The backend enforces this Chinese-write contract and may reject a clearly non-Chinese semantic proposal for correction. Canonical records and bound evidence are authoritative. The blocks shared_language, remembered_experiences, and relationship_context are deterministic read-only projections."
           s=s.replace(old2,new2)
           s=s.replace("capture relationship memory through trusted memory_search, memory_reinforce, and memory_remember client tools", "capture relationship memory and stable identities through trusted memory/entity search and commit tools")
+          p.write_text(s)
+
+          p=Path('relationship-memory/tests/relationship-memory.test.ts')
+          s=p.read_text()
+          s=s.replace("      'personal_experience', 'shared_experience', 'relationship_event', 'inside_joke',\n    ]);", "      'personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference',\n    ]);", 1)
+          s=s.replace("it('registers only memory_search and memory_remember plus read-only investigation tools', async () => {", "it('registers memory and entity semantic tools plus read-only investigation tools', async () => {")
+          s=s.replace("expect(tools.map((t) => t.name)).toEqual(['memory_search', 'memory_reinforce', 'memory_remember']);", "expect(tools.map((t) => t.name)).toEqual(['memory_search', 'entity_search', 'entity_remember', 'memory_reinforce', 'memory_remember']);")
+          s=s.replace("expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember']);", "expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember']);")
+          s=s.replace("const remembered = await tools[2].execute('call-1', personal());", "const remembered = await tools.find((tool) => tool.name === 'memory_remember')!.execute('call-1', personal());")
+          p.write_text(s)
+
+          p=Path('relationship-memory/tests/admin-read-model.test.ts')
+          s=p.read_text().replace("        inside_joke: 1,\n      },", "        inside_joke: 1,\n        user_preference: 0,\n      },", 1)
           p.write_text(s)
           PY
 
@@ -183,7 +339,7 @@ jobs:
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add relationship-memory/src/schema/index.ts relationship-memory/src/store/index.ts relationship-memory/src/tools/index.ts relationship-memory/src/adapter/index.ts relationship-memory/src/recall/index.ts relationship-memory/src/projection/index.ts relationship-memory/tests/semantic-context.test.ts Subconscious.af
+          git add relationship-memory/src/schema/index.ts relationship-memory/src/store/index.ts relationship-memory/src/tools/index.ts relationship-memory/src/adapter/index.ts relationship-memory/src/recall/index.ts relationship-memory/src/projection/index.ts relationship-memory/tests/relationship-memory.test.ts relationship-memory/tests/admin-read-model.test.ts relationship-memory/tests/semantic-context.test.ts Subconscious.af
           git diff --cached --check
           git commit -m "feat: add relationship semantic context foundation"
           git push origin HEAD:task/093m-relationship-memory-semantic-context-foundation
