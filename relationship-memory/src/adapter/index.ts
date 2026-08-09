@@ -6,6 +6,7 @@ import type { AssistantRememberIntentRecord, CanonicalMessage, ParticipantRole }
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
 import { entityRememberToolSchema, entitySearchToolSchema, memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
+import { createSemanticRetrieverFromEnvironment } from '../retrieval/index.js';
 
 export interface RelationshipTool {
   label: string;
@@ -88,12 +89,15 @@ export function createRuntime(
   assistantIntents: AssistantRememberIntentRecord[] = [],
 ): RelationshipMemoryRuntime {
   const store = new RelationshipMemoryStore(rootDir, subjectId);
+  let semanticRetriever;
+  try { semanticRetriever = createSemanticRetrieverFromEnvironment(rootDir); } catch { semanticRetriever = undefined; }
   return new RelationshipMemoryRuntime(
     store,
     new Map(canonicalMessages.map((m) => [m.message_id, m])),
     () => new Date().toISOString(),
     new Map(assistantIntents.map((intent) => [intent.intent_id, intent])),
     true,
+    semanticRetriever,
   );
 }
 
@@ -107,13 +111,13 @@ export function buildRelationshipTools(
       label: 'memory_search', name: 'memory_search',
       description: 'Search canonical relationship-memory records, including bounded reinforcement metadata and linked assistant remember provenance, before choosing whether to reinforce or create. For new trusted evidence that explicitly repeats an existing durable user preference, a search hit is not terminal: follow with memory_reinforce.',
       parameters: memorySearchToolSchema(),
-      async execute(_toolCallId, args) { return wrapResult({ results: runtime.memorySearch((args ?? {}) as never) }); },
+      async execute(_toolCallId, args) { return wrapResult({ results: await runtime.memorySearchHybrid((args ?? {}) as never) }); },
     },
     {
       label: 'entity_search', name: 'entity_search',
       description: 'Search first-class canonical entity identities by canonical name, exact/normalized alias, or description before proposing an identity.',
       parameters: entitySearchToolSchema(),
-      async execute(_toolCallId, args) { return wrapResult({ results: runtime.entitySearch((args ?? {}) as never) }); },
+      async execute(_toolCallId, args) { return wrapResult({ results: await runtime.entitySearchHybrid((args ?? {}) as never) }); },
     },
     {
       label: 'entity_remember', name: 'entity_remember',
