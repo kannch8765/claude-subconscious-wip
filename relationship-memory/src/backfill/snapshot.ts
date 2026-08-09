@@ -127,5 +127,9 @@ export function resolveBackfillTranscriptInput(
   if (transcriptPath === '/root' || transcriptPath.startsWith('/root/')) {
     fail('direct /root transcript access is disabled; export an immutable owner snapshot and use --snapshot-manifest');
   }
+  const privilegedSnapshotRoot = '/var/lib/subconscious-backfill-input';
+  if (transcriptPath === privilegedSnapshotRoot || transcriptPath.startsWith(`${privilegedSnapshotRoot}/`)) {
+    fail('direct privileged snapshot access is disabled; use the corresponding --snapshot-manifest');
+  }
   return transcriptPath;
 }

@@ -51,6 +51,12 @@ describe('backfill snapshot authority boundary', () => {
     expect(() => resolveBackfillTranscriptInput({ transcript: '/root/.claude/projects/private.jsonl' })).toThrow(/direct \/root transcript access is disabled/);
   });
 
+  it('refuses direct sealed-snapshot payload access so manifest validation cannot be bypassed', () => {
+    expect(() => resolveBackfillTranscriptInput({
+      transcript: '/var/lib/subconscious-backfill-input/owner-canary-03-post-093m/transcript.jsonl',
+    })).toThrow(/direct privileged snapshot access is disabled.*--snapshot-manifest/);
+  });
+
   it('rejects a writable transcript before hashing or backfill', () => {
     const f = fixture();
     fs.chmodSync(f.dir, 0o750);
