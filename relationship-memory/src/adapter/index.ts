@@ -140,8 +140,22 @@ export function buildRelationshipTools(
   ];
 }
 
-export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = ['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember'] as const;
+export const RELATIONSHIP_ALLOWED_BUILTIN_TOOLS = ['Read', 'Grep', 'Glob'] as const;
+export const RELATIONSHIP_EXTERNAL_TOOLS = ['memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember'] as const;
+export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = [...RELATIONSHIP_ALLOWED_BUILTIN_TOOLS, ...RELATIONSHIP_EXTERNAL_TOOLS] as const;
+export const RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS = [
+  'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'TaskStop', 'Skill', 'Task', 'TodoWrite', 'Write', 'AskUserQuestion',
+] as const;
 export const FORBIDDEN_MARKDOWN_MEMORY_TOOLS = ['memory', 'memory_insert', 'memory_replace', 'memory_rethink'] as const;
+export const RELATIONSHIP_DISALLOWED_CLIENT_TOOLS = [...RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS, ...FORBIDDEN_MARKDOWN_MEMORY_TOOLS] as const;
+
+export function assertRelationshipClientToolInventory(toolNames: readonly string[]): void {
+  const known = new Set<string>([...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, ...RELATIONSHIP_DISALLOWED_CLIENT_TOOLS]);
+  const unexpected = [...new Set(toolNames.filter((name) => !known.has(name)))].sort();
+  if (unexpected.length > 0) {
+    throw new Error(`Unexpected Letta Code tool inventory for relationship observer: ${unexpected.join(', ')}`);
+  }
+}
 
 export function readProjectionBlocks(rootDir = relationshipMemoryRoot()): Array<{ label: string; value: string }> {
   const store = new RelationshipMemoryStore(rootDir, process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user');

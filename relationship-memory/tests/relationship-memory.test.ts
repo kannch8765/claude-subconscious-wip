@@ -4,6 +4,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   appendCanonicalEvidenceCatalog,
+  assertRelationshipClientToolInventory,
   buildCanonicalMessages,
   buildRelationshipTools,
   cursorShouldAdvance,
@@ -12,6 +13,7 @@ import {
   memoryRememberToolSchema,
   memoryReinforceToolSchema,
   RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
+  RELATIONSHIP_DISALLOWED_CLIENT_TOOLS,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
   rebuildProjection,
@@ -330,6 +332,13 @@ describe('adopted SDK/configuration boundary', () => {
     expect(tools.map((t) => t.name)).toEqual(['memory_search', 'entity_search', 'entity_remember', 'memory_reinforce', 'memory_remember']);
     expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember']);
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).not.toContain(forbidden as any);
+    expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).toEqual(expect.arrayContaining(['Bash', 'Write', 'Edit', 'Task', 'Skill', 'TodoWrite']));
+    for (const allowed of RELATIONSHIP_ALLOWED_CLIENT_TOOLS) expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).not.toContain(allowed as any);
+    expect(() => assertRelationshipClientToolInventory([
+      'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'Glob', 'Grep', 'TaskStop', 'Read', 'Skill', 'Task', 'TodoWrite', 'Write',
+      'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember',
+    ])).not.toThrow();
+    expect(() => assertRelationshipClientToolInventory(['Read', 'FutureUnknownBuiltin'])).toThrow(/FutureUnknownBuiltin/);
     const remembered = await tools.find((tool) => tool.name === 'memory_remember')!.execute('call-1', personal());
     expect(remembered).toEqual(expect.objectContaining({ outcome: 'accepted' }));
     const searched = await tools[0].execute('call-2', { query: 'historic city' });
