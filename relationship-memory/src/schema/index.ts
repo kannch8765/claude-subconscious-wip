@@ -69,6 +69,16 @@ export interface CanonicalMemoryRecord {
   dedupe_key: string;
 }
 
+export interface ReinforcementRecord {
+  schema_version: 1;
+  reinforcement_id: string;
+  memory_id: string;
+  batch_id: string;
+  evidence_ids: string[];
+  latest_evidence_at: string;
+  recorded_at: string;
+}
+
 export interface EvidenceRecord {
   evidence_id: string;
   memory_id: string;
@@ -273,4 +283,8 @@ export interface EffectiveMemoryRecord extends Omit<CanonicalMemoryRecord, 'stat
   owner_corrected: boolean;
   latest_revision_id?: string;
   latest_revision_at?: string;
+  reinforcement_count?: number;
+  reinforcement_evidence_count?: number;
+  reinforcement_evidence_ids?: string[];
+  latest_reinforcement_at?: string;
 }

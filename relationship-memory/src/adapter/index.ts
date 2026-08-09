@@ -4,12 +4,12 @@ import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
 import { extractAllContent } from '../../../scripts/transcript_utils.js';
 import type { AssistantRememberIntentRecord, CanonicalMessage, ParticipantRole } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
-import { memoryRememberToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
+import { memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
 
 export interface RelationshipTool {
   label: string;
-  name: 'memory_search' | 'memory_remember';
+  name: 'memory_search' | 'memory_remember' | 'memory_reinforce';
   description: string;
   parameters: Record<string, unknown>;
   execute(toolCallId: string, args: unknown): Promise<unknown>;
@@ -104,9 +104,15 @@ export function buildRelationshipTools(
   return [
     {
       label: 'memory_search', name: 'memory_search',
-      description: 'Search canonical relationship-memory records, including linked assistant remember memory/feel provenance, before proposing a new record.',
+      description: 'Search canonical relationship-memory records, including bounded reinforcement metadata and linked assistant remember provenance, before choosing whether to reinforce or create.',
       parameters: memorySearchToolSchema(),
       async execute(_toolCallId, args) { return wrapResult({ results: runtime.memorySearch((args ?? {}) as never) }); },
+    },
+    {
+      label: 'memory_reinforce', name: 'memory_reinforce',
+      description: 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying episode/event. Do not use lexical similarity alone to decide sameness.',
+      parameters: memoryReinforceToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(runtime.reinforce(batchId, args as never)); },
     },
     {
       label: 'memory_remember', name: 'memory_remember',
@@ -117,7 +123,7 @@ export function buildRelationshipTools(
   ];
 }
 
-export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = ['Read', 'Grep', 'Glob', 'memory_search', 'memory_remember'] as const;
+export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = ['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember'] as const;
 export const FORBIDDEN_MARKDOWN_MEMORY_TOOLS = ['memory', 'memory_insert', 'memory_replace', 'memory_rethink'] as const;
 
 export function readProjectionBlocks(rootDir = relationshipMemoryRoot()): Array<{ label: string; value: string }> {

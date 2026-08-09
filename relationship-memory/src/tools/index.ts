@@ -9,6 +9,7 @@ import type {
   MemoryKind,
   ParticipantRole,
   RememberOutcome,
+  ReinforcementRecord,
 } from '../schema/index.js';
 import { validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
@@ -23,6 +24,8 @@ export interface SearchQuery {
   time_end?: string;
   query?: string;
 }
+
+export interface ReinforceInput { memory_id: string; evidence_message_ids: string[] }
 
 export interface RememberResult {
   outcome: RememberOutcome['outcome'];
@@ -62,7 +65,12 @@ export class RelationshipMemoryRuntime {
   memorySearch(query: SearchQuery): EffectiveMemoryRecord[] {
     const needle = query.query?.trim().toLowerCase();
     const trigger = query.trigger?.trim().toLowerCase();
-    return new RelationshipMemoryOwnerControlPlane(this.store).search({ active: true }).filter((memory) => {
+    return new RelationshipMemoryOwnerControlPlane(this.store).search({ active: true }).map((memory) => {
+      const reinforcements = this.store.listReinforcements().filter((item) => item.memory_id === memory.memory_id);
+      const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
+      const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
+      return { ...memory, ...(reinforcements.length ? { reinforcement_count: reinforcements.length, reinforcement_evidence_count: evidenceIds.length, reinforcement_evidence_ids: evidenceIds.slice(-20), latest_reinforcement_at: latest } : {}) };
+    }).filter((memory) => {
       if (query.kind && memory.kind !== query.kind) return false;
       if (query.participant && !memory.participants.includes(query.participant)) return false;
       if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
@@ -150,6 +158,43 @@ export class RelationshipMemoryRuntime {
     } catch {
       return this.markRetryable(batchId, sourceKey, 'Failed to durably record permanent rejection.', now, intent);
     }
+  }
+
+  reinforce(batchId: string, input: ReinforceInput): RememberResult {
+    const now = this.now();
+    const memoryId = typeof input?.memory_id === 'string' ? input.memory_id.trim() : '';
+    const ids = Array.isArray(input?.evidence_message_ids) ? input.evidence_message_ids.map((id) => typeof id === 'string' ? id.trim() : '') : [];
+    const normalizedIds = [...ids].sort();
+    const sourceKey = stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_message_ids: normalizedIds });
+    const previous = this.store.getTerminalOutcome(sourceKey);
+    if (previous) {
+      if (previous.outcome === 'accepted' || previous.outcome === 'duplicate') return { outcome: 'duplicate', memory_id: previous.memory_id ?? memoryId };
+      return { outcome: previous.outcome, rejection_code: previous.rejection_code, reason: previous.reason };
+    }
+    if (!memoryId || ids.length === 0 || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+      return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'memory_id and unique non-empty evidence_message_ids are required.', now);
+    }
+    const memory = this.store.getMemory(memoryId);
+    if (!memory) return this.persistPermanent(batchId, sourceKey, 'unknown_memory', `Unknown canonical memory ID: ${memoryId}`, now);
+    const messages: CanonicalMessage[] = [];
+    for (const id of normalizedIds) {
+      const message = this.messages.get(id);
+      if (!message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${id}`, now);
+      messages.push(message);
+    }
+    const evidence: EvidenceRecord[] = messages.map((message) => ({
+      evidence_id: stableId('ev', { memory_id: memoryId, message_id: message.message_id }), memory_id: memoryId,
+      conversation_id: message.conversation_id, message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
+    }));
+    const reinforcement: ReinforcementRecord = {
+      schema_version: 1, reinforcement_id: stableId('reinforce', { memory_id: memoryId, evidence_message_ids: normalizedIds }),
+      memory_id: memoryId, batch_id: batchId, evidence_ids: evidence.map((item) => item.evidence_id),
+      latest_evidence_at: messages.map((message) => message.captured_at).sort().at(-1)!, recorded_at: now,
+    };
+    const existed = this.store.listReinforcements().some((item) => item.reinforcement_id === reinforcement.reinforcement_id);
+    try { this.store.appendReinforcement(reinforcement, evidence); }
+    catch (error) { return this.markRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }
+    return this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now);
   }
 
   remember(batchId: string, rawProposal: unknown): RememberResult {
@@ -397,6 +442,13 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
       },
     },
   };
+}
+
+export function memoryReinforceToolSchema(): Record<string, unknown> {
+  return { type: 'object', additionalProperties: false, required: ['memory_id', 'evidence_message_ids'], properties: {
+    memory_id: { type: 'string', minLength: 1, description: 'Existing canonical memory_id selected after memory_search.' },
+    evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Exact message_id values from the trusted current-batch evidence catalog that support the same underlying memory.' },
+  } };
 }
 
 export function memorySearchToolSchema(): Record<string, unknown> {
