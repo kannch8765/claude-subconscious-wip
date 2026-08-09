@@ -16,6 +16,7 @@ import type {
 import { normalizeEntityAlias, validateEntityIdentityProposal, validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
+import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
 export interface SearchQuery {
   kind?: MemoryKind;
@@ -25,10 +26,11 @@ export interface SearchQuery {
   time_start?: string;
   time_end?: string;
   query?: string;
+  limit?: number;
 }
 
 export interface ReinforceInput { memory_id: string; evidence_message_ids: string[] }
-export interface EntitySearchQuery { query?: string }
+export interface EntitySearchQuery { query?: string; limit?: number }
 export interface EntitySearchResult extends EntityIdentityRecord { evidence_ids: string[]; evidence_message_ids: string[] }
 
 export interface RememberResult {
@@ -54,6 +56,7 @@ export class RelationshipMemoryRuntime {
     readonly now: () => string = () => new Date().toISOString(),
     readonly trustedAssistantIntents: Map<string, AssistantRememberIntentRecord> = new Map(),
     readonly requireChineseSemanticProse = false,
+    readonly semanticRetriever?: SemanticRetriever,
   ) {}
 
   private linkedAssistantIntents(memoryId: string): AssistantRememberIntentRecord[] {
@@ -93,6 +96,30 @@ export class RelationshipMemoryRuntime {
     });
   }
 
+  async memorySearchHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
+    const semanticQuery = query.query?.trim();
+    if (!this.semanticRetriever || !semanticQuery) return this.memorySearch(query);
+    const candidates = this.memorySearch({ ...query, query: undefined });
+    const documents = candidates.map((memory) => {
+      const linkedIntents = this.linkedAssistantIntents(memory.memory_id).map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text }));
+      return {
+        id: `memory:${memory.memory_id}`,
+        text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
+      };
+    });
+    try {
+      const semantic = await this.semanticRetriever.rank(documents, semanticQuery);
+      return candidates.map((memory, index) => ({
+        memory,
+        score: hybridScore(lexicalTextScore(documents[index].text, semanticQuery), semantic.get(documents[index].id)),
+      })).sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
+        .slice(0, Math.max(1, Math.min(query.limit ?? 8, 20)))
+        .map((item) => item.memory);
+    } catch {
+      return this.memorySearch(query);
+    }
+  }
+
   entitySearch(query: EntitySearchQuery = {}): EntitySearchResult[] {
     const needle = query.query?.trim();
     const normalized = needle ? normalizeEntityAlias(needle) : undefined;
@@ -108,6 +135,27 @@ export class RelationshipMemoryRuntime {
         evidence_message_ids: evidence.map((item) => item.message_id),
       };
     });
+  }
+
+  async entitySearchHybrid(query: EntitySearchQuery = {}): Promise<EntitySearchResult[]> {
+    const semanticQuery = query.query?.trim();
+    if (!this.semanticRetriever || !semanticQuery) return this.entitySearch(query);
+    const candidates = this.entitySearch({});
+    const documents = candidates.map((entity) => ({
+      id: `entity:${entity.entity_id}`,
+      text: semanticText(entity.canonical_name, entity.aliases, entity.entity_type, entity.description),
+    }));
+    try {
+      const semantic = await this.semanticRetriever.rank(documents, semanticQuery);
+      return candidates.map((entity, index) => ({
+        entity,
+        score: hybridScore(lexicalTextScore(documents[index].text, semanticQuery), semantic.get(documents[index].id)),
+      })).sort((a, b) => b.score - a.score || b.entity.observed_at.localeCompare(a.entity.observed_at))
+        .slice(0, Math.max(1, Math.min(query.limit ?? 8, 20)))
+        .map((item) => item.entity);
+    } catch {
+      return this.entitySearch(query);
+    }
   }
 
   private entityRetryable(batchId: string, sourceKey: string, reason: string, now: string): RememberResult {
@@ -564,7 +612,7 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
 }
 
 export function entitySearchToolSchema(): Record<string, unknown> {
-  return { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1 } } };
+  return { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1 }, limit: { type: 'integer', minimum: 1, maximum: 20 } } };
 }
 
 export function entityRememberToolSchema(): Record<string, unknown> {
@@ -596,7 +644,7 @@ export function memorySearchToolSchema(): Record<string, unknown> {
     properties: {
       kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'] },
       participant: { type: 'string', enum: ['user', 'assistant'] },
-      trigger: { type: 'string' }, linked_memory_id: { type: 'string' }, time_start: { type: 'string' }, time_end: { type: 'string' }, query: { type: 'string' },
+      trigger: { type: 'string' }, linked_memory_id: { type: 'string' }, time_start: { type: 'string' }, time_end: { type: 'string' }, query: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 20 },
     },
   };
 }
