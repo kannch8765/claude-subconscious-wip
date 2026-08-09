@@ -6,12 +6,14 @@ import type {
   CanonicalMemoryRecord,
   EffectiveMemoryRecord,
   EvidenceRecord,
+  EntityEvidenceRecord,
+  EntityIdentityRecord,
   MemoryKind,
   ParticipantRole,
   RememberOutcome,
   ReinforcementRecord,
 } from '../schema/index.js';
-import { validateProposal } from '../schema/index.js';
+import { normalizeEntityAlias, validateEntityIdentityProposal, validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 
@@ -26,10 +28,13 @@ export interface SearchQuery {
 }
 
 export interface ReinforceInput { memory_id: string; evidence_message_ids: string[] }
+export interface EntitySearchQuery { query?: string }
+export interface EntitySearchResult extends EntityIdentityRecord { evidence_ids: string[]; evidence_message_ids: string[] }
 
 export interface RememberResult {
   outcome: RememberOutcome['outcome'];
   memory_id?: string;
+  entity_id?: string;
   rejection_code?: string;
   reason?: string;
 }
@@ -48,6 +53,7 @@ export class RelationshipMemoryRuntime {
     readonly messages: Map<string, CanonicalMessage>,
     readonly now: () => string = () => new Date().toISOString(),
     readonly trustedAssistantIntents: Map<string, AssistantRememberIntentRecord> = new Map(),
+    readonly requireChineseSemanticProse = false,
   ) {}
 
   private linkedAssistantIntents(memoryId: string): AssistantRememberIntentRecord[] {
@@ -85,6 +91,92 @@ export class RelationshipMemoryRuntime {
       if (trigger && !haystack.includes(trigger)) return false;
       return true;
     });
+  }
+
+  entitySearch(query: EntitySearchQuery = {}): EntitySearchResult[] {
+    const needle = query.query?.trim();
+    const normalized = needle ? normalizeEntityAlias(needle) : undefined;
+    return this.store.listEntities().filter((entity) => {
+      if (!needle || !normalized) return true;
+      if (entity.aliases.some((alias) => normalizeEntityAlias(alias) === normalized)) return true;
+      return stableJson({ canonical_name: entity.canonical_name, aliases: entity.aliases, description: entity.description }).toLowerCase().includes(needle.toLowerCase());
+    }).map((entity) => {
+      const evidence = this.store.listEntityEvidence().filter((item) => item.entity_id === entity.entity_id);
+      return {
+        ...entity,
+        evidence_ids: evidence.map((item) => item.evidence_id),
+        evidence_message_ids: evidence.map((item) => item.message_id),
+      };
+    });
+  }
+
+  private entityRetryable(batchId: string, sourceKey: string, reason: string, now: string): RememberResult {
+    this.retryableBatches.add(batchId);
+    try { this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now }); } catch { }
+    return { outcome: 'retryable_failed', reason };
+  }
+
+  private entityPermanent(batchId: string, sourceKey: string, code: string, reason: string, now: string): RememberResult {
+    try {
+      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });
+      return { outcome: 'permanently_rejected', rejection_code: code, reason };
+    } catch {
+      return this.entityRetryable(batchId, sourceKey, 'Failed to durably record entity rejection.', now);
+    }
+  }
+
+  private entityOutcome(batchId: string, sourceKey: string, outcome: 'accepted' | 'duplicate', entityId: string, now: string): RememberResult {
+    try {
+      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome, entity_id: entityId, recorded_at: now });
+      return { outcome, entity_id: entityId };
+    } catch (error) {
+      return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now);
+    }
+  }
+
+  rememberEntity(batchId: string, rawProposal: unknown): RememberResult {
+    const now = this.now();
+    const sourceKey = stableId('entity_src', { batch_id: batchId, proposal: rawProposal });
+    const previous = this.store.getTerminalEntityOutcome(sourceKey);
+    if (previous) {
+      if ((previous.outcome === 'accepted' || previous.outcome === 'duplicate') && previous.entity_id) return { outcome: 'duplicate', entity_id: previous.entity_id };
+      return { outcome: previous.outcome, rejection_code: previous.rejection_code, reason: previous.reason };
+    }
+    const validation = validateEntityIdentityProposal(rawProposal, { requireChineseSemanticProse: this.requireChineseSemanticProse });
+    if (!validation.ok || !validation.proposal) return this.entityPermanent(batchId, sourceKey, validation.code ?? 'invalid_schema', validation.reason ?? 'Invalid entity proposal.', now);
+    const proposal = validation.proposal;
+    const evidenceMessages: CanonicalMessage[] = [];
+    for (const messageId of proposal.evidence_message_ids) {
+      const message = this.messages.get(messageId);
+      if (!message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${messageId}`, now);
+      evidenceMessages.push(message);
+    }
+    const aliases = proposal.aliases.map(normalizeEntityAlias);
+    const collisions = this.store.listEntities().filter((entity) => entity.aliases.some((alias) => aliases.includes(normalizeEntityAlias(alias))));
+    if (collisions.length > 0) {
+      const existing = collisions[0];
+      if (collisions.some((entity) => entity.entity_id !== existing.entity_id)) return this.entityPermanent(batchId, sourceKey, 'alias_collision', 'Alias set maps to multiple existing entity identities.', now);
+      const existingAliases = new Set(existing.aliases.map(normalizeEntityAlias));
+      const proposalNames = new Set([normalizeEntityAlias(proposal.canonical_name), ...aliases]);
+      const sameIdentity = existing.entity_type === proposal.entity_type
+        && existing.description === proposal.description
+        && [...proposalNames].every((alias) => existingAliases.has(alias));
+      if (!sameIdentity) return this.entityPermanent(batchId, sourceKey, 'alias_collision', `Alias already belongs to canonical entity ${existing.canonical_name}.`, now);
+      return this.entityOutcome(batchId, sourceKey, 'duplicate', existing.entity_id, now);
+    }
+    const recovered = this.store.getEntityBySourceKey(sourceKey);
+    if (recovered) return this.entityOutcome(batchId, sourceKey, 'duplicate', recovered.entity_id, now);
+    const entityId = stableId('entity', { subject_id: this.store.subjectId, canonical_name: normalizeEntityAlias(proposal.canonical_name) });
+    const entity: EntityIdentityRecord = {
+      schema_version: 1, entity_id: entityId, subject_id: this.store.subjectId, canonical_name: proposal.canonical_name, aliases: proposal.aliases,
+      entity_type: proposal.entity_type, description: proposal.description, observed_at: evidenceMessages.map((m) => m.captured_at).sort()[0] ?? now, created_at: now, source_key: sourceKey,
+    };
+    const evidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({
+      evidence_id: stableId('entity_ev', { entity_id: entityId, message_id: message.message_id }), entity_id: entityId, conversation_id: message.conversation_id,
+      message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
+    }));
+    try { this.store.appendEntity(entity, evidence); } catch (error) { return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }
+    return this.entityOutcome(batchId, sourceKey, 'accepted', entityId, now);
   }
 
   private trustedIntent(intentId: string | undefined): AssistantRememberIntentRecord | undefined {
@@ -219,7 +311,7 @@ export class RelationshipMemoryRuntime {
       );
     }
 
-    const validation = validateProposal(rawProposal);
+    const validation = validateProposal(rawProposal, { requireChineseSemanticProse: this.requireChineseSemanticProse });
     if (!validation.ok || !validation.proposal) {
       return this.persistPermanent(
         batchId,
@@ -352,8 +444,11 @@ export class RelationshipMemoryRuntime {
   finalizeBatch(batchId: string, sessionSucceeded: boolean): BatchCompletion {
     const now = this.now();
     const outcomes = this.store.listOutcomes().filter((item) => item.batch_id === batchId);
+    const entityOutcomes = this.store.listEntityOutcomes().filter((item) => item.batch_id === batchId);
     const latestBySource = new Map<string, RememberOutcome>();
     for (const outcome of outcomes) latestBySource.set(outcome.source_key, outcome);
+    const latestEntityBySource = new Map<string, (typeof entityOutcomes)[number]>();
+    for (const outcome of entityOutcomes) latestEntityBySource.set(outcome.source_key, outcome);
 
     const intentOutcomes = this.store.listAssistantIntentOutcomes().filter((item) => item.batch_id === batchId);
     const latestByIntent = new Map<string, AssistantIntentOutcome>();
@@ -366,6 +461,7 @@ export class RelationshipMemoryRuntime {
     const retryable = !sessionSucceeded
       || this.retryableBatches.has(batchId)
       || [...latestBySource.values()].some((item) => item.outcome === 'retryable_failed')
+      || [...latestEntityBySource.values()].some((item) => item.outcome === 'retryable_failed')
       || unresolvedAssistantIntent;
     const status: BatchCompletion = retryable ? 'retryable_failure' : 'completed';
     this.store.finalizeBatch({
@@ -373,7 +469,7 @@ export class RelationshipMemoryRuntime {
       status,
       created_at: this.store.listBatches().find((item) => item.batch_id === batchId)?.created_at ?? now,
       finalized_at: now,
-      ...(!retryable && outcomes.length === 0 && this.trustedAssistantIntents.size === 0 ? { detail: 'no_memory_required' as const } : {}),
+      ...(!retryable && outcomes.length === 0 && entityOutcomes.length === 0 && this.trustedAssistantIntents.size === 0 ? { detail: 'no_memory_required' as const } : {}),
     });
     return status;
   }
@@ -394,7 +490,7 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
       schema_version: { type: 'integer', enum: [1], description: 'Relationship-memory proposal schema version; must be 1.' },
       kind: {
         type: 'string',
-        enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke'],
+        enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'],
         description: 'Canonical relationship-memory kind. payload fields must match this kind exactly.',
       },
       summary: string,
@@ -417,6 +513,8 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
           'shared_experience requires title, event, shared_meaning; optional symbols, recall_triggers.',
           'relationship_event requires event, meaning; optional prior_context, resulting_change.',
           'inside_joke requires name, meaning, trigger_phrases; optional origin, callbacks, tone.',
+          'user_preference requires topic, preference; optional context, reason, recall_triggers.',
+          'For DS-authored new writes, summary and narrative semantic prose must be Chinese; literal names, aliases, trigger tokens, code, provider names, paths, URLs, and trusted evidence stay source-faithful.',
         ].join(' '),
         properties: {
           title: string,
@@ -438,8 +536,32 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
           origin: string,
           callbacks: strings,
           tone: string,
+          topic: string,
+          preference: string,
+          context: string,
+          reason: string,
         },
       },
+    },
+  };
+}
+
+export function entitySearchToolSchema(): Record<string, unknown> {
+  return { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1 } } };
+}
+
+export function entityRememberToolSchema(): Record<string, unknown> {
+  const string = { type: 'string', minLength: 1 };
+  return {
+    type: 'object', additionalProperties: false,
+    required: ['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description', 'evidence_message_ids'],
+    properties: {
+      schema_version: { type: 'integer', enum: [1] },
+      canonical_name: string,
+      aliases: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Literal names/aliases; preserve source spelling such as GPT, ChatGPT, Claude, Claude Code.' },
+      entity_type: { type: 'string', enum: ['user', 'assistant', 'other'] },
+      description: { type: 'string', minLength: 1, description: 'Perspective-neutral Chinese semantic description. Do not write fragile second-person identity such as 琥珀 = 你.' },
+      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },
     },
   };
 }
@@ -455,7 +577,7 @@ export function memorySearchToolSchema(): Record<string, unknown> {
   return {
     type: 'object', additionalProperties: false,
     properties: {
-      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke'] },
+      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'] },
       participant: { type: 'string', enum: ['user', 'assistant'] },
       trigger: { type: 'string' }, linked_memory_id: { type: 'string' }, time_start: { type: 'string' }, time_end: { type: 'string' }, query: { type: 'string' },
     },

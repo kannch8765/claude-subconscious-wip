@@ -234,11 +234,11 @@ function containsHan(value: string): boolean {
 }
 
 const semanticProseFields: Record<MemoryKind, string[]> = {
-  personal_experience: ['title', 'experience', 'emotional_tone', 'why_memorable'],
-  shared_experience: ['title', 'event', 'shared_meaning'],
+  personal_experience: ['experience', 'emotional_tone', 'why_memorable'],
+  shared_experience: ['event', 'shared_meaning'],
   relationship_event: ['event', 'meaning', 'prior_context', 'resulting_change'],
   inside_joke: ['meaning', 'origin', 'tone'],
-  user_preference: ['topic', 'preference', 'context', 'reason'],
+  user_preference: ['preference', 'context', 'reason'],
 };
 
 function validateChineseSemanticProse(kind: MemoryKind, summary: string, payload: Record<string, unknown>): ValidationResult | null {

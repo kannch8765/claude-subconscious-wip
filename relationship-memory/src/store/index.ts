@@ -15,7 +15,7 @@ import type {
   OwnerRevisionRecord,
 } from '../schema/index.js';
 
-export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'entity_commit' | 'entity_outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
+export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
 export type FailureInjector = (phase: StorePhase) => boolean;
 
 function ensureDir(dir: string): void {
@@ -109,14 +109,14 @@ export class RelationshipMemoryStore {
   }
 
   appendEntity(record: EntityIdentityRecord, evidence: EntityEvidenceRecord[]): void {
-    if (this.failureInjector?.('entity_commit')) throw new Error('injected entity commit failure');
+    if (this.failureInjector?.('memory_commit')) throw new Error('injected entity commit failure');
     if (!this.getEntity(record.entity_id)) appendJsonl(this.file('entities.jsonl'), record);
     const existingEvidence = new Set(this.listEntityEvidence().map((item) => item.evidence_id));
     for (const item of evidence) if (!existingEvidence.has(item.evidence_id)) appendJsonl(this.file('entity-evidence.jsonl'), item);
   }
 
   appendEntityOutcome(outcome: EntityOutcome): void {
-    if (this.failureInjector?.('entity_outcome_commit')) throw new Error('injected entity outcome commit failure');
+    if (this.failureInjector?.('outcome_commit')) throw new Error('injected entity outcome commit failure');
     appendJsonl(this.file('entity-outcomes.jsonl'), outcome);
   }
 
