@@ -1,8 +1,8 @@
 import * as crypto from 'crypto';
-import * as fs from 'fs';
+import fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resolveBackfillTranscriptInput, validateBackfillSnapshot } from '../src/backfill/snapshot.js';
 
 const roots: string[] = [];
@@ -55,6 +55,27 @@ describe('backfill snapshot authority boundary', () => {
     expect(() => resolveBackfillTranscriptInput({
       transcript: '/var/lib/subconscious-backfill-input/owner-canary-03-post-093m/transcript.jsonl',
     })).toThrow(/direct privileged snapshot access is disabled.*--snapshot-manifest/);
+  });
+
+  it('refuses a filesystem alias resolving to a sealed privileged snapshot payload', () => {
+    const alias = '/tmp/093n-sealed-link.jsonl';
+    const sealed = '/var/lib/subconscious-backfill-input/owner-canary-03-post-093m/transcript.jsonl';
+    const realpath = vi.spyOn(fs, 'realpathSync').mockImplementation(((input: fs.PathLike) => {
+      if (String(input) === alias) return sealed;
+      return String(input);
+    }) as typeof fs.realpathSync);
+    try {
+      expect(() => resolveBackfillTranscriptInput({ transcript: alias })).toThrow(/direct privileged snapshot access is disabled.*--snapshot-manifest/);
+    } finally {
+      realpath.mockRestore();
+    }
+  });
+
+  it('keeps ordinary caller-owned filesystem aliases supported and returns their canonical target', () => {
+    const f = fixture();
+    const alias = path.join(path.dirname(f.dir), 'ordinary-link.jsonl');
+    fs.symlinkSync(f.transcript, alias);
+    expect(resolveBackfillTranscriptInput({ transcript: alias })).toBe(f.transcript);
   });
 
   it('rejects a writable transcript before hashing or backfill', () => {

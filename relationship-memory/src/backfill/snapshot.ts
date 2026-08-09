@@ -1,5 +1,5 @@
 import * as crypto from 'crypto';
-import * as fs from 'fs';
+import fs from 'fs';
 import * as path from 'path';
 
 export interface BackfillSnapshotManifestV1 {
@@ -115,6 +115,16 @@ export interface BackfillTranscriptInput {
   snapshotManifest?: string;
 }
 
+function assertNonPrivilegedDirectTranscript(transcriptPath: string): void {
+  if (transcriptPath === '/root' || transcriptPath.startsWith('/root/')) {
+    fail('direct /root transcript access is disabled; export an immutable owner snapshot and use --snapshot-manifest');
+  }
+  const privilegedSnapshotRoot = '/var/lib/subconscious-backfill-input';
+  if (transcriptPath === privilegedSnapshotRoot || transcriptPath.startsWith(`${privilegedSnapshotRoot}/`)) {
+    fail('direct privileged snapshot access is disabled; use the corresponding --snapshot-manifest');
+  }
+}
+
 export function resolveBackfillTranscriptInput(
   input: BackfillTranscriptInput,
   options: BackfillSnapshotValidationOptions = {},
@@ -124,12 +134,14 @@ export function resolveBackfillTranscriptInput(
   }
   if (input.snapshotManifest) return validateBackfillSnapshot(path.resolve(input.snapshotManifest), options).transcriptPath;
   const transcriptPath = path.resolve(input.transcript!);
-  if (transcriptPath === '/root' || transcriptPath.startsWith('/root/')) {
-    fail('direct /root transcript access is disabled; export an immutable owner snapshot and use --snapshot-manifest');
+  assertNonPrivilegedDirectTranscript(transcriptPath);
+
+  let filesystemTarget: string;
+  try {
+    filesystemTarget = fs.realpathSync(transcriptPath);
+  } catch (error) {
+    fail(`direct transcript source cannot be resolved (${error instanceof Error ? error.message : String(error)})`);
   }
-  const privilegedSnapshotRoot = '/var/lib/subconscious-backfill-input';
-  if (transcriptPath === privilegedSnapshotRoot || transcriptPath.startsWith(`${privilegedSnapshotRoot}/`)) {
-    fail('direct privileged snapshot access is disabled; use the corresponding --snapshot-manifest');
-  }
-  return transcriptPath;
+  assertNonPrivilegedDirectTranscript(filesystemTarget);
+  return filesystemTarget;
 }
