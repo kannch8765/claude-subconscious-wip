@@ -1,11 +1,12 @@
 import type { AssistantRememberIntentRecord, CanonicalMessage } from '../relationship-memory/src/schema/index.js';
 import {
   appendTrustedRelationshipCatalog,
+  assertRelationshipClientToolInventory,
   buildRelationshipTools,
   createRuntime,
-  FORBIDDEN_MARKDOWN_MEMORY_TOOLS,
   relationshipMemoryRoot,
   RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
+  RELATIONSHIP_DISALLOWED_CLIENT_TOOLS,
 } from '../relationship-memory/src/adapter/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { stableJson } from '../relationship-memory/src/store/index.js';
@@ -57,7 +58,7 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
     const relationshipTools = buildRelationshipTools(runtime, input.batchId, jsonResult);
     const resume = resumeSession as any;
     session = resume(input.conversationId, {
-      disallowedTools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode', ...FORBIDDEN_MARKDOWN_MEMORY_TOOLS],
+      disallowedTools: [...RELATIONSHIP_DISALLOWED_CLIENT_TOOLS],
       allowedTools: [...RELATIONSHIP_ALLOWED_CLIENT_TOOLS],
       tools: relationshipTools,
       permissionMode: 'bypassPermissions',
@@ -67,6 +68,8 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
       sleeptime: { trigger: 'off' },
       memfsStartup: 'skip',
     });
+    const init = await session.initialize();
+    assertRelationshipClientToolInventory(Array.isArray(init?.tools) ? init.tools : []);
 
     const durableAssistantIntents = assistantIntents.map((intent) => {
       const stored = runtime.store.getAssistantIntent(intent.intent_id);
