@@ -13,11 +13,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { AssistantRememberIntentRecord, CanonicalMessage } from '../relationship-memory/src/schema/index.js';
-import { appendTrustedRelationshipCatalog, buildRelationshipTools, createRuntime, FORBIDDEN_MARKDOWN_MEMORY_TOOLS, relationshipMemoryRoot, RELATIONSHIP_ALLOWED_CLIENT_TOOLS } from '../relationship-memory/src/adapter/index.js';
 import { cursorShouldAdvance } from '../relationship-memory/src/tools/index.js';
-import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
-import { stableJson } from '../relationship-memory/src/store/index.js';
-import { buildLettaApiUrl } from './letta_api_url.js';
+import { runRelationshipObserverBatch } from './relationship_observer_runner.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -44,100 +41,17 @@ function log(message: string): void {
   fs.appendFileSync(LOG_FILE, `[${timestamp}] ${message}\n`);
 }
 
-async function syncProjectionBlocks(apiKey: string, agentId: string, runtime: ReturnType<typeof createRuntime>): Promise<void> {
-  const projection = rebuildProjection(runtime.store);
-  for (const [label, value] of Object.entries(projection.blocks)) {
-    const response = await fetch(buildLettaApiUrl(`/agents/${agentId}/core-memory/blocks/${label}`), {
-      method: 'PATCH',
-      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ value }),
-    });
-    if (!response.ok) throw new Error(`Projection sync failed for ${label} (${response.status})`);
-  }
-  log(`Projection revision synchronized: ${projection.revision}`);
-}
-
 async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable_failure'> {
-  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
-  const assistantIntents = payload.assistantIntents ?? [];
-  const runtime = createRuntime(payload.canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
-  runtime.store.beginBatch(payload.batchId, new Date().toISOString());
-
-  let session: any = null;
-  let sessionSucceeded = true;
-
-  try {
-    log(`Loading Letta Code SDK...`);
-    const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
-    const relationshipTools = buildRelationshipTools(runtime, payload.batchId, jsonResult);
-    const blockedTools = [
-      'AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode',
-      ...FORBIDDEN_MARKDOWN_MEMORY_TOOLS,
-    ];
-    const sessionOptions: Record<string, unknown> = {
-      disallowedTools: blockedTools,
-      allowedTools: [...RELATIONSHIP_ALLOWED_CLIENT_TOOLS],
-      tools: relationshipTools,
-      permissionMode: 'bypassPermissions',
-      cwd: payload.cwd,
-      skillSources: [],
-      systemInfoReminder: false,
-      sleeptime: { trigger: 'off' },
-      memfsStartup: 'skip',
-    };
-
-    log(`Creating SDK session for conversation ${payload.conversationId} (relationship-memory batch ${payload.batchId})`);
-    log(`  agent: ${payload.agentId}`);
-    log(`  cwd: ${payload.cwd}`);
-    log(`  allowedTools: ${RELATIONSHIP_ALLOWED_CLIENT_TOOLS.join(', ')}`);
-
-    session = resumeSession(payload.conversationId, sessionOptions);
-    const durableAssistantIntents = assistantIntents.map((intent) => {
-      const stored = runtime.store.getAssistantIntent(intent.intent_id);
-      if (!stored || stableJson(stored) !== stableJson(intent)) {
-        throw new Error(`Trusted assistant intent payload/store mismatch: ${intent.intent_id}`);
-      }
-      return stored;
-    });
-    const observerMessage = appendTrustedRelationshipCatalog(payload.message, payload.canonicalMessages, durableAssistantIntents);
-    log(`Sending message (${observerMessage.length} chars, ${payload.canonicalMessages.length} trusted evidence choices, ${durableAssistantIntents.length} trusted assistant intents)...`);
-    await session.send(observerMessage);
-
-    let assistantResponse = '';
-    let messageCount = 0;
-    for await (const msg of session.stream()) {
-      messageCount++;
-      if (msg.type === 'assistant' && msg.content) {
-        assistantResponse += msg.content;
-        log(`  Assistant chunk: ${msg.content.substring(0, 100)}...`);
-      } else if (msg.type === 'tool_call') {
-        log(`  Tool call: ${(msg as any).toolName}`);
-      } else if (msg.type === 'error') {
-        sessionSucceeded = false;
-        log(`  Error: ${(msg as any).message}`);
-      }
-    }
-    log(`Stream complete: ${messageCount} messages, assistant response: ${assistantResponse.length} chars`);
-  } catch (error) {
-    sessionSucceeded = false;
-    log(`  Session failure: ${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    if (session) {
-      session.close();
-      log('SDK session closed');
-    }
-  }
-
-  const completion = runtime.finalizeBatch(payload.batchId, sessionSucceeded);
-  log(`Relationship-memory batch finalized: ${completion}`);
-  if (completion === 'completed') {
-    const apiKey = process.env.LETTA_API_KEY;
-    if (apiKey) {
-      try { await syncProjectionBlocks(apiKey, payload.agentId, runtime); }
-      catch (error) { log(`Projection sync deferred: ${error instanceof Error ? error.message : String(error)}`); }
-    }
-  }
-  return completion;
+  return runRelationshipObserverBatch({
+    agentId: payload.agentId,
+    conversationId: payload.conversationId,
+    message: payload.message,
+    cwd: payload.cwd,
+    batchId: payload.batchId,
+    canonicalMessages: payload.canonicalMessages,
+    assistantIntents: payload.assistantIntents ?? [],
+    log,
+  });
 }
 
 async function main(): Promise<void> {
