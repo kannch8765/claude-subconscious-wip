@@ -67,7 +67,7 @@ function existingMemory(root: string, id = 'existing'): CanonicalMemoryRecord {
 describe('Task 093AA legacy semantic migration', () => {
   it('terminates a zero-memory source with a durable receipt and checkpoint without provenance', async () => {
     const root = temp(); const s = source('1'); seed(root, s);
-    const result = await runLegacySemanticMigration({ rootDir: root, maxRecords: 1, processor: async (item, batchId) => {
+    const result = await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, maxRecords: 1, processor: async (item, batchId) => {
       const runtime = new LegacySemanticMutationRuntime(root, 'subject-kohaku', item, batchId, () => '2026-08-11T00:00:00Z');
       expect(runtime.complete('no_memory_required')).toEqual({ completion: 'no_memory_required' });
       return { completion: 'no_memory_required' };
@@ -80,7 +80,7 @@ describe('Task 093AA legacy semantic migration', () => {
 
   it('creates multiple first-class canonical memories from one source with no fake transcript evidence', async () => {
     const root = temp(); const s = source('2'); seed(root, s);
-    await runLegacySemanticMigration({ rootDir: root, processor: async (item, batchId) => {
+    await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, processor: async (item, batchId) => {
       const runtime = new LegacySemanticMutationRuntime(root, 'subject-kohaku', item, batchId, () => '2026-08-11T00:00:00Z');
       expect(runtime.createMemory(sharedProposal()).outcome).toBe('created');
       expect(runtime.createMemory(preferenceProposal()).outcome).toBe('created');
@@ -124,14 +124,14 @@ describe('Task 093AA legacy semantic migration', () => {
 
   it('recovers idempotently after canonical mutation before source checkpoint', async () => {
     const root = temp(); const s = source('6'); seed(root, s);
-    const first = await runLegacySemanticMigration({ rootDir: root, processor: async (item, batchId) => {
+    const first = await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, processor: async (item, batchId) => {
       const runtime = new LegacySemanticMutationRuntime(root, 'subject-kohaku', item, batchId, () => '2026-08-11T00:00:00Z');
       expect(runtime.createMemory(sharedProposal()).outcome).toBe('created');
       return { completion: 'retryable_failure', reason: 'synthetic interruption after mutation' };
     } });
     expect(first.status).toBe('blocked-failure');
     expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest).processed_source_ids).toEqual([]);
-    const second = await runLegacySemanticMigration({ rootDir: root, processor: async (item, batchId) => {
+    const second = await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, processor: async (item, batchId) => {
       const runtime = new LegacySemanticMutationRuntime(root, 'subject-kohaku', item, batchId, () => '2026-08-11T00:01:00Z');
       expect(runtime.createMemory(sharedProposal()).outcome).toBe('duplicate_link');
       expect(runtime.complete('completed')).toEqual({ completion: 'completed' });
@@ -146,20 +146,20 @@ describe('Task 093AA legacy semantic migration', () => {
   it('fails closed on manifest/state mismatch and processed-without-terminal-receipt corruption', async () => {
     const root = temp(); const s = source('7'); seed(root, s);
     fs.writeFileSync(path.join(root, 'bad-state.json'), JSON.stringify({ schema_version: 1, manifest_digest: 'other', processed_source_ids: [] }));
-    await expect(runLegacySemanticMigration({ rootDir: root, statePath: path.join(root, 'bad-state.json'), processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/different manifest/);
+    await expect(runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, statePath: path.join(root, 'bad-state.json'), processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/different manifest/);
     fs.writeFileSync(path.join(root, 'legacy-semantic-migration-state.json'), JSON.stringify({ schema_version: 1, manifest_digest: manifest, processed_source_ids: [s.legacy_source_id] }));
-    await expect(runLegacySemanticMigration({ rootDir: root, processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/without terminal receipt/);
+    await expect(runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/without terminal receipt/);
   });
 
   it('supports bounded/exact-source canaries and a truthful non-mutating dry-run', async () => {
     const root = temp(); const a = source('8'); const b = source('9', 'archive'); seed(root, a, b);
     const before = fs.readdirSync(root).sort();
-    const dry = await runLegacySemanticMigration({ rootDir: root, sourceIds: [b.legacy_source_id], maxRecords: 1, dryRun: true, processor: async () => { throw new Error('must not run'); } });
+    const dry = await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, sourceIds: [b.legacy_source_id], maxRecords: 1, dryRun: true, processor: async () => { throw new Error('must not run'); } });
     expect(dry.status).toBe('dry-run'); expect(dry.remaining).toBe(1); expect(fs.readdirSync(root).sort()).toEqual(before);
     let seen = '';
-    const live = await runLegacySemanticMigration({ rootDir: root, sourceIds: [b.legacy_source_id], maxRecords: 1, processor: async (item) => { seen = item.legacy_source_id; return { completion: 'no_memory_required' }; } });
+    const live = await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, sourceIds: [b.legacy_source_id], maxRecords: 1, processor: async (item) => { seen = item.legacy_source_id; return { completion: 'no_memory_required' }; } });
     expect(live.status).toBe('completed'); expect(seen).toBe(b.legacy_source_id);
-    await expect(runLegacySemanticMigration({ rootDir: root, sourceIds: ['missing'], processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/unknown legacy source/);
+    await expect(runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, sourceIds: ['missing'], processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/unknown legacy source/);
   });
 
   it('does not expose legacy_source_id as a model-controlled tool argument and requires explicit completion', () => {
@@ -172,12 +172,69 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(runtime.completionState()).toBeUndefined();
   });
 
+  it('binds execution to the expected frozen manifest before processor work', async () => {
+    const root = temp(); const s = source('manifest-ok'); seed(root, s);
+    let calls = 0;
+    const ok = await runLegacySemanticMigration({
+      rootDir: root, expectedManifestDigest: manifest,
+      processor: async () => { calls += 1; return { completion: 'no_memory_required' }; },
+    });
+    expect(ok.status).toBe('completed'); expect(calls).toBe(1);
+
+    const wrongRoot = temp();
+    const wrongManifest = '1'.repeat(64);
+    seed(wrongRoot, { ...source('manifest-wrong'), manifest_digest: wrongManifest });
+    let wrongCalls = 0;
+    await expect(runLegacySemanticMigration({
+      rootDir: wrongRoot, expectedManifestDigest: manifest,
+      processor: async () => { wrongCalls += 1; return { completion: 'no_memory_required' }; },
+    })).rejects.toThrow(/does not match expected frozen manifest/);
+    expect(wrongCalls).toBe(0);
+  });
+
+  it('does not recover terminal completion from a different manifest', async () => {
+    const root = temp(); const s = source('manifest-receipt'); seed(root, s);
+    const oldManifest = '2'.repeat(64);
+    fs.writeFileSync(path.join(root, 'legacy-semantic-receipts.jsonl'), `${JSON.stringify({
+      schema_version: 1, receipt_id: 'old-receipt', manifest_digest: oldManifest, legacy_source_id: s.legacy_source_id,
+      batch_id: legacySemanticBatchId(oldManifest, s.legacy_source_id), result: 'no_memory_required', provenance_ids: [], memory_ids: [],
+      recorded_at: '2026-08-10T00:00:00.000Z',
+    })}\n`);
+    let calls = 0;
+    const result = await runLegacySemanticMigration({
+      rootDir: root, expectedManifestDigest: manifest,
+      processor: async () => { calls += 1; return { completion: 'no_memory_required' }; },
+    });
+    expect(result.status).toBe('completed'); expect(calls).toBe(1);
+    const receipts = listLegacySemanticReceipts(root);
+    expect(receipts).toHaveLength(2);
+    expect(receipts[1].manifest_digest).toBe(manifest);
+  });
+
+  it('fails closed on malformed parseable legacy source rows before processor work', async () => {
+    for (const [label, mutate] of [
+      ['missing identity', (record: any) => { delete record.legacy_source_id; }],
+      ['invalid digest', (record: any) => { record.manifest_digest = 'not-a-sha256'; }],
+    ] as const) {
+      const root = temp();
+      const record: any = source(`malformed-${label.replace(/ /g, '-')}`);
+      mutate(record);
+      fs.writeFileSync(path.join(root, 'legacy-assistant-sources.jsonl'), `${JSON.stringify(record)}\n`);
+      let calls = 0;
+      await expect(runLegacySemanticMigration({
+        rootDir: root, expectedManifestDigest: manifest,
+        processor: async () => { calls += 1; return { completion: 'no_memory_required' }; },
+      })).rejects.toThrow(/legacy source/);
+      expect(calls).toBe(0);
+    }
+  });
+
   it('keeps the semantic runner input authority inside the ingested source ledger', async () => {
     const root = temp(); const s = source('11'); seed(root, s);
     fs.mkdirSync(path.join(root, 'unrelated-ombre-tree', 'dynamic'), { recursive: true });
     fs.writeFileSync(path.join(root, 'unrelated-ombre-tree', 'dynamic', '999.md'), 'must not be read');
     let body = '';
-    await runLegacySemanticMigration({ rootDir: root, processor: async (item) => { body = item.body_text; return { completion: 'no_memory_required' }; } });
+    await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, processor: async (item) => { body = item.body_text; return { completion: 'no_memory_required' }; } });
     expect(body).toBe('历史内容 11');
     expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest).processed_source_ids).toEqual([s.legacy_source_id]);
   });
