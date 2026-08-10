@@ -11,6 +11,7 @@ import {
 } from '../relationship-memory/src/recall/index.js';
 import { getConfiguredAgentIdReadOnly } from './agent_config.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
+import { disableLettaCodeAutoUpdater } from './letta_code_runtime_env.js';
 import { createConversation } from './conversation_utils.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
@@ -68,6 +69,7 @@ async function runLettaRecallModel(core: RelationshipMemoryRecallSession, query:
   const apiKey = process.env.LETTA_API_KEY;
   if (!apiKey) throw new Error('LETTA_API_KEY is not set');
   const agentId = getConfiguredAgentIdReadOnly();
+  disableLettaCodeAutoUpdater();
   const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
   const conversationId = await createConversation(apiKey, agentId, log);
   let sdkSession: any = null;

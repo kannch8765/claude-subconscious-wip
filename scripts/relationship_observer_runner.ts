@@ -11,6 +11,7 @@ import {
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { stableJson } from '../relationship-memory/src/store/index.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
+import { disableLettaCodeAutoUpdater } from './letta_code_runtime_env.js';
 
 export interface RelationshipObserverBatchInput {
   agentId: string;
@@ -54,6 +55,7 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
   let sessionSucceeded = true;
 
   try {
+    disableLettaCodeAutoUpdater();
     const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
     const relationshipTools = buildRelationshipTools(runtime, input.batchId, jsonResult);
     const resume = resumeSession as any;
