@@ -1,7 +1,7 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { stableId, stableJson } from '../store/index.js';
+import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 
 export const LEGACY_BUCKET_TYPES = ['permanent', 'dynamic', 'feel', 'archive'] as const;
 export type LegacyBucketType = (typeof LEGACY_BUCKET_TYPES)[number];
@@ -300,37 +300,52 @@ function atomicWriteJson(file: string, value: unknown): void {
 }
 
 export class LegacyMemorySourceStore {
-  constructor(readonly rootDir: string) { fs.mkdirSync(rootDir, { recursive: true }); }
+  private readonly mutationStore: RelationshipMemoryStore;
+
+  constructor(readonly rootDir: string) {
+    fs.mkdirSync(rootDir, { recursive: true });
+    // Reuse Task 093W's filesystem mutation boundary so legacy ledgers cannot
+    // become a parallel unguarded writer lane beside canonical memory writes.
+    this.mutationStore = new RelationshipMemoryStore(rootDir, '__legacy_import_boundary__');
+  }
+
   private file(name: string): string { return path.join(this.rootDir, name); }
+  withMutationBoundary<T>(operation: () => T): T { return this.mutationStore.withMutationBoundary(operation); }
   listSources(): LegacyAssistantMemorySourceRecord[] { return readJsonl(this.file('legacy-assistant-sources.jsonl')); }
   listProvenance(): LegacyMemoryProvenanceLink[] { return readJsonl(this.file('legacy-memory-provenance.jsonl')); }
   listReceipts(): LegacyImportReceipt[] { return readJsonl(this.file('legacy-import-receipts.jsonl')); }
   getSource(id: string): LegacyAssistantMemorySourceRecord | undefined { return this.listSources().find((source) => source.legacy_source_id === id); }
   appendSource(source: LegacyAssistantMemorySourceRecord): 'accepted' | 'duplicate' {
-    const existing = this.getSource(source.legacy_source_id);
-    if (existing) {
-      if (stableJson(existing) !== stableJson(source)) throw new Error(`legacy source identity collision: ${source.legacy_source_id}`);
-      return 'duplicate';
-    }
-    appendJsonl(this.file('legacy-assistant-sources.jsonl'), source);
-    return 'accepted';
+    return this.withMutationBoundary(() => {
+      const existing = this.getSource(source.legacy_source_id);
+      if (existing) {
+        if (stableJson(existing) !== stableJson(source)) throw new Error(`legacy source identity collision: ${source.legacy_source_id}`);
+        return 'duplicate';
+      }
+      appendJsonl(this.file('legacy-assistant-sources.jsonl'), source);
+      return 'accepted';
+    });
   }
   appendProvenance(link: Omit<LegacyMemoryProvenanceLink, 'schema_version' | 'provenance_id'>): LegacyMemoryProvenanceLink {
-    const record: LegacyMemoryProvenanceLink = {
-      schema_version: 1,
-      provenance_id: stableId('legacy_provenance', { legacy_source_id: link.legacy_source_id, canonical_memory_id: link.canonical_memory_id, disposition: link.disposition }),
-      ...link,
-    };
-    const existing = this.listProvenance().find((item) => item.provenance_id === record.provenance_id);
-    if (existing && stableJson(existing) !== stableJson(record)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
-    if (!existing) appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
-    return existing ?? record;
+    return this.withMutationBoundary(() => {
+      const record: LegacyMemoryProvenanceLink = {
+        schema_version: 1,
+        provenance_id: stableId('legacy_provenance', { legacy_source_id: link.legacy_source_id, canonical_memory_id: link.canonical_memory_id, disposition: link.disposition }),
+        ...link,
+      };
+      const existing = this.listProvenance().find((item) => item.provenance_id === record.provenance_id);
+      if (existing && stableJson(existing) !== stableJson(record)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
+      if (!existing) appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
+      return existing ?? record;
+    });
   }
   memoriesForSource(sourceId: string): string[] { return this.listProvenance().filter((item) => item.legacy_source_id === sourceId).map((item) => item.canonical_memory_id); }
   sourcesForMemory(memoryId: string): string[] { return this.listProvenance().filter((item) => item.canonical_memory_id === memoryId).map((item) => item.legacy_source_id); }
   appendReceipt(receipt: LegacyImportReceipt): void {
-    const duplicate = this.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
-    if (!duplicate) appendJsonl(this.file('legacy-import-receipts.jsonl'), receipt);
+    this.withMutationBoundary(() => {
+      const duplicate = this.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
+      if (!duplicate) appendJsonl(this.file('legacy-import-receipts.jsonl'), receipt);
+    });
   }
 }
 
@@ -352,32 +367,64 @@ export function loadLegacyImportState(file: string, manifestDigest: string): Leg
 export function runLegacyImport(options: LegacyImportOptions): LegacyImportResult {
   const manifest = buildLegacyManifest(options.rootDir);
   const statePath = path.join(options.storeDir, 'legacy-import-state.json');
-  const state = loadLegacyImportState(statePath, manifest.manifest_digest);
+  const initialState = loadLegacyImportState(statePath, manifest.manifest_digest);
   const store = new LegacyMemorySourceStore(options.storeDir);
-  const processed = new Set(state.processed_paths);
+  const processed = new Set(initialState.processed_paths);
   const limit = options.maxRecords ?? Number.POSITIVE_INFINITY;
   let count = 0;
   let accepted = 0;
   let duplicates = 0;
   const isolated: LegacyImportReceipt[] = [];
+
+  const checkpoint = (relativePath: string): void => {
+    const current = loadLegacyImportState(statePath, manifest.manifest_digest);
+    if (!current.processed_paths.includes(relativePath)) {
+      current.processed_paths = [...current.processed_paths, relativePath].sort(bytewiseCompare);
+      atomicWriteJson(statePath, current);
+    }
+    processed.add(relativePath);
+  };
+
   for (const entry of manifest.entries) {
     if (processed.has(entry.relative_path) || count >= limit) continue;
     count += 1;
+
+    let source: LegacyAssistantMemorySourceRecord;
     try {
-      const source = parseLegacySource(options.rootDir, entry, manifest.manifest_digest, options.subjectId);
-      if (options.dryRun) continue;
-      const result = store.appendSource(source);
-      if (result === 'accepted') accepted += 1; else duplicates += 1;
-      const receipt: LegacyImportReceipt = { schema_version: 1, manifest_digest: manifest.manifest_digest, relative_path: entry.relative_path, result, legacy_source_id: source.legacy_source_id };
-      store.appendReceipt(receipt);
-      processed.add(entry.relative_path);
-      state.processed_paths = [...processed].sort(bytewiseCompare);
-      atomicWriteJson(statePath, state);
+      source = parseLegacySource(options.rootDir, entry, manifest.manifest_digest, options.subjectId);
     } catch (error) {
       const receipt: LegacyImportReceipt = { schema_version: 1, manifest_digest: manifest.manifest_digest, relative_path: entry.relative_path, result: 'isolated', reason: error instanceof Error ? error.message : String(error) };
-      isolated.push(receipt);
-      if (!options.dryRun) store.appendReceipt(receipt);
+      if (options.dryRun) {
+        isolated.push(receipt);
+        continue;
+      }
+      const committed = store.withMutationBoundary(() => {
+        const current = loadLegacyImportState(statePath, manifest.manifest_digest);
+        if (current.processed_paths.includes(entry.relative_path)) return false;
+        // Receipt durability precedes terminal checkpointing. If state persistence fails,
+        // the next run safely dedupes the receipt and retries only the checkpoint.
+        store.appendReceipt(receipt);
+        checkpoint(entry.relative_path);
+        return true;
+      });
+      if (committed) isolated.push(receipt);
+      else processed.add(entry.relative_path);
+      continue;
     }
+
+    if (options.dryRun) continue;
+    const committed = store.withMutationBoundary(() => {
+      const current = loadLegacyImportState(statePath, manifest.manifest_digest);
+      if (current.processed_paths.includes(entry.relative_path)) return undefined;
+      const result = store.appendSource(source);
+      const receipt: LegacyImportReceipt = { schema_version: 1, manifest_digest: manifest.manifest_digest, relative_path: entry.relative_path, result, legacy_source_id: source.legacy_source_id };
+      store.appendReceipt(receipt);
+      checkpoint(entry.relative_path);
+      return result;
+    });
+    if (committed === 'accepted') accepted += 1;
+    else if (committed === 'duplicate') duplicates += 1;
+    else processed.add(entry.relative_path);
   }
   return { manifest_digest: manifest.manifest_digest, processed: count, accepted, duplicates, isolated, dry_run: options.dryRun ?? false };
 }
