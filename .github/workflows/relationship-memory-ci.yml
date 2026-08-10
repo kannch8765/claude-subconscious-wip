@@ -15,13 +15,13 @@ concurrency:
 
 jobs:
   test:
-    name: npm ci + npm test (exact Task 093U R1 head)
+    name: npm ci + npm test (exact Task 093V head)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      TARGET_SHA: fc9b07af095ed49e3cf4914d5eb3df098c1c07e0
+      TARGET_SHA: 992193fee42d77c840086bd2bfa79c3d1fd87816
     steps:
-      - name: Checkout exact Task 093U R1 head
+      - name: Checkout exact Task 093V head
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
