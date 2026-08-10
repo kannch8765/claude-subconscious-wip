@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
+import { spawn, type ChildProcess } from 'child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { LegacyMemorySourceStore, buildLegacyManifest, loadLegacyImportState } from '../src/legacy/index.js';
 
@@ -16,14 +16,14 @@ function bucket(root: string, relative: string): void {
   const id = path.basename(relative, '.md');
   fs.writeFileSync(file, `---\nid: ${id}\nname: 并发测试\ntype: memory\ncreated: 2026-07-01T01:02:03\nlast_active: 2026-07-02T04:05:06\ndomain: [关系]\ntags: [琥珀, 猫]\nimportance: 8\nvalence: 0.7\narousal: 0.4\nactivation_count: 1.5\n---\n历史记忆。\n`, 'utf8');
 }
-function spawnChild(mode: string, sourceRoot: string, storeDir: string, startFile: string): ChildProcessWithoutNullStreams {
+function spawnChild(mode: string, sourceRoot: string, storeDir: string, startFile: string): ChildProcess {
   return spawn(tsxCli, [childScript, mode, sourceRoot, storeDir, startFile], { cwd: process.cwd(), env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
 }
-function finish(child: ChildProcessWithoutNullStreams): Promise<{ code: number | null; stdout: string; stderr: string }> {
+function finish(child: ChildProcess): Promise<{ code: number | null; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     let stdout = ''; let stderr = '';
-    child.stdout.on('data', (chunk) => { stdout += String(chunk); });
-    child.stderr.on('data', (chunk) => { stderr += String(chunk); });
+    child.stdout!.on('data', (chunk) => { stdout += String(chunk); });
+    child.stderr!.on('data', (chunk) => { stderr += String(chunk); });
     child.on('close', (code) => resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() }));
   });
 }
