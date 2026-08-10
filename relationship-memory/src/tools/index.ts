@@ -89,10 +89,21 @@ export class RelationshipMemoryRuntime {
     readonly semanticRetriever?: SemanticRetriever,
   ) {}
 
-  private trustedEvidence(id: string): CanonicalMessage | undefined {
-    const direct = this.messages.get(id);
-    if (direct) return direct;
-    return [...this.messages.values()].find((message) => canonicalEvidenceId(message) === id);
+  private trustedEvidence(id: string, allowLegacyMessageId = false): { message?: CanonicalMessage; ambiguous?: boolean } {
+    const values = [...this.messages.values()];
+    const exact = values.filter((message) => canonicalEvidenceId(message) === id);
+    if (exact.length === 1) return { message: exact[0] };
+    if (exact.length > 1) return { ambiguous: true };
+    if (!allowLegacyMessageId) return {};
+    const legacy = values.filter((message) => message.message_id === id);
+    if (legacy.length === 1) return { message: legacy[0] };
+    if (legacy.length > 1) return { ambiguous: true };
+    return {};
+  }
+
+  private legacyEvidenceField(raw: unknown): boolean {
+    return !!raw && typeof raw === 'object' && !Array.isArray(raw)
+      && !('evidence_ids' in raw) && 'evidence_message_ids' in raw;
   }
 
   private linkedAssistantIntents(memoryId: string): AssistantRememberIntentRecord[] {
@@ -231,11 +242,13 @@ export class RelationshipMemoryRuntime {
     const validation = validateEntityIdentityProposal(rawProposal, { requireChineseSemanticProse: this.requireChineseSemanticProse });
     if (!validation.ok || !validation.proposal) return this.entityPermanent(batchId, sourceKey, validation.code ?? 'invalid_schema', validation.reason ?? 'Invalid entity proposal.', now);
     const proposal = validation.proposal;
+    const legacyEvidenceField = this.legacyEvidenceField(rawProposal);
     const evidenceMessages: CanonicalMessage[] = [];
-    for (const messageId of proposal.evidence_message_ids) {
-      const message = this.trustedEvidence(messageId);
-      if (!message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${messageId}`, now);
-      evidenceMessages.push(message);
+    for (const evidenceId of proposal.evidence_message_ids) {
+      const resolved = this.trustedEvidence(evidenceId, legacyEvidenceField);
+      if (resolved.ambiguous) return this.entityPermanent(batchId, sourceKey, 'ambiguous_evidence', `Legacy message_id identifies multiple trusted transcript events; use an exact evidence_id: ${evidenceId}`, now);
+      if (!resolved.message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${evidenceId}`, now);
+      evidenceMessages.push(resolved.message);
     }
     const recovered = this.store.getEntityBySourceKey(sourceKey);
     if (recovered) {
@@ -397,9 +410,10 @@ export class RelationshipMemoryRuntime {
     if (!memory) return this.persistPermanent(batchId, sourceKey, 'unknown_memory', `Unknown canonical memory ID: ${memoryId}`, now);
     const messages: CanonicalMessage[] = [];
     for (const id of normalizedIds) {
-      const message = this.trustedEvidence(id);
-      if (!message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
-      messages.push(message);
+      const resolved = this.trustedEvidence(id, legacyEvidenceField);
+      if (resolved.ambiguous) return this.persistPermanent(batchId, sourceKey, 'ambiguous_evidence', `Legacy message_id identifies multiple trusted transcript events; use an exact evidence_id: ${id}`, now);
+      if (!resolved.message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
+      messages.push(resolved.message);
     }
     const originalEvidenceIds = this.originalMemoryEvidenceIds(memory);
     if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now);
@@ -464,6 +478,7 @@ export class RelationshipMemoryRuntime {
     }
 
     const proposal = validation.proposal;
+    const legacyEvidenceField = this.legacyEvidenceField(rawProposal);
     let assistantIntent: AssistantRememberIntentRecord | undefined;
     if (proposal.assistant_intent_id) {
       assistantIntent = this.trustedIntent(proposal.assistant_intent_id);
@@ -485,20 +500,24 @@ export class RelationshipMemoryRuntime {
     }
 
     const evidenceMessages: CanonicalMessage[] = [];
-    for (const messageId of proposal.evidence_message_ids) {
-      const message = this.trustedEvidence(messageId);
-      if (!message) {
-        return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${messageId}`, now, assistantIntent);
+    for (const evidenceId of proposal.evidence_message_ids) {
+      const resolved = this.trustedEvidence(evidenceId, legacyEvidenceField);
+      if (resolved.ambiguous) {
+        return this.persistPermanent(batchId, sourceKey, 'ambiguous_evidence', `Legacy message_id identifies multiple trusted transcript events; use an exact evidence_id: ${evidenceId}`, now, assistantIntent);
       }
-      evidenceMessages.push(message);
+      if (!resolved.message) {
+        return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${evidenceId}`, now, assistantIntent);
+      }
+      evidenceMessages.push(resolved.message);
     }
 
+    const canonicalEvidenceIds = evidenceMessages.map(canonicalEvidenceId);
     const dedupeKey = stableId('dedupe', {
       subject_id: this.store.subjectId,
       kind: proposal.kind,
       summary: proposal.summary,
       participants: proposal.participants,
-      evidence_message_ids: proposal.evidence_message_ids,
+      evidence_message_ids: canonicalEvidenceIds,
       payload: proposal.payload,
       linked_memory_ids: proposal.linked_memory_ids ?? [],
     });
@@ -639,7 +658,7 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
       summary: string,
       participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
       evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Exact evidence_id values copied from the trusted current-batch transcript-event evidence catalog.' },
-      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy compatibility alias for evidence_ids; do not send both.' },
+      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy message_id compatibility alias. A message_id is accepted only when it uniquely identifies one trusted event in the current batch; ambiguous multi-event messages are rejected and require an exact evidence_id. Do not send both fields.' },
       linked_memory_ids: strings,
       assistant_intent_id: {
         type: 'string', minLength: 1,
@@ -703,7 +722,7 @@ export function entityRememberToolSchema(): Record<string, unknown> {
       entity_type: { type: 'string', enum: ['user', 'assistant', 'other'] },
       description: { type: 'string', minLength: 1, description: 'Perspective-neutral Chinese semantic description. Do not write fragile second-person identity such as 琥珀 = 你.' },
       evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },
-      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy compatibility alias for evidence_ids; do not send both.' },
+      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy message_id compatibility alias. A message_id is accepted only when it uniquely identifies one trusted event in the current batch; ambiguous multi-event messages are rejected and require an exact evidence_id. Do not send both fields.' },
     },
   };
 }
@@ -712,7 +731,7 @@ export function memoryReinforceToolSchema(): Record<string, unknown> {
   return { type: 'object', additionalProperties: false, required: ['memory_id'], oneOf: [{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }], properties: {
     memory_id: { type: 'string', minLength: 1, description: 'Existing canonical memory_id selected after memory_search.' },
     evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Exact transcript-event evidence_id values from the trusted current-batch catalog that support the same underlying memory.' },
-    evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Legacy compatibility alias for evidence_ids; do not send both.' },
+    evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Legacy message_id compatibility alias. A message_id is accepted only when it uniquely identifies one trusted event in the current batch; ambiguous multi-event messages are rejected and require an exact evidence_id. Do not send both fields.' },
   } };
 }
 

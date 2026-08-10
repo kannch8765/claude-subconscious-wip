@@ -68,6 +68,47 @@ describe('canonical transcript-event evidence', () => {
     expect(legacyRuntime.remember('batch-old', legacyProposal).outcome).toBe('accepted');
   });
 
+  it('resolves legacy message IDs only for a unique new event and rejects ambiguous multi-block messages', () => {
+    const events = buildCanonicalMessages([
+      { type: 'user', uuid: 'u1', timestamp: '2026-08-10T00:00:00Z', message: { content: [{ type: 'text', text: '猫喜欢画画。' }] } },
+      { type: 'user', uuid: 'u2', timestamp: '2026-08-10T00:01:00Z', message: { content: [{ type: 'text', text: '猫今天又画了一张。' }] } },
+    ] as any[], -1, 'conv-legacy-crossing');
+    const store = new RelationshipMemoryStore(tempDir(), 'subject');
+    const runtime = new RelationshipMemoryRuntime(store, new Map(events.map((event) => [event.evidence_id!, event])), () => '2026-08-10T01:00:00Z');
+    const remembered = runtime.remember('legacy-create', {
+      schema_version: 1, kind: 'personal_experience', summary: '猫喜欢画画', participants: ['user'],
+      evidence_message_ids: ['u1'], payload: { title: '画画', experience: '猫喜欢画画。' },
+    });
+    expect(remembered.outcome).toBe('accepted');
+    expect(store.listEvidence().find((item) => item.memory_id === remembered.memory_id)?.source_evidence_id).toBe(events[0].evidence_id);
+    expect(runtime.reinforce('legacy-reinforce', { memory_id: remembered.memory_id!, evidence_message_ids: ['u2'] }).outcome).toBe('accepted');
+    expect(runtime.rememberEntity('legacy-entity', {
+      schema_version: 1, canonical_name: '猫', aliases: ['猫'], entity_type: 'user', description: '对话中的用户身份', evidence_message_ids: ['u1'],
+    }).outcome).toBe('accepted');
+    expect(runtime.remember('exact-id-does-not-accept-message-id', {
+      schema_version: 1, kind: 'personal_experience', summary: '精确证据 ID 不降级', participants: ['user'],
+      evidence_ids: ['u1'], payload: { title: '精确 ID', experience: '精确 evidence_ids 不接受 message_id。' },
+    }).rejection_code).toBe('unresolvable_evidence');
+
+    const ambiguousEvents = buildCanonicalMessages([
+      { type: 'assistant', uuid: 'a-multi', timestamp: '2026-08-10T00:02:00Z', message: { content: [
+        { type: 'text', text: '先说一句。' },
+        { type: 'tool_use', id: 'toolu_multi', name: 'Write', input: { file_path: 'diary.md', content: '再写一段。' } },
+      ] } },
+    ] as any[], -1, 'conv-ambiguous');
+    const ambiguousStore = new RelationshipMemoryStore(tempDir(), 'subject');
+    const ambiguousRuntime = new RelationshipMemoryRuntime(ambiguousStore, new Map(ambiguousEvents.map((event) => [event.evidence_id!, event])), () => '2026-08-10T01:00:00Z');
+    const legacyAmbiguous = ambiguousRuntime.remember('ambiguous', {
+      schema_version: 1, kind: 'relationship_event', summary: '旧消息 ID 不能塌缩多事件', participants: ['assistant'],
+      evidence_message_ids: ['a-multi'], payload: { event: '同一消息包含多个证据事件', meaning: '必须使用精确的后端 evidence_id' },
+    });
+    expect(legacyAmbiguous).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'ambiguous_evidence' }));
+    expect(ambiguousRuntime.remember('exact-after-ambiguous', {
+      schema_version: 1, kind: 'relationship_event', summary: '精确事件 ID 可继续使用', participants: ['assistant'],
+      evidence_ids: [ambiguousEvents[1].evidence_id!], payload: { event: '精确选择工具事件', meaning: '保留 block 级证据来源' },
+    }).outcome).toBe('accepted');
+  });
+
   it('keeps Task 093T observer builtin-tool isolation unchanged', () => {
     expect(RELATIONSHIP_ALLOWED_BUILTIN_TOOLS).toEqual([]);
     expect(RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS).toContain('Bash');
