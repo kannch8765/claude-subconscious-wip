@@ -504,6 +504,7 @@ Every canonical outcome must remain traceable to the immutable legacy_source_id.
 The legacy source subject_id is immutable provenance/import identity only; it must not constrain or replace the canonical target subject chosen by the relationship-memory runtime.
 Preserve source-faithful actor identity and attribution. Explicit names, aliases, model names, and who-did-what relationships in the legacy source must not be renamed, normalized, or reassigned when carried into canonical prose.
 Never infer that two named actors are the same identity, and never substitute Kohaku, the current agent identity, or source ownership for a named actor unless the legacy source itself explicitly states that equivalence. If identity or attribution is ambiguous, preserve the source wording or omit the uncertain attribution rather than inventing one.
+Keep semantic ownership aligned with source attribution: user_preference is only for a preference of the user. Never encode an assistant or third-party trait, preference, or behavior as user_preference, and never use participants to imply a different actor than the source states.
 For feel/ sources, preserve historical temporality: first-person feeling prose records what Kohaku felt when authored and must not be rewritten as an assertion of Kohaku's current feeling without independent current evidence. Raw feel prose is not automatically ordinary recall text.
 Legacy embeddings, dehydration summaries, and cooldown databases are derived artifacts and are never primary source truth.
 `.trim();

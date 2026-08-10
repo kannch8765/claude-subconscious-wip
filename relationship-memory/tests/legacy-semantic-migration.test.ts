@@ -77,6 +77,8 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(LEGACY_OBSERVER_CONTRACT).toContain('must not be renamed, normalized, or reassigned');
     expect(LEGACY_OBSERVER_CONTRACT).toContain('Never infer that two named actors are the same identity');
     expect(LEGACY_OBSERVER_CONTRACT).toContain('never substitute Kohaku, the current agent identity, or source ownership for a named actor');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('user_preference is only for a preference of the user');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('Never encode an assistant or third-party trait, preference, or behavior as user_preference');
   });
 
   it('terminates a zero-memory source with a durable receipt and checkpoint without provenance', async () => {
