@@ -88,7 +88,8 @@ async function main(): Promise<void> {
 
   const apiKey = process.env.LETTA_API_KEY;
   if (!apiKey) throw new Error('LETTA_API_KEY is required for legacy semantic backfill.');
-  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID ?? 'local-user';
+  // RELATIONSHIP_MEMORY_SUBJECT_ID is the canonical relationship-memory target; legacy source identity remains bound to each immutable source record.
+  const canonicalSubjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID ?? 'local-user';
   const agentId = await getBackfillAgentId(apiKey, (message) => console.error(`[legacy-backfill] ${message}`));
   const state = loadLegacySemanticState(statePath, manifestDigest);
   if (state.agent_id && state.agent_id !== agentId) {
@@ -108,7 +109,7 @@ async function main(): Promise<void> {
     processor: async (source, batchId) => {
       const conversationId = await createConversation(apiKey, agentId, () => {});
       return runLegacySemanticObserverSource({
-        agentId, conversationId, source, batchId, rootDir, subjectId, cwd,
+        agentId, conversationId, source, batchId, rootDir, subjectId: canonicalSubjectId, cwd,
         log: (message) => console.error(`[legacy-backfill] ${message}`),
       });
     },
