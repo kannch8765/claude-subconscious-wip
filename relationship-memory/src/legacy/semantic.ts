@@ -1,0 +1,420 @@
+import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import type { CanonicalMemoryRecord, OwnerSemanticContent, ReinforcementRecord } from '../schema/index.js';
+import { validateSemanticContent } from '../schema/index.js';
+import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
+import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
+import {
+  LegacyMemorySourceStore,
+  type LegacyAssistantMemorySourceRecord,
+  type LegacyMemoryProvenanceLink,
+} from './index.js';
+
+export const LEGACY_FEEL_TEMPORALITY = 'historical_at_source_time' as const;
+
+export type LegacySemanticCompletion = 'completed' | 'no_memory_required' | 'retryable_failure';
+
+export interface LegacySemanticMutationResult {
+  outcome: 'created' | 'duplicate_link' | 'reinforced' | 'permanently_rejected' | 'retryable_failed';
+  memory_id?: string;
+  reason?: string;
+}
+
+export interface LegacySemanticState {
+  schema_version: 1;
+  manifest_digest: string;
+  processed_source_ids: string[];
+  agent_id?: string;
+  conversation_id?: string;
+}
+
+export interface LegacySemanticReceipt {
+  schema_version: 1;
+  receipt_id: string;
+  manifest_digest: string;
+  legacy_source_id: string;
+  batch_id: string;
+  result: LegacySemanticCompletion;
+  provenance_ids: string[];
+  memory_ids: string[];
+  recorded_at: string;
+  reason?: string;
+}
+
+export interface LegacySemanticProcessorResult {
+  completion: LegacySemanticCompletion;
+  reason?: string;
+}
+
+export interface RunLegacySemanticMigrationOptions {
+  rootDir: string;
+  statePath?: string;
+  maxRecords?: number;
+  sourceIds?: string[];
+  dryRun?: boolean;
+  processor: (source: LegacyAssistantMemorySourceRecord, batchId: string) => Promise<LegacySemanticProcessorResult>;
+}
+
+export interface LegacySemanticRunResult {
+  status: 'completed' | 'no-op' | 'blocked-failure' | 'dry-run';
+  manifest_digest?: string;
+  processed: number;
+  remaining: number;
+  source_id?: string;
+  detail?: string;
+}
+
+function atomicWriteJson(file: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp-${process.pid}-${crypto.randomUUID()}`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  fs.renameSync(tmp, file);
+}
+
+function readJsonl<T>(file: string): T[] {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
+}
+
+function appendJsonl(file: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.appendFileSync(file, `${JSON.stringify(value)}\n`, 'utf8');
+}
+
+function semanticShape(content: OwnerSemanticContent): string {
+  return stableJson({
+    kind: content.kind,
+    summary: content.summary,
+    participants: content.participants,
+    payload: content.payload,
+    linked_memory_ids: content.linked_memory_ids ?? [],
+  });
+}
+
+function memoryContent(memory: CanonicalMemoryRecord): OwnerSemanticContent {
+  return {
+    kind: memory.kind,
+    summary: memory.summary,
+    participants: memory.participants,
+    payload: memory.payload,
+    ...(memory.linked_memory_ids ? { linked_memory_ids: memory.linked_memory_ids } : {}),
+  };
+}
+
+export class LegacySemanticMutationRuntime {
+  private completion?: 'completed' | 'no_memory_required';
+  readonly canonicalStore: RelationshipMemoryStore;
+  readonly legacyStore: LegacyMemorySourceStore;
+
+  constructor(
+    readonly rootDir: string,
+    readonly subjectId: string,
+    readonly source: LegacyAssistantMemorySourceRecord,
+    readonly batchId: string,
+    readonly now: () => string = () => new Date().toISOString(),
+  ) {
+    this.canonicalStore = new RelationshipMemoryStore(rootDir, subjectId);
+    this.legacyStore = new LegacyMemorySourceStore(rootDir);
+    if (source.subject_id !== subjectId) throw new Error(`Legacy source subject mismatch: ${source.legacy_source_id}`);
+  }
+
+  provenance(): LegacyMemoryProvenanceLink[] {
+    return this.legacyStore.listProvenance().filter((item) => item.legacy_source_id === this.source.legacy_source_id);
+  }
+
+  completionState(): 'completed' | 'no_memory_required' | undefined { return this.completion; }
+
+  private validateCreateInput(raw: unknown): { ok: true; content: OwnerSemanticContent } | { ok: false; reason: string } {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return { ok: false, reason: 'legacy memory proposal must be an object' };
+    const input = raw as Record<string, unknown>;
+    const allowed = new Set(['schema_version', 'kind', 'summary', 'participants', 'payload', 'linked_memory_ids', 'historical_temporality']);
+    for (const key of Object.keys(input)) if (!allowed.has(key)) return { ok: false, reason: `unknown legacy proposal field: ${key}` };
+    if (this.source.bucket_type === 'feel' && input.historical_temporality !== LEGACY_FEEL_TEMPORALITY) {
+      return { ok: false, reason: `feel/ sources require historical_temporality=${LEGACY_FEEL_TEMPORALITY}` };
+    }
+    const semantic = validateSemanticContent({
+      schema_version: input.schema_version,
+      kind: input.kind,
+      summary: input.summary,
+      participants: input.participants,
+      payload: input.payload,
+      ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}),
+    }, { requireChineseSemanticProse: true });
+    if (!semantic.ok || !semantic.content) return { ok: false, reason: `${semantic.code ?? 'invalid_schema'}: ${semantic.reason ?? 'invalid semantic content'}` };
+    for (const memoryId of semantic.content.linked_memory_ids ?? []) {
+      if (!this.canonicalStore.getMemory(memoryId)) return { ok: false, reason: `unknown linked memory: ${memoryId}` };
+    }
+    return { ok: true, content: semantic.content };
+  }
+
+  createMemory(raw: unknown): LegacySemanticMutationResult {
+    if (this.completion) return { outcome: 'permanently_rejected', reason: 'source already completed in this observer session' };
+    const validated = this.validateCreateInput(raw);
+    if ('reason' in validated) return { outcome: 'permanently_rejected', reason: validated.reason };
+    const content = validated.content;
+    const sourceKey = stableId('legacy_memory_src', { legacy_source_id: this.source.legacy_source_id, semantic: content });
+
+    const recovered = this.canonicalStore.getMemoryBySourceKey(sourceKey);
+    if (recovered) {
+      this.legacyStore.appendProvenance({
+        legacy_source_id: this.source.legacy_source_id,
+        canonical_memory_id: recovered.memory_id,
+        disposition: 'created',
+        recorded_at: this.now(),
+      });
+      return { outcome: 'duplicate_link', memory_id: recovered.memory_id };
+    }
+
+    const targetShape = semanticShape(content);
+    const effective = new RelationshipMemoryOwnerControlPlane(this.canonicalStore).listEffective();
+    const duplicate = effective.find((candidate) => semanticShape(candidate) === targetShape);
+    if (duplicate) {
+      this.legacyStore.appendProvenance({
+        legacy_source_id: this.source.legacy_source_id,
+        canonical_memory_id: duplicate.memory_id,
+        disposition: 'duplicate_link',
+        recorded_at: this.now(),
+      });
+      return { outcome: 'duplicate_link', memory_id: duplicate.memory_id };
+    }
+
+    const memoryId = stableId('mem', { subject_id: this.subjectId, source_key: sourceKey });
+    const memory: CanonicalMemoryRecord = {
+      schema_version: 1,
+      memory_id: memoryId,
+      subject_id: this.subjectId,
+      ...content,
+      status: 'active',
+      observed_at: this.source.created_at_utc,
+      created_at: this.now(),
+      source_key: sourceKey,
+      dedupe_key: stableId('dedupe', { subject_id: this.subjectId, semantic: content }),
+    };
+    try {
+      this.canonicalStore.appendMemory(memory, []);
+      this.legacyStore.appendProvenance({
+        legacy_source_id: this.source.legacy_source_id,
+        canonical_memory_id: memoryId,
+        disposition: 'created',
+        recorded_at: this.now(),
+      });
+      return { outcome: 'created', memory_id: memoryId };
+    } catch (error) {
+      return { outcome: 'retryable_failed', reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  duplicateLink(memoryId: string): LegacySemanticMutationResult {
+    if (this.completion) return { outcome: 'permanently_rejected', reason: 'source already completed in this observer session' };
+    const memory = this.canonicalStore.getMemory(memoryId);
+    if (!memory) return { outcome: 'permanently_rejected', reason: `unknown canonical memory: ${memoryId}` };
+    try {
+      this.legacyStore.appendProvenance({
+        legacy_source_id: this.source.legacy_source_id,
+        canonical_memory_id: memoryId,
+        disposition: 'duplicate_link',
+        recorded_at: this.now(),
+      });
+      return { outcome: 'duplicate_link', memory_id: memoryId };
+    } catch (error) {
+      return { outcome: 'retryable_failed', reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  reinforce(memoryId: string): LegacySemanticMutationResult {
+    if (this.completion) return { outcome: 'permanently_rejected', reason: 'source already completed in this observer session' };
+    const memory = this.canonicalStore.getMemory(memoryId);
+    if (!memory) return { outcome: 'permanently_rejected', reason: `unknown canonical memory: ${memoryId}` };
+    const reinforcement: ReinforcementRecord = {
+      schema_version: 1,
+      reinforcement_id: stableId('legacy_reinforce', { legacy_source_id: this.source.legacy_source_id, memory_id: memoryId }),
+      memory_id: memoryId,
+      batch_id: this.batchId,
+      evidence_ids: [],
+      latest_evidence_at: this.source.last_active_at_utc,
+      recorded_at: this.now(),
+    };
+    try {
+      this.canonicalStore.appendReinforcement(reinforcement, []);
+      this.legacyStore.appendProvenance({
+        legacy_source_id: this.source.legacy_source_id,
+        canonical_memory_id: memoryId,
+        disposition: 'reinforced',
+        recorded_at: this.now(),
+      });
+      return { outcome: 'reinforced', memory_id: memoryId };
+    } catch (error) {
+      return { outcome: 'retryable_failed', reason: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  complete(kind: 'completed' | 'no_memory_required'): { completion: 'completed' | 'no_memory_required' } | { error: string } {
+    if (this.completion) return { completion: this.completion };
+    const provenance = this.provenance();
+    if (kind === 'no_memory_required' && provenance.length > 0) return { error: 'no_memory_required is invalid after canonical provenance was written' };
+    if (kind === 'completed' && provenance.length === 0) return { error: 'completed requires at least one canonical provenance outcome' };
+    this.completion = kind;
+    return { completion: kind };
+  }
+}
+
+export function legacyMemoryCreateToolSchema(source: LegacyAssistantMemorySourceRecord): Record<string, unknown> {
+  const string = { type: 'string', minLength: 1 };
+  const strings = { type: 'array', uniqueItems: true, items: string };
+  return {
+    type: 'object', additionalProperties: false,
+    required: ['schema_version', 'kind', 'summary', 'participants', 'payload', ...(source.bucket_type === 'feel' ? ['historical_temporality'] : [])],
+    properties: {
+      schema_version: { type: 'integer', enum: [1] },
+      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'] },
+      summary: string,
+      participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
+      linked_memory_ids: strings,
+      historical_temporality: { type: 'string', enum: [LEGACY_FEEL_TEMPORALITY], description: 'Required for feel/ sources: this prose describes the historical source-time feeling, never a current-state assertion.' },
+      payload: {
+        type: 'object',
+        description: 'Kind-specific canonical relationship-memory payload. DS-authored semantic prose must be Chinese; source-faithful names/triggers may remain literal.',
+      },
+    },
+  };
+}
+
+export function legacyMemoryExistingToolSchema(): Record<string, unknown> {
+  return { type: 'object', additionalProperties: false, required: ['memory_id'], properties: { memory_id: { type: 'string', minLength: 1 } } };
+}
+
+export function legacySourceCompleteToolSchema(): Record<string, unknown> {
+  return { type: 'object', additionalProperties: false, required: ['result'], properties: { result: { type: 'string', enum: ['completed', 'no_memory_required'] } } };
+}
+
+export function legacySemanticBatchId(manifestDigest: string, sourceId: string): string {
+  return stableId('legacy_semantic_batch', { manifest_digest: manifestDigest, legacy_source_id: sourceId });
+}
+
+export function loadLegacySemanticState(file: string, manifestDigest: string): LegacySemanticState {
+  if (!fs.existsSync(file)) return { schema_version: 1, manifest_digest: manifestDigest, processed_source_ids: [] };
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf8')) as LegacySemanticState;
+  if (parsed.schema_version !== 1 || !Array.isArray(parsed.processed_source_ids)) throw new Error('malformed legacy semantic migration state');
+  if (parsed.manifest_digest !== manifestDigest) throw new Error('legacy semantic migration state is bound to a different manifest');
+  return parsed;
+}
+
+export function saveLegacySemanticState(file: string, state: LegacySemanticState): void { atomicWriteJson(file, state); }
+
+export function listLegacySemanticReceipts(rootDir: string): LegacySemanticReceipt[] {
+  return readJsonl<LegacySemanticReceipt>(path.join(rootDir, 'legacy-semantic-receipts.jsonl'));
+}
+
+function receiptId(receipt: Omit<LegacySemanticReceipt, 'schema_version' | 'receipt_id' | 'recorded_at'>): string {
+  return stableId('legacy_semantic_receipt', receipt);
+}
+
+function appendSemanticReceipt(rootDir: string, receipt: LegacySemanticReceipt): LegacySemanticReceipt {
+  const file = path.join(rootDir, 'legacy-semantic-receipts.jsonl');
+  const existing = listLegacySemanticReceipts(rootDir).find((item) => item.receipt_id === receipt.receipt_id);
+  if (existing) return existing;
+  appendJsonl(file, receipt);
+  return receipt;
+}
+
+function terminalReceipt(rootDir: string, sourceId: string): LegacySemanticReceipt | undefined {
+  return [...listLegacySemanticReceipts(rootDir)].reverse().find((item) => item.legacy_source_id === sourceId && item.result !== 'retryable_failure');
+}
+
+function remainingCount(sources: LegacyAssistantMemorySourceRecord[], processed: Set<string>, selected?: Set<string>): number {
+  return sources.filter((source) => (!selected || selected.has(source.legacy_source_id)) && !processed.has(source.legacy_source_id)).length;
+}
+
+export async function runLegacySemanticMigration(options: RunLegacySemanticMigrationOptions): Promise<LegacySemanticRunResult> {
+  const rootDir = path.resolve(options.rootDir);
+  const statePath = path.resolve(options.statePath ?? path.join(rootDir, 'legacy-semantic-migration-state.json'));
+  const legacyStore = new LegacyMemorySourceStore(rootDir);
+  const sources = legacyStore.listSources();
+  if (sources.length === 0) return { status: 'no-op', processed: 0, remaining: 0, detail: 'no legacy assistant sources found' };
+  const manifestDigests = [...new Set(sources.map((source) => source.manifest_digest))];
+  if (manifestDigests.length !== 1) throw new Error('legacy semantic sources span multiple manifest digests');
+  const manifestDigest = manifestDigests[0];
+  const state = loadLegacySemanticState(statePath, manifestDigest);
+  const processed = new Set(state.processed_source_ids);
+  const selected = options.sourceIds?.length ? new Set(options.sourceIds) : undefined;
+  if (selected) {
+    const known = new Set(sources.map((source) => source.legacy_source_id));
+    const missing = [...selected].filter((id) => !known.has(id));
+    if (missing.length) throw new Error(`unknown legacy source id(s): ${missing.join(', ')}`);
+  }
+  for (const sourceId of processed) {
+    if (!terminalReceipt(rootDir, sourceId)) throw new Error(`semantic state marks source processed without terminal receipt: ${sourceId}`);
+  }
+
+  const candidates = sources.filter((source) => (!selected || selected.has(source.legacy_source_id)) && !processed.has(source.legacy_source_id));
+  const maxRecords = options.maxRecords ?? Number.POSITIVE_INFINITY;
+  const planned = candidates.slice(0, maxRecords);
+  if (options.dryRun) return { status: 'dry-run', manifest_digest: manifestDigest, processed: 0, remaining: candidates.length };
+  if (planned.length === 0) return { status: 'no-op', manifest_digest: manifestDigest, processed: 0, remaining: 0 };
+
+  let completedCount = 0;
+  for (const source of planned) {
+    const recovered = terminalReceipt(rootDir, source.legacy_source_id);
+    if (recovered) {
+      legacyStore.withMutationBoundary(() => {
+        if (!processed.has(source.legacy_source_id)) {
+          state.processed_source_ids.push(source.legacy_source_id);
+          saveLegacySemanticState(statePath, state);
+          processed.add(source.legacy_source_id);
+        }
+      });
+      completedCount += 1;
+      continue;
+    }
+
+    const batchId = legacySemanticBatchId(manifestDigest, source.legacy_source_id);
+    const result = await options.processor(source, batchId);
+    const provenance = legacyStore.listProvenance().filter((item) => item.legacy_source_id === source.legacy_source_id);
+    let failure: string | undefined;
+    if (result.completion === 'completed' && provenance.length === 0) failure = 'observer completed without canonical provenance';
+    if (result.completion === 'no_memory_required' && provenance.length > 0) failure = 'observer returned no_memory_required after canonical provenance was written';
+    const effectiveCompletion: LegacySemanticCompletion = failure ? 'retryable_failure' : result.completion;
+    const memoryIds = [...new Set(provenance.map((item) => item.canonical_memory_id))].sort();
+    const provenanceIds = provenance.map((item) => item.provenance_id).sort();
+    const receiptCore = {
+      manifest_digest: manifestDigest,
+      legacy_source_id: source.legacy_source_id,
+      batch_id: batchId,
+      result: effectiveCompletion,
+      provenance_ids: provenanceIds,
+      memory_ids: memoryIds,
+      ...((failure ?? result.reason) ? { reason: failure ?? result.reason } : {}),
+    } as const;
+    const receipt: LegacySemanticReceipt = {
+      schema_version: 1,
+      receipt_id: receiptId(receiptCore),
+      ...receiptCore,
+      recorded_at: new Date().toISOString(),
+    };
+
+    if (effectiveCompletion === 'retryable_failure') {
+      legacyStore.withMutationBoundary(() => appendSemanticReceipt(rootDir, receipt));
+      return {
+        status: 'blocked-failure', manifest_digest: manifestDigest, processed: completedCount,
+        remaining: remainingCount(sources, processed, selected), source_id: source.legacy_source_id,
+        detail: receipt.reason ?? 'legacy semantic observer retryable failure',
+      };
+    }
+
+    legacyStore.withMutationBoundary(() => {
+      appendSemanticReceipt(rootDir, receipt);
+      if (!processed.has(source.legacy_source_id)) {
+        state.processed_source_ids.push(source.legacy_source_id);
+        saveLegacySemanticState(statePath, state);
+        processed.add(source.legacy_source_id);
+      }
+    });
+    completedCount += 1;
+  }
+
+  return {
+    status: 'completed', manifest_digest: manifestDigest, processed: completedCount,
+    remaining: remainingCount(sources, processed, selected),
+  };
+}

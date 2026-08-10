@@ -11,5 +11,6 @@ export * from './admin/index.js';
 export * from './recall/index.js';
 export * from './backfill/index.js';
 export * from './legacy/index.js';
+export * from './legacy/semantic.js';
 
 export * from './retrieval/index.js';

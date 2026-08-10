@@ -31,7 +31,8 @@
     "send": "tsx scripts/send_messages_to_letta.ts",
     "test": "vitest run",
     "test:watch": "vitest",
-    "backfill": "tsx scripts/relationship_memory_backfill.ts"
+    "backfill": "tsx scripts/relationship_memory_backfill.ts",
+    "legacy-backfill": "tsx scripts/legacy_semantic_backfill.ts"
   },
   "dependencies": {
     "@letta-ai/letta-code-sdk": "0.1.12",

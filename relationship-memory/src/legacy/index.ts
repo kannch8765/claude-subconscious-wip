@@ -347,9 +347,13 @@ export class LegacyMemorySourceStore {
         ...link,
       };
       const existing = this.listProvenance().find((item) => item.provenance_id === record.provenance_id);
-      if (existing && stableJson(existing) !== stableJson(record)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
-      if (!existing) appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
-      return existing ?? record;
+      if (existing) {
+        const comparable = { ...record, recorded_at: existing.recorded_at };
+        if (stableJson(existing) !== stableJson(comparable)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
+        return existing;
+      }
+      appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
+      return record;
     });
   }
   memoriesForSource(sourceId: string): string[] { return this.listProvenance().filter((item) => item.legacy_source_id === sourceId).map((item) => item.canonical_memory_id); }
@@ -364,8 +368,15 @@ export class LegacyMemorySourceStore {
 
 export function resolveLegacyLineage(source: LegacyAssistantMemorySourceRecord, allSources: LegacyAssistantMemorySourceRecord[]): { supersedes?: string; superseded_by?: string } {
   const byBucketId = new Map(allSources.map((item) => [item.bucket_id, item.legacy_source_id]));
-  const supersedes = typeof source.frontmatter.supersedes === 'string' ? byBucketId.get(String(source.frontmatter.supersedes)) : undefined;
-  const supersededBy = typeof source.frontmatter.superseded_by === 'string' ? byBucketId.get(String(source.frontmatter.superseded_by)) : undefined;
+  const normalizeRef = (value: unknown): string | undefined => {
+    if (typeof value !== 'string' && typeof value !== 'number') return undefined;
+    const normalized = String(value).trim();
+    return normalized || undefined;
+  };
+  const supersedesRef = normalizeRef(source.frontmatter.supersedes);
+  const supersededByRef = normalizeRef(source.frontmatter.superseded_by);
+  const supersedes = supersedesRef ? byBucketId.get(supersedesRef) : undefined;
+  const supersededBy = supersededByRef ? byBucketId.get(supersededByRef) : undefined;
   return { ...(supersedes ? { supersedes } : {}), ...(supersededBy ? { superseded_by: supersededBy } : {}) };
 }
 
