@@ -502,6 +502,8 @@ One source may semantically yield zero, one, or many canonical relationship memo
 For each semantic item, choose among: no canonical memory required; provenance-link an existing duplicate; reinforce an existing canonical memory; create a canonical memory; and use existing relationship-memory linking where appropriate.
 Every canonical outcome must remain traceable to the immutable legacy_source_id.
 The legacy source subject_id is immutable provenance/import identity only; it must not constrain or replace the canonical target subject chosen by the relationship-memory runtime.
+Preserve source-faithful actor identity and attribution. Explicit names, aliases, model names, and who-did-what relationships in the legacy source must not be renamed, normalized, or reassigned when carried into canonical prose.
+Never infer that two named actors are the same identity, and never substitute Kohaku, the current agent identity, or source ownership for a named actor unless the legacy source itself explicitly states that equivalence. If identity or attribution is ambiguous, preserve the source wording or omit the uncertain attribution rather than inventing one.
 For feel/ sources, preserve historical temporality: first-person feeling prose records what Kohaku felt when authored and must not be rewritten as an assertion of Kohaku's current feeling without independent current evidence. Raw feel prose is not automatically ordinary recall text.
 Legacy embeddings, dehydration summaries, and cooldown databases are derived artifacts and are never primary source truth.
 `.trim();

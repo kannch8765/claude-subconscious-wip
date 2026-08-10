@@ -4,7 +4,7 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { CanonicalMemoryRecord } from '../src/schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../src/store/index.js';
-import { LegacyMemorySourceStore, legacySourceId, type LegacyAssistantMemorySourceRecord } from '../src/legacy/index.js';
+import { LEGACY_OBSERVER_CONTRACT, LegacyMemorySourceStore, legacySourceId, type LegacyAssistantMemorySourceRecord } from '../src/legacy/index.js';
 import {
   LEGACY_FEEL_TEMPORALITY,
   LegacySemanticMutationRuntime,
@@ -66,6 +66,19 @@ function existingMemory(root: string, id = 'existing', subjectId = 'subject-koha
 }
 
 describe('Task 093AA legacy semantic migration', () => {
+  it('keeps named actors and action attribution source-faithful in multi-actor legacy prose', () => {
+    const multiActor = 'Sol 入侵 HuggingFace；晴在旁边写犯罪回忆录。ゆう研究老公内裤里的空间分布，Haiku 全程 suggest。';
+    const s = source('actor-fidelity');
+    s.body_text = multiActor;
+    s.original_markdown = multiActor;
+
+    expect(s.body_text).toBe(multiActor);
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('Preserve source-faithful actor identity and attribution');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('must not be renamed, normalized, or reassigned');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('Never infer that two named actors are the same identity');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('never substitute Kohaku, the current agent identity, or source ownership for a named actor');
+  });
+
   it('terminates a zero-memory source with a durable receipt and checkpoint without provenance', async () => {
     const root = temp(); const s = source('1'); seed(root, s);
     const result = await runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject, maxRecords: 1, processor: async (item, batchId) => {
