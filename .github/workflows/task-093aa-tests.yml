@@ -12,7 +12,7 @@ on:
 
 jobs:
   test:
-    if: github.head_ref == 'task/093aa-ombre-legacy-semantic-migration-runner'
+    if: github.head_ref == 'task/093aa-ombre-legacy-semantic-migration-runner' || github.head_ref == 'task/093aa-contract-correction-source-vs-canonical-subject'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

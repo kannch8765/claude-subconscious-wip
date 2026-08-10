@@ -54,10 +54,10 @@ function sharedProposal(name = '京都旅行') {
 function preferenceProposal() {
   return { schema_version: 1, kind: 'user_preference', summary: '猫喜欢偏蓝调的滤镜风格', participants: ['user'], payload: { topic: '滤镜风格', preference: '猫偏好蓝调滤镜', context: '拍照时会优先尝试偏蓝调版本' } };
 }
-function existingMemory(root: string, id = 'existing'): CanonicalMemoryRecord {
-  const store = new RelationshipMemoryStore(root, 'subject-kohaku');
+function existingMemory(root: string, id = 'existing', subjectId = 'subject-kohaku'): CanonicalMemoryRecord {
+  const store = new RelationshipMemoryStore(root, subjectId);
   const memory: CanonicalMemoryRecord = {
-    schema_version: 1, memory_id: id, subject_id: 'subject-kohaku', kind: 'user_preference', summary: '猫喜欢偏蓝调的滤镜风格', participants: ['user'],
+    schema_version: 1, memory_id: id, subject_id: subjectId, kind: 'user_preference', summary: '猫喜欢偏蓝调的滤镜风格', participants: ['user'],
     payload: { topic: '滤镜风格', preference: '猫偏好蓝调滤镜', context: '拍照时会优先尝试偏蓝调版本' }, status: 'active',
     observed_at: '2026-05-01T00:00:00Z', created_at: '2026-05-01T00:00:00Z', source_key: `src-${id}`, dedupe_key: `dedupe-${id}`,
   };
@@ -167,6 +167,37 @@ describe('Task 093AA legacy semantic migration', () => {
     await expect(runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject, statePath: path.join(root, 'bad-state.json'), processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/different manifest/);
     fs.writeFileSync(path.join(root, 'legacy-semantic-migration-state.json'), JSON.stringify({ schema_version: 1, manifest_digest: manifest, canonical_subject_id: canonicalSubject, processed_source_ids: [s.legacy_source_id] }));
     await expect(runLegacySemanticMigration({ rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject, processor: async () => ({ completion: 'no_memory_required' }) })).rejects.toThrow(/without terminal receipt/);
+  });
+
+  it('isolates semantic provenance from the same legacy source under another canonical subject', async () => {
+    const root = temp(); const s = source('subject-provenance-isolation'); const legacy = seed(root, s);
+    const subjectA = 'subject-a'; const subjectB = 'subject-b';
+    const memoryA = existingMemory(root, 'memory-a', subjectA);
+    legacy.appendProvenance({
+      legacy_source_id: s.legacy_source_id,
+      canonical_memory_id: memoryA.memory_id,
+      disposition: 'created',
+      recorded_at: '2026-08-11T00:00:00Z',
+    });
+
+    const result = await runLegacySemanticMigration({
+      rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: subjectB,
+      processor: async (item, batchId) => {
+        const runtime = new LegacySemanticMutationRuntime(root, subjectB, item, batchId, () => '2026-08-11T00:01:00Z');
+        expect(runtime.provenance()).toEqual([]);
+        expect(runtime.complete('no_memory_required')).toEqual({ completion: 'no_memory_required' });
+        return { completion: 'no_memory_required' };
+      },
+    });
+
+    expect(result.status).toBe('completed');
+    expect(legacy.listProvenance()).toHaveLength(1);
+    expect(listLegacySemanticReceipts(root)[0]).toMatchObject({
+      canonical_subject_id: subjectB,
+      result: 'no_memory_required',
+      provenance_ids: [],
+      memory_ids: [],
+    });
   });
 
   it('binds semantic state and terminal receipts to the canonical target subject', async () => {
