@@ -57,7 +57,16 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
   try {
     disableLettaCodeAutoUpdater();
     const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
-    const relationshipTools = buildRelationshipTools(runtime, input.batchId, jsonResult);
+    const relationshipTools = buildRelationshipTools(runtime, input.batchId, jsonResult).map((tool) => {
+      if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
+      const execute = tool.execute.bind(tool);
+      return {
+        ...tool,
+        async execute(toolCallId: string, args: unknown) {
+          return runtime.store.withMutationBoundary(() => execute(toolCallId, args));
+        },
+      };
+    });
     const resume = resumeSession as any;
     session = resume(input.conversationId, {
       disallowedTools: [...RELATIONSHIP_DISALLOWED_CLIENT_TOOLS],
@@ -96,7 +105,7 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
     if (session) session.close();
   }
 
-  const completion = runtime.finalizeBatch(input.batchId, sessionSucceeded);
+  const completion = runtime.store.withMutationBoundary(() => runtime.finalizeBatch(input.batchId, sessionSucceeded));
   if (completion === 'completed') {
     const apiKey = process.env.LETTA_API_KEY;
     if (apiKey) {
