@@ -326,13 +326,13 @@ describe('observer contract correction', () => {
 });
 
 describe('adopted SDK/configuration boundary', () => {
-  it('registers memory and entity semantic tools plus read-only investigation tools', async () => {
+  it('registers only relationship semantic tools and denies every builtin tool', async () => {
     const rt = runtime(); rt.store.beginBatch('tools', '2026-01-01T00:00:00.000Z');
     const tools = buildRelationshipTools(rt, 'tools');
     expect(tools.map((t) => t.name)).toEqual(['memory_search', 'entity_search', 'entity_remember', 'memory_reinforce', 'memory_remember']);
-    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['Read', 'Grep', 'Glob', 'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember']);
+    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember']);
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).not.toContain(forbidden as any);
-    expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).toEqual(expect.arrayContaining(['Bash', 'Write', 'Edit', 'Task', 'Skill', 'TodoWrite']));
+    expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).toEqual(expect.arrayContaining(['Bash', 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'Task', 'Skill', 'TodoWrite']));
     for (const allowed of RELATIONSHIP_ALLOWED_CLIENT_TOOLS) expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).not.toContain(allowed as any);
     expect(() => assertRelationshipClientToolInventory([
       'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'Glob', 'Grep', 'TaskStop', 'Read', 'Skill', 'Task', 'TodoWrite', 'Write',

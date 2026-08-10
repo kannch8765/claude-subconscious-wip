@@ -140,11 +140,11 @@ export function buildRelationshipTools(
   ];
 }
 
-export const RELATIONSHIP_ALLOWED_BUILTIN_TOOLS = ['Read', 'Grep', 'Glob'] as const;
+export const RELATIONSHIP_ALLOWED_BUILTIN_TOOLS = [] as const;
 export const RELATIONSHIP_EXTERNAL_TOOLS = ['memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember'] as const;
 export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = [...RELATIONSHIP_ALLOWED_BUILTIN_TOOLS, ...RELATIONSHIP_EXTERNAL_TOOLS] as const;
 export const RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS = [
-  'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'TaskStop', 'Skill', 'Task', 'TodoWrite', 'Write', 'AskUserQuestion',
+  'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'Glob', 'Grep', 'TaskStop', 'Read', 'Skill', 'Task', 'TodoWrite', 'Write', 'AskUserQuestion',
 ] as const;
 export const FORBIDDEN_MARKDOWN_MEMORY_TOOLS = ['memory', 'memory_insert', 'memory_replace', 'memory_rethink'] as const;
 export const RELATIONSHIP_DISALLOWED_CLIENT_TOOLS = [...RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS, ...FORBIDDEN_MARKDOWN_MEMORY_TOOLS] as const;
