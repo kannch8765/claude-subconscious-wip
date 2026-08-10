@@ -69,6 +69,8 @@ interface LlmConfig {
 interface AgentDetails {
   id: string;
   name: string;
+  system?: string;
+  tags?: string[];
   llm_config?: LlmConfig;
 }
 
@@ -214,6 +216,104 @@ async function renameAgent(apiKey: string, agentId: string, name: string): Promi
     // Non-fatal - agent still works with _copy name
     console.error(`Warning: Could not rename agent: ${response.status}`);
   }
+}
+
+/**
+ * Read the canonical managed-agent system prompt from the bundled .af file.
+ *
+ * Subconscious.af is the single source of truth for the managed observer prompt;
+ * do not duplicate the prompt in TypeScript or fixtures.
+ */
+export function getCanonicalManagedSystemPrompt(): string {
+  let content: unknown;
+  try {
+    content = JSON.parse(fs.readFileSync(DEFAULT_AGENT_FILE, 'utf-8'));
+  } catch (error) {
+    throw new Error(`Failed to read canonical Subconscious.af: ${error}`);
+  }
+
+  const agents = (content as { agents?: Array<{ system?: unknown }> }).agents;
+  if (!Array.isArray(agents) || agents.length !== 1 || typeof agents[0]?.system !== 'string' || agents[0].system.length === 0) {
+    throw new Error('Canonical Subconscious.af must contain exactly one agent with a non-empty system prompt');
+  }
+
+  return agents[0].system;
+}
+
+/**
+ * Reconcile a Subconscious-managed adopted agent with the canonical .af prompt.
+ *
+ * This is intentionally called only after resolution has established that the
+ * selected agent is managed by Subconscious. It must never be used as a global
+ * tag scan, and it must never mutate an ordinary external LETTA_AGENT_ID.
+ */
+async function reconcileManagedAgentSystem(
+  apiKey: string,
+  agentId: string,
+  log: (msg: string) => void = console.log,
+): Promise<void> {
+  const canonicalSystem = getCanonicalManagedSystemPrompt();
+  const url = buildLettaApiUrl(`/agents/${agentId}`);
+  const getResponse = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
+  });
+
+  if (!getResponse.ok) {
+    const errorText = await getResponse.text();
+    throw new Error(`Failed to read managed agent before system reconciliation: ${getResponse.status} ${errorText}`);
+  }
+
+  const agent = await getResponse.json() as AgentDetails;
+  if (agent.system === canonicalSystem) {
+    log('Managed Subconscious system prompt already matches canonical Subconscious.af');
+    return;
+  }
+
+  const patchResponse = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ system: canonicalSystem }),
+  });
+
+  if (!patchResponse.ok) {
+    const errorText = await patchResponse.text();
+    throw new Error(`Failed to reconcile managed Subconscious system prompt: ${patchResponse.status} ${errorText}`);
+  }
+
+  log('Reconciled managed Subconscious system prompt from canonical Subconscious.af');
+}
+
+/**
+ * Determine whether an env-selected agent is an existing Subconscious-managed
+ * adopted agent without mutating it. The origin tag is an ownership marker for
+ * this narrow purpose; this function never scans the global agent inventory.
+ */
+async function isManagedEnvAgent(
+  apiKey: string,
+  agentId: string,
+  log: (msg: string) => void = console.log,
+): Promise<boolean> {
+  const url = buildLettaApiUrl(`/agents/${agentId}`);
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    log(`Could not verify LETTA_AGENT_ID ownership (${response.status}); treating it as external for managed reconciliation`);
+    return false;
+  }
+
+  const agent = await response.json() as AgentDetails;
+  return Array.isArray(agent.tags) && agent.tags.includes('origin:claude-subconcious');
 }
 
 /**
@@ -589,36 +689,43 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
     agentSource = 'imported';
   }
   
-  // 4. Ensure required tags are present only for Subconscious-managed agents.
+  // 4. Reconcile only Subconscious-managed agents.
   //
-  // A user-supplied LETTA_AGENT_ID may point at a normal Letta Code agent with
-  // its own MemFS repo. Patching tags on that external agent is surprisingly
-  // heavyweight: if the outgoing tag list includes git-memory-enabled, the
-  // server's update path may run git-memory initialization/backfill even when
-  // we are only adding an origin marker. Treat env-provided agents as external
-  // and avoid mutating their tags here.
+  // Saved/imported configuration is managed by definition. An env-selected
+  // LETTA_AGENT_ID may be either the already-adopted Subconscious agent or an
+  // ordinary external Letta/Letta Code agent. For env IDs, perform one read-only
+  // ownership probe: origin:claude-subconcious permits system reconciliation;
+  // absence of that tag means zero managed PATCHes. Never scan the global agent
+  // inventory by tag.
   if (agentSource !== 'env') {
     try {
       await ensureRequiredAgentTags(apiKey, agentId, log);
     } catch (error) {
       log(`Warning: Could not ensure required tags: ${error}`);
     }
-  } else {
-    log('Using external LETTA_AGENT_ID; skipping Subconscious tag reconciliation');
-  }
 
-  // 5. Ensure model is available (auto-select if not)
-  try {
-    const configuredModel = await ensureModelAvailable(apiKey, agentId, log);
-    if (configuredModel && config.model !== configuredModel) {
-      // Update saved config with the model that was configured
-      saveConfig({
-        ...config,
-        model: configuredModel,
-      });
+    // Prompt reconciliation is authority-critical: a stale managed observer
+    // must not silently continue under obsolete memory/tool rules. Let failures
+    // propagate instead of importing/replacing the agent or pretending success.
+    await reconcileManagedAgentSystem(apiKey, agentId, log);
+
+    // 5. Existing model auto-selection remains scoped to config-managed agents.
+    try {
+      const configuredModel = await ensureModelAvailable(apiKey, agentId, log);
+      if (configuredModel && config.model !== configuredModel) {
+        saveConfig({
+          ...config,
+          model: configuredModel,
+        });
+      }
+    } catch (error) {
+      log(`Warning: Could not verify model availability: ${error}`);
     }
-  } catch (error) {
-    log(`Warning: Could not verify model availability: ${error}`);
+  } else if (await isManagedEnvAgent(apiKey, agentId, log)) {
+    log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling system prompt only');
+    await reconcileManagedAgentSystem(apiKey, agentId, log);
+  } else {
+    log('Using ordinary external LETTA_AGENT_ID; skipping all Subconscious-managed mutation');
   }
   
   return agentId;
