@@ -358,11 +358,13 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
     const recovered = terminalReceipt(rootDir, source.legacy_source_id);
     if (recovered) {
       legacyStore.withMutationBoundary(() => {
-        if (!processed.has(source.legacy_source_id)) {
-          state.processed_source_ids.push(source.legacy_source_id);
-          saveLegacySemanticState(statePath, state);
-          processed.add(source.legacy_source_id);
+        const latestState = loadLegacySemanticState(statePath, manifestDigest);
+        if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
+          latestState.processed_source_ids.push(source.legacy_source_id);
+          saveLegacySemanticState(statePath, latestState);
         }
+        state.processed_source_ids = latestState.processed_source_ids;
+        processed.add(source.legacy_source_id);
       });
       completedCount += 1;
       continue;
@@ -404,11 +406,13 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
 
     legacyStore.withMutationBoundary(() => {
       appendSemanticReceipt(rootDir, receipt);
-      if (!processed.has(source.legacy_source_id)) {
-        state.processed_source_ids.push(source.legacy_source_id);
-        saveLegacySemanticState(statePath, state);
-        processed.add(source.legacy_source_id);
+      const latestState = loadLegacySemanticState(statePath, manifestDigest);
+      if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
+        latestState.processed_source_ids.push(source.legacy_source_id);
+        saveLegacySemanticState(statePath, latestState);
       }
+      state.processed_source_ids = latestState.processed_source_ids;
+      processed.add(source.legacy_source_id);
     });
     completedCount += 1;
   }

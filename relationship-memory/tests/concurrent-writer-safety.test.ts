@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { afterEach, describe, expect, it } from 'vitest';
-import { RelationshipMemoryStore } from '../src/store/index.js';
+import { RelationshipMemoryStore, stableId } from '../src/store/index.js';
 
 const childScript = path.resolve('relationship-memory/tests/concurrent-writer-child.ts');
 const tsxCli = path.resolve('node_modules/.bin/tsx');
@@ -85,7 +85,10 @@ describe('cross-process canonical mutation boundary', () => {
       schema_version: 1, memory_id: 'mem-seed', subject_id: 'subject-test', kind: 'user_preference',
       summary: '用户喜欢拉面。', participants: ['user'], payload: { topic: '食物', preference: '喜欢拉面' },
       status: 'active', observed_at: '2026-08-10T00:00:00.000Z', created_at: '2026-08-10T00:00:00.000Z',
-      source_key: 'seed-source', dedupe_key: 'seed-dedupe',
+      source_key: 'seed-source', dedupe_key: stableId('dedupe', {
+        subject_id: 'subject-test', kind: 'user_preference', summary: '用户喜欢拉面。', participants: ['user'],
+        evidence_message_ids: ['seed-source-evidence'], payload: { topic: '食物', preference: '喜欢拉面' }, linked_memory_ids: [],
+      }),
     } as any, [{
       evidence_id: 'seed-evidence', memory_id: 'mem-seed', conversation_id: 'conversation-test', message_id: 'seed-message',
       role: 'user', quote: '猫喜欢拉面', captured_at: '2026-08-10T00:00:00.000Z', source_evidence_id: 'seed-source-evidence',
