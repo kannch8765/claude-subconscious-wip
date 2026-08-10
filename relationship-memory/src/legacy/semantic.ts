@@ -293,7 +293,7 @@ export function legacyMemoryCreateToolSchema(source: LegacyAssistantMemorySource
       schema_version: { type: 'integer', enum: [1] },
       kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'] },
       summary: string,
-      participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, description: 'Relationship roles actually supported by this source item: user means the user; assistant means the canonical relationship assistant/Kohaku, not another named assistant or third party; use both only for source-supported shared involvement or shared meaning.', items: { type: 'string', enum: ['user', 'assistant'] } },
+      participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
       linked_memory_ids: strings,
       historical_temporality: { type: 'string', enum: [LEGACY_FEEL_TEMPORALITY], description: 'Required for feel/ sources: this prose describes the historical source-time feeling, never a current-state assertion.' },
       payload: {
