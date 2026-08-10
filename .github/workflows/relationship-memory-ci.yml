@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      TARGET_SHA: 38550ea0c45ba3bd09006d1ac95b2d5b34e7b77a
+      TARGET_SHA: 432709f3d8b396557bdd9de3f764b8fe1194dc7b
     steps:
       - name: Checkout exact Task 093AA head
         uses: actions/checkout@v4
