@@ -12,6 +12,7 @@ import {
 } from './index.js';
 
 export const LEGACY_FEEL_TEMPORALITY = 'historical_at_source_time' as const;
+export const OMBRE_LEGACY_FROZEN_MANIFEST_DIGEST = '5226a04525e4fef5bffa8e76b41526aa46d147ac1c861e22d79d04912314ae31' as const;
 
 export type LegacySemanticCompletion = 'completed' | 'no_memory_required' | 'retryable_failure';
 
@@ -49,6 +50,7 @@ export interface LegacySemanticProcessorResult {
 
 export interface RunLegacySemanticMigrationOptions {
   rootDir: string;
+  expectedManifestDigest: string;
   statePath?: string;
   maxRecords?: number;
   sourceIds?: string[];
@@ -318,8 +320,10 @@ function appendSemanticReceipt(rootDir: string, receipt: LegacySemanticReceipt):
   return receipt;
 }
 
-function terminalReceipt(rootDir: string, sourceId: string): LegacySemanticReceipt | undefined {
-  return [...listLegacySemanticReceipts(rootDir)].reverse().find((item) => item.legacy_source_id === sourceId && item.result !== 'retryable_failure');
+function terminalReceipt(rootDir: string, sourceId: string, manifestDigest: string): LegacySemanticReceipt | undefined {
+  return [...listLegacySemanticReceipts(rootDir)].reverse().find((item) =>
+    item.legacy_source_id === sourceId && item.manifest_digest === manifestDigest && item.result !== 'retryable_failure'
+  );
 }
 
 function remainingCount(sources: LegacyAssistantMemorySourceRecord[], processed: Set<string>, selected?: Set<string>): number {
@@ -332,9 +336,14 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
   const legacyStore = new LegacyMemorySourceStore(rootDir);
   const sources = legacyStore.listSources();
   if (sources.length === 0) return { status: 'no-op', processed: 0, remaining: 0, detail: 'no legacy assistant sources found' };
+  const expectedManifestDigest = options.expectedManifestDigest.trim();
+  if (!/^[0-9a-f]{64}$/i.test(expectedManifestDigest)) throw new Error('expected legacy semantic manifest digest must be a SHA-256 hex digest');
   const manifestDigests = [...new Set(sources.map((source) => source.manifest_digest))];
   if (manifestDigests.length !== 1) throw new Error('legacy semantic sources span multiple manifest digests');
   const manifestDigest = manifestDigests[0];
+  if (manifestDigest !== expectedManifestDigest) {
+    throw new Error(`legacy semantic source manifest ${manifestDigest} does not match expected frozen manifest ${expectedManifestDigest}`);
+  }
   const state = loadLegacySemanticState(statePath, manifestDigest);
   const processed = new Set(state.processed_source_ids);
   const selected = options.sourceIds?.length ? new Set(options.sourceIds) : undefined;
@@ -344,7 +353,7 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
     if (missing.length) throw new Error(`unknown legacy source id(s): ${missing.join(', ')}`);
   }
   for (const sourceId of processed) {
-    if (!terminalReceipt(rootDir, sourceId)) throw new Error(`semantic state marks source processed without terminal receipt: ${sourceId}`);
+    if (!terminalReceipt(rootDir, sourceId, manifestDigest)) throw new Error(`semantic state marks source processed without terminal receipt: ${sourceId}`);
   }
 
   const candidates = sources.filter((source) => (!selected || selected.has(source.legacy_source_id)) && !processed.has(source.legacy_source_id));
@@ -355,7 +364,7 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
 
   let completedCount = 0;
   for (const source of planned) {
-    const recovered = terminalReceipt(rootDir, source.legacy_source_id);
+    const recovered = terminalReceipt(rootDir, source.legacy_source_id, manifestDigest);
     if (recovered) {
       legacyStore.withMutationBoundary(() => {
         const latestState = loadLegacySemanticState(statePath, manifestDigest);
