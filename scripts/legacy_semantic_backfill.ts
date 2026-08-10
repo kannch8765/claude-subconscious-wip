@@ -76,10 +76,11 @@ async function main(): Promise<void> {
   if (manifestDigest !== expectedManifestDigest) {
     throw new Error(`legacy semantic source manifest ${manifestDigest} does not match expected frozen manifest ${expectedManifestDigest}`);
   }
+  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID ?? 'local-user';
 
   if (args.dryRun) {
     const result = await runLegacySemanticMigration({
-      rootDir, expectedManifestDigest, statePath, maxRecords: args.maxRecords, sourceIds: args.sourceIds, dryRun: true,
+      rootDir, expectedManifestDigest, canonicalSubjectId: subjectId, statePath, maxRecords: args.maxRecords, sourceIds: args.sourceIds, dryRun: true,
       processor: async () => { throw new Error('dry-run must not invoke semantic processor'); },
     });
     console.log(JSON.stringify(result));
@@ -88,9 +89,8 @@ async function main(): Promise<void> {
 
   const apiKey = process.env.LETTA_API_KEY;
   if (!apiKey) throw new Error('LETTA_API_KEY is required for legacy semantic backfill.');
-  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID ?? 'local-user';
   const agentId = await getBackfillAgentId(apiKey, (message) => console.error(`[legacy-backfill] ${message}`));
-  const state = loadLegacySemanticState(statePath, manifestDigest);
+  const state = loadLegacySemanticState(statePath, manifestDigest, subjectId);
   if (state.agent_id && state.agent_id !== agentId) {
     throw new Error(`Legacy semantic state is bound to a different backfill agent (${state.agent_id}); use the original dedicated agent or a new state file.`);
   }
@@ -102,6 +102,7 @@ async function main(): Promise<void> {
   const result = await runLegacySemanticMigration({
     rootDir,
     expectedManifestDigest,
+    canonicalSubjectId: subjectId,
     statePath,
     maxRecords: args.maxRecords,
     sourceIds: args.sourceIds,
