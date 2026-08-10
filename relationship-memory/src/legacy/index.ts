@@ -214,10 +214,21 @@ function requiredStringArray(value: unknown, name: string): string[] {
   return value as string[];
 }
 
-function utcFromNaive(raw: string, name: string): string {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(raw)) throw new Error(`${name} must be a naive ISO-8601 timestamp`);
-  const date = new Date(`${raw}Z`);
-  if (Number.isNaN(date.getTime())) throw new Error(`${name} is invalid`);
+function utcFromOmbreTimestamp(raw: string, name: string): string {
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|\+00:00)?$/);
+  if (!match) throw new Error(`${name} must be an ISO-8601 UTC timestamp`);
+  const [, year, month, day, hour, minute, second] = match;
+  const normalized = match[8] ? raw.replace(/\+00:00$/, 'Z') : `${raw}Z`;
+  const date = new Date(normalized);
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.getUTCFullYear() !== Number(year) ||
+    date.getUTCMonth() + 1 !== Number(month) ||
+    date.getUTCDate() !== Number(day) ||
+    date.getUTCHours() !== Number(hour) ||
+    date.getUTCMinutes() !== Number(minute) ||
+    date.getUTCSeconds() !== Number(second)
+  ) throw new Error(`${name} is invalid`);
   return date.toISOString();
 }
 
@@ -244,7 +255,9 @@ export function parseLegacySource(
   const bucketId = String(frontmatter.id);
   if (!bucketId) throw new Error('id is required');
   const filenameStem = path.posix.basename(entry.relative_path, '.md');
-  if (bucketId !== filenameStem) throw new Error(`bucket id ${bucketId} does not match filename ${filenameStem}`);
+  const titleSuffix = `_${bucketId}`;
+  const filenameMatchesBucketId = filenameStem === bucketId || (filenameStem.endsWith(titleSuffix) && filenameStem.length > titleSuffix.length);
+  if (!filenameMatchesBucketId) throw new Error(`bucket id ${bucketId} does not match filename ${filenameStem}`);
   const rawCreated = requiredString(frontmatter.created, 'created');
   const rawLastActive = requiredString(frontmatter.last_active, 'last_active');
   const metadata: LegacyFrontmatterMetadata = {
@@ -276,8 +289,8 @@ export function parseLegacySource(
     frontmatter: metadata,
     raw_created: rawCreated,
     raw_last_active: rawLastActive,
-    created_at_utc: utcFromNaive(rawCreated, 'created'),
-    last_active_at_utc: utcFromNaive(rawLastActive, 'last_active'),
+    created_at_utc: utcFromOmbreTimestamp(rawCreated, 'created'),
+    last_active_at_utc: utcFromOmbreTimestamp(rawLastActive, 'last_active'),
     manifest_digest: manifestDigest,
   };
 }
