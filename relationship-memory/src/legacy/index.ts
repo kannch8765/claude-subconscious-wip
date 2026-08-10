@@ -178,7 +178,7 @@ function parseFrontmatter(source: string): { frontmatter: Record<string, unknown
   let listKey: string | undefined;
   for (const line of yaml.split('\n')) {
     if (!line.trim() || line.trimStart().startsWith('#')) continue;
-    const list = line.match(/^\s+-\s+(.+)$/);
+    const list = line.match(/^\s*-\s+(.+)$/);
     if (list && listKey) {
       const current = result[listKey];
       if (!Array.isArray(current)) throw new Error(`invalid list field: ${listKey}`);
