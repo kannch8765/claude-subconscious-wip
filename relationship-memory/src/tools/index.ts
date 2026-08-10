@@ -29,7 +29,7 @@ export interface SearchQuery {
   limit?: number;
 }
 
-export interface ReinforceInput { memory_id: string; evidence_message_ids: string[] }
+export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[] }
 export interface EntitySearchQuery { query?: string; limit?: number }
 export interface EntitySearchResult extends EntityIdentityRecord { evidence_ids: string[]; evidence_message_ids: string[] }
 
@@ -51,6 +51,32 @@ function rawAssistantIntentId(value: unknown): string | undefined {
   return typeof candidate === 'string' && candidate.trim() ? candidate.trim() : undefined;
 }
 
+function canonicalEvidenceId(message: CanonicalMessage): string {
+  return message.evidence_id ?? message.message_id;
+}
+
+function memoryEvidenceId(memoryId: string, message: CanonicalMessage): string {
+  return message.evidence_id
+    ? stableId('ev', { memory_id: memoryId, source_evidence_id: message.evidence_id })
+    : stableId('ev', { memory_id: memoryId, message_id: message.message_id });
+}
+
+function entityEvidenceId(entityId: string, message: CanonicalMessage): string {
+  return message.evidence_id
+    ? stableId('entity_ev', { entity_id: entityId, source_evidence_id: message.evidence_id })
+    : stableId('entity_ev', { entity_id: entityId, message_id: message.message_id });
+}
+
+function evidenceProvenance(message: CanonicalMessage) {
+  return {
+    source_evidence_id: canonicalEvidenceId(message),
+    ...(message.event_kind ? { event_kind: message.event_kind } : {}),
+    ...(message.block_index === undefined ? {} : { block_index: message.block_index }),
+    ...(message.tool_name ? { tool_name: message.tool_name } : {}),
+    ...(message.tool_use_id ? { tool_use_id: message.tool_use_id } : {}),
+  };
+}
+
 export class RelationshipMemoryRuntime {
   private readonly retryableBatches = new Set<string>();
 
@@ -62,6 +88,12 @@ export class RelationshipMemoryRuntime {
     readonly requireChineseSemanticProse = false,
     readonly semanticRetriever?: SemanticRetriever,
   ) {}
+
+  private trustedEvidence(id: string): CanonicalMessage | undefined {
+    const direct = this.messages.get(id);
+    if (direct) return direct;
+    return [...this.messages.values()].find((message) => canonicalEvidenceId(message) === id);
+  }
 
   private linkedAssistantIntents(memoryId: string): AssistantRememberIntentRecord[] {
     const latest = new Map<string, AssistantIntentOutcome>();
@@ -201,20 +233,21 @@ export class RelationshipMemoryRuntime {
     const proposal = validation.proposal;
     const evidenceMessages: CanonicalMessage[] = [];
     for (const messageId of proposal.evidence_message_ids) {
-      const message = this.messages.get(messageId);
-      if (!message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${messageId}`, now);
+      const message = this.trustedEvidence(messageId);
+      if (!message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${messageId}`, now);
       evidenceMessages.push(message);
     }
     const recovered = this.store.getEntityBySourceKey(sourceKey);
     if (recovered) {
       const recoveredEvidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({
-        evidence_id: stableId('entity_ev', { entity_id: recovered.entity_id, message_id: message.message_id }),
+        evidence_id: entityEvidenceId(recovered.entity_id, message),
         entity_id: recovered.entity_id,
         conversation_id: message.conversation_id,
         message_id: message.message_id,
         role: message.role,
         quote: message.quote,
         captured_at: message.captured_at,
+        ...evidenceProvenance(message),
       }));
       try {
         this.store.appendEntity(recovered, recoveredEvidence);
@@ -243,8 +276,9 @@ export class RelationshipMemoryRuntime {
       entity_type: proposal.entity_type, description: proposal.description, observed_at: evidenceMessages.map((m) => m.captured_at).sort()[0] ?? now, created_at: now, source_key: sourceKey,
     };
     const evidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({
-      evidence_id: stableId('entity_ev', { entity_id: entityId, message_id: message.message_id }), entity_id: entityId, conversation_id: message.conversation_id,
+      evidence_id: entityEvidenceId(entityId, message), entity_id: entityId, conversation_id: message.conversation_id,
       message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
+      ...evidenceProvenance(message),
     }));
     try { this.store.appendEntity(entity, evidence); } catch (error) { return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }
     return this.entityOutcome(batchId, sourceKey, 'accepted', entityId, now);
@@ -332,7 +366,7 @@ export class RelationshipMemoryRuntime {
         kind: memory.kind,
         summary: memory.summary,
         participants: memory.participants,
-        evidence_message_ids: prefix.map((item) => item.message_id),
+        evidence_message_ids: prefix.map((item) => item.source_evidence_id ?? item.message_id),
         payload: memory.payload,
         linked_memory_ids: memory.linked_memory_ids ?? [],
       });
@@ -344,23 +378,27 @@ export class RelationshipMemoryRuntime {
   reinforce(batchId: string, input: ReinforceInput): RememberResult {
     const now = this.now();
     const memoryId = typeof input?.memory_id === 'string' ? input.memory_id.trim() : '';
-    const ids = Array.isArray(input?.evidence_message_ids) ? input.evidence_message_ids.map((id) => typeof id === 'string' ? id.trim() : '') : [];
+    const rawIds = input?.evidence_ids ?? input?.evidence_message_ids;
+    const ids = Array.isArray(rawIds) ? rawIds.map((id) => typeof id === 'string' ? id.trim() : '') : [];
     const normalizedIds = [...ids].sort();
-    const sourceKey = stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_message_ids: normalizedIds });
+    const legacyEvidenceField = input?.evidence_ids === undefined && input?.evidence_message_ids !== undefined;
+    const sourceKey = legacyEvidenceField
+      ? stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_message_ids: normalizedIds })
+      : stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_ids: normalizedIds });
     const previous = this.store.getTerminalOutcome(sourceKey);
     if (previous) {
       if (previous.outcome === 'accepted' || previous.outcome === 'duplicate') return { outcome: 'duplicate', memory_id: previous.memory_id ?? memoryId };
       return { outcome: previous.outcome, rejection_code: previous.rejection_code, reason: previous.reason };
     }
     if (!memoryId || ids.length === 0 || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
-      return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'memory_id and unique non-empty evidence_message_ids are required.', now);
+      return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'memory_id and unique non-empty evidence_ids are required.', now);
     }
     const memory = this.store.getMemory(memoryId);
     if (!memory) return this.persistPermanent(batchId, sourceKey, 'unknown_memory', `Unknown canonical memory ID: ${memoryId}`, now);
     const messages: CanonicalMessage[] = [];
     for (const id of normalizedIds) {
-      const message = this.messages.get(id);
-      if (!message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${id}`, now);
+      const message = this.trustedEvidence(id);
+      if (!message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
       messages.push(message);
     }
     const originalEvidenceIds = this.originalMemoryEvidenceIds(memory);
@@ -370,15 +408,18 @@ export class RelationshipMemoryRuntime {
       if (reinforcement.memory_id !== memoryId) continue;
       for (const evidenceId of reinforcement.evidence_ids) completedEvidenceIds.add(evidenceId);
     }
-    const newMessages = messages.filter((message) => !completedEvidenceIds.has(stableId('ev', { memory_id: memoryId, message_id: message.message_id })));
+    const newMessages = messages.filter((message) => !completedEvidenceIds.has(memoryEvidenceId(memoryId, message)));
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now);
-    const newMessageIds = newMessages.map((message) => message.message_id).sort();
+    const newMessageIds = newMessages.map(canonicalEvidenceId).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({
-      evidence_id: stableId('ev', { memory_id: memoryId, message_id: message.message_id }), memory_id: memoryId,
+      evidence_id: memoryEvidenceId(memoryId, message), memory_id: memoryId,
       conversation_id: message.conversation_id, message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
+      ...evidenceProvenance(message),
     }));
     const reinforcement: ReinforcementRecord = {
-      schema_version: 1, reinforcement_id: stableId('reinforce', { memory_id: memoryId, evidence_message_ids: newMessageIds }),
+      schema_version: 1, reinforcement_id: legacyEvidenceField
+        ? stableId('reinforce', { memory_id: memoryId, evidence_message_ids: newMessageIds })
+        : stableId('reinforce', { memory_id: memoryId, evidence_ids: newMessageIds }),
       memory_id: memoryId, batch_id: batchId, evidence_ids: evidence.map((item) => item.evidence_id),
       latest_evidence_at: newMessages.map((message) => message.captured_at).sort().at(-1)!, recorded_at: now,
     };
@@ -445,9 +486,9 @@ export class RelationshipMemoryRuntime {
 
     const evidenceMessages: CanonicalMessage[] = [];
     for (const messageId of proposal.evidence_message_ids) {
-      const message = this.messages.get(messageId);
+      const message = this.trustedEvidence(messageId);
       if (!message) {
-        return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence message is not available in the trusted batch: ${messageId}`, now, assistantIntent);
+        return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${messageId}`, now, assistantIntent);
       }
       evidenceMessages.push(message);
     }
@@ -465,13 +506,14 @@ export class RelationshipMemoryRuntime {
     const recoveredMemory = this.store.getMemoryBySourceKey(sourceKey);
     if (recoveredMemory) {
       const recoveredEvidence: EvidenceRecord[] = evidenceMessages.map((message) => ({
-        evidence_id: stableId('ev', { memory_id: recoveredMemory.memory_id, message_id: message.message_id }),
+        evidence_id: memoryEvidenceId(recoveredMemory.memory_id, message),
         memory_id: recoveredMemory.memory_id,
         conversation_id: message.conversation_id,
         message_id: message.message_id,
         role: message.role,
         quote: message.quote,
         captured_at: message.captured_at,
+        ...evidenceProvenance(message),
       }));
       try {
         this.store.appendMemory(recoveredMemory, recoveredEvidence);
@@ -522,13 +564,14 @@ export class RelationshipMemoryRuntime {
       dedupe_key: dedupeKey,
     };
     const evidence: EvidenceRecord[] = evidenceMessages.map((message) => ({
-      evidence_id: stableId('ev', { memory_id: memoryId, message_id: message.message_id }),
+      evidence_id: memoryEvidenceId(memoryId, message),
       memory_id: memoryId,
       conversation_id: message.conversation_id,
       message_id: message.message_id,
       role: message.role,
       quote: message.quote,
       captured_at: message.captured_at,
+      ...evidenceProvenance(message),
     }));
 
     try {
@@ -584,7 +627,8 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload'],
+    required: ['schema_version', 'kind', 'summary', 'participants', 'payload'],
+    oneOf: [{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }],
     properties: {
       schema_version: { type: 'integer', enum: [1], description: 'Relationship-memory proposal schema version; must be 1.' },
       kind: {
@@ -594,10 +638,8 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
       },
       summary: string,
       participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
-      evidence_message_ids: {
-        type: 'array', minItems: 1, uniqueItems: true, items: string,
-        description: 'Exact message_id values copied from the current-batch relationship-memory evidence catalog.',
-      },
+      evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Exact evidence_id values copied from the trusted current-batch transcript-event evidence catalog.' },
+      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy compatibility alias for evidence_ids; do not send both.' },
       linked_memory_ids: strings,
       assistant_intent_id: {
         type: 'string', minLength: 1,
@@ -653,22 +695,24 @@ export function entityRememberToolSchema(): Record<string, unknown> {
   const string = { type: 'string', minLength: 1 };
   return {
     type: 'object', additionalProperties: false,
-    required: ['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description', 'evidence_message_ids'],
+    required: ['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description'], oneOf: [{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }],
     properties: {
       schema_version: { type: 'integer', enum: [1] },
       canonical_name: string,
       aliases: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Literal names/aliases; preserve source spelling such as GPT, ChatGPT, Claude, Claude Code.' },
       entity_type: { type: 'string', enum: ['user', 'assistant', 'other'] },
       description: { type: 'string', minLength: 1, description: 'Perspective-neutral Chinese semantic description. Do not write fragile second-person identity such as 琥珀 = 你.' },
-      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },
+      evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string },
+      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy compatibility alias for evidence_ids; do not send both.' },
     },
   };
 }
 
 export function memoryReinforceToolSchema(): Record<string, unknown> {
-  return { type: 'object', additionalProperties: false, required: ['memory_id', 'evidence_message_ids'], properties: {
+  return { type: 'object', additionalProperties: false, required: ['memory_id'], oneOf: [{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }], properties: {
     memory_id: { type: 'string', minLength: 1, description: 'Existing canonical memory_id selected after memory_search.' },
-    evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Exact message_id values from the trusted current-batch evidence catalog that support the same underlying memory.' },
+    evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Exact transcript-event evidence_id values from the trusted current-batch catalog that support the same underlying memory.' },
+    evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Legacy compatibility alias for evidence_ids; do not send both.' },
   } };
 }
 
