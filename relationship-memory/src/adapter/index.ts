@@ -1,8 +1,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
-import { extractAllContent } from '../../../scripts/transcript_utils.js';
-import type { AssistantRememberIntentRecord, CanonicalMessage, ParticipantRole } from '../schema/index.js';
+import type { AssistantRememberIntentRecord, CanonicalMessage, ParticipantRole, TranscriptEvidenceKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
 import { entityRememberToolSchema, entitySearchToolSchema, memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
@@ -22,24 +21,87 @@ export function relationshipMemoryRoot(): string {
   return process.env.RELATIONSHIP_MEMORY_DIR || path.join(os.homedir(), '.local', 'share', 'relationship-memory');
 }
 
+const MAX_TRANSCRIPT_EVIDENCE_CHARS = 12_000;
+
+function boundedEvidenceText(value: unknown): string | null {
+  let text: string;
+  if (typeof value === 'string') text = value;
+  else {
+    try { text = JSON.stringify(value, null, 2); } catch { text = String(value); }
+  }
+  text = text.trim();
+  if (!text) return null;
+  if (text.length <= MAX_TRANSCRIPT_EVIDENCE_CHARS) return text;
+  return `${text.slice(0, MAX_TRANSCRIPT_EVIDENCE_CHARS)}\n... [transcript evidence truncated at ${MAX_TRANSCRIPT_EVIDENCE_CHARS} chars]`;
+}
+
+function transcriptEventId(
+  conversationId: string,
+  messageId: string,
+  blockIndex: number,
+  eventKind: TranscriptEvidenceKind,
+  toolUseId?: string,
+): string {
+  return stableId('transcript_ev', {
+    conversation_id: conversationId,
+    message_id: messageId,
+    block_index: blockIndex,
+    event_kind: eventKind,
+    ...(toolUseId ? { tool_use_id: toolUseId } : {}),
+  });
+}
+
 export function buildCanonicalMessages(
   messages: TranscriptMessage[],
   startIndex: number,
   conversationId: string,
 ): CanonicalMessage[] {
   const result: CanonicalMessage[] = [];
+  const toolNames = new Map<string, string>();
   for (let i = startIndex + 1; i < messages.length; i++) {
     const message = messages[i];
     if (message.type !== 'user' && message.type !== 'assistant') continue;
-    const text = extractAllContent(message).text?.trim();
-    if (!text || !message.uuid) continue;
-    result.push({
-      conversation_id: conversationId,
-      message_id: message.uuid,
-      role: message.type as ParticipantRole,
-      quote: text,
-      captured_at: message.timestamp || new Date(0).toISOString(),
-    });
+    if (!message.uuid) continue;
+    const role = message.type as ParticipantRole;
+    const capturedAt = message.timestamp || new Date(0).toISOString();
+    const content = message.message?.content ?? message.content;
+    const blocks = Array.isArray(content) ? content : [{ type: 'text', text: content }];
+    for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+      const block = blocks[blockIndex] as any;
+      let eventKind: TranscriptEvidenceKind | null = null;
+      let quote: string | null = null;
+      let toolName: string | undefined;
+      let toolUseId: string | undefined;
+
+      if (block?.type === 'text') {
+        eventKind = role === 'user' ? 'user_text' : 'assistant_text';
+        quote = boundedEvidenceText(block.text);
+      } else if (role === 'assistant' && block?.type === 'tool_use' && block.name) {
+        eventKind = 'assistant_tool_use';
+        toolName = String(block.name);
+        toolUseId = typeof block.id === 'string' && block.id ? block.id : undefined;
+        if (toolUseId) toolNames.set(toolUseId, toolName);
+        quote = boundedEvidenceText(block.input);
+      } else if (block?.type === 'tool_result') {
+        eventKind = 'tool_result';
+        toolUseId = typeof block.tool_use_id === 'string' && block.tool_use_id ? block.tool_use_id : undefined;
+        toolName = toolUseId ? toolNames.get(toolUseId) : undefined;
+        quote = boundedEvidenceText(block.content);
+      }
+      if (!eventKind || !quote) continue;
+      result.push({
+        evidence_id: transcriptEventId(conversationId, message.uuid, blockIndex, eventKind, toolUseId),
+        conversation_id: conversationId,
+        message_id: message.uuid,
+        block_index: blockIndex,
+        role,
+        event_kind: eventKind,
+        ...(toolName ? { tool_name: toolName } : {}),
+        ...(toolUseId ? { tool_use_id: toolUseId } : {}),
+        quote,
+        captured_at: capturedAt,
+      });
+    }
   }
   return result;
 }
@@ -57,10 +119,29 @@ export function appendCanonicalEvidenceCatalog(
   workerMessage: string,
   canonicalMessages: CanonicalMessage[],
 ): string {
-  const entries = canonicalMessages.map((message) =>
-    `  <evidence message_id="${escapeWorkerXml(message.message_id)}" role="${escapeWorkerXml(message.role)}">${escapeWorkerXml(message.quote)}</evidence>`,
-  ).join('\n');
-  return `${workerMessage}\n\n<relationship_memory_evidence_catalog>\n${entries}\n</relationship_memory_evidence_catalog>`;
+  const entries = canonicalMessages.map((event) => {
+    const evidenceId = event.evidence_id ?? event.message_id;
+    const attrs = [
+      `evidence_id="${escapeWorkerXml(evidenceId)}"`,
+      `message_id="${escapeWorkerXml(event.message_id)}"`,
+      `role="${escapeWorkerXml(event.role)}"`,
+      `event_kind="${escapeWorkerXml(event.event_kind ?? (event.role === 'user' ? 'user_text' : 'assistant_text'))}"`,
+      ...(event.block_index === undefined ? [] : [`block_index="${event.block_index}"`]),
+      ...(event.tool_name ? [`tool_name="${escapeWorkerXml(event.tool_name)}"`] : []),
+      ...(event.tool_use_id ? [`tool_use_id="${escapeWorkerXml(event.tool_use_id)}"`] : []),
+      `captured_at="${escapeWorkerXml(event.captured_at)}"`,
+    ];
+    return `  <evidence ${attrs.join(' ')}>${escapeWorkerXml(event.quote)}</evidence>`;
+  }).join('\n');
+  const semantics = [
+    '<relationship_memory_evidence_semantics>',
+    'Trusted evidence proves only what appeared in the Claude transcript and its event provenance; tool-returned claims are not automatically world truth.',
+    'Judge semantics yourself. Ignore routine code edits, installs, tests, file reads, shell noise, and arbitrary tool results unless they carry durable relationship-relevant meaning.',
+    'Relationship-relevant durable meaning that appears only in assistant tool input or textual tool results is eligible when cited by exact evidence_id.',
+    'Never invent evidence IDs; use the backend-owned evidence_id from the catalog.',
+    '</relationship_memory_evidence_semantics>',
+  ].join('\n');
+  return `${workerMessage}\n\n${semantics}\n\n<relationship_memory_evidence_catalog trusted="transcript_provenance_only">\n${entries}\n</relationship_memory_evidence_catalog>`;
 }
 
 export function appendTrustedRelationshipCatalog(
@@ -93,7 +174,7 @@ export function createRuntime(
   try { semanticRetriever = createSemanticRetrieverFromEnvironment(rootDir); } catch { semanticRetriever = undefined; }
   return new RelationshipMemoryRuntime(
     store,
-    new Map(canonicalMessages.map((m) => [m.message_id, m])),
+    new Map(canonicalMessages.map((m) => [m.evidence_id ?? m.message_id, m])),
     () => new Date().toISOString(),
     new Map(assistantIntents.map((intent) => [intent.intent_id, intent])),
     true,

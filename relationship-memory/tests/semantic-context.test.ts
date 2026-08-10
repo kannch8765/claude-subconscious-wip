@@ -117,7 +117,7 @@ describe('Task 093M semantic context foundation', () => {
     expect(store.listEntities()).toHaveLength(1);
     expect(store.listEntityEvidence()).toEqual([{
       evidence_id: stableId('entity_ev', { entity_id: entityId, message_id: 'identity' }), entity_id: entityId,
-      conversation_id: messages[4].conversation_id, message_id: 'identity', role: 'user', quote: messages[4].quote, captured_at: messages[4].captured_at,
+      conversation_id: messages[4].conversation_id, message_id: 'identity', role: 'user', quote: messages[4].quote, captured_at: messages[4].captured_at, source_evidence_id: 'identity',
     }]);
     expect(store.listEntityOutcomes().at(-1)).toEqual(expect.objectContaining({ outcome: 'duplicate', entity_id: entityId }));
     expect(replay.finalizeBatch(batchId, true)).toBe('completed');

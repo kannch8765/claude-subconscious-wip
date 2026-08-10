@@ -268,7 +268,8 @@ describe('observer contract correction', () => {
     ) as any;
 
     expect(sdkVisible.type).toBe('object');
-    expect(sdkVisible.required).toEqual(['schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload']);
+    expect(sdkVisible.required).toEqual(['schema_version', 'kind', 'summary', 'participants', 'payload']);
+    expect((schema as any).oneOf).toEqual([{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }]);
     expect(Object.keys(sdkVisible.properties)).toEqual(expect.arrayContaining([
       'schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload', 'linked_memory_ids',
     ]));
@@ -295,7 +296,8 @@ describe('observer contract correction', () => {
     ];
     const observerMessage = appendCanonicalEvidenceCatalog('<claude_code_session_update>fixture</claude_code_session_update>', canonical);
 
-    expect(observerMessage).toContain('<relationship_memory_evidence_catalog>');
+    expect(observerMessage).toContain('<relationship_memory_evidence_semantics>');
+    expect(observerMessage).toContain('<relationship_memory_evidence_catalog trusted="transcript_provenance_only">');
     expect(observerMessage).toContain('message_id="msg-&amp;-&quot;-1" role="user"');
     expect(observerMessage).toContain('&lt;gift&gt; &amp; &quot;shared&quot;');
     expect(observerMessage).toContain(`message_id="${messages[1].message_id}" role="assistant"`);
@@ -367,10 +369,12 @@ describe('adopted SDK/configuration boundary', () => {
       { type: 'user', uuid: 'u-1', timestamp: '2026-01-01T00:00:00Z', message: { content: [{ type: 'text', text: 'hello' }] } },
       { type: 'assistant', uuid: 'a-1', timestamp: '2026-01-01T00:00:01Z', message: { content: [{ type: 'text', text: 'hi' }] } },
     ];
-    expect(buildCanonicalMessages(transcript, 0, 'conv-1')).toEqual([
-      { conversation_id: 'conv-1', message_id: 'u-1', role: 'user', quote: 'hello', captured_at: '2026-01-01T00:00:00Z' },
-      { conversation_id: 'conv-1', message_id: 'a-1', role: 'assistant', quote: 'hi', captured_at: '2026-01-01T00:00:01Z' },
+    const canonical = buildCanonicalMessages(transcript, 0, 'conv-1');
+    expect(canonical).toEqual([
+      { evidence_id: stableId('transcript_ev', { conversation_id: 'conv-1', message_id: 'u-1', block_index: 0, event_kind: 'user_text' }), conversation_id: 'conv-1', message_id: 'u-1', block_index: 0, role: 'user', event_kind: 'user_text', quote: 'hello', captured_at: '2026-01-01T00:00:00Z' },
+      { evidence_id: stableId('transcript_ev', { conversation_id: 'conv-1', message_id: 'a-1', block_index: 0, event_kind: 'assistant_text' }), conversation_id: 'conv-1', message_id: 'a-1', block_index: 0, role: 'assistant', event_kind: 'assistant_text', quote: 'hi', captured_at: '2026-01-01T00:00:01Z' },
     ]);
+    expect(buildCanonicalMessages(transcript, 0, 'conv-1')).toEqual(canonical);
     expect(makeBatchId('session', 0, 2)).toBe(makeBatchId('session', 0, 2));
   });
 });
@@ -516,7 +520,8 @@ describe('reinforcement and linking foundation', () => {
 
   it('publishes a narrow trusted memory_reinforce tool schema', () => {
     const schema = memoryReinforceToolSchema() as any;
-    expect(schema.required).toEqual(['memory_id', 'evidence_message_ids']);
+    expect(schema.required).toEqual(['memory_id']);
+    expect(schema.oneOf).toEqual([{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }]);
     expect(schema.additionalProperties).toBe(false);
     expect(schema.properties.evidence_message_ids.minItems).toBe(1);
   });

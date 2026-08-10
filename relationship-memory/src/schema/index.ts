@@ -8,6 +8,7 @@ export const MEMORY_KINDS = [
 
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
 export type ParticipantRole = 'user' | 'assistant';
+export type TranscriptEvidenceKind = 'user_text' | 'assistant_text' | 'assistant_tool_use' | 'tool_result';
 export type RememberOutcomeKind = 'accepted' | 'duplicate' | 'permanently_rejected' | 'retryable_failed';
 export type BatchCompletion = 'completed' | 'retryable_failure';
 export type AssistantIntentOutcomeKind = RememberOutcomeKind;
@@ -20,6 +21,12 @@ export interface CanonicalMessage {
   role: ParticipantRole;
   quote: string;
   captured_at: string;
+  /** Stable backend-owned transcript-event identity. Legacy message evidence may omit this. */
+  evidence_id?: string;
+  event_kind?: TranscriptEvidenceKind;
+  block_index?: number;
+  tool_name?: string;
+  tool_use_id?: string;
 }
 
 export interface MemoryProposalV1 {
@@ -63,6 +70,11 @@ export interface EntityEvidenceRecord {
   role: ParticipantRole;
   quote: string;
   captured_at: string;
+  source_evidence_id?: string;
+  event_kind?: TranscriptEvidenceKind;
+  block_index?: number;
+  tool_name?: string;
+  tool_use_id?: string;
 }
 
 export interface EntityOutcome {
@@ -139,6 +151,11 @@ export interface EvidenceRecord {
   role: ParticipantRole;
   quote: string;
   captured_at: string;
+  source_evidence_id?: string;
+  event_kind?: TranscriptEvidenceKind;
+  block_index?: number;
+  tool_name?: string;
+  tool_use_id?: string;
 }
 
 export interface RememberOutcome {
@@ -167,7 +184,7 @@ export interface ValidationResult {
 }
 
 const commonKeys = new Set([
-  'schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload', 'linked_memory_ids', 'assistant_intent_id',
+  'schema_version', 'kind', 'summary', 'participants', 'evidence_ids', 'evidence_message_ids', 'payload', 'linked_memory_ids', 'assistant_intent_id',
 ]);
 const forbiddenAuthorityKeys = new Set([
   'memory_id', 'subject_id', 'status', 'observed_at', 'created_at', 'conversation_id', 'role', 'quote', 'captured_at',
@@ -273,8 +290,9 @@ export function validateProposal(input: unknown, options: { requireChineseSemant
     return reject('invalid_participants', 'participants must contain one or two unique roles: user and/or assistant.');
   }
 
-  const evidenceIds = cleanStringArray(input.evidence_message_ids, true);
-  if (!evidenceIds) return reject('invalid_evidence_message_ids', 'evidence_message_ids must be a non-empty unique string array.');
+  if ('evidence_ids' in input && 'evidence_message_ids' in input) return reject('ambiguous_evidence_ids', 'Supply evidence_ids or legacy evidence_message_ids, not both.');
+  const evidenceIds = cleanStringArray(input.evidence_ids ?? input.evidence_message_ids, true);
+  if (!evidenceIds) return reject('invalid_evidence_ids', 'evidence_ids (or legacy evidence_message_ids) must be a non-empty unique string array.');
 
   let assistantIntentId: string | undefined;
   if ('assistant_intent_id' in input) {
@@ -351,7 +369,7 @@ export function validateEntityIdentityProposal(
   options: { requireChineseSemanticProse?: boolean } = {},
 ): EntityValidationResult {
   if (!plainObject(input)) return { ok: false, code: 'invalid_schema', reason: 'Entity identity proposal must be an object.' };
-  const allowed = new Set(['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description', 'evidence_message_ids']);
+  const allowed = new Set(['schema_version', 'canonical_name', 'aliases', 'entity_type', 'description', 'evidence_ids', 'evidence_message_ids']);
   for (const key of Object.keys(input)) if (!allowed.has(key)) return { ok: false, code: 'unknown_field', reason: `Unknown entity identity field: ${key}` };
   if (input.schema_version !== 1) return { ok: false, code: 'invalid_schema_version', reason: 'schema_version must be literal 1.' };
   const canonicalName = cleanString(input.canonical_name);
@@ -372,8 +390,9 @@ export function validateEntityIdentityProposal(
     seen.add(normalized);
     aliases.push(value);
   }
-  const evidenceIds = cleanStringArray(input.evidence_message_ids, true);
-  if (!evidenceIds) return { ok: false, code: 'invalid_evidence_message_ids', reason: 'evidence_message_ids must be a non-empty unique string array.' };
+  if ('evidence_ids' in input && 'evidence_message_ids' in input) return { ok: false, code: 'ambiguous_evidence_ids', reason: 'Supply evidence_ids or legacy evidence_message_ids, not both.' };
+  const evidenceIds = cleanStringArray(input.evidence_ids ?? input.evidence_message_ids, true);
+  if (!evidenceIds) return { ok: false, code: 'invalid_evidence_ids', reason: 'evidence_ids (or legacy evidence_message_ids) must be a non-empty unique string array.' };
   return { ok: true, proposal: { schema_version: 1, canonical_name: canonicalName, aliases, entity_type: input.entity_type as EntityType, description, evidence_message_ids: evidenceIds } };
 }
 
