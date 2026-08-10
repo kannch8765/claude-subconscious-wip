@@ -79,6 +79,9 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(LEGACY_OBSERVER_CONTRACT).toContain('never substitute Kohaku, the current agent identity, or source ownership for a named actor');
     expect(LEGACY_OBSERVER_CONTRACT).toContain('user_preference is only for a preference of the user');
     expect(LEGACY_OBSERVER_CONTRACT).toContain('Never encode an assistant or third-party trait, preference, or behavior as user_preference');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('A third-party-only event must be omitted unless the source itself gives it relationship significance');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('never turn it into the user\'s personal experience just to fit the schema');
+    expect((legacyMemoryCreateToolSchema(s).properties as any).participants.description).toContain('canonical relationship assistant/Kohaku');
   });
 
   it('terminates a zero-memory source with a durable receipt and checkpoint without provenance', async () => {
