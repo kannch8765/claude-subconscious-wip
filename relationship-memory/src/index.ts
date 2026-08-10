@@ -10,5 +10,6 @@ export * from './observability/index.js';
 export * from './admin/index.js';
 export * from './recall/index.js';
 export * from './backfill/index.js';
+export * from './legacy/index.js';
 
 export * from './retrieval/index.js';
