@@ -1,6 +1,15 @@
 /**
- * Agent configuration for live Subconscious plus the dedicated historical
- * relationship-memory backfill observer.
+ * Agent Configuration Utility
+ * 
+ * Resolves agent ID from (in order):
+ * 1. LETTA_AGENT_ID environment variable
+ * 2. Saved config file (~/.letta/claude-subconscious/config.json)
+ * 3. Auto-import from bundled Subconscious.af
+ * 
+ * Model configuration:
+ * - After agent creation, checks if the agent's model is available
+ * - If not available, auto-selects from available models with preference order
+ * - LETTA_MODEL environment variable can override (if available on server)
  */
 
 import * as fs from 'fs';
@@ -10,34 +19,28 @@ import { buildLettaApiUrl } from './letta_api_url.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 const CONFIG_DIR = path.join(process.env.HOME || '~', '.letta', 'claude-subconscious');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
-const DEFAULT_BACKFILL_CONFIG_FILE = path.join(CONFIG_DIR, 'backfill-config.json');
 const DEFAULT_AGENT_FILE = path.join(__dirname, '..', 'Subconscious.af');
 
-const REQUIRED_AGENT_TAGS = ['git-memory-enabled', 'origin:claude-subconcious'];
-export const BACKFILL_PURPOSE_TAG = 'purpose:relationship-memory-backfill';
-
+// Preferred models in order of preference for auto-selection
+// Tilted towards quality - Subconscious needs good instruction following and tool use
 const PREFERRED_MODELS = [
-  'letta/auto',
-  'anthropic/claude-sonnet-4-5',
-  'openai/gpt-4.1-mini',
-  'anthropic/claude-haiku-4-5',
-  'openai/gpt-5.2',
-  'google_ai/gemini-3-flash',
-  'google_ai/gemini-2.5-flash',
-  'minimax/MiniMax-M2.7',
+  'letta/auto',                   // Letta Cloud auto-routing
+  'anthropic/claude-sonnet-4-5', // Best for agents per Anthropic
+  'openai/gpt-4.1-mini',         // Good balance, 1M context, cheap
+  'anthropic/claude-haiku-4-5',  // Fast Claude option
+  'openai/gpt-5.2',              // Flagship fallback
+  'google_ai/gemini-3-flash',    // Google's balanced option
+  'google_ai/gemini-2.5-flash',  // Fallback
+  'minimax/MiniMax-M2.7',        // MiniMax flagship, 1M context
 ];
 
 interface Config {
   agentId?: string;
   importedAt?: string;
-  model?: string;
-}
-
-interface BackfillConfig {
-  agentId?: string;
-  importedAt?: string;
+  model?: string; // Track which model was configured
 }
 
 interface LettaModel {
@@ -71,391 +74,698 @@ interface AgentDetails {
   llm_config?: LlmConfig;
 }
 
+/**
+ * Regex for validating Letta agent ID format
+ * Format: agent-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (UUID v4 with 'agent-' prefix)
+ */
 const AGENT_ID_REGEX = /^agent-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/**
+ * Validate agent ID format
+ * 
+ * @param agentId - The agent ID to validate
+ * @returns true if valid, false otherwise
+ */
 export function isValidAgentId(agentId: string): boolean {
   return AGENT_ID_REGEX.test(agentId);
 }
 
-function invalidAgentIdMessage(variable: string, agentId: string): string {
-  return [
-    `Invalid ${variable} format: "${agentId}"`,
+/**
+ * Get a helpful error message for invalid agent ID format
+ */
+function getInvalidAgentIdMessage(agentId: string): string {
+  const lines = [
+    `Invalid LETTA_AGENT_ID format: "${agentId}"`,
     '',
     'The agent ID must be a UUID with the "agent-" prefix.',
     'Expected format: agent-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
     'Example: agent-a1b2c3d4-e5f6-7890-abcd-ef1234567890',
-  ].join('\n');
+    '',
+    'Common mistakes:',
+    '  - Using the agent\'s friendly name (e.g., "Memo") instead of the UUID',
+    '  - Missing the "agent-" prefix',
+    '',
+    'To find your agent ID:',
+    '  1. Go to https://app.letta.com',
+    '  2. Select your agent',
+    '  3. Copy the ID from the URL or agent settings',
+  ];
+  return lines.join('\n');
 }
 
+/**
+ * Read saved config
+ */
 function readConfig(): Config {
-  if (!fs.existsSync(CONFIG_FILE)) return {};
-  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')) as Config; }
-  catch { return {}; }
+  if (fs.existsSync(CONFIG_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf-8'));
+    } catch {
+      return {};
+    }
+  }
+  return {};
 }
 
+/**
+ * Save config
+ */
 function saveConfig(config: Config): void {
-  fs.mkdirSync(CONFIG_DIR, { recursive: true });
-  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf8');
-}
-
-function backfillConfigFile(): string {
-  return process.env.LETTA_BACKFILL_CONFIG_FILE || DEFAULT_BACKFILL_CONFIG_FILE;
-}
-
-function readBackfillConfig(): BackfillConfig {
-  const file = backfillConfigFile();
-  if (!fs.existsSync(file)) return {};
-  try { return JSON.parse(fs.readFileSync(file, 'utf8')) as BackfillConfig; }
-  catch { return {}; }
-}
-
-function saveBackfillConfig(config: BackfillConfig): void {
-  const file = backfillConfigFile();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, JSON.stringify(config, null, 2), 'utf8');
-}
-
-function agentTemplate(): { name: string; system: string } {
-  const raw = JSON.parse(fs.readFileSync(DEFAULT_AGENT_FILE, 'utf8')) as {
-    agents?: Array<{ name?: unknown; system?: unknown }>;
-  };
-  if (!Array.isArray(raw.agents) || raw.agents.length !== 1) {
-    throw new Error('Canonical Subconscious.af must contain exactly one agent');
+  if (!fs.existsSync(CONFIG_DIR)) {
+    fs.mkdirSync(CONFIG_DIR, { recursive: true });
   }
-  const agent = raw.agents[0];
-  if (typeof agent.system !== 'string' || !agent.system) {
-    throw new Error('Canonical Subconscious.af must contain exactly one agent with a non-empty system prompt');
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2), 'utf-8');
+}
+
+/**
+ * Get original agent name from .af file
+ */
+function getAgentNameFromFile(): string {
+  try {
+    const content = JSON.parse(fs.readFileSync(DEFAULT_AGENT_FILE, 'utf-8'));
+    // .af files have agents array with name property
+    if (content.agents && content.agents.length > 0 && content.agents[0].name) {
+      return content.agents[0].name;
+    }
+  } catch {
+    // Fall back to filename
   }
-  return {
-    name: typeof agent.name === 'string' && agent.name ? agent.name : 'Subconscious',
-    system: agent.system,
-  };
+  return path.basename(DEFAULT_AGENT_FILE, '.af');
 }
 
-export function getCanonicalManagedSystemPrompt(): string {
-  return agentTemplate().system;
-}
+/**
+ * Rename an agent
+ */
+const REQUIRED_AGENT_TAGS = ['git-memory-enabled', 'origin:claude-subconcious'];
 
-async function getAgentDetails(apiKey: string, agentId: string): Promise<AgentDetails> {
-  const response = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
+/**
+ * Ensure required tags are present on an agent.
+ * - git-memory-enabled: triggers git-backed memory filesystem
+ * - origin:claude-subconcious: identifies agent origin for tracking
+ */
+async function ensureRequiredAgentTags(apiKey: string, agentId: string, log: (msg: string) => void = console.log): Promise<void> {
+  // First GET the agent to read current tags
+  const getUrl = buildLettaApiUrl(`/agents/${agentId}`);
+  const getResponse = await fetch(getUrl, {
     method: 'GET',
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
   });
-  if (!response.ok) throw new Error(`Failed to get agent details: ${response.status}`);
-  return response.json() as Promise<AgentDetails>;
-}
 
-async function ensureTags(
-  apiKey: string,
-  agentId: string,
-  required: string[],
-  log: (message: string) => void,
-): Promise<void> {
-  const response = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
-  if (!response.ok) {
-    log(`Warning: Could not fetch agent tags: ${response.status}`);
+  if (!getResponse.ok) {
+    log(`Warning: Could not fetch agent tags: ${getResponse.status}`);
     return;
   }
-  const agent = await response.json() as AgentDetails;
-  const existing = Array.isArray(agent.tags) ? agent.tags : [];
-  const missing = required.filter((tag) => !existing.includes(tag));
-  if (!missing.length) return;
 
-  const patch = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
+  const agent = await getResponse.json();
+  const existingTags = agent.tags || [];
+  const missingTags = REQUIRED_AGENT_TAGS.filter(tag => !existingTags.includes(tag));
+
+  if (missingTags.length === 0) return;
+
+  const patchUrl = buildLettaApiUrl(`/agents/${agentId}`);
+  const response = await fetch(patchUrl, {
     method: 'PATCH',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ tags: [...existing, ...missing] }),
+    body: JSON.stringify({ tags: [...existingTags, ...missingTags] }),
   });
-  if (!patch.ok) log(`Warning: Could not update agent tags: ${patch.status}`);
+
+  if (!response.ok) {
+    // Non-fatal - agent still works without required tags
+    log(`Warning: Could not update agent tags: ${response.status}`);
+  }
 }
 
+async function renameAgent(apiKey: string, agentId: string, name: string): Promise<void> {
+  const url = buildLettaApiUrl(`/agents/${agentId}`);
+  
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ name }),
+  });
+
+  if (!response.ok) {
+    // Non-fatal - agent still works with _copy name
+    console.error(`Warning: Could not rename agent: ${response.status}`);
+  }
+}
+
+/**
+ * Read the canonical managed-agent system prompt from the bundled .af file.
+ *
+ * Subconscious.af is the single source of truth for the managed observer prompt;
+ * do not duplicate the prompt in TypeScript or fixtures.
+ */
+export function getCanonicalManagedSystemPrompt(): string {
+  let content: unknown;
+  try {
+    content = JSON.parse(fs.readFileSync(DEFAULT_AGENT_FILE, 'utf-8'));
+  } catch (error) {
+    throw new Error(`Failed to read canonical Subconscious.af: ${error}`);
+  }
+
+  const agents = (content as { agents?: Array<{ system?: unknown }> }).agents;
+  if (!Array.isArray(agents) || agents.length !== 1 || typeof agents[0]?.system !== 'string' || agents[0].system.length === 0) {
+    throw new Error('Canonical Subconscious.af must contain exactly one agent with a non-empty system prompt');
+  }
+
+  return agents[0].system;
+}
+
+/**
+ * Reconcile a Subconscious-managed adopted agent with the canonical .af prompt.
+ *
+ * This is intentionally called only after resolution has established that the
+ * selected agent is managed by Subconscious. It must never be used as a global
+ * tag scan, and it must never mutate an ordinary external LETTA_AGENT_ID.
+ */
 async function reconcileManagedAgentSystem(
   apiKey: string,
   agentId: string,
-  log: (message: string) => void,
+  log: (msg: string) => void = console.log,
 ): Promise<void> {
-  const canonical = getCanonicalManagedSystemPrompt();
-  const response = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
+  const canonicalSystem = getCanonicalManagedSystemPrompt();
+  const url = buildLettaApiUrl(`/agents/${agentId}`);
+  const getResponse = await fetch(url, {
     method: 'GET',
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
   });
-  if (!response.ok) {
-    throw new Error(`Failed to read managed agent before system reconciliation: ${response.status} ${await response.text()}`);
+
+  if (!getResponse.ok) {
+    const errorText = await getResponse.text();
+    throw new Error(`Failed to read managed agent before system reconciliation: ${getResponse.status} ${errorText}`);
   }
-  const agent = await response.json() as AgentDetails;
-  if (agent.system === canonical) {
+
+  const agent = await getResponse.json() as AgentDetails;
+  if (agent.system === canonicalSystem) {
     log('Managed Subconscious system prompt already matches canonical Subconscious.af');
     return;
   }
 
-  const patch = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
+  const patchResponse = await fetch(url, {
     method: 'PATCH',
     headers: {
-      Authorization: `Bearer ${apiKey}`,
+      'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ system: canonical }),
+    body: JSON.stringify({ system: canonicalSystem }),
   });
-  if (!patch.ok) {
-    throw new Error(`Failed to reconcile managed Subconscious system prompt: ${patch.status} ${await patch.text()}`);
+
+  if (!patchResponse.ok) {
+    const errorText = await patchResponse.text();
+    throw new Error(`Failed to reconcile managed Subconscious system prompt: ${patchResponse.status} ${errorText}`);
   }
+
   log('Reconciled managed Subconscious system prompt from canonical Subconscious.af');
 }
 
-async function isManagedEnvAgent(apiKey: string, agentId: string): Promise<boolean> {
-  const response = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
+/**
+ * Determine whether an env-selected agent is an existing Subconscious-managed
+ * adopted agent without mutating it. The origin tag is an ownership marker for
+ * this narrow purpose; this function never scans the global agent inventory.
+ */
+async function isManagedEnvAgent(
+  apiKey: string,
+  agentId: string,
+  log: (msg: string) => void = console.log,
+): Promise<boolean> {
+  const url = buildLettaApiUrl(`/agents/${agentId}`);
+  const response = await fetch(url, {
     method: 'GET',
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
   });
-  if (!response.ok) return false;
+
+  if (!response.ok) {
+    log(`Could not verify LETTA_AGENT_ID ownership (${response.status}); treating it as external for managed reconciliation`);
+    return false;
+  }
+
   const agent = await response.json() as AgentDetails;
   return Array.isArray(agent.tags) && agent.tags.includes('origin:claude-subconcious');
 }
 
+/**
+ * List available models from Letta server
+ */
+async function listAvailableModels(apiKey: string): Promise<LettaModel[]> {
+  const url = buildLettaApiUrl('/models/');
+  
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to list models: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Get agent details including current model configuration
+ */
+async function getAgentDetails(apiKey: string, agentId: string): Promise<AgentDetails> {
+  const url = buildLettaApiUrl(`/agents/${agentId}`);
+  
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to get agent details: ${response.status}`);
+  }
+
+  return response.json();
+}
+
+/**
+ * Get model handle from agent details
+ * The handle format is "provider/model" (e.g., "openai/gpt-4o-mini")
+ */
+function getAgentModelHandle(agent: AgentDetails): string | null {
+  const llmConfig = agent.llm_config;
+  if (!llmConfig) return null;
+  
+  // Try handle first (newer format)
+  if (llmConfig.handle) return llmConfig.handle;
+  
+  // Fall back to constructing from provider and model
+  if (llmConfig.provider_name && llmConfig.model) {
+    return `${llmConfig.provider_name}/${llmConfig.model}`;
+  }
+  
+  return llmConfig.model || null;
+}
+
+/**
+ * Check if a model is available on the server
+ */
+function isModelAvailable(models: LettaModel[], modelHandle: string): boolean {
+  return findModel(models, modelHandle) !== null;
+}
+
+/**
+ * Find a model in the available models list by handle.
+ * Returns the matching LettaModel or null.
+ */
 export function findModel(models: LettaModel[], modelHandle: string): LettaModel | null {
-  const normalized = modelHandle.toLowerCase();
-  return models.find((model) => {
-    const handle = model.handle?.toLowerCase() || `${model.provider_type}/${model.model}`.toLowerCase();
-    return handle === normalized
-      || model.model?.toLowerCase() === normalized
-      || `${model.provider_type}/${model.name}`.toLowerCase() === normalized;
+  const normalizedHandle = modelHandle.toLowerCase();
+
+  return models.find(m => {
+    const handle = m.handle?.toLowerCase() || `${m.provider_type}/${m.model}`.toLowerCase();
+    return handle === normalizedHandle ||
+           m.model?.toLowerCase() === normalizedHandle ||
+           `${m.provider_type}/${m.name}`.toLowerCase() === normalizedHandle;
   }) || null;
 }
 
-export function buildLlmConfig(
-  modelHandle: string,
-  models: LettaModel[],
-  currentConfig: LlmConfig | undefined,
-): LlmConfig {
-  const slash = modelHandle.indexOf('/');
-  const providerName = slash > 0 ? modelHandle.slice(0, slash) : undefined;
-  const modelName = slash > 0 ? modelHandle.slice(slash + 1) : modelHandle;
-  const info = findModel(models, modelHandle);
-  const config: LlmConfig = {
-    ...(currentConfig || {}),
-    model: modelName,
-    handle: modelHandle,
-    provider_name: providerName || info?.provider_type || currentConfig?.provider_name,
-    model_endpoint_type: info?.provider_type || currentConfig?.model_endpoint_type,
-  };
-  const envWindow = process.env.LETTA_CONTEXT_WINDOW;
-  if (envWindow) {
-    const parsed = Number.parseInt(envWindow, 10);
-    if (Number.isFinite(parsed) && parsed > 0) config.context_window = parsed;
+/**
+ * Select best available model from preferences
+ */
+function selectBestModel(models: LettaModel[], preferences: string[]): string | null {
+  // First, try preferred models in order
+  for (const preferred of preferences) {
+    if (isModelAvailable(models, preferred)) {
+      return preferred;
+    }
   }
-  return config;
+  
+  // Fall back to first available model
+  if (models.length > 0) {
+    const first = models[0];
+    return first.handle || `${first.provider_type}/${first.model}`;
+  }
+  
+  return null;
 }
 
+/**
+ * Ensure agent's model is available on the server
+ * If not, auto-select from available models and update the agent
+ * 
+ * @returns The model handle that was configured (or null if no change needed)
+ */
 async function ensureModelAvailable(
   apiKey: string,
   agentId: string,
-  log: (message: string) => void,
+  log: (msg: string) => void = console.log
 ): Promise<string | null> {
   try {
-    const [modelsResponse, agent] = await Promise.all([
-      fetch(buildLettaApiUrl('/models/'), {
-        method: 'GET',
-        headers: { Authorization: `Bearer ${apiKey}` },
-      }),
+    // Get available models and agent details in parallel
+    const [models, agent] = await Promise.all([
+      listAvailableModels(apiKey),
       getAgentDetails(apiKey, agentId),
     ]);
-    if (!modelsResponse.ok) throw new Error(`Failed to list models: ${modelsResponse.status}`);
-    const models = await modelsResponse.json() as LettaModel[];
-    const current = agent.llm_config?.handle
-      || (agent.llm_config?.provider_name && agent.llm_config?.model
-        ? `${agent.llm_config.provider_name}/${agent.llm_config.model}`
-        : agent.llm_config?.model);
-    const requested = process.env.LETTA_MODEL;
-    let selected: string | undefined;
-    if (requested && findModel(models, requested)) selected = requested;
-    else if (current && findModel(models, current)) return null;
-    else selected = PREFERRED_MODELS.find((candidate) => !!findModel(models, candidate))
-      || models[0]?.handle
-      || (models[0] ? `${models[0].provider_type}/${models[0].model}` : undefined);
-    if (!selected) return null;
+    
+    const currentModel = getAgentModelHandle(agent);
+    log(`Agent's current model: ${currentModel || 'unknown'}`);
+    log(`Available models: ${models.length} found`);
+    
+    // Check if LETTA_MODEL env var is set
+    const envModel = process.env.LETTA_MODEL;
+    if (envModel) {
+      if (isModelAvailable(models, envModel)) {
+        if (currentModel !== envModel) {
+          log(`Using LETTA_MODEL override: ${envModel}`);
+          await updateAgentModel(apiKey, agentId, envModel, models, agent.llm_config, log);
+          return envModel;
+        }
+        // Model matches, but check if context_window needs updating
+        const envCW = process.env.LETTA_CONTEXT_WINDOW;
+        if (envCW && agent.llm_config?.context_window !== parseInt(envCW, 10)) {
+          log(`Updating context_window to ${envCW} (was ${agent.llm_config?.context_window})`);
+          await updateAgentModel(apiKey, agentId, envModel, models, agent.llm_config, log);
+          return envModel;
+        }
+        return null; // Already using desired model and context_window
+      } else {
+        log(`Warning: LETTA_MODEL="${envModel}" is not available on this server`);
+        log(`Available models: ${models.map(m => m.handle || `${m.provider_type}/${m.model}`).slice(0, 10).join(', ')}${models.length > 10 ? '...' : ''}`);
+      }
+    }
 
-    const llm = buildLlmConfig(selected, models, agent.llm_config);
-    const body: Record<string, unknown> = { model: selected };
-    if (typeof llm.context_window === 'number') body.context_window_limit = llm.context_window;
-    const patch = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-    if (!patch.ok) throw new Error(`Failed to update agent model: ${patch.status} ${await patch.text()}`);
-    return selected;
+    // Check if current model is available
+    if (currentModel && isModelAvailable(models, currentModel)) {
+      log(`Agent's model "${currentModel}" is available`);
+      return null; // No change needed
+    }
+
+    // Model not available - need to select alternative
+    log(`Agent's model "${currentModel}" is NOT available on this server`);
+
+    const selectedModel = selectBestModel(models, PREFERRED_MODELS);
+    if (!selectedModel) {
+      throw new Error('No models available on this server. Please configure your Letta server with at least one LLM provider.');
+    }
+
+    log(`Auto-selecting model: ${selectedModel}`);
+    console.log(`\n⚠️  Model Update Required`);
+    console.log(`   The Subconscious agent's default model (${currentModel}) is not available.`);
+    console.log(`   Auto-selecting: ${selectedModel}`);
+    console.log(`   To use a different model, set LETTA_MODEL environment variable.\n`);
+
+    await updateAgentModel(apiKey, agentId, selectedModel, models, agent.llm_config, log);
+    return selectedModel;
+    
   } catch (error) {
+    // Log but don't fail - the agent might still work
     log(`Warning: Could not verify model availability: ${error}`);
     return null;
   }
 }
 
-async function importAgent(
-  apiKey: string,
-  name: string,
-  tags: string[],
-  log: (message: string) => void,
-): Promise<string> {
-  const file = fs.readFileSync(DEFAULT_AGENT_FILE);
-  const form = new FormData();
-  form.append('file', new Blob([file], { type: 'application/json' }), 'Subconscious.af');
-  const response = await fetch(buildLettaApiUrl('/agents/import'), {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}` },
-    body: form,
-  });
-  if (!response.ok) throw new Error(`Failed to import agent: ${response.status} ${await response.text()}`);
-  const result = await response.json() as { agent_ids?: string[] };
-  const agentId = result.agent_ids?.[0];
-  if (!agentId) throw new Error('Import succeeded but no agent ID returned');
+/**
+ * Build llm_config for a model handle using metadata from the available models
+ * list and the agent's current llm_config as a base.
+ *
+ * This preserves existing settings (context_window, temperature, etc.) while
+ * overriding model-identity fields. If LETTA_CONTEXT_WINDOW is set, it takes
+ * precedence over the current value.
+ */
+export function buildLlmConfig(
+  modelHandle: string,
+  models: LettaModel[],
+  currentConfig: LlmConfig | undefined,
+): LlmConfig {
+  const slashIdx = modelHandle.indexOf('/');
+  const providerName = slashIdx > 0 ? modelHandle.substring(0, slashIdx) : undefined;
+  const modelName = slashIdx > 0 ? modelHandle.substring(slashIdx + 1) : modelHandle;
 
-  const rename = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
-    method: 'PATCH',
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({ name }),
-  });
-  if (!rename.ok) log(`Warning: Could not rename agent: ${rename.status}`);
-  await ensureTags(apiKey, agentId, tags, log);
-  return agentId;
-}
+  const modelInfo = findModel(models, modelHandle);
 
-function getKnownLiveAgentIdReadOnly(): string | undefined {
-  const env = process.env.LETTA_AGENT_ID;
-  if (env) {
-    if (!isValidAgentId(env)) throw new Error(invalidAgentIdMessage('LETTA_AGENT_ID', env));
-    return env;
-  }
-  const config = readConfig();
-  return config.agentId && isValidAgentId(config.agentId) ? config.agentId : undefined;
-}
+  // Spread current config to preserve settings, then override model fields
+  const config: LlmConfig = {
+    ...(currentConfig || {}),
+    model: modelName,
+    handle: modelHandle,
+    provider_name: providerName || modelInfo?.provider_type || currentConfig?.provider_name,
+    model_endpoint_type: modelInfo?.provider_type || currentConfig?.model_endpoint_type,
+  };
 
-export function getConfiguredAgentIdReadOnly(): string {
-  const id = getKnownLiveAgentIdReadOnly();
-  if (id) return id;
-  throw new Error('No existing Letta agent is configured for read-only recall. Set LETTA_AGENT_ID or initialize Subconscious first.');
-}
-
-export async function getAgentId(
-  apiKey: string,
-  log: (message: string) => void = console.log,
-): Promise<string> {
-  const env = process.env.LETTA_AGENT_ID;
-  if (env) {
-    if (!isValidAgentId(env)) throw new Error(invalidAgentIdMessage('LETTA_AGENT_ID', env));
-    log(`Using agent ID from LETTA_AGENT_ID: ${env}`);
-    if (await isManagedEnvAgent(apiKey, env)) {
-      log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling system prompt only');
-      await reconcileManagedAgentSystem(apiKey, env, log);
-    } else {
-      log('Using ordinary external LETTA_AGENT_ID; skipping all Subconscious-managed mutation');
+  // LETTA_CONTEXT_WINDOW env var overrides the current value
+  const envContextWindow = process.env.LETTA_CONTEXT_WINDOW;
+  if (envContextWindow) {
+    const parsed = parseInt(envContextWindow, 10);
+    if (!isNaN(parsed) && parsed > 0) {
+      config.context_window = parsed;
     }
-    return env;
   }
 
-  let config = readConfig();
-  let agentId = config.agentId;
-  if (!agentId || !isValidAgentId(agentId)) {
-    agentId = await importAgent(apiKey, agentTemplate().name, REQUIRED_AGENT_TAGS, log);
-    config = { agentId, importedAt: new Date().toISOString() };
-    saveConfig(config);
-  }
-
-  await ensureTags(apiKey, agentId, REQUIRED_AGENT_TAGS, log);
-  await reconcileManagedAgentSystem(apiKey, agentId, log);
-  const model = await ensureModelAvailable(apiKey, agentId, log);
-  if (model && config.model !== model) saveConfig({ ...config, model });
-  return agentId;
-}
-
-async function verifyDedicatedBackfillAgent(
-  apiKey: string,
-  agentId: string,
-  liveAgentId: string | undefined,
-  log: (message: string) => void,
-): Promise<void> {
-  if (liveAgentId && liveAgentId === agentId) {
-    throw new Error(`Dedicated backfill agent must differ from live Subconscious agent: ${agentId}`);
-  }
-
-  const required = [...REQUIRED_AGENT_TAGS, BACKFILL_PURPOSE_TAG];
-  await ensureTags(apiKey, agentId, required, log);
-  await reconcileManagedAgentSystem(apiKey, agentId, log);
-
-  const response = await fetch(buildLettaApiUrl(`/agents/${agentId}`), {
-    method: 'GET',
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
-  if (!response.ok) {
-    throw new Error(`Failed to verify dedicated backfill agent identity: ${response.status} ${await response.text()}`);
-  }
-  const agent = await response.json() as AgentDetails;
-  if (!Array.isArray(agent.tags) || !agent.tags.includes(BACKFILL_PURPOSE_TAG)) {
-    throw new Error(`Dedicated backfill agent is missing required purpose tag: ${BACKFILL_PURPOSE_TAG}`);
-  }
+  return config;
 }
 
 /**
- * Dedicated historical resolver. It never reads LETTA_AGENT_ID as its own
- * selection source, never scans the global agent inventory, and stores its
- * managed identity separately from the live Subconscious config.
+ * Update agent's model configuration via the agent PATCH endpoint.
+ *
+ * Letta deprecated the `llm_config` request body (HTTP 400:
+ * "The `llm_config` field is deprecated and no longer accepted. Use the `model`
+ * field instead."). The replacement shape is top-level `model` plus
+ * `context_window_limit` — the latter explicitly avoids the old footgun where
+ * a bare `{ model }` PATCH reset context_window to a server default.
+ *
+ * buildLlmConfig() is kept for callers that still need the resolved
+ * provider/model metadata; we just pull the two server-accepted fields out of
+ * it and send those.
  */
-export async function getBackfillAgentId(
+async function updateAgentModel(
   apiKey: string,
-  log: (message: string) => void = console.log,
-): Promise<string> {
-  const liveAgentId = getKnownLiveAgentIdReadOnly();
-  const env = process.env.LETTA_BACKFILL_AGENT_ID;
-  let agentId: string;
+  agentId: string,
+  modelHandle: string,
+  models: LettaModel[],
+  currentConfig: LlmConfig | undefined,
+  log: (msg: string) => void = console.log
+): Promise<void> {
+  const url = buildLettaApiUrl(`/agents/${agentId}`);
 
-  if (env) {
-    if (!isValidAgentId(env)) throw new Error(invalidAgentIdMessage('LETTA_BACKFILL_AGENT_ID', env));
-    agentId = env;
-    log(`Using dedicated backfill agent from LETTA_BACKFILL_AGENT_ID: ${agentId}`);
-  } else {
-    const config = readBackfillConfig();
-    if (config.agentId) {
-      if (!isValidAgentId(config.agentId)) {
-        throw new Error(`Saved dedicated backfill agent ID has invalid format: ${config.agentId}`);
-      }
-      agentId = config.agentId;
-      log(`Using saved dedicated backfill agent ID: ${agentId}`);
-    } else {
-      const template = agentTemplate();
-      agentId = await importAgent(
-        apiKey,
-        `${template.name} Relationship Memory Backfill`,
-        [...REQUIRED_AGENT_TAGS, BACKFILL_PURPOSE_TAG],
-        log,
-      );
-      if (liveAgentId && liveAgentId === agentId) {
-        throw new Error(`Provisioned backfill agent unexpectedly equals live Subconscious agent: ${agentId}`);
-      }
-      saveBackfillConfig({ agentId, importedAt: new Date().toISOString() });
-      log(`Provisioned and saved dedicated backfill agent: ${agentId}`);
+  log(`Updating agent model to: ${modelHandle}`);
+
+  const llmConfig = buildLlmConfig(modelHandle, models, currentConfig);
+
+  const body: Record<string, unknown> = { model: modelHandle };
+  if (typeof llmConfig.context_window === 'number') {
+    body.context_window_limit = llmConfig.context_window;
+    if (llmConfig.context_window !== currentConfig?.context_window) {
+      log(`Including context_window: ${llmConfig.context_window}`);
     }
   }
 
-  await verifyDedicatedBackfillAgent(apiKey, agentId, liveAgentId, log);
+  const response = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to update agent model: ${response.status} ${errorText}`);
+  }
+
+  log(`Agent model updated to: ${modelHandle}`);
+}
+
+/**
+ * Import agent from .af file
+ */
+async function importDefaultAgent(apiKey: string): Promise<string> {
+  const url = buildLettaApiUrl('/agents/import');
+  
+  // Read the agent file
+  const agentFileContent = fs.readFileSync(DEFAULT_AGENT_FILE);
+  
+  // Get original name for later rename
+  const originalName = getAgentNameFromFile();
+  
+  // Create form data with the file
+  const formData = new FormData();
+  const blob = new Blob([agentFileContent], { type: 'application/json' });
+  formData.append('file', blob, 'Subconscious.af');
+  
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: formData,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to import agent: ${response.status} ${errorText}`);
+  }
+
+  const result = await response.json();
+  
+  if (!result.agent_ids || result.agent_ids.length === 0) {
+    throw new Error('Import succeeded but no agent ID returned');
+  }
+  
+  const agentId = result.agent_ids[0];
+  
+  // Rename to original name (removes "_copy" suffix added by import)
+  await renameAgent(apiKey, agentId, originalName);
+  
+  // Ensure required tags are present for memory + origin tracking
+  await ensureRequiredAgentTags(apiKey, agentId);
+  
   return agentId;
 }
 
-export function needsImport(): boolean {
-  if (process.env.LETTA_AGENT_ID) return false;
-  return !readConfig().agentId;
+export function getConfiguredAgentIdReadOnly(): string {
+  const envAgentId = process.env.LETTA_AGENT_ID;
+  if (envAgentId) {
+    if (!isValidAgentId(envAgentId)) throw new Error(getInvalidAgentIdMessage(envAgentId));
+    return envAgentId;
+  }
+  const config = readConfig();
+  if (config.agentId && isValidAgentId(config.agentId)) return config.agentId;
+  throw new Error('No existing Letta agent is configured for read-only recall. Set LETTA_AGENT_ID or initialize Subconscious first.');
 }
 
+/**
+ * Get or create agent ID
+ * 
+ * Returns the agent ID from env var, saved config, or imports the default agent.
+ * After getting the agent, verifies the model is available and auto-selects if not.
+ */
+export async function getAgentId(apiKey: string, log: (msg: string) => void = console.log): Promise<string> {
+  let agentId: string;
+  let config = readConfig();
+  let agentSource: 'env' | 'saved' | 'imported';
+  
+  // 1. Check environment variable
+  const envAgentId = process.env.LETTA_AGENT_ID;
+  if (envAgentId) {
+    // Validate format before using
+    if (!isValidAgentId(envAgentId)) {
+      const errorMsg = getInvalidAgentIdMessage(envAgentId);
+      log(`WARNING: ${errorMsg}`);
+      throw new Error(errorMsg);
+    }
+    log(`Using agent ID from LETTA_AGENT_ID: ${envAgentId}`);
+    agentId = envAgentId;
+    agentSource = 'env';
+  }
+  // 2. Check saved config
+  else if (config.agentId) {
+    // Validate saved config (in case it was manually edited or corrupted)
+    if (!isValidAgentId(config.agentId)) {
+      log(`WARNING: Saved agent ID has invalid format: ${config.agentId}`);
+      log(`Ignoring invalid saved config and attempting to import default agent...`);
+      // Fall through to import default agent
+      agentId = await importAndSaveAgent(apiKey, log);
+      config = readConfig(); // Reload config after import
+      agentSource = 'imported';
+    } else {
+      log(`Using saved agent ID: ${config.agentId}`);
+      agentId = config.agentId;
+      agentSource = 'saved';
+    }
+  }
+  // 3. Import default agent
+  else {
+    agentId = await importAndSaveAgent(apiKey, log);
+    config = readConfig(); // Reload config after import
+    agentSource = 'imported';
+  }
+  
+  // 4. Reconcile only Subconscious-managed agents.
+  //
+  // Saved/imported configuration is managed by definition. An env-selected
+  // LETTA_AGENT_ID may be either the already-adopted Subconscious agent or an
+  // ordinary external Letta/Letta Code agent. For env IDs, perform one read-only
+  // ownership probe: origin:claude-subconcious permits system reconciliation;
+  // absence of that tag means zero managed PATCHes. Never scan the global agent
+  // inventory by tag.
+  if (agentSource !== 'env') {
+    try {
+      await ensureRequiredAgentTags(apiKey, agentId, log);
+    } catch (error) {
+      log(`Warning: Could not ensure required tags: ${error}`);
+    }
+
+    // Prompt reconciliation is authority-critical: a stale managed observer
+    // must not silently continue under obsolete memory/tool rules. Let failures
+    // propagate instead of importing/replacing the agent or pretending success.
+    await reconcileManagedAgentSystem(apiKey, agentId, log);
+
+    // 5. Existing model auto-selection remains scoped to config-managed agents.
+    try {
+      const configuredModel = await ensureModelAvailable(apiKey, agentId, log);
+      if (configuredModel && config.model !== configuredModel) {
+        saveConfig({
+          ...config,
+          model: configuredModel,
+        });
+      }
+    } catch (error) {
+      log(`Warning: Could not verify model availability: ${error}`);
+    }
+  } else if (await isManagedEnvAgent(apiKey, agentId, log)) {
+    log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling system prompt only');
+    await reconcileManagedAgentSystem(apiKey, agentId, log);
+  } else {
+    log('Using ordinary external LETTA_AGENT_ID; skipping all Subconscious-managed mutation');
+  }
+  
+  return agentId;
+}
+
+/**
+ * Import default agent and save to config
+ */
+async function importAndSaveAgent(apiKey: string, log: (msg: string) => void): Promise<string> {
+  log('No agent configured - importing default Subconscious agent...');
+  
+  if (!fs.existsSync(DEFAULT_AGENT_FILE)) {
+    throw new Error(`Default agent file not found: ${DEFAULT_AGENT_FILE}`);
+  }
+  
+  const agentId = await importDefaultAgent(apiKey);
+  log(`Imported agent: ${agentId}`);
+  
+  // Save for future use
+  saveConfig({
+    agentId,
+    importedAt: new Date().toISOString(),
+  });
+  log(`Saved agent ID to ${CONFIG_FILE}`);
+  
+  return agentId;
+}
+
+/**
+ * Check if we need to import (for quick checks without async)
+ */
+export function needsImport(): boolean {
+  if (process.env.LETTA_AGENT_ID) return false;
+  const config = readConfig();
+  return !config.agentId;
+}
+
+/**
+ * Get config file path (for logging/debugging)
+ */
 export function getConfigPath(): string {
   return CONFIG_FILE;
 }
