@@ -178,7 +178,7 @@ function parseFrontmatter(source: string): { frontmatter: Record<string, unknown
   let listKey: string | undefined;
   for (const line of yaml.split('\n')) {
     if (!line.trim() || line.trimStart().startsWith('#')) continue;
-    const list = line.match(/^\s+-\s+(.+)$/);
+    const list = line.match(/^\s*-\s+(.+)$/);
     if (list && listKey) {
       const current = result[listKey];
       if (!Array.isArray(current)) throw new Error(`invalid list field: ${listKey}`);
@@ -258,9 +258,6 @@ export function parseLegacySource(
     arousal: requiredNumber(frontmatter.arousal, 'arousal'),
     activation_count: requiredNumber(frontmatter.activation_count, 'activation_count'),
   };
-  delete metadata.id;
-  delete metadata.created;
-  delete metadata.last_active;
   return {
     schema_version: 1,
     legacy_source_id: legacySourceId(subjectId, bucketType, bucketId),
@@ -282,6 +279,13 @@ export function parseLegacySource(
   };
 }
 
+function atomicWriteJson(file: string, value: unknown): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  fs.renameSync(tmp, file);
+}
+
 function readJsonl<T>(file: string): T[] {
   if (!fs.existsSync(file)) return [];
   return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
@@ -289,63 +293,74 @@ function readJsonl<T>(file: string): T[] {
 
 function appendJsonl(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.appendFileSync(file, `${JSON.stringify(value)}\n`, 'utf8');
-}
-
-function atomicWriteJson(file: string, value: unknown): void {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.tmp-${process.pid}-${crypto.randomUUID()}`;
-  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
-  fs.renameSync(tmp, file);
+  fs.appendFileSync(file, `${stableJson(value)}\n`, 'utf8');
 }
 
 export class LegacyMemorySourceStore {
-  private readonly mutationStore: RelationshipMemoryStore;
+  private readonly baseDir: string;
+  private readonly lockDir: string;
 
-  constructor(readonly rootDir: string) {
-    fs.mkdirSync(rootDir, { recursive: true });
-    // Reuse Task 093W's filesystem mutation boundary so legacy ledgers cannot
-    // become a parallel unguarded writer lane beside canonical memory writes.
-    this.mutationStore = new RelationshipMemoryStore(rootDir, '__legacy_import_boundary__');
+  constructor(baseDir: string) {
+    this.baseDir = path.resolve(baseDir);
+    this.lockDir = path.join(this.baseDir, '.legacy-import.lock');
   }
 
-  private file(name: string): string { return path.join(this.rootDir, name); }
-  withMutationBoundary<T>(operation: () => T): T { return this.mutationStore.withMutationBoundary(operation); }
+  private file(name: string): string { return path.join(this.baseDir, name); }
+
+  withMutationBoundary<T>(fn: () => T): T {
+    fs.mkdirSync(this.baseDir, { recursive: true });
+    let lockFd: number | undefined;
+    try {
+      lockFd = fs.openSync(this.lockDir, 'wx');
+      return fn();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') throw new Error('legacy import mutation lock is already held');
+      throw error;
+    } finally {
+      if (lockFd !== undefined) fs.closeSync(lockFd);
+      if (fs.existsSync(this.lockDir)) fs.unlinkSync(this.lockDir);
+    }
+  }
+
   listSources(): LegacyAssistantMemorySourceRecord[] { return readJsonl(this.file('legacy-assistant-sources.jsonl')); }
   listProvenance(): LegacyMemoryProvenanceLink[] { return readJsonl(this.file('legacy-memory-provenance.jsonl')); }
   listReceipts(): LegacyImportReceipt[] { return readJsonl(this.file('legacy-import-receipts.jsonl')); }
-  getSource(id: string): LegacyAssistantMemorySourceRecord | undefined { return this.listSources().find((source) => source.legacy_source_id === id); }
+
   appendSource(source: LegacyAssistantMemorySourceRecord): 'accepted' | 'duplicate' {
-    return this.withMutationBoundary(() => {
-      const existing = this.getSource(source.legacy_source_id);
-      if (existing) {
-        if (stableJson(existing) !== stableJson(source)) throw new Error(`legacy source identity collision: ${source.legacy_source_id}`);
-        return 'duplicate';
-      }
-      appendJsonl(this.file('legacy-assistant-sources.jsonl'), source);
-      return 'accepted';
-    });
+    const existing = this.listSources().find((item) => item.legacy_source_id === source.legacy_source_id);
+    if (existing) {
+      if (stableJson(existing) !== stableJson(source)) throw new Error(`legacy source identity collision: ${source.legacy_source_id}`);
+      return 'duplicate';
+    }
+    appendJsonl(this.file('legacy-assistant-sources.jsonl'), source);
+    return 'accepted';
   }
-  appendProvenance(link: Omit<LegacyMemoryProvenanceLink, 'schema_version' | 'provenance_id'>): LegacyMemoryProvenanceLink {
-    return this.withMutationBoundary(() => {
-      const record: LegacyMemoryProvenanceLink = {
-        schema_version: 1,
-        provenance_id: stableId('legacy_provenance', { legacy_source_id: link.legacy_source_id, canonical_memory_id: link.canonical_memory_id, disposition: link.disposition }),
-        ...link,
-      };
-      const existing = this.listProvenance().find((item) => item.provenance_id === record.provenance_id);
-      if (existing && stableJson(existing) !== stableJson(record)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
-      if (!existing) appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
-      return existing ?? record;
-    });
+
+  appendProvenance(input: Omit<LegacyMemoryProvenanceLink, 'schema_version' | 'provenance_id'>): LegacyMemoryProvenanceLink {
+    const source = this.listSources().find((item) => item.legacy_source_id === input.legacy_source_id);
+    if (!source) throw new Error(`unknown legacy source: ${input.legacy_source_id}`);
+    const record: LegacyMemoryProvenanceLink = {
+      schema_version: 1,
+      provenance_id: stableId('legacy_provenance', { legacy_source_id: input.legacy_source_id, canonical_memory_id: input.canonical_memory_id, disposition: input.disposition }),
+      ...input,
+    };
+    const existing = this.listProvenance().find((item) => item.provenance_id === record.provenance_id);
+    if (existing && stableJson(existing) !== stableJson(record)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
+    if (!existing) appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
+    return record;
   }
-  memoriesForSource(sourceId: string): string[] { return this.listProvenance().filter((item) => item.legacy_source_id === sourceId).map((item) => item.canonical_memory_id); }
-  sourcesForMemory(memoryId: string): string[] { return this.listProvenance().filter((item) => item.canonical_memory_id === memoryId).map((item) => item.legacy_source_id); }
+
   appendReceipt(receipt: LegacyImportReceipt): void {
-    this.withMutationBoundary(() => {
-      const duplicate = this.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
-      if (!duplicate) appendJsonl(this.file('legacy-import-receipts.jsonl'), receipt);
-    });
+    const duplicate = this.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
+    if (!duplicate) appendJsonl(this.file('legacy-import-receipts.jsonl'), receipt);
+  }
+
+  memoriesForSource(legacySourceIdValue: string): string[] {
+    return this.listProvenance().filter((item) => item.legacy_source_id === legacySourceIdValue).map((item) => item.canonical_memory_id).sort(bytewiseCompare);
+  }
+
+  sourcesForMemory(canonicalMemoryId: string): string[] {
+    return this.listProvenance().filter((item) => item.canonical_memory_id === canonicalMemoryId).map((item) => item.legacy_source_id).sort(bytewiseCompare);
   }
 }
 
@@ -433,9 +448,7 @@ export const LEGACY_OBSERVER_CONTRACT = `
 You are evaluating one immutable historical legacy_assistant_memory source from ombre_brain.
 The source is evidence, not a current assistant_remember_intent and not transcript evidence.
 Never invent conversation_id, message_id, or transcript evidence IDs for it.
-One source may semantically yield zero, one, or many canonical relationship memories; never force 1 source = 1 memory and never use naive paragraph splitting as a substitute for semantic judgment.
-For each semantic item, choose among: no canonical memory required; provenance-link an existing duplicate; reinforce an existing canonical memory; create a canonical memory; and use existing relationship-memory linking where appropriate.
-Every canonical outcome must remain traceable to the immutable legacy_source_id.
-For feel/ sources, preserve historical temporality: first-person feeling prose records what Kohaku felt when authored and must not be rewritten as an assertion of Kohaku's current feeling without independent current evidence. Raw feel prose is not automatically ordinary recall text.
-Legacy embeddings, dehydration summaries, and cooldown databases are derived artifacts and are never primary source truth.
-`.trim();
+For each source, use semantic judgment to decide whether it yields zero, one, or many canonical relationship memories; naive paragraph splitting is forbidden.
+Preserve bucket provenance and historical temporality. A feel/ source records how the assistant historically felt at that time; never assert it as a current feeling merely because it came from feel/.
+Old embedding databases, dehydration caches, and vector artifacts are derived/non-authoritative and are not source memories.
+`;

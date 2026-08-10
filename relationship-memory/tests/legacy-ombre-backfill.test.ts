@@ -47,6 +47,13 @@ function parsed(root: string, relative: string) {
   const entry = manifest.entries.find((item) => item.relative_path === relative)!;
   return parseLegacySource(root, entry, manifest.manifest_digest, 'subject-kohaku');
 }
+function blockListBucket(root: string, relative: string, indent: '' | '  '): string {
+  const file = path.join(root, relative);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const id = path.basename(relative, '.md');
+  fs.writeFileSync(file, `---\nid: ${id}\nname: 列表兼容测试\ntype: memory\ncreated: 2026-07-01T01:02:03\nlast_active: 2026-07-02T04:05:06\ndomain:\n${indent}- relationship\n${indent}- daily\ntags:\n${indent}- kohaku\n${indent}- cat\nimportance: 8\nvalence: 0.7\narousal: 0.4\nactivation_count: 3.5\n---\nsynthetic fixture only.\n`, 'utf8');
+  return file;
+}
 
 describe('Task 093X Ombre legacy source foundation', () => {
   it('recursively discovers nested category/topic markdown with bytewise deterministic ordering', () => {
@@ -73,6 +80,27 @@ describe('Task 093X Ombre legacy source foundation', () => {
   it('normalizes numeric YAML IDs to strings without rewriting source and preserves float activation count', () => {
     const root = temp(); const file = bucket(root, 'dynamic/914798167722.md'); const raw = fs.readFileSync(file, 'utf8');
     const source = parsed(root, 'dynamic/914798167722.md'); expect(source.bucket_id).toBe('914798167722'); expect(source.original_markdown).toBe(raw); expect(source.frontmatter.activation_count).toBe(3.5);
+  });
+
+  it('accepts both column-0 and indented block lists and creates normal legacy sources', () => {
+    const root = temp(); const store = new LegacyMemorySourceStore(path.join(root, 'store'));
+    blockListBucket(root, 'dynamic/101.md', ''); blockListBucket(root, 'dynamic/102.md', '  ');
+    const columnZero = parsed(root, 'dynamic/101.md'); const indented = parsed(root, 'dynamic/102.md');
+    expect(columnZero.frontmatter.domain).toEqual(['relationship', 'daily']);
+    expect(columnZero.frontmatter.tags).toEqual(['kohaku', 'cat']);
+    expect(indented.frontmatter.domain).toEqual(['relationship', 'daily']);
+    expect(indented.frontmatter.tags).toEqual(['kohaku', 'cat']);
+    expect(store.appendSource(columnZero)).toBe('accepted'); expect(store.appendSource(indented)).toBe('accepted');
+  });
+
+  it('dry-runs a mixed block-list fixture without isolation or persistent import mutation', () => {
+    const root = temp(); const storeDir = path.join(root, 'dry-store');
+    blockListBucket(root, 'dynamic/201.md', ''); blockListBucket(root, 'archive/topic/202.md', '  ');
+    const result = runLegacyImport({ rootDir: root, storeDir, subjectId: 's', dryRun: true });
+    expect(result.processed).toBe(2); expect(result.isolated).toHaveLength(0); expect(result.dry_run).toBe(true);
+    expect(fs.existsSync(path.join(storeDir, 'legacy-assistant-sources.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(storeDir, 'legacy-import-receipts.jsonl'))).toBe(false);
+    expect(fs.existsSync(path.join(storeDir, 'legacy-import-state.json'))).toBe(false);
   });
 
   it('isolates filename/id mismatch and malformed YAML without corrupting good inputs', () => {
