@@ -111,14 +111,13 @@ export class LegacySemanticMutationRuntime {
 
   constructor(
     readonly rootDir: string,
-    readonly subjectId: string,
+    readonly canonicalSubjectId: string,
     readonly source: LegacyAssistantMemorySourceRecord,
     readonly batchId: string,
     readonly now: () => string = () => new Date().toISOString(),
   ) {
-    this.canonicalStore = new RelationshipMemoryStore(rootDir, subjectId);
+    this.canonicalStore = new RelationshipMemoryStore(rootDir, canonicalSubjectId);
     this.legacyStore = new LegacyMemorySourceStore(rootDir);
-    if (source.subject_id !== subjectId) throw new Error(`Legacy source subject mismatch: ${source.legacy_source_id}`);
   }
 
   provenance(): LegacyMemoryProvenanceLink[] {
@@ -181,17 +180,17 @@ export class LegacySemanticMutationRuntime {
       return { outcome: 'duplicate_link', memory_id: duplicate.memory_id };
     }
 
-    const memoryId = stableId('mem', { subject_id: this.subjectId, source_key: sourceKey });
+    const memoryId = stableId('mem', { subject_id: this.canonicalSubjectId, source_key: sourceKey });
     const memory: CanonicalMemoryRecord = {
       schema_version: 1,
       memory_id: memoryId,
-      subject_id: this.subjectId,
+      subject_id: this.canonicalSubjectId,
       ...content,
       status: 'active',
       observed_at: this.source.created_at_utc,
       created_at: this.now(),
       source_key: sourceKey,
-      dedupe_key: stableId('dedupe', { subject_id: this.subjectId, semantic: content }),
+      dedupe_key: stableId('dedupe', { subject_id: this.canonicalSubjectId, semantic: content }),
     };
     try {
       this.canonicalStore.appendMemory(memory, []);
