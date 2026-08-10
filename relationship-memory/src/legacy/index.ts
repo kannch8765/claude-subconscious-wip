@@ -415,53 +415,40 @@ export function runLegacyImport(options: LegacyImportOptions): LegacyImportResul
         const current = loadLegacyImportState(statePath, manifest.manifest_digest);
         if (current.processed_paths.includes(entry.relative_path)) return false;
         // Receipt durability precedes terminal checkpointing. If state persistence fails,
-        // the next run safely dedupes this exact receipt before retrying the checkpoint.
-        const duplicateReceipt = store.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
-        if (!duplicateReceipt) appendJsonl(path.join(options.storeDir, 'legacy-import-receipts.jsonl'), receipt);
-        current.processed_paths = [...current.processed_paths, entry.relative_path].sort(bytewiseCompare);
-        atomicWriteJson(statePath, current);
+        // the next run safely dedupes the receipt and retries only the checkpoint.
+        store.appendReceipt(receipt);
+        checkpoint(entry.relative_path);
         return true;
       });
-      if (committed) {
-        processed.add(entry.relative_path);
-        isolated.push(receipt);
-      }
+      if (committed) isolated.push(receipt);
+      else processed.add(entry.relative_path);
       continue;
     }
 
     if (options.dryRun) continue;
-    const outcome = store.withMutationBoundary(() => {
+    const committed = store.withMutationBoundary(() => {
       const current = loadLegacyImportState(statePath, manifest.manifest_digest);
       if (current.processed_paths.includes(entry.relative_path)) return undefined;
-      const existing = store.getSource(source.legacy_source_id);
-      let result: 'accepted' | 'duplicate';
-      if (existing) {
-        if (stableJson(existing) !== stableJson(source)) throw new Error(`legacy source identity collision: ${source.legacy_source_id}`);
-        result = 'duplicate';
-      } else {
-        appendJsonl(path.join(options.storeDir, 'legacy-assistant-sources.jsonl'), source);
-        result = 'accepted';
-      }
+      const result = store.appendSource(source);
       const receipt: LegacyImportReceipt = { schema_version: 1, manifest_digest: manifest.manifest_digest, relative_path: entry.relative_path, result, legacy_source_id: source.legacy_source_id };
-      const duplicateReceipt = store.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
-      if (!duplicateReceipt) appendJsonl(path.join(options.storeDir, 'legacy-import-receipts.jsonl'), receipt);
-      current.processed_paths = [...current.processed_paths, entry.relative_path].sort(bytewiseCompare);
-      atomicWriteJson(statePath, current);
+      store.appendReceipt(receipt);
+      checkpoint(entry.relative_path);
       return result;
     });
-    if (!outcome) continue;
-    processed.add(entry.relative_path);
-    if (outcome === 'accepted') accepted += 1;
-    else duplicates += 1;
+    if (committed === 'accepted') accepted += 1;
+    else if (committed === 'duplicate') duplicates += 1;
+    else processed.add(entry.relative_path);
   }
-
-  return { manifest_digest: manifest.manifest_digest, processed: count, accepted, duplicates, isolated, dry_run: options.dryRun === true };
+  return { manifest_digest: manifest.manifest_digest, processed: count, accepted, duplicates, isolated, dry_run: options.dryRun ?? false };
 }
 
 export const LEGACY_OBSERVER_CONTRACT = `
-Legacy Ombre sources are immutable evidence, not canonical relationship memories by themselves.
-For each source, the semantic observer may produce zero, one, or many canonical memories after judging the full source meaning; naive paragraph splitting is forbidden.
-A feel/ source describes historical temporality: preserve what was felt at that time and do not assert it as the assistant's current feeling unless fresh evidence independently supports that claim.
-Keep legacy_source_id and source provenance linked to every canonical outcome, including duplicate-link and reinforcement outcomes.
-Never invent conversation_id, message_id, or transcript evidence IDs for legacy sources that did not originate from transcript evidence.
-`;
+You are evaluating one immutable historical legacy_assistant_memory source from ombre_brain.
+The source is evidence, not a current assistant_remember_intent and not transcript evidence.
+Never invent conversation_id, message_id, or transcript evidence IDs for it.
+One source may semantically yield zero, one, or many canonical relationship memories; never force 1 source = 1 memory and never use naive paragraph splitting as a substitute for semantic judgment.
+For each semantic item, choose among: no canonical memory required; provenance-link an existing duplicate; reinforce an existing canonical memory; create a canonical memory; and use existing relationship-memory linking where appropriate.
+Every canonical outcome must remain traceable to the immutable legacy_source_id.
+For feel/ sources, preserve historical temporality: first-person feeling prose records what Kohaku felt when authored and must not be rewritten as an assertion of Kohaku's current feeling without independent current evidence. Raw feel prose is not automatically ordinary recall text.
+Legacy embeddings, dehydration summaries, and cooldown databases are derived artifacts and are never primary source truth.
+`.trim();
