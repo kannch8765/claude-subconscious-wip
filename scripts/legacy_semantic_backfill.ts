@@ -4,6 +4,7 @@ import { relationshipMemoryRoot } from '../relationship-memory/src/adapter/index
 import { LegacyMemorySourceStore } from '../relationship-memory/src/legacy/index.js';
 import {
   loadLegacySemanticState,
+  OMBRE_LEGACY_FROZEN_MANIFEST_DIGEST,
   runLegacySemanticMigration,
   saveLegacySemanticState,
 } from '../relationship-memory/src/legacy/semantic.js';
@@ -15,13 +16,14 @@ interface Args {
   root?: string;
   state?: string;
   cwd?: string;
+  expectedManifestDigest?: string;
   maxRecords: number;
   sourceIds: string[];
   dryRun: boolean;
 }
 
 function usage(): never {
-  console.error('Usage: npx tsx scripts/legacy_semantic_backfill.ts [--root <relationship-memory-dir>] [--state <checkpoint.json>] [--cwd <dir>] [--max-records N] [--source-id <legacy_source_id> ...] [--dry-run]');
+  console.error('Usage: npx tsx scripts/legacy_semantic_backfill.ts [--root <relationship-memory-dir>] [--state <checkpoint.json>] [--cwd <dir>] [--expected-manifest-digest <sha256>] [--max-records N] [--source-id <legacy_source_id> ...] [--dry-run]');
   process.exit(2);
 }
 
@@ -39,6 +41,10 @@ function parseArgs(argv: string[]): Args {
     if (flag === '--root') { result.root = value; i += 1; }
     else if (flag === '--state') { result.state = value; i += 1; }
     else if (flag === '--cwd') { result.cwd = value; i += 1; }
+    else if (flag === '--expected-manifest-digest') {
+      if (!value) usage();
+      result.expectedManifestDigest = value; i += 1;
+    }
     else if (flag === '--max-records') { result.maxRecords = positive(value, flag); i += 1; }
     else if (flag === '--source-id') {
       if (!value) usage();
@@ -54,6 +60,10 @@ async function main(): Promise<void> {
   const rootDir = path.resolve(args.root ?? relationshipMemoryRoot());
   const statePath = path.resolve(args.state ?? path.join(rootDir, 'legacy-semantic-migration-state.json'));
   const cwd = path.resolve(args.cwd ?? process.cwd());
+  const expectedManifestDigest = args.expectedManifestDigest
+    ?? process.env.LEGACY_SEMANTIC_EXPECTED_MANIFEST_DIGEST
+    ?? OMBRE_LEGACY_FROZEN_MANIFEST_DIGEST;
+  if (!/^[0-9a-f]{64}$/i.test(expectedManifestDigest)) throw new Error('expected legacy semantic manifest digest must be a SHA-256 hex digest');
   const sourceStore = new LegacyMemorySourceStore(rootDir);
   const sources = sourceStore.listSources();
   if (sources.length === 0) {
@@ -63,10 +73,13 @@ async function main(): Promise<void> {
   const manifestDigests = [...new Set(sources.map((source) => source.manifest_digest))];
   if (manifestDigests.length !== 1) throw new Error('legacy semantic sources span multiple manifest digests');
   const manifestDigest = manifestDigests[0];
+  if (manifestDigest !== expectedManifestDigest) {
+    throw new Error(`legacy semantic source manifest ${manifestDigest} does not match expected frozen manifest ${expectedManifestDigest}`);
+  }
 
   if (args.dryRun) {
     const result = await runLegacySemanticMigration({
-      rootDir, statePath, maxRecords: args.maxRecords, sourceIds: args.sourceIds, dryRun: true,
+      rootDir, expectedManifestDigest, statePath, maxRecords: args.maxRecords, sourceIds: args.sourceIds, dryRun: true,
       processor: async () => { throw new Error('dry-run must not invoke semantic processor'); },
     });
     console.log(JSON.stringify(result));
@@ -88,6 +101,7 @@ async function main(): Promise<void> {
 
   const result = await runLegacySemanticMigration({
     rootDir,
+    expectedManifestDigest,
     statePath,
     maxRecords: args.maxRecords,
     sourceIds: args.sourceIds,
