@@ -1,41 +1,41 @@
-name: relationship memory exact-head CI
+name: Task 093U R1 correction runner
 
 on:
   push:
     branches:
       - ci/relationship-memory-01
-  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: relationship-memory-01-ci
+  group: relationship-memory-093u-r1-correction
   cancel-in-progress: false
 
 jobs:
-  test:
-    name: npm ci + npm test (exact Task 093U head)
+  correct-and-test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
-      TARGET_SHA: 9ae170475d7c7194972169ba1553f1e97cbdd659
+      BASE_SHA: 9ae170475d7c7194972169ba1553f1e97cbdd659
+      TARGET_BRANCH: task/093u-relationship-memory-transcript-event-evidence-foundation
     steps:
-      - name: Checkout exact Task 093U head
+      - name: Checkout isolated CI runner branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ env.TARGET_SHA }}
-          fetch-depth: 1
-          persist-credentials: false
+          fetch-depth: 0
 
-      - name: Verify exact checkout
+      - name: Prepare reviewed patch
         shell: bash
         run: |
           set -euo pipefail
-          actual="$(git rev-parse HEAD)"
-          echo "expected=${TARGET_SHA}"
-          echo "actual=${actual}"
-          test "${actual}" = "${TARGET_SHA}"
+          base64 -d .github/task-093u-r1.patch.gz.b64 | gzip -d > /tmp/093u-r1.patch
+          test "$(git ls-remote origin refs/heads/${TARGET_BRANCH} | cut -f1)" = "${BASE_SHA}"
+          git checkout --detach "${BASE_SHA}"
+          test "$(git rev-parse HEAD)" = "${BASE_SHA}"
+          git apply --check -p1 /tmp/093u-r1.patch
+          git apply -p1 /tmp/093u-r1.patch
+          git diff --check
 
       - name: Set up Node 22
         uses: actions/setup-node@v4
@@ -46,5 +46,17 @@ jobs:
       - name: Install exact lockfile dependencies
         run: npm ci
 
-      - name: Run repository tests
+      - name: Run full repository tests before publication
         run: npm test
+
+      - name: Create clean R1 correction commit and fast-forward task branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add relationship-memory/src/tools/index.ts relationship-memory/tests/relationship-memory.test.ts relationship-memory/tests/semantic-context.test.ts relationship-memory/tests/transcript-event-evidence.test.ts
+          git config user.name "Sou"
+          git config user.email "105340539+kannch8765@users.noreply.github.com"
+          git commit -m "task 093u: address reviewer R1"
+          echo "R1_HEAD=$(git rev-parse HEAD)"
+          test -z "$(git status --porcelain)"
+          git push origin HEAD:refs/heads/${TARGET_BRANCH}
