@@ -273,22 +273,110 @@ function reject(code: string, reason: string): ValidationResult {
   return { ok: false, code, reason };
 }
 
+export interface SemanticContentValidationResult {
+  ok: boolean;
+  content?: OwnerSemanticContent;
+  code?: string;
+  reason?: string;
+}
+
+export function validateSemanticContent(
+  input: unknown,
+  options: { requireChineseSemanticProse?: boolean } = {},
+): SemanticContentValidationResult {
+  if (!plainObject(input)) return { ok: false, code: 'invalid_schema', reason: 'Semantic content must be an object.' };
+  const allowedFields = new Set(['schema_version', 'kind', 'summary', 'participants', 'payload', 'linked_memory_ids']);
+  for (const key of Object.keys(input)) {
+    if (!allowedFields.has(key)) return { ok: false, code: 'unknown_field', reason: `Unknown semantic content field: ${key}` };
+    if (forbiddenAuthorityKeys.has(key)) return { ok: false, code: 'authority_field_forbidden', reason: `Authoritative field is backend-owned: ${key}` };
+  }
+  if (input.schema_version !== 1) return { ok: false, code: 'invalid_schema_version', reason: 'schema_version must be literal 1.' };
+  if (!MEMORY_KINDS.includes(input.kind as MemoryKind)) return { ok: false, code: 'invalid_kind', reason: 'Unsupported relationship-memory kind.' };
+  const kind = input.kind as MemoryKind;
+  const summary = cleanString(input.summary);
+  if (!summary) return { ok: false, code: 'invalid_summary', reason: 'summary must be a non-empty string.' };
+
+  const participants = cleanStringArray(input.participants, true);
+  if (!participants || participants.length > 2 || participants.some((r) => r !== 'user' && r !== 'assistant')) {
+    return { ok: false, code: 'invalid_participants', reason: 'participants must contain one or two unique roles: user and/or assistant.' };
+  }
+
+  let linkedMemoryIds: string[] | undefined;
+  if ('linked_memory_ids' in input) {
+    const cleaned = cleanStringArray(input.linked_memory_ids);
+    if (!cleaned) return { ok: false, code: 'invalid_linked_memory_ids', reason: 'linked_memory_ids must be a unique non-empty string array when present.' };
+    linkedMemoryIds = cleaned;
+  }
+
+  if (!plainObject(input.payload)) return { ok: false, code: 'invalid_payload', reason: 'payload must be an object.' };
+  const rules = payloadKeys[kind];
+  const allowed = new Set([...rules.required, ...rules.optional]);
+  for (const key of Object.keys(input.payload)) {
+    if (!allowed.has(key)) return { ok: false, code: 'unknown_payload_field', reason: `Unknown ${kind} payload field: ${key}` };
+  }
+
+  const payload: Record<string, unknown> = {};
+  for (const key of rules.required) {
+    const isArray = rules.arrays?.includes(key) ?? false;
+    if (isArray) {
+      const cleaned = cleanStringArray(input.payload[key], rules.nonEmptyArrays?.includes(key) ?? false);
+      if (!cleaned) return { ok: false, code: 'invalid_payload_field', reason: `${kind}.${key} must be a valid non-empty unique string array.` };
+      payload[key] = cleaned;
+    } else {
+      const cleaned = cleanString(input.payload[key]);
+      if (!cleaned) return { ok: false, code: 'invalid_payload_field', reason: `${kind}.${key} must be a non-empty string.` };
+      payload[key] = cleaned;
+    }
+  }
+
+  for (const key of rules.optional) {
+    if (!(key in input.payload)) continue;
+    if (input.payload[key] === null) return { ok: false, code: 'invalid_optional_null', reason: `${kind}.${key} must be omitted rather than null.` };
+    const isArray = rules.arrays?.includes(key) ?? false;
+    if (isArray) {
+      const cleaned = cleanStringArray(input.payload[key]);
+      if (!cleaned) return { ok: false, code: 'invalid_payload_field', reason: `${kind}.${key} must be a unique non-empty string array.` };
+      payload[key] = cleaned;
+    } else {
+      const cleaned = cleanString(input.payload[key]);
+      if (!cleaned) return { ok: false, code: 'invalid_payload_field', reason: `${kind}.${key} must be a non-empty string.` };
+      payload[key] = cleaned;
+    }
+  }
+
+  if (options.requireChineseSemanticProse) {
+    const languageFailure = validateChineseSemanticProse(kind, summary, payload);
+    if (languageFailure) return languageFailure;
+  }
+
+  return {
+    ok: true,
+    content: {
+      kind,
+      summary,
+      participants: participants as ParticipantRole[],
+      payload,
+      ...(linkedMemoryIds ? { linked_memory_ids: linkedMemoryIds } : {}),
+    },
+  };
+}
+
 export function validateProposal(input: unknown, options: { requireChineseSemanticProse?: boolean } = {}): ValidationResult {
   if (!plainObject(input)) return reject('invalid_schema', 'Proposal must be an object.');
   for (const key of Object.keys(input)) {
     if (!commonKeys.has(key)) return reject('unknown_field', `Unknown proposal field: ${key}`);
     if (forbiddenAuthorityKeys.has(key)) return reject('authority_field_forbidden', `Authoritative field is backend-owned: ${key}`);
   }
-  if (input.schema_version !== 1) return reject('invalid_schema_version', 'schema_version must be literal 1.');
-  if (!MEMORY_KINDS.includes(input.kind as MemoryKind)) return reject('invalid_kind', 'Unsupported relationship-memory kind.');
-  const kind = input.kind as MemoryKind;
-  const summary = cleanString(input.summary);
-  if (!summary) return reject('invalid_summary', 'summary must be a non-empty string.');
 
-  const participants = cleanStringArray(input.participants, true);
-  if (!participants || participants.length > 2 || participants.some((r) => r !== 'user' && r !== 'assistant')) {
-    return reject('invalid_participants', 'participants must contain one or two unique roles: user and/or assistant.');
-  }
+  const semantic = validateSemanticContent({
+    schema_version: input.schema_version,
+    kind: input.kind,
+    summary: input.summary,
+    participants: input.participants,
+    payload: input.payload,
+    ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}),
+  }, options);
+  if (!semantic.ok || !semantic.content) return reject(semantic.code ?? 'invalid_schema', semantic.reason ?? 'Invalid semantic content.');
 
   if ('evidence_ids' in input && 'evidence_message_ids' in input) return reject('ambiguous_evidence_ids', 'Supply evidence_ids or legacy evidence_message_ids, not both.');
   const evidenceIds = cleanStringArray(input.evidence_ids ?? input.evidence_message_ids, true);
@@ -301,64 +389,16 @@ export function validateProposal(input: unknown, options: { requireChineseSemant
     assistantIntentId = cleaned;
   }
 
-  let linkedMemoryIds: string[] | undefined;
-  if ('linked_memory_ids' in input) {
-    const cleaned = cleanStringArray(input.linked_memory_ids);
-    if (!cleaned) return reject('invalid_linked_memory_ids', 'linked_memory_ids must be a unique non-empty string array when present.');
-    linkedMemoryIds = cleaned;
-  }
-
-  if (!plainObject(input.payload)) return reject('invalid_payload', 'payload must be an object.');
-  const rules = payloadKeys[kind];
-  const allowed = new Set([...rules.required, ...rules.optional]);
-  for (const key of Object.keys(input.payload)) {
-    if (!allowed.has(key)) return reject('unknown_payload_field', `Unknown ${kind} payload field: ${key}`);
-  }
-
-  const payload: Record<string, unknown> = {};
-  for (const key of rules.required) {
-    const isArray = rules.arrays?.includes(key) ?? false;
-    if (isArray) {
-      const cleaned = cleanStringArray(input.payload[key], rules.nonEmptyArrays?.includes(key) ?? false);
-      if (!cleaned) return reject('invalid_payload_field', `${kind}.${key} must be a valid non-empty unique string array.`);
-      payload[key] = cleaned;
-    } else {
-      const cleaned = cleanString(input.payload[key]);
-      if (!cleaned) return reject('invalid_payload_field', `${kind}.${key} must be a non-empty string.`);
-      payload[key] = cleaned;
-    }
-  }
-
-  for (const key of rules.optional) {
-    if (!(key in input.payload)) continue;
-    if (input.payload[key] === null) return reject('invalid_optional_null', `${kind}.${key} must be omitted rather than null.`);
-    const isArray = rules.arrays?.includes(key) ?? false;
-    if (isArray) {
-      const cleaned = cleanStringArray(input.payload[key]);
-      if (!cleaned) return reject('invalid_payload_field', `${kind}.${key} must be a unique non-empty string array.`);
-      payload[key] = cleaned;
-    } else {
-      const cleaned = cleanString(input.payload[key]);
-      if (!cleaned) return reject('invalid_payload_field', `${kind}.${key} must be a non-empty string.`);
-      payload[key] = cleaned;
-    }
-  }
-
-  if (options.requireChineseSemanticProse) {
-    const languageFailure = validateChineseSemanticProse(kind, summary, payload);
-    if (languageFailure) return languageFailure;
-  }
-
   return {
     ok: true,
     proposal: {
       schema_version: 1,
-      kind,
-      summary,
-      participants: participants as ParticipantRole[],
+      kind: semantic.content.kind,
+      summary: semantic.content.summary,
+      participants: semantic.content.participants,
       evidence_message_ids: evidenceIds,
-      payload,
-      ...(linkedMemoryIds ? { linked_memory_ids: linkedMemoryIds } : {}),
+      payload: semantic.content.payload,
+      ...(semantic.content.linked_memory_ids ? { linked_memory_ids: semantic.content.linked_memory_ids } : {}),
       ...(assistantIntentId ? { assistant_intent_id: assistantIntentId } : {}),
     },
   };

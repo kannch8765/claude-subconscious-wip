@@ -214,6 +214,11 @@ function requiredStringArray(value: unknown, name: string): string[] {
   return value as string[];
 }
 
+function requiredPlainObject(value: unknown, name: string): Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(`${name} must be an object`);
+  return value as Record<string, unknown>;
+}
+
 function utcFromOmbreTimestamp(raw: string, name: string): string {
   const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|\+00:00)?$/);
   if (!match) throw new Error(`${name} must be an ISO-8601 UTC timestamp`);
@@ -234,6 +239,40 @@ function utcFromOmbreTimestamp(raw: string, name: string): string {
 
 export function legacySourceId(subjectId: string, bucketType: LegacyBucketType, bucketId: string): string {
   return stableId('legacy_source', { subject_id: subjectId, source_system: 'ombre_brain', bucket_type: bucketType, bucket_id: String(bucketId) });
+}
+
+export function validateLegacyAssistantMemorySourceRecord(value: unknown): LegacyAssistantMemorySourceRecord {
+  const source = requiredPlainObject(value, 'legacy source record');
+  if (source.schema_version !== 1) throw new Error('legacy source schema_version must be literal 1');
+  const subjectId = requiredString(source.subject_id, 'legacy source subject_id');
+  const bucketType = requiredString(source.bucket_type, 'legacy source bucket_type') as LegacyBucketType;
+  if (!LEGACY_BUCKET_TYPES.includes(bucketType)) throw new Error('legacy source bucket_type is unsupported');
+  const bucketId = requiredString(source.bucket_id, 'legacy source bucket_id');
+  const legacyId = requiredString(source.legacy_source_id, 'legacy source legacy_source_id');
+  if (legacyId !== legacySourceId(subjectId, bucketType, bucketId)) throw new Error('legacy source identity does not match subject/bucket identity');
+  if (source.provenance_kind !== 'legacy_assistant_memory') throw new Error('legacy source provenance_kind must be legacy_assistant_memory');
+  if (source.source_system !== 'ombre_brain') throw new Error('legacy source source_system must be ombre_brain');
+  const relativePath = requiredString(source.relative_path, 'legacy source relative_path');
+  if (!relativePath.startsWith(`${bucketType}/`)) throw new Error('legacy source relative_path does not match bucket_type');
+  requiredString(source.source_sha256, 'legacy source source_sha256');
+  requiredString(source.original_markdown, 'legacy source original_markdown');
+  if (typeof source.body_text !== 'string') throw new Error('legacy source body_text must be a string');
+  const frontmatter = requiredPlainObject(source.frontmatter, 'legacy source frontmatter');
+  requiredString(frontmatter.name, 'legacy source frontmatter.name');
+  requiredString(frontmatter.type, 'legacy source frontmatter.type');
+  requiredStringArray(frontmatter.domain, 'legacy source frontmatter.domain');
+  requiredStringArray(frontmatter.tags, 'legacy source frontmatter.tags');
+  requiredNumber(frontmatter.importance, 'legacy source frontmatter.importance');
+  requiredNumber(frontmatter.valence, 'legacy source frontmatter.valence');
+  requiredNumber(frontmatter.arousal, 'legacy source frontmatter.arousal');
+  requiredNumber(frontmatter.activation_count, 'legacy source frontmatter.activation_count');
+  requiredString(source.raw_created, 'legacy source raw_created');
+  requiredString(source.raw_last_active, 'legacy source raw_last_active');
+  utcFromOmbreTimestamp(requiredString(source.created_at_utc, 'legacy source created_at_utc'), 'legacy source created_at_utc');
+  utcFromOmbreTimestamp(requiredString(source.last_active_at_utc, 'legacy source last_active_at_utc'), 'legacy source last_active_at_utc');
+  const manifestDigest = requiredString(source.manifest_digest, 'legacy source manifest_digest');
+  if (!/^[0-9a-f]{64}$/i.test(manifestDigest)) throw new Error('legacy source manifest_digest must be a SHA-256 hex digest');
+  return source as unknown as LegacyAssistantMemorySourceRecord;
 }
 
 export function parseLegacySource(
@@ -324,7 +363,9 @@ export class LegacyMemorySourceStore {
 
   private file(name: string): string { return path.join(this.rootDir, name); }
   withMutationBoundary<T>(operation: () => T): T { return this.mutationStore.withMutationBoundary(operation); }
-  listSources(): LegacyAssistantMemorySourceRecord[] { return readJsonl(this.file('legacy-assistant-sources.jsonl')); }
+  listSources(): LegacyAssistantMemorySourceRecord[] {
+    return readJsonl<unknown>(this.file('legacy-assistant-sources.jsonl')).map((source) => validateLegacyAssistantMemorySourceRecord(source));
+  }
   listProvenance(): LegacyMemoryProvenanceLink[] { return readJsonl(this.file('legacy-memory-provenance.jsonl')); }
   listReceipts(): LegacyImportReceipt[] { return readJsonl(this.file('legacy-import-receipts.jsonl')); }
   getSource(id: string): LegacyAssistantMemorySourceRecord | undefined { return this.listSources().find((source) => source.legacy_source_id === id); }
@@ -347,9 +388,13 @@ export class LegacyMemorySourceStore {
         ...link,
       };
       const existing = this.listProvenance().find((item) => item.provenance_id === record.provenance_id);
-      if (existing && stableJson(existing) !== stableJson(record)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
-      if (!existing) appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
-      return existing ?? record;
+      if (existing) {
+        const comparable = { ...record, recorded_at: existing.recorded_at };
+        if (stableJson(existing) !== stableJson(comparable)) throw new Error(`legacy provenance identity collision: ${record.provenance_id}`);
+        return existing;
+      }
+      appendJsonl(this.file('legacy-memory-provenance.jsonl'), record);
+      return record;
     });
   }
   memoriesForSource(sourceId: string): string[] { return this.listProvenance().filter((item) => item.legacy_source_id === sourceId).map((item) => item.canonical_memory_id); }
@@ -364,8 +409,15 @@ export class LegacyMemorySourceStore {
 
 export function resolveLegacyLineage(source: LegacyAssistantMemorySourceRecord, allSources: LegacyAssistantMemorySourceRecord[]): { supersedes?: string; superseded_by?: string } {
   const byBucketId = new Map(allSources.map((item) => [item.bucket_id, item.legacy_source_id]));
-  const supersedes = typeof source.frontmatter.supersedes === 'string' ? byBucketId.get(String(source.frontmatter.supersedes)) : undefined;
-  const supersededBy = typeof source.frontmatter.superseded_by === 'string' ? byBucketId.get(String(source.frontmatter.superseded_by)) : undefined;
+  const normalizeRef = (value: unknown): string | undefined => {
+    if (typeof value !== 'string' && typeof value !== 'number') return undefined;
+    const normalized = String(value).trim();
+    return normalized || undefined;
+  };
+  const supersedesRef = normalizeRef(source.frontmatter.supersedes);
+  const supersededByRef = normalizeRef(source.frontmatter.superseded_by);
+  const supersedes = supersedesRef ? byBucketId.get(supersedesRef) : undefined;
+  const supersededBy = supersededByRef ? byBucketId.get(supersededByRef) : undefined;
   return { ...(supersedes ? { supersedes } : {}), ...(supersededBy ? { superseded_by: supersededBy } : {}) };
 }
 

@@ -1,0 +1,24 @@
+name: Task 093AA tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'relationship-memory/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/task-093aa-tests.yml'
+
+jobs:
+  test:
+    if: github.head_ref == 'task/093aa-ombre-legacy-semantic-migration-runner'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
