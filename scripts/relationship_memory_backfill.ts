@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 import * as path from 'path';
-import { getAgentId } from './agent_config.js';
+import { getBackfillAgentId } from './agent_config.js';
 import { createConversation } from './conversation_utils.js';
 import { runRelationshipObserverBatch } from './relationship_observer_runner.js';
 import {
@@ -63,7 +63,7 @@ async function main(): Promise<void> {
   if (!apiKey) throw new Error('LETTA_API_KEY is required for relationship-memory historical backfill.');
 
   const state = loadBackfillState(statePath);
-  const agentId = await getAgentId(apiKey, () => {});
+  const agentId = await getBackfillAgentId(apiKey, () => {});
   if (state.agent_id && state.agent_id !== agentId) {
     throw new Error(`Backfill state is bound to a different agent (${state.agent_id}); use a new checkpoint file.`);
   }
