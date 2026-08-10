@@ -214,10 +214,21 @@ function requiredStringArray(value: unknown, name: string): string[] {
   return value as string[];
 }
 
-function utcFromNaive(raw: string, name: string): string {
-  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(raw)) throw new Error(`${name} must be a naive ISO-8601 timestamp`);
-  const date = new Date(`${raw}Z`);
-  if (Number.isNaN(date.getTime())) throw new Error(`${name} is invalid`);
+function utcFromOmbreTimestamp(raw: string, name: string): string {
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|\+00:00)?$/);
+  if (!match) throw new Error(`${name} must be an ISO-8601 UTC timestamp`);
+  const [, year, month, day, hour, minute, second] = match;
+  const normalized = match[8] ? raw.replace(/\+00:00$/, 'Z') : `${raw}Z`;
+  const date = new Date(normalized);
+  if (
+    Number.isNaN(date.getTime()) ||
+    date.getUTCFullYear() !== Number(year) ||
+    date.getUTCMonth() + 1 !== Number(month) ||
+    date.getUTCDate() !== Number(day) ||
+    date.getUTCHours() !== Number(hour) ||
+    date.getUTCMinutes() !== Number(minute) ||
+    date.getUTCSeconds() !== Number(second)
+  ) throw new Error(`${name} is invalid`);
   return date.toISOString();
 }
 
@@ -244,7 +255,9 @@ export function parseLegacySource(
   const bucketId = String(frontmatter.id);
   if (!bucketId) throw new Error('id is required');
   const filenameStem = path.posix.basename(entry.relative_path, '.md');
-  if (bucketId !== filenameStem) throw new Error(`bucket id ${bucketId} does not match filename ${filenameStem}`);
+  const titleSuffix = `_${bucketId}`;
+  const filenameMatchesBucketId = filenameStem === bucketId || (filenameStem.endsWith(titleSuffix) && filenameStem.length > titleSuffix.length);
+  if (!filenameMatchesBucketId) throw new Error(`bucket id ${bucketId} does not match filename ${filenameStem}`);
   const rawCreated = requiredString(frontmatter.created, 'created');
   const rawLastActive = requiredString(frontmatter.last_active, 'last_active');
   const metadata: LegacyFrontmatterMetadata = {
@@ -276,8 +289,8 @@ export function parseLegacySource(
     frontmatter: metadata,
     raw_created: rawCreated,
     raw_last_active: rawLastActive,
-    created_at_utc: utcFromNaive(rawCreated, 'created'),
-    last_active_at_utc: utcFromNaive(rawLastActive, 'last_active'),
+    created_at_utc: utcFromOmbreTimestamp(rawCreated, 'created'),
+    last_active_at_utc: utcFromOmbreTimestamp(rawLastActive, 'last_active'),
     manifest_digest: manifestDigest,
   };
 }
@@ -402,40 +415,53 @@ export function runLegacyImport(options: LegacyImportOptions): LegacyImportResul
         const current = loadLegacyImportState(statePath, manifest.manifest_digest);
         if (current.processed_paths.includes(entry.relative_path)) return false;
         // Receipt durability precedes terminal checkpointing. If state persistence fails,
-        // the next run safely dedupes the receipt and retries only the checkpoint.
-        store.appendReceipt(receipt);
-        checkpoint(entry.relative_path);
+        // the next run safely dedupes this exact receipt before retrying the checkpoint.
+        const duplicateReceipt = store.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
+        if (!duplicateReceipt) appendJsonl(path.join(options.storeDir, 'legacy-import-receipts.jsonl'), receipt);
+        current.processed_paths = [...current.processed_paths, entry.relative_path].sort(bytewiseCompare);
+        atomicWriteJson(statePath, current);
         return true;
       });
-      if (committed) isolated.push(receipt);
-      else processed.add(entry.relative_path);
+      if (committed) {
+        processed.add(entry.relative_path);
+        isolated.push(receipt);
+      }
       continue;
     }
 
     if (options.dryRun) continue;
-    const committed = store.withMutationBoundary(() => {
+    const outcome = store.withMutationBoundary(() => {
       const current = loadLegacyImportState(statePath, manifest.manifest_digest);
       if (current.processed_paths.includes(entry.relative_path)) return undefined;
-      const result = store.appendSource(source);
+      const existing = store.getSource(source.legacy_source_id);
+      let result: 'accepted' | 'duplicate';
+      if (existing) {
+        if (stableJson(existing) !== stableJson(source)) throw new Error(`legacy source identity collision: ${source.legacy_source_id}`);
+        result = 'duplicate';
+      } else {
+        appendJsonl(path.join(options.storeDir, 'legacy-assistant-sources.jsonl'), source);
+        result = 'accepted';
+      }
       const receipt: LegacyImportReceipt = { schema_version: 1, manifest_digest: manifest.manifest_digest, relative_path: entry.relative_path, result, legacy_source_id: source.legacy_source_id };
-      store.appendReceipt(receipt);
-      checkpoint(entry.relative_path);
+      const duplicateReceipt = store.listReceipts().some((item) => stableJson(item) === stableJson(receipt));
+      if (!duplicateReceipt) appendJsonl(path.join(options.storeDir, 'legacy-import-receipts.jsonl'), receipt);
+      current.processed_paths = [...current.processed_paths, entry.relative_path].sort(bytewiseCompare);
+      atomicWriteJson(statePath, current);
       return result;
     });
-    if (committed === 'accepted') accepted += 1;
-    else if (committed === 'duplicate') duplicates += 1;
-    else processed.add(entry.relative_path);
+    if (!outcome) continue;
+    processed.add(entry.relative_path);
+    if (outcome === 'accepted') accepted += 1;
+    else duplicates += 1;
   }
-  return { manifest_digest: manifest.manifest_digest, processed: count, accepted, duplicates, isolated, dry_run: options.dryRun ?? false };
+
+  return { manifest_digest: manifest.manifest_digest, processed: count, accepted, duplicates, isolated, dry_run: options.dryRun === true };
 }
 
 export const LEGACY_OBSERVER_CONTRACT = `
-You are evaluating one immutable historical legacy_assistant_memory source from ombre_brain.
-The source is evidence, not a current assistant_remember_intent and not transcript evidence.
-Never invent conversation_id, message_id, or transcript evidence IDs for it.
-One source may semantically yield zero, one, or many canonical relationship memories; never force 1 source = 1 memory and never use naive paragraph splitting as a substitute for semantic judgment.
-For each semantic item, choose among: no canonical memory required; provenance-link an existing duplicate; reinforce an existing canonical memory; create a canonical memory; and use existing relationship-memory linking where appropriate.
-Every canonical outcome must remain traceable to the immutable legacy_source_id.
-For feel/ sources, preserve historical temporality: first-person feeling prose records what Kohaku felt when authored and must not be rewritten as an assertion of Kohaku's current feeling without independent current evidence. Raw feel prose is not automatically ordinary recall text.
-Legacy embeddings, dehydration summaries, and cooldown databases are derived artifacts and are never primary source truth.
-`.trim();
+Legacy Ombre sources are immutable evidence, not canonical relationship memories by themselves.
+For each source, the semantic observer may produce zero, one, or many canonical memories after judging the full source meaning; naive paragraph splitting is forbidden.
+A feel/ source describes historical temporality: preserve what was felt at that time and do not assert it as the assistant's current feeling unless fresh evidence independently supports that claim.
+Keep legacy_source_id and source provenance linked to every canonical outcome, including duplicate-link and reinforcement outcomes.
+Never invent conversation_id, message_id, or transcript evidence IDs for legacy sources that did not originate from transcript evidence.
+`;

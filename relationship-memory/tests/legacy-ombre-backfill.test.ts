@@ -82,6 +82,36 @@ describe('Task 093X Ombre legacy source foundation', () => {
     const source = parsed(root, 'dynamic/914798167722.md'); expect(source.bucket_id).toBe('914798167722'); expect(source.original_markdown).toBe(raw); expect(source.frontmatter.activation_count).toBe(3.5);
   });
 
+  it('accepts exact-id and title-prefixed filename forms while preserving the full relative path', () => {
+    const root = temp(); bucket(root, 'dynamic/topic/42.md'); bucket(root, 'archive/topic/remembering_the_cat_77.md', ['id: 77']);
+    const exact = parsed(root, 'dynamic/topic/42.md'); const titled = parsed(root, 'archive/topic/remembering_the_cat_77.md');
+    expect(exact.bucket_id).toBe('42');
+    expect(titled.bucket_id).toBe('77'); expect(titled.relative_path).toBe('archive/topic/remembering_the_cat_77.md');
+  });
+
+  it('requires an underscore token boundary for title-prefixed filenames', () => {
+    const root = temp(); bucket(root, 'dynamic/title42.md', ['id: 42']); bucket(root, 'dynamic/title_43.md', ['id: 42']);
+    const result = runLegacyImport({ rootDir: root, storeDir: path.join(root, 'store'), subjectId: 's', dryRun: true });
+    expect(result.processed).toBe(2); expect(result.isolated).toHaveLength(2);
+    expect(result.isolated.map((item) => item.relative_path)).toEqual(['dynamic/title42.md', 'dynamic/title_43.md']);
+  });
+
+  it('accepts naive, Z, and +00:00 UTC timestamps as the same semantic instant while preserving raw text', () => {
+    const root = temp();
+    bucket(root, 'dynamic/naive_1.md', ['id: 1', 'created: 2026-05-25T14:44:43.565804', 'last_active: 2026-05-25T14:44:43.565804']);
+    bucket(root, 'dynamic/zulu_2.md', ['id: 2', 'created: 2026-05-25T14:44:43.565804Z', 'last_active: 2026-05-25T14:44:43.565804Z']);
+    bucket(root, 'dynamic/offset_3.md', ['id: 3', 'created: 2026-05-25T14:44:43.565804+00:00', 'last_active: 2026-05-25T14:44:43.565804+00:00']);
+    const naive = parsed(root, 'dynamic/naive_1.md'); const zulu = parsed(root, 'dynamic/zulu_2.md'); const offset = parsed(root, 'dynamic/offset_3.md');
+    expect(naive.raw_created).toBe('2026-05-25T14:44:43.565804'); expect(zulu.raw_created).toBe('2026-05-25T14:44:43.565804Z'); expect(offset.raw_created).toBe('2026-05-25T14:44:43.565804+00:00');
+    expect(zulu.created_at_utc).toBe(naive.created_at_utc); expect(offset.created_at_utc).toBe(naive.created_at_utc); expect(naive.created_at_utc).toBe('2026-05-25T14:44:43.565Z');
+  });
+
+  it('isolates malformed or non-zero-offset timestamps instead of coercing them', () => {
+    const root = temp(); bucket(root, 'dynamic/bad_1.md', ['id: 1', 'created: 2026-02-31T14:44:43']); bucket(root, 'dynamic/offset_2.md', ['id: 2', 'created: 2026-05-25T14:44:43+09:00']);
+    const result = runLegacyImport({ rootDir: root, storeDir: path.join(root, 'store'), subjectId: 's', dryRun: true });
+    expect(result.processed).toBe(2); expect(result.accepted).toBe(0); expect(result.isolated).toHaveLength(2);
+  });
+
   it('accepts both column-0 and indented block lists and creates normal legacy sources', () => {
     const root = temp(); const store = new LegacyMemorySourceStore(path.join(root, 'store'));
     blockListBucket(root, 'dynamic/101.md', ''); blockListBucket(root, 'dynamic/102.md', '  ');
