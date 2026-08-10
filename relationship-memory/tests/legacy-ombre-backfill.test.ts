@@ -108,6 +108,22 @@ describe('Task 093X Ombre legacy source foundation', () => {
     bucket(root, 'dynamic/3.md'); expect(() => runLegacyImport({ rootDir: root, storeDir, subjectId: 's' })).toThrow(/different manifest/);
   });
 
+  it('checkpoints terminal isolation so bounded resume advances past a malformed first entry', () => {
+    const root = temp(); const storeDir = path.join(root, 'store');
+    fs.mkdirSync(path.join(root, 'archive'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'archive/1.md'), '---\nid: 1\nBAD YAML\n---\nbody', 'utf8');
+    bucket(root, 'dynamic/2.md');
+    const first = runLegacyImport({ rootDir: root, storeDir, subjectId: 's', maxRecords: 1 });
+    expect(first.processed).toBe(1); expect(first.isolated).toHaveLength(1); expect(first.isolated[0].relative_path).toBe('archive/1.md');
+    const manifest = buildLegacyManifest(root);
+    expect(loadLegacyImportState(path.join(storeDir, 'legacy-import-state.json'), manifest.manifest_digest).processed_paths).toEqual(['archive/1.md']);
+    const second = runLegacyImport({ rootDir: root, storeDir, subjectId: 's', maxRecords: 1 });
+    expect(second.processed).toBe(1); expect(second.accepted).toBe(1); expect(second.isolated).toHaveLength(0);
+    const store = new LegacyMemorySourceStore(storeDir);
+    expect(store.listSources()).toHaveLength(1);
+    expect(store.listReceipts().filter((item) => item.relative_path === 'archive/1.md' && item.result === 'isolated')).toHaveLength(1);
+  });
+
   it('dry-run and maxRecords never commit beyond the requested boundary', () => {
     const root = temp(); bucket(root, 'dynamic/1.md'); bucket(root, 'dynamic/2.md'); const dryStore = path.join(root, 'dry');
     const dry = runLegacyImport({ rootDir: root, storeDir: dryStore, subjectId: 's', maxRecords: 1, dryRun: true }); expect(dry.processed).toBe(1); expect(new LegacyMemorySourceStore(dryStore).listSources()).toHaveLength(0); expect(fs.existsSync(path.join(dryStore, 'legacy-import-state.json'))).toBe(false);
