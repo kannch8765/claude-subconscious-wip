@@ -1,6 +1,6 @@
 #!/usr/bin/env npx tsx
 import * as path from 'path';
-import { getBackfillAgentId } from './agent_config.js';
+import { getBackfillAgentId } from './backfill_agent_config.js';
 import { createConversation } from './conversation_utils.js';
 import { runRelationshipObserverBatch } from './relationship_observer_runner.js';
 import {
@@ -27,18 +27,15 @@ function usage(): never {
   console.error('Usage: npx tsx scripts/relationship_memory_backfill.ts (--snapshot-manifest <manifest.json> | --transcript <file-or-root>) --state <checkpoint.json> [--root <relationship-memory-dir>] [--cwd <dir>] [--max-batches N] [--max-records N] [--max-bytes N]');
   process.exit(2);
 }
-
 function positive(value: string | undefined, flag: string): number {
   const parsed = Number.parseInt(value ?? '', 10);
   if (!Number.isInteger(parsed) || parsed < 1) throw new Error(`${flag} must be a positive integer`);
   return parsed;
 }
-
 function parseArgs(argv: string[]): Args {
   const result: Args = { maxBatches: 1, maxRecords: 40, maxBytes: 2 * 1024 * 1024 };
   for (let i = 0; i < argv.length; i += 1) {
-    const flag = argv[i];
-    const value = argv[i + 1];
+    const flag = argv[i]; const value = argv[i + 1];
     if (flag === '--transcript') { result.transcript = value; i += 1; }
     else if (flag === '--snapshot-manifest') { result.snapshotManifest = value; i += 1; }
     else if (flag === '--state') { result.state = value; i += 1; }
@@ -77,32 +74,20 @@ async function main(): Promise<void> {
     saveBackfillState(statePath, state);
   }
   const conversationId = state.conversation_id;
-
   const processor = async (batch: HistoricalBatch) => ({
     completion: await runRelationshipObserverBatch({
-      agentId,
-      conversationId,
-      message: batch.observerMessage,
-      cwd,
-      batchId: batch.batchId,
-      canonicalMessages: batch.canonicalMessages,
-      rootDir,
+      agentId, conversationId, message: batch.observerMessage, cwd, batchId: batch.batchId,
+      canonicalMessages: batch.canonicalMessages, rootDir,
       log: (message) => console.error(`[backfill] ${message}`),
     }),
   });
-
   const result = await runHistoricalBackfill({
-    transcriptPath: transcript,
-    statePath,
-    maxBatches: args.maxBatches,
-    maxRecordsPerBatch: args.maxRecords,
-    maxBatchBytes: args.maxBytes,
-    processor,
+    transcriptPath: transcript, statePath, maxBatches: args.maxBatches,
+    maxRecordsPerBatch: args.maxRecords, maxBatchBytes: args.maxBytes, processor,
   });
   console.log(JSON.stringify(result));
   if (result.status === 'blocked-failure') process.exitCode = 1;
 }
-
 main().catch((error) => {
   console.error(JSON.stringify({ status: 'blocked-failure', detail: error instanceof Error ? error.message : String(error) }));
   process.exitCode = 1;
