@@ -80,52 +80,50 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toEqual([s.legacy_source_id]);
   });
 
-  it('auto-retries a classified zero-mutation missing-completion attempt and then continues to the next source', async () => {
-    const root = temp(); const a = source('auto-retry-a'); const b = source('auto-retry-b'); seed(root, a, b);
+  it('does not harness-auto-retry a missing native terminal result and resumes durably on the next invocation', async () => {
+    const root = temp(); const a = source('native-terminal-a'); const b = source('native-terminal-b'); seed(root, a, b);
     const calls: string[] = [];
-    const attempts = new Map<string, number>();
-    const result = await runLegacySemanticMigration({
+    const blocked = await runLegacySemanticMigration({
       rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject, maxRecords: 2,
       processor: async (item) => {
         calls.push(item.legacy_source_id);
-        const attempt = (attempts.get(item.legacy_source_id) ?? 0) + 1;
-        attempts.set(item.legacy_source_id, attempt);
-        if (item.legacy_source_id === a.legacy_source_id && attempt === 1) {
-          return { completion: 'retryable_failure', reason: 'observer ended without explicit legacy_source_complete', retry_class: 'zero_mutation_missing_completion' };
-        }
-        return { completion: 'no_memory_required' };
+        return { completion: 'retryable_failure', reason: 'native observer did not produce a locally valid legacy_source_complete terminal result' };
       },
     });
-    expect(result.status).toBe('completed');
+    expect(blocked.status).toBe('blocked-failure');
+    expect(calls).toEqual([a.legacy_source_id]);
+    expect(listLegacySemanticReceipts(root).map((receipt) => [receipt.legacy_source_id, receipt.result, receipt.attempt])).toEqual([
+      [a.legacy_source_id, 'retryable_failure', 1],
+    ]);
+    expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toEqual([]);
+
+    const resumed = await runLegacySemanticMigration({
+      rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject, maxRecords: 2,
+      processor: async (item) => { calls.push(item.legacy_source_id); return { completion: 'no_memory_required' }; },
+    });
+    expect(resumed.status).toBe('completed');
     expect(calls).toEqual([a.legacy_source_id, a.legacy_source_id, b.legacy_source_id]);
     expect(listLegacySemanticReceipts(root).map((receipt) => [receipt.legacy_source_id, receipt.result, receipt.attempt])).toEqual([
       [a.legacy_source_id, 'retryable_failure', 1],
       [a.legacy_source_id, 'no_memory_required', 2],
       [b.legacy_source_id, 'no_memory_required', 1],
     ]);
-    expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toEqual([a.legacy_source_id, b.legacy_source_id]);
-
-    const resumed = await runLegacySemanticMigration({
-      rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject,
-      processor: async () => { throw new Error('completed sources must not be reprocessed'); },
-    });
-    expect(resumed.status).toBe('no-op');
   });
 
-  it('bounds repeated zero-mutation missing-completion retries and remains resumable', async () => {
-    const root = temp(); const s = source('auto-retry-bounded'); seed(root, s);
+  it('increments durable attempt receipts across owner resumes instead of retrying inside one run', async () => {
+    const root = temp(); const s = source('native-terminal-resume'); seed(root, s);
     let calls = 0;
-    const blocked = await runLegacySemanticMigration({
-      rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject,
-      processor: async () => {
-        calls += 1;
-        return { completion: 'retryable_failure', reason: 'observer ended without explicit legacy_source_complete', retry_class: 'zero_mutation_missing_completion' };
-      },
-    });
-    expect(blocked.status).toBe('blocked-failure');
-    expect(calls).toBe(2);
-    expect(listLegacySemanticReceipts(root).map((receipt) => [receipt.result, receipt.attempt])).toEqual([['retryable_failure', 1], ['retryable_failure', 2]]);
-    expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toEqual([]);
+    for (let expectedAttempt = 1; expectedAttempt <= 2; expectedAttempt += 1) {
+      const blocked = await runLegacySemanticMigration({
+        rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject,
+        processor: async () => { calls += 1; return { completion: 'retryable_failure', reason: 'synthetic native transport interruption' }; },
+      });
+      expect(blocked.status).toBe('blocked-failure');
+      expect(calls).toBe(expectedAttempt);
+      expect(listLegacySemanticReceipts(root).map((receipt) => receipt.attempt)).toEqual(
+        Array.from({ length: expectedAttempt }, (_, index) => index + 1),
+      );
+    }
 
     const resumed = await runLegacySemanticMigration({
       rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject,
@@ -135,33 +133,22 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(listLegacySemanticReceipts(root).map((receipt) => receipt.attempt)).toEqual([1, 2, 3]);
   });
 
-  it('does not auto-retry a classified failure when canonical or provenance mutation occurred', async () => {
-    const root = temp(); const s = source('auto-retry-mutated'); seed(root, s);
+  it('still fails closed immediately when a retryable observer result follows canonical mutation', async () => {
+    const root = temp(); const s = source('native-retry-mutated'); seed(root, s);
     let calls = 0;
     const result = await runLegacySemanticMigration({
       rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject,
       processor: async (item, batchId) => {
         calls += 1;
         const runtime = new LegacySemanticMutationRuntime(root, canonicalSubject, item, batchId, () => '2026-08-11T00:00:00Z');
-        expect(runtime.createMemory(sharedProposal('自动重试边界')).outcome).toBe('created');
-        return { completion: 'retryable_failure', reason: 'observer ended without explicit legacy_source_complete', retry_class: 'zero_mutation_missing_completion' };
+        expect(runtime.createMemory(sharedProposal('native failure boundary')).outcome).toBe('created');
+        return { completion: 'retryable_failure', reason: 'synthetic native transport interruption after mutation' };
       },
     });
     expect(result.status).toBe('blocked-failure');
     expect(calls).toBe(1);
     expect(new RelationshipMemoryStore(root, canonicalSubject).listMemories()).toHaveLength(1);
     expect(new LegacyMemorySourceStore(root).listProvenance()).toHaveLength(1);
-  });
-
-  it('does not auto-retry unclassified zero-mutation failures', async () => {
-    const root = temp(); const s = source('auto-retry-unclassified'); seed(root, s);
-    let calls = 0;
-    const result = await runLegacySemanticMigration({
-      rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject,
-      processor: async () => { calls += 1; return { completion: 'retryable_failure', reason: 'observer/tool session retryable failure' }; },
-    });
-    expect(result.status).toBe('blocked-failure');
-    expect(calls).toBe(1);
   });
 
   it('redacts source credentials before observation and hard-rejects credential-bearing canonical proposals', () => {

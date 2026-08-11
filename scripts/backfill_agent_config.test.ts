@@ -58,7 +58,7 @@ describe('dedicated historical backfill agent resolver', () => {
           model: profile.model,
           embedding: profile.embedding,
           context_window_limit: profile.contextWindow,
-          model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+          model_settings: { provider_type: 'deepseek', parallel_tool_calls: false },
         });
         patched = true;
         return jsonResponse({ ok: true });
@@ -68,8 +68,8 @@ describe('dedicated historical backfill agent resolver', () => {
         id: BACKFILL,
         model: profile.model,
         embedding: profile.embedding,
-        llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: true },
-        model_settings: { parallel_tool_calls: true },
+        llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: false },
+        model_settings: { parallel_tool_calls: false },
       });
     }));
     const logs: string[] = [];

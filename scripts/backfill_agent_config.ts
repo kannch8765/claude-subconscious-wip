@@ -57,7 +57,7 @@ export const LEGACY_FILL_VERIFIED_RUNTIME = {
   model: 'opencode-deepseek/deepseek-v4-flash',
   embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
   contextWindow: 400_000,
-  parallelToolCalls: true,
+  parallelToolCalls: false,
 } as const;
 
 function configFile(): string {
@@ -143,8 +143,8 @@ export async function configureVerifiedLegacyFillRuntime(
     throw new Error(`Legacy fill runtime context mismatch after PATCH: ${verified.llm_config?.context_window ?? 'missing'}`);
   }
   const parallel = verified.model_settings?.parallel_tool_calls ?? verified.llm_config?.parallel_tool_calls;
-  if (parallel !== true) throw new Error('Legacy fill runtime parallel_tool_calls was not enabled');
-  log(`Verified legacy fill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=true`);
+  if (parallel !== profile.parallelToolCalls) throw new Error(`Legacy fill runtime parallel_tool_calls mismatch after PATCH: ${String(parallel)}`);
+  log(`Verified legacy fill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=${profile.parallelToolCalls}`);
 }
 async function importDedicatedAgent(apiKey: string): Promise<string> {
   const file = fs.readFileSync(DEFAULT_AGENT_FILE);
