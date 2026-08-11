@@ -105,9 +105,10 @@ describe('native legacy semantic observer integration', () => {
     expect(new LegacyMemorySourceStore(root).listProvenance()).toEqual([
       expect.objectContaining({ legacy_source_id: item.legacy_source_id, canonical_memory_id: memories[0].memory_id, disposition: 'created' }),
     ]);
-    expect(new RelationshipMemoryStore(root, 'kohaku').listBatches()).toEqual([
-      expect.objectContaining({ batch_id: 'batch-native', status: 'completed' }),
-    ]);
+    const completedBatches = new RelationshipMemoryStore(root, 'kohaku').listBatches();
+    expect(completedBatches).toHaveLength(2);
+    expect(completedBatches[0]).toMatchObject({ batch_id: 'batch-native', status: 'pending' });
+    expect(completedBatches.at(-1)).toMatchObject({ batch_id: 'batch-native', status: 'completed' });
   });
 
   it('fails closed and leaves the batch resumable when a native terminal result violates local provenance invariants', async () => {
@@ -130,8 +131,9 @@ describe('native legacy semantic observer integration', () => {
     expect(result.completion).toBe('retryable_failure');
     expect(new RelationshipMemoryStore(root, 'kohaku').listMemories()).toHaveLength(0);
     expect(new LegacyMemorySourceStore(root).listProvenance()).toHaveLength(0);
-    expect(new RelationshipMemoryStore(root, 'kohaku').listBatches()).toEqual([
-      expect.objectContaining({ batch_id: 'batch-native', status: 'retryable_failure' }),
-    ]);
+    const failedBatches = new RelationshipMemoryStore(root, 'kohaku').listBatches();
+    expect(failedBatches).toHaveLength(2);
+    expect(failedBatches[0]).toMatchObject({ batch_id: 'batch-native', status: 'pending' });
+    expect(failedBatches.at(-1)).toMatchObject({ batch_id: 'batch-native', status: 'retryable_failure' });
   });
 });
