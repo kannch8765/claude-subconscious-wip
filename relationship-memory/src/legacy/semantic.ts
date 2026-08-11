@@ -14,6 +14,59 @@ import {
 export const LEGACY_FEEL_TEMPORALITY = 'historical_at_source_time' as const;
 export const OMBRE_LEGACY_FROZEN_MANIFEST_DIGEST = '5226a04525e4fef5bffa8e76b41526aa46d147ac1c861e22d79d04912314ae31' as const;
 
+
+export const LEGACY_MEMORY_PAYLOAD_GUIDE = [
+  'legacy_memory_create payload fields are kind-specific; never probe the schema with test or placeholder memories.',
+  'personal_experience requires: title, experience. Optional: time_text, places[], themes[], emotional_tone, why_memorable, recall_triggers[].',
+  'shared_experience requires: title, event, shared_meaning. Optional: symbols[], recall_triggers[].',
+  'relationship_event requires: event, meaning. Optional: prior_context, resulting_change.',
+  'inside_joke requires: name, meaning, trigger_phrases[] (non-empty). Optional: origin, callbacks[], tone.',
+  'user_preference requires: topic, preference. Optional: context, reason, recall_triggers[].',
+  'Only send fields allowed for the selected kind, and every create call must be a source-faithful canonical proposal.',
+].join('\n');
+
+const LEGACY_CREDENTIAL_PATTERNS = [
+  /(?:password|passwd|pwd|密码)\s*(?:[:=：]\s*)?["'`]?([^\s"'`,;，。]+)/giu,
+  /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|auth[_ -]?token|secret|密钥|令牌)\s*[:=：]\s*["'`]?([A-Za-z0-9._~+/=-]{4,})/giu,
+  /Bearer\s+([A-Za-z0-9._~+/=-]{4,})/giu,
+] as const;
+
+function sourceTextValues(source: LegacyAssistantMemorySourceRecord): string[] {
+  return [source.original_markdown, source.body_text, JSON.stringify(source.frontmatter)];
+}
+
+export function extractLegacyCredentialValues(source: LegacyAssistantMemorySourceRecord): string[] {
+  const values = new Set<string>();
+  for (const text of sourceTextValues(source)) {
+    for (const pattern of LEGACY_CREDENTIAL_PATTERNS) {
+      pattern.lastIndex = 0;
+      for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+        const value = match[1]?.trim();
+        if (value && value.length >= 4) values.add(value);
+      }
+    }
+  }
+  return [...values];
+}
+
+function redactLegacyCredentialValues(value: unknown, credentials: readonly string[]): unknown {
+  if (typeof value === 'string') {
+    return credentials.reduce((text, credential) => text.split(credential).join('[REDACTED]'), value);
+  }
+  if (Array.isArray(value)) return value.map((item) => redactLegacyCredentialValues(item, credentials));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, redactLegacyCredentialValues(item, credentials)]));
+  }
+  return value;
+}
+
+export function sanitizeLegacySourceForObserver(source: LegacyAssistantMemorySourceRecord): LegacyAssistantMemorySourceRecord {
+  const credentials = extractLegacyCredentialValues(source);
+  if (credentials.length === 0) return source;
+  return redactLegacyCredentialValues(source, credentials) as LegacyAssistantMemorySourceRecord;
+}
+
 export type LegacySemanticCompletion = 'completed' | 'no_memory_required' | 'retryable_failure';
 
 export interface LegacySemanticMutationResult {
@@ -27,12 +80,11 @@ export interface LegacySemanticState {
   manifest_digest: string;
   canonical_subject_id: string;
   processed_source_ids: string[];
-  agent_id?: string;
-  conversation_id?: string;
 }
 
 export interface LegacySemanticReceipt {
   schema_version: 1;
+  attempt?: number;
   receipt_id: string;
   manifest_digest: string;
   canonical_subject_id: string;
@@ -48,6 +100,7 @@ export interface LegacySemanticReceipt {
 export interface LegacySemanticProcessorResult {
   completion: LegacySemanticCompletion;
   reason?: string;
+  retry_class?: 'zero_mutation_missing_completion';
 }
 
 export interface RunLegacySemanticMigrationOptions {
@@ -165,6 +218,11 @@ export class LegacySemanticMutationRuntime {
       ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}),
     }, { requireChineseSemanticProse: true });
     if (!semantic.ok || !semantic.content) return { ok: false, reason: `${semantic.code ?? 'invalid_schema'}: ${semantic.reason ?? 'invalid semantic content'}` };
+    const sourceCredentials = extractLegacyCredentialValues(this.source);
+    const proposalText = stableJson(semantic.content);
+    if (sourceCredentials.some((credential) => proposalText.includes(credential))) {
+      return { ok: false, reason: 'legacy proposal contains source credential material' };
+    }
     for (const memoryId of semantic.content.linked_memory_ids ?? []) {
       if (!this.canonicalMemory(memoryId)) return { ok: false, reason: `unknown linked memory: ${memoryId}` };
     }
@@ -298,7 +356,33 @@ export function legacyMemoryCreateToolSchema(source: LegacyAssistantMemorySource
       historical_temporality: { type: 'string', enum: [LEGACY_FEEL_TEMPORALITY], description: 'Required for feel/ sources: this prose describes the historical source-time feeling, never a current-state assertion.' },
       payload: {
         type: 'object',
-        description: 'Kind-specific canonical relationship-memory payload. DS-authored semantic prose must be Chinese; source-faithful names/triggers may remain literal.',
+        additionalProperties: false,
+        description: `${LEGACY_MEMORY_PAYLOAD_GUIDE} DS-authored semantic prose must be Chinese; source-faithful names/triggers may remain literal.`,
+        properties: {
+          title: string,
+          experience: string,
+          time_text: string,
+          places: strings,
+          themes: strings,
+          emotional_tone: string,
+          why_memorable: string,
+          recall_triggers: strings,
+          event: string,
+          shared_meaning: string,
+          symbols: strings,
+          meaning: string,
+          prior_context: string,
+          resulting_change: string,
+          name: string,
+          trigger_phrases: strings,
+          origin: string,
+          callbacks: strings,
+          tone: string,
+          topic: string,
+          preference: string,
+          context: string,
+          reason: string,
+        },
       },
     },
   };
@@ -324,7 +408,12 @@ export function loadLegacySemanticState(file: string, manifestDigest: string, ca
   }
   if (parsed.manifest_digest !== manifestDigest) throw new Error('legacy semantic migration state is bound to a different manifest');
   if (parsed.canonical_subject_id !== canonicalSubjectId) throw new Error('legacy semantic migration state is bound to a different canonical subject');
-  return parsed;
+  return {
+    schema_version: 1,
+    manifest_digest: parsed.manifest_digest,
+    canonical_subject_id: parsed.canonical_subject_id,
+    processed_source_ids: [...parsed.processed_source_ids],
+  };
 }
 
 export function saveLegacySemanticState(file: string, state: LegacySemanticState): void { atomicWriteJson(file, state); }
@@ -353,6 +442,23 @@ function terminalReceipt(rootDir: string, sourceId: string, manifestDigest: stri
 
 function remainingCount(sources: LegacyAssistantMemorySourceRecord[], processed: Set<string>, selected?: Set<string>): number {
   return sources.filter((source) => (!selected || selected.has(source.legacy_source_id)) && !processed.has(source.legacy_source_id)).length;
+}
+
+const LEGACY_ZERO_MUTATION_MAX_ATTEMPTS = 2;
+
+function semanticMutationFingerprint(legacyStore: LegacyMemorySourceStore, canonicalStore: RelationshipMemoryStore): string {
+  return stableId('legacy_semantic_mutation_snapshot', {
+    memories: canonicalStore.listMemories(),
+    evidence: canonicalStore.listEvidence(),
+    reinforcements: canonicalStore.listReinforcements(),
+    provenance: legacyStore.listProvenance(),
+  });
+}
+
+function nextReceiptAttempt(rootDir: string, sourceId: string, manifestDigest: string, canonicalSubjectId: string): number {
+  return listLegacySemanticReceipts(rootDir).filter((item) =>
+    item.legacy_source_id === sourceId && item.manifest_digest === manifestDigest && item.canonical_subject_id === canonicalSubjectId
+  ).length + 1;
 }
 
 export async function runLegacySemanticMigration(options: RunLegacySemanticMigrationOptions): Promise<LegacySemanticRunResult> {
@@ -408,51 +514,62 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
     }
 
     const batchId = legacySemanticBatchId(manifestDigest, source.legacy_source_id, canonicalSubjectId);
-    const result = await options.processor(source, batchId);
-    const provenance = provenanceForSubject(legacyStore, canonicalStore, canonicalSubjectId, source.legacy_source_id);
-    let failure: string | undefined;
-    if (result.completion === 'completed' && provenance.length === 0) failure = 'observer completed without canonical provenance';
-    if (result.completion === 'no_memory_required' && provenance.length > 0) failure = 'observer returned no_memory_required after canonical provenance was written';
-    const effectiveCompletion: LegacySemanticCompletion = failure ? 'retryable_failure' : result.completion;
-    const memoryIds = [...new Set(provenance.map((item) => item.canonical_memory_id))].sort();
-    const provenanceIds = provenance.map((item) => item.provenance_id).sort();
-    const receiptCore = {
-      manifest_digest: manifestDigest,
-      canonical_subject_id: canonicalSubjectId,
-      legacy_source_id: source.legacy_source_id,
-      batch_id: batchId,
-      result: effectiveCompletion,
-      provenance_ids: provenanceIds,
-      memory_ids: memoryIds,
-      ...((failure ?? result.reason) ? { reason: failure ?? result.reason } : {}),
-    } as const;
-    const receipt: LegacySemanticReceipt = {
-      schema_version: 1,
-      receipt_id: receiptId(receiptCore),
-      ...receiptCore,
-      recorded_at: new Date().toISOString(),
-    };
-
-    if (effectiveCompletion === 'retryable_failure') {
-      legacyStore.withMutationBoundary(() => appendSemanticReceipt(rootDir, receipt));
-      return {
-        status: 'blocked-failure', manifest_digest: manifestDigest, processed: completedCount,
-        remaining: remainingCount(sources, processed, selected), source_id: source.legacy_source_id,
-        detail: receipt.reason ?? 'legacy semantic observer retryable failure',
+    let sourceCompleted = false;
+    for (let attemptInRun = 1; attemptInRun <= LEGACY_ZERO_MUTATION_MAX_ATTEMPTS; attemptInRun += 1) {
+      const beforeMutation = semanticMutationFingerprint(legacyStore, canonicalStore);
+      const result = await options.processor(source, batchId);
+      const afterMutation = semanticMutationFingerprint(legacyStore, canonicalStore);
+      const provenance = provenanceForSubject(legacyStore, canonicalStore, canonicalSubjectId, source.legacy_source_id);
+      let failure: string | undefined;
+      if (result.completion === 'completed' && provenance.length === 0) failure = 'observer completed without canonical provenance';
+      if (result.completion === 'no_memory_required' && provenance.length > 0) failure = 'observer returned no_memory_required after canonical provenance was written';
+      const effectiveCompletion: LegacySemanticCompletion = failure ? 'retryable_failure' : result.completion;
+      const memoryIds = [...new Set(provenance.map((item) => item.canonical_memory_id))].sort();
+      const provenanceIds = provenance.map((item) => item.provenance_id).sort();
+      const receiptCore = {
+        attempt: nextReceiptAttempt(rootDir, source.legacy_source_id, manifestDigest, canonicalSubjectId),
+        manifest_digest: manifestDigest,
+        canonical_subject_id: canonicalSubjectId,
+        legacy_source_id: source.legacy_source_id,
+        batch_id: batchId,
+        result: effectiveCompletion,
+        provenance_ids: provenanceIds,
+        memory_ids: memoryIds,
+        ...((failure ?? result.reason) ? { reason: failure ?? result.reason } : {}),
+      } as const;
+      const receipt: LegacySemanticReceipt = {
+        schema_version: 1,
+        receipt_id: receiptId(receiptCore),
+        ...receiptCore,
+        recorded_at: new Date().toISOString(),
       };
-    }
 
-    legacyStore.withMutationBoundary(() => {
-      appendSemanticReceipt(rootDir, receipt);
-      const latestState = loadLegacySemanticState(statePath, manifestDigest, canonicalSubjectId);
-      if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
-        latestState.processed_source_ids.push(source.legacy_source_id);
-        saveLegacySemanticState(statePath, latestState);
+      if (effectiveCompletion === 'retryable_failure') {
+        legacyStore.withMutationBoundary(() => appendSemanticReceipt(rootDir, receipt));
+        const safeZeroMutationRetry = result.retry_class === 'zero_mutation_missing_completion' && beforeMutation === afterMutation;
+        if (safeZeroMutationRetry && attemptInRun < LEGACY_ZERO_MUTATION_MAX_ATTEMPTS) continue;
+        return {
+          status: 'blocked-failure', manifest_digest: manifestDigest, processed: completedCount,
+          remaining: remainingCount(sources, processed, selected), source_id: source.legacy_source_id,
+          detail: receipt.reason ?? 'legacy semantic observer retryable failure',
+        };
       }
-      state.processed_source_ids = latestState.processed_source_ids;
-      processed.add(source.legacy_source_id);
-    });
-    completedCount += 1;
+
+      legacyStore.withMutationBoundary(() => {
+        appendSemanticReceipt(rootDir, receipt);
+        const latestState = loadLegacySemanticState(statePath, manifestDigest, canonicalSubjectId);
+        if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
+          latestState.processed_source_ids.push(source.legacy_source_id);
+          saveLegacySemanticState(statePath, latestState);
+        }
+        state.processed_source_ids = latestState.processed_source_ids;
+        processed.add(source.legacy_source_id);
+      });
+      completedCount += 1;
+      sourceCompleted = true;
+      break;
+    }
+    if (!sourceCompleted) throw new Error(`legacy semantic retry loop exited without terminal result: ${source.legacy_source_id}`);
   }
 
   return {

@@ -3,12 +3,10 @@ import * as path from 'path';
 import { relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { LegacyMemorySourceStore } from '../relationship-memory/src/legacy/index.js';
 import {
-  loadLegacySemanticState,
   OMBRE_LEGACY_FROZEN_MANIFEST_DIGEST,
   runLegacySemanticMigration,
-  saveLegacySemanticState,
 } from '../relationship-memory/src/legacy/semantic.js';
-import { getBackfillAgentId } from './backfill_agent_config.js';
+import { configureVerifiedLegacyFillRuntime, getBackfillAgentId } from './backfill_agent_config.js';
 import { createConversation } from './conversation_utils.js';
 import { runLegacySemanticObserverSource } from './legacy_semantic_observer_runner.js';
 
@@ -17,13 +15,15 @@ interface Args {
   state?: string;
   cwd?: string;
   expectedManifestDigest?: string;
+  agentId?: string;
+  runtimeProfile?: 'verified-dsv4';
   maxRecords: number;
   sourceIds: string[];
   dryRun: boolean;
 }
 
 function usage(): never {
-  console.error('Usage: npx tsx scripts/legacy_semantic_backfill.ts [--root <relationship-memory-dir>] [--state <checkpoint.json>] [--cwd <dir>] [--expected-manifest-digest <sha256>] [--max-records N] [--source-id <legacy_source_id> ...] [--dry-run]');
+  console.error('Usage: npx tsx scripts/legacy_semantic_backfill.ts [--root <relationship-memory-dir>] [--state <checkpoint.json>] [--cwd <dir>] [--expected-manifest-digest <sha256>] [--agent-id <agent-id>] [--runtime-profile verified-dsv4] [--max-records N] [--source-id <legacy_source_id> ...] [--dry-run]');
   process.exit(2);
 }
 
@@ -45,6 +45,8 @@ function parseArgs(argv: string[]): Args {
       if (!value) usage();
       result.expectedManifestDigest = value; i += 1;
     }
+    else if (flag === '--agent-id') { if (!value) usage(); result.agentId = value; i += 1; }
+    else if (flag === '--runtime-profile') { if (value !== 'verified-dsv4') usage(); result.runtimeProfile = value; i += 1; }
     else if (flag === '--max-records') { result.maxRecords = positive(value, flag); i += 1; }
     else if (flag === '--source-id') {
       if (!value) usage();
@@ -76,7 +78,7 @@ async function main(): Promise<void> {
   if (manifestDigest !== expectedManifestDigest) {
     throw new Error(`legacy semantic source manifest ${manifestDigest} does not match expected frozen manifest ${expectedManifestDigest}`);
   }
-  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID ?? 'local-user';
+  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID ?? 'kohaku';
 
   if (args.dryRun) {
     const result = await runLegacySemanticMigration({
@@ -89,14 +91,13 @@ async function main(): Promise<void> {
 
   const apiKey = process.env.LETTA_API_KEY;
   if (!apiKey) throw new Error('LETTA_API_KEY is required for legacy semantic backfill.');
-  const agentId = await getBackfillAgentId(apiKey, (message) => console.error(`[legacy-backfill] ${message}`));
-  const state = loadLegacySemanticState(statePath, manifestDigest, subjectId);
-  if (state.agent_id && state.agent_id !== agentId) {
-    throw new Error(`Legacy semantic state is bound to a different backfill agent (${state.agent_id}); use the original dedicated agent or a new state file.`);
-  }
-  if (!state.agent_id) {
-    state.agent_id = agentId;
-    saveLegacySemanticState(statePath, state);
+  const agentId = await getBackfillAgentId(
+    apiKey,
+    (message) => console.error(`[legacy-backfill] ${message}`),
+    { agentId: args.agentId, reconcileCanonicalPrompt: false },
+  );
+  if (args.runtimeProfile === 'verified-dsv4') {
+    await configureVerifiedLegacyFillRuntime(apiKey, agentId, (message) => console.error(`[legacy-backfill] ${message}`));
   }
 
   const result = await runLegacySemanticMigration({

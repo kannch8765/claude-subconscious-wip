@@ -4,7 +4,9 @@ import {
 } from '../relationship-memory/src/legacy/index.js';
 import {
   LegacySemanticMutationRuntime,
+  LEGACY_MEMORY_PAYLOAD_GUIDE,
   legacyMemoryCreateToolSchema,
+  sanitizeLegacySourceForObserver,
   legacyMemoryExistingToolSchema,
   legacySourceCompleteToolSchema,
   type LegacySemanticProcessorResult,
@@ -44,14 +46,18 @@ function sourceMessage(source: LegacyAssistantMemorySourceRecord): string {
     '',
     'You are processing exactly one immutable legacy source in this run.',
     'Use memory_search before deciding duplicate/reinforcement versus creation when useful.',
+    'Apply a strict relationship-memory relevance gate before mutating: ordinary technical implementation, bug-fix, deployment, configuration, monitoring, or operational-status facts are no_memory_required unless they carry durable preference, identity/role significance, a personally or jointly lived experience with enduring human meaning, a relationship event/change, or inside-joke/shared-language value. Importance or technical detail alone is never sufficient.',
+    'Preserve actor/action fidelity literally: assistant-authored provenance does NOT make an unstated actor the assistant. If the source omits who performed an action, keep the canonical prose actorless/neutral. Preserve explicit names as written unless this source itself establishes an identity mapping; never silently map Sol, Sonnet, 晴, ゆう, Claude, GPT, or another named actor onto user/assistant. Also preserve action strength literally: do not upgrade 管理/拥有/位于 into 建立/创建/迁移/提交/实现 or otherwise invent an action absent from the source. Keep actorless/passive status wording actorless: 项目完成/代码已写/测试通过/列为候选 must not become 用户完成/琥珀完成/克宝完成/琥珀提出. An explicit first-person pronoun in this legacy assistant-authored source is an explicit actor; an omitted subject is not.',
     'Use legacy_memory_create once per distinct canonical semantic item; one source may require several calls.',
+    'The payload contract is fully specified below. Never make test/probe/placeholder create calls to discover schema fields; every create call mutates canonical memory and must be source-faithful.',
+    LEGACY_MEMORY_PAYLOAD_GUIDE,
     'Use legacy_memory_duplicate_link for an already-canonical semantic item that needs provenance but no reinforcement.',
     'Use legacy_memory_reinforce only when this historical source genuinely reinforces the same underlying canonical memory.',
     'When semantic processing is finished, you MUST call legacy_source_complete with completed, or no_memory_required if and only if no canonical provenance was written.',
     'Do not include legacy_source_id in tool arguments; the runtime binds every mutation to this source.',
     '',
     'IMMUTABLE_LEGACY_SOURCE_JSON:',
-    JSON.stringify(source),
+    JSON.stringify(sanitizeLegacySourceForObserver(source)),
   ].join('\n');
 }
 
@@ -69,6 +75,7 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
   let session: any = null;
   let sessionSucceeded = true;
   let toolRetryableFailure = false;
+  let toolPermanentlyRejected = false;
 
   try {
     disableLettaCodeAutoUpdater();
@@ -79,6 +86,7 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
     const wrapMutation = (fn: (args: any) => any) => async (_toolCallId: string, args: unknown) => {
       const result = fn(args);
       if (result?.outcome === 'retryable_failed') toolRetryableFailure = true;
+      if (result?.outcome === 'permanently_rejected') toolPermanentlyRejected = true;
       return jsonResult(result);
     };
     const tools: any[] = [
@@ -153,6 +161,15 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
     finalized_at: now,
     ...(!retryable && completion === 'no_memory_required' ? { detail: 'no_memory_required' as const } : {}),
   });
-  if (retryable) return { completion: 'retryable_failure', reason: !completion ? 'observer ended without explicit legacy_source_complete' : 'observer/tool session retryable failure' };
+  if (retryable) {
+    const pureMissingCompletion = !completion && sessionSucceeded && !toolRetryableFailure && !toolPermanentlyRejected;
+    return {
+      completion: 'retryable_failure',
+      reason: !completion
+        ? (toolPermanentlyRejected ? 'observer ended after permanently rejected legacy mutation tool call' : 'observer ended without explicit legacy_source_complete')
+        : 'observer/tool session retryable failure',
+      ...(pureMissingCompletion ? { retry_class: 'zero_mutation_missing_completion' as const } : {}),
+    };
+  }
   return { completion };
 }
