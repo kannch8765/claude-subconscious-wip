@@ -52,7 +52,7 @@ function stable(value: unknown): string {
   return JSON.stringify(value);
 }
 
-const COMPLETION_TOOL_SOURCE = `def legacy_source_complete(result: str) -> str:\n    \"\"\"Mark one legacy semantic source complete. The caller validates local provenance after the terminal call.\"\"\"\n    if result not in (\"completed\", \"no_memory_required\"):\n        raise ValueError(\"result must be completed or no_memory_required\")\n    return result\n`;
+const COMPLETION_TOOL_SOURCE = `def legacy_source_complete(result: str) -> str:\n    \"\"\"Mark one legacy semantic source complete. The caller validates local provenance after the terminal call.\"\"\"\n    normalized = getattr(result, \"value\", result)\n    if normalized not in (\"completed\", \"no_memory_required\"):\n        raise ValueError(\"result must be completed or no_memory_required\")\n    return normalized\n`;
 
 export async function ensureLegacyCompletionTool(
   client: NativeLettaClientLike,

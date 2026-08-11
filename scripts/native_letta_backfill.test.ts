@@ -80,6 +80,7 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.upserts[0]).toEqual(expect.objectContaining({
       enable_parallel_execution: false,
       args_json_schema: expect.objectContaining({ title: 'LegacySourceCompleteArgs' }),
+      source_code: expect.stringContaining('getattr(result, \"value\", result)'),
     }));
     expect(client.updates).toHaveLength(1);
     expect((client.updates[0].tool_rules as any[]).slice(-2)).toEqual([
