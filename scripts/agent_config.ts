@@ -7,9 +7,10 @@
  * 3. Auto-import from bundled Subconscious.af
  * 
  * Model configuration:
- * - After agent creation, checks if the agent's model is available
- * - If not available, auto-selects from available models with preference order
- * - LETTA_MODEL environment variable can override (if available on server)
+ * - Managed saved/imported agents reconcile to canonical Subconscious.af runtime policy
+ * - Model availability discovery is diagnostic for managed agents and must not override that authority
+ * - Legacy auto-selection remains available only when a caller explicitly allows fallback
+ * - LETTA_MODEL environment variable remains an explicit operator override
  */
 
 import * as fs from 'fs';
@@ -481,7 +482,8 @@ function selectBestModel(models: LettaModel[], preferences: string[]): string | 
 async function ensureModelAvailable(
   apiKey: string,
   agentId: string,
-  log: (msg: string) => void = console.log
+  log: (msg: string) => void = console.log,
+  allowAutoSelection = true,
 ): Promise<string | null> {
   try {
     // Get available models and agent details in parallel
@@ -523,8 +525,16 @@ async function ensureModelAvailable(
       return null; // No change needed
     }
 
-    // Model not available - need to select alternative
+    // Model not available. For Subconscious-managed agents, canonical .af /
+    // explicit operator configuration is authoritative even when /models is
+    // temporarily incomplete or represents the model differently. Availability
+    // discovery may warn, but must not silently PATCH the managed agent away
+    // from a configuration that was just reconciled successfully.
     log(`Agent's model "${currentModel}" is NOT available on this server`);
+    if (!allowAutoSelection) {
+      log('Preserving reconciled managed model; availability fallback is disabled for Subconscious-managed agents');
+      return null;
+    }
 
     const selectedModel = selectBestModel(models, PREFERRED_MODELS);
     if (!selectedModel) {
@@ -769,9 +779,9 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
     // propagate instead of importing/replacing the agent or pretending success.
     await reconcileManagedAgentConfiguration(apiKey, agentId, log);
 
-    // 5. Existing model auto-selection remains scoped to config-managed agents.
+    // 5. Availability discovery is diagnostic only after managed reconciliation.
     try {
-      const configuredModel = await ensureModelAvailable(apiKey, agentId, log);
+      const configuredModel = await ensureModelAvailable(apiKey, agentId, log, false);
       if (configuredModel && config.model !== configuredModel) {
         saveConfig({
           ...config,
@@ -782,7 +792,7 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
       log(`Warning: Could not verify model availability: ${error}`);
     }
   } else if (await isManagedEnvAgent(apiKey, agentId, log)) {
-    log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling system prompt only');
+    log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling canonical runtime configuration');
     await reconcileManagedAgentConfiguration(apiKey, agentId, log);
   } else {
     log('Using ordinary external LETTA_AGENT_ID; skipping all Subconscious-managed mutation');
