@@ -57,7 +57,7 @@ export const LEGACY_FILL_VERIFIED_RUNTIME = {
   model: 'opencode-deepseek/deepseek-v4-flash',
   embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
   contextWindow: 400_000,
-  parallelToolCalls: false,
+  parallelToolCalls: true,
 } as const;
 
 function configFile(): string {
@@ -134,17 +134,27 @@ export async function configureVerifiedLegacyFillRuntime(
     model_settings: { provider_type: 'deepseek', parallel_tool_calls: profile.parallelToolCalls },
   }, 'Failed to apply verified legacy fill runtime');
 
-  const verified = await fetchAgent(apiKey, agentId);
-  const modelHandle = verified.model ?? verified.llm_config?.handle;
-  const embeddingHandle = verified.embedding ?? verified.embedding_config?.handle;
-  if (modelHandle !== profile.model) throw new Error(`Legacy fill runtime model mismatch after PATCH: ${modelHandle ?? 'missing'}`);
-  if (embeddingHandle !== profile.embedding) throw new Error(`Legacy fill runtime embedding mismatch after PATCH: ${embeddingHandle ?? 'missing'}`);
-  if (verified.llm_config?.context_window !== profile.contextWindow) {
-    throw new Error(`Legacy fill runtime context mismatch after PATCH: ${verified.llm_config?.context_window ?? 'missing'}`);
+  let verified: AgentDetails | undefined;
+  let mismatch = 'runtime state not yet visible';
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    verified = await fetchAgent(apiKey, agentId);
+    const modelHandle = verified.model ?? verified.llm_config?.handle;
+    const embeddingHandle = verified.embedding ?? verified.embedding_config?.handle;
+    const contextWindow = verified.llm_config?.context_window;
+    const parallel = verified.model_settings?.parallel_tool_calls ?? verified.llm_config?.parallel_tool_calls;
+    if (
+      modelHandle === profile.model
+      && embeddingHandle === profile.embedding
+      && contextWindow === profile.contextWindow
+      && parallel === profile.parallelToolCalls
+    ) {
+      log(`Verified legacy fill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=${profile.parallelToolCalls}`);
+      return;
+    }
+    mismatch = `model=${modelHandle ?? 'missing'}, embedding=${embeddingHandle ?? 'missing'}, context=${contextWindow ?? 'missing'}, parallel_tool_calls=${String(parallel)}`;
+    if (attempt < 19) await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  const parallel = verified.model_settings?.parallel_tool_calls ?? verified.llm_config?.parallel_tool_calls;
-  if (parallel !== profile.parallelToolCalls) throw new Error(`Legacy fill runtime parallel_tool_calls mismatch after PATCH: ${String(parallel)}`);
-  log(`Verified legacy fill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=${profile.parallelToolCalls}`);
+  throw new Error(`Legacy fill runtime mismatch after PATCH: ${mismatch}`);
 }
 async function importDedicatedAgent(apiKey: string): Promise<string> {
   const file = fs.readFileSync(DEFAULT_AGENT_FILE);

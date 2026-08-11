@@ -169,10 +169,11 @@ export async function runNativeClientToolConversation(input: {
   conversationId: string;
   message: string;
   tools: readonly NativeClientTool[];
-}): Promise<{ response: any; clientToolFailure: boolean }> {
+}): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
   let clientToolFailure = false;
+  let terminalSeen: 'completed' | 'no_memory_required' | undefined;
   let response = await input.client.conversations.messages.create(input.conversationId, {
     agent_id: input.agentId,
     messages: [{ role: 'user', content: input.message }],
@@ -182,11 +183,14 @@ export async function runNativeClientToolConversation(input: {
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const messages = Array.isArray(response?.messages) ? response.messages : [];
     const terminal = extractLegacyCompletion(messages);
-    const requests = approvalRequests(messages);
-    if (terminal && requests.length > 0) {
-      throw new Error('Letta returned legacy_source_complete together with pending client tool approvals');
+    if (terminal) {
+      if (terminalSeen && terminalSeen !== terminal) {
+        throw new Error('Letta returned conflicting legacy_source_complete results across approval rounds');
+      }
+      terminalSeen = terminal;
     }
-    if (requests.length === 0) return { response, clientToolFailure };
+    const requests = approvalRequests(messages);
+    if (requests.length === 0) return { response, clientToolFailure, terminal: terminalSeen };
 
     const approvals: any[] = [];
     for (const request of requests) {

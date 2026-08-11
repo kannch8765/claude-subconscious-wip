@@ -106,7 +106,8 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
     });
     if (native.clientToolFailure) toolRetryableFailure = true;
 
-    const terminal = extractLegacyCompletion(Array.isArray(native.response?.messages) ? native.response.messages : []);
+    const terminal = native.terminal
+      ?? extractLegacyCompletion(Array.isArray(native.response?.messages) ? native.response.messages : []);
     if (terminal) {
       const accepted = mutationRuntime.complete(terminal);
       if ('error' in accepted) {

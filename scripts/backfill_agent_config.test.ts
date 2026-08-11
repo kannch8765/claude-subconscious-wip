@@ -58,7 +58,7 @@ describe('dedicated historical backfill agent resolver', () => {
           model: profile.model,
           embedding: profile.embedding,
           context_window_limit: profile.contextWindow,
-          model_settings: { provider_type: 'deepseek', parallel_tool_calls: false },
+          model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
         });
         patched = true;
         return jsonResponse({ ok: true });
@@ -68,13 +68,41 @@ describe('dedicated historical backfill agent resolver', () => {
         id: BACKFILL,
         model: profile.model,
         embedding: profile.embedding,
-        llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: false },
-        model_settings: { parallel_tool_calls: false },
+        llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: true },
+        model_settings: { parallel_tool_calls: true },
       });
     }));
     const logs: string[] = [];
     await expect(configureVerifiedLegacyFillRuntime('test-key', BACKFILL, (message) => logs.push(message))).resolves.toBeUndefined();
     expect(logs.join(' ')).toContain('context=400000');
+    expect(logs.join(' ')).toContain('parallel_tool_calls=true');
+  });
+
+  it('tolerates a briefly stale GET after applying the verified runtime profile', async () => {
+    const profile = LEGACY_FILL_VERIFIED_RUNTIME;
+    let reads = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'PATCH') return jsonResponse({ ok: true });
+      reads += 1;
+      if (reads === 1) {
+        return jsonResponse({
+          id: BACKFILL,
+          model: profile.model,
+          embedding: profile.embedding,
+          llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: false },
+          model_settings: { parallel_tool_calls: false },
+        });
+      }
+      return jsonResponse({
+        id: BACKFILL,
+        model: profile.model,
+        embedding: profile.embedding,
+        llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: true },
+        model_settings: { parallel_tool_calls: true },
+      });
+    }));
+    await expect(configureVerifiedLegacyFillRuntime('test-key', BACKFILL, () => {})).resolves.toBeUndefined();
+    expect(reads).toBe(2);
   });
 
   it('fails closed before any mutation if dedicated and live identities collapse', async () => {

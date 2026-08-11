@@ -8,10 +8,11 @@ import {
   type NativeLettaClientLike,
 } from './native_letta_backfill.js';
 
-function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: any[]; updates: any[]; attachments: string[] } {
+function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: any[]; updates: any[]; attachments: string[]; upserts: any[] } {
   const bodies: any[] = [];
   const updates: any[] = [];
   const attachments: string[] = [];
+  const upserts: any[] = [];
   const state: any = {
     tools: [],
     tool_rules: [{ type: 'continue_loop', tool_name: 'existing_tool' }],
@@ -20,8 +21,9 @@ function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: an
     bodies,
     updates,
     attachments,
+    upserts,
     tools: {
-      async upsert() { return { id: 'tool-native-terminal' }; },
+      async upsert(body) { upserts.push(body); return { id: 'tool-native-terminal' }; },
     },
     agents: {
       async retrieve() { return state; },
@@ -60,6 +62,7 @@ describe('native Letta legacy backfill harness', () => {
     const first = await ensureLegacyCompletionTool(client, 'agent-test');
     expect(first).toMatchObject({ toolId: 'tool-native-terminal', attached: true, rulesChanged: true });
     expect(client.attachments).toEqual(['tool-native-terminal']);
+    expect(client.upserts[0]).toEqual(expect.objectContaining({ enable_parallel_execution: false }));
     expect(client.updates).toHaveLength(1);
     expect((client.updates[0].tool_rules as any[]).slice(-2)).toEqual([
       { type: 'required_before_exit', tool_name: LEGACY_COMPLETION_TOOL_NAME },
@@ -97,18 +100,32 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.bodies[1].messages).toEqual([{ type: 'approval', approvals: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] }]);
   });
 
-  it('fails closed instead of running local mutations after a terminal call with pending approvals', async () => {
-    const client = fakeClient([{
-      messages: [
-        { message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{"result":"completed"}', tool_call_id: 'terminal' } },
-        { message_type: 'approval_request_message', tool_call: { name: 'legacy_memory_create', arguments: '{}', tool_call_id: 'mutation' } },
-      ],
-    }]);
-    let executed = false;
-    await expect(runNativeClientToolConversation({
+  it('drains client approvals before accepting a terminal emitted in the same model turn', async () => {
+    const client = fakeClient([
+      {
+        messages: [
+          { message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{"result":"completed"}', tool_call_id: 'terminal' } },
+          { message_type: 'approval_request_message', tool_call: { name: 'legacy_memory_create', arguments: '{"content":"memory"}', tool_call_id: 'mutation' } },
+        ],
+        stop_reason: 'requires_approval',
+      },
+      { messages: [], stop_reason: 'tool_rule' },
+    ]);
+    const seen: unknown[] = [];
+    const result = await runNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
-      tools: [{ name: 'legacy_memory_create', description: 'create', parameters: {}, async execute() { executed = true; return {}; } }],
-    })).rejects.toThrow(/pending client tool approvals/);
-    expect(executed).toBe(false);
+      tools: [{
+        name: 'legacy_memory_create', description: 'create', parameters: {},
+        async execute(_id, args) { seen.push(args); return { outcome: 'accepted' }; },
+      }],
+    });
+    expect(seen).toEqual([{ content: 'memory' }]);
+    expect(result.terminal).toBe('completed');
+    expect(result.clientToolFailure).toBe(false);
+    expect(client.bodies).toHaveLength(2);
+    expect(client.bodies[1].messages).toEqual([{
+      type: 'approval',
+      approvals: [{ type: 'tool', tool_call_id: 'mutation', tool_return: '{"outcome":"accepted"}', status: 'success' }],
+    }]);
   });
 });
