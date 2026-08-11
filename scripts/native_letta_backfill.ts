@@ -4,6 +4,9 @@ import { normalizeLettaBaseUrl } from './letta_api_url.js';
 
 export const LEGACY_COMPLETION_TOOL_NAME = 'legacy_source_complete';
 const MAX_CLIENT_TOOL_ROUNDS = 128;
+const MAX_ACTIVE_RUN_CONFLICT_RECOVERIES = 3;
+const ACTIVE_RUN_WAIT_TIMEOUT_MS = 120_000;
+const ACTIVE_RUN_POLL_INTERVAL_MS = 1_000;
 
 export interface NativeClientTool {
   name: string;
@@ -27,6 +30,9 @@ export interface NativeLettaClientLike {
     messages: {
       create(conversationId: string, body: Record<string, unknown>): Promise<AsyncIterable<any>>;
     };
+  };
+  runs: {
+    retrieve(runId: string): Promise<any>;
   };
 }
 
@@ -221,6 +227,71 @@ async function collectLettaStream(stream: AsyncIterable<any>): Promise<{ message
   return { messages, stop_reason: stopReason, usage };
 }
 
+
+export function extractActiveConversationRunConflict(error: unknown): { runId: string } | undefined {
+  const candidate = error as any;
+  if (candidate?.status !== 409) return undefined;
+  const body = candidate?.error && typeof candidate.error === 'object' ? candidate.error : undefined;
+  const runId = typeof body?.run_id === 'string' ? body.run_id : undefined;
+  const detail = typeof body?.detail === 'string' ? body.detail : '';
+  if (!runId?.startsWith('run-')) return undefined;
+  if (!detail.includes('Cannot send a new message') || !detail.includes('currently being processed for this conversation')) return undefined;
+  return { runId };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export async function waitForActiveConversationRun(
+  client: NativeLettaClientLike,
+  runId: string,
+  conversationId: string,
+  options: { timeoutMs?: number; pollIntervalMs?: number } = {},
+): Promise<any> {
+  const timeoutMs = options.timeoutMs ?? ACTIVE_RUN_WAIT_TIMEOUT_MS;
+  const pollIntervalMs = options.pollIntervalMs ?? ACTIVE_RUN_POLL_INTERVAL_MS;
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    const run = await client.runs.retrieve(runId);
+    if (run?.conversation_id && run.conversation_id !== conversationId) {
+      throw new Error(`Letta 409 referenced run ${runId} from a different conversation`);
+    }
+    if (run?.status === 'completed') {
+      if (run?.stop_reason !== 'requires_approval') {
+        throw new Error(`Letta conflicting run ${runId} completed with unexpected stop_reason=${String(run?.stop_reason)}`);
+      }
+      return run;
+    }
+    if (run?.status === 'failed' || run?.status === 'cancelled') {
+      throw new Error(`Letta conflicting run ${runId} ended with status=${run.status}`);
+    }
+    if (run?.status !== 'created' && run?.status !== 'running') {
+      throw new Error(`Letta conflicting run ${runId} returned unexpected status=${String(run?.status)}`);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for Letta conflicting run ${runId} to finish`);
+    }
+    await sleep(pollIntervalMs);
+  }
+}
+
+async function createContinuationWithRunConflictRecovery(
+  client: NativeLettaClientLike,
+  conversationId: string,
+  body: Record<string, unknown>,
+): Promise<AsyncIterable<any>> {
+  for (let recovery = 0; ; recovery += 1) {
+    try {
+      return await client.conversations.messages.create(conversationId, body);
+    } catch (error) {
+      const conflict = extractActiveConversationRunConflict(error);
+      if (!conflict || recovery >= MAX_ACTIVE_RUN_CONFLICT_RECOVERIES) throw error;
+      await waitForActiveConversationRun(client, conflict.runId, conversationId);
+    }
+  }
+}
+
 export async function runNativeClientToolConversation(input: {
   client: NativeLettaClientLike;
   agentId: string;
@@ -296,7 +367,7 @@ export async function runNativeClientToolConversation(input: {
       unresolvedParseFailures.set(name, (unresolvedParseFailures.get(name) ?? 0) + failures);
     }
 
-    response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
+    response = await collectLettaStream(await createContinuationWithRunConflictRecovery(input.client, input.conversationId, {
       agent_id: input.agentId,
       streaming: true,
       messages: [{ type: 'tool_return', tool_returns: approvals }],

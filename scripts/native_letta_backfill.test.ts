@@ -2,17 +2,23 @@ import { describe, expect, it } from 'vitest';
 import {
   LEGACY_COMPLETION_TOOL_NAME,
   ensureLegacyCompletionTool,
+  extractActiveConversationRunConflict,
   extractLegacyCompletion,
   reconcileLegacyCompletionRules,
   runNativeClientToolConversation,
+  waitForActiveConversationRun,
   type NativeLettaClientLike,
 } from './native_letta_backfill.js';
 
-function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: any[]; updates: any[]; attachments: string[]; upserts: any[] } {
+function fakeClient(
+  responses: any[] = [],
+  runResponses: any[] = [],
+): NativeLettaClientLike & { bodies: any[]; updates: any[]; attachments: string[]; upserts: any[]; runIds: string[] } {
   const bodies: any[] = [];
   const updates: any[] = [];
   const attachments: string[] = [];
   const upserts: any[] = [];
+  const runIds: string[] = [];
   const state: any = {
     tools: [],
     tool_rules: [{ type: 'continue_loop', tool_name: 'existing_tool' }],
@@ -22,6 +28,7 @@ function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: an
     updates,
     attachments,
     upserts,
+    runIds,
     tools: {
       async upsert(body) { upserts.push(body); return { id: 'tool-native-terminal' }; },
     },
@@ -38,6 +45,7 @@ function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: an
           bodies.push(body);
           const response = responses.shift();
           if (!response) throw new Error('unexpected native Letta request');
+          if (response.throw) throw response.throw;
           return (async function* () {
             for (const message of response.messages ?? []) yield message;
             if (response.stop_reason) {
@@ -48,6 +56,14 @@ function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: an
             if (response.usage) yield { message_type: 'usage_statistics', ...response.usage };
           })();
         },
+      },
+    },
+    runs: {
+      async retrieve(runId) {
+        runIds.push(runId);
+        const response = runResponses.shift();
+        if (!response) throw new Error(`unexpected native Letta run retrieve: ${runId}`);
+        return response;
       },
     },
   };
@@ -225,6 +241,72 @@ describe('native Letta legacy backfill harness', () => {
       expect.objectContaining({ tool_call_id: 'bad', status: 'error' }),
       expect.objectContaining({ tool_call_id: 'same-round-success', status: 'success' }),
     ]);
+  });
+
+  it('recognizes only the active-run conversation conflict shape', () => {
+    const error = Object.assign(new Error('conflict'), {
+      status: 409,
+      error: {
+        detail: 'CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation. Please wait for it to complete.',
+        run_id: 'run-active',
+      },
+    });
+    expect(extractActiveConversationRunConflict(error)).toEqual({ runId: 'run-active' });
+    expect(extractActiveConversationRunConflict(Object.assign(new Error('other conflict'), {
+      status: 409,
+      error: { detail: 'some other conflict', run_id: 'run-other' },
+    }))).toBeUndefined();
+  });
+
+  it('waits for the conflicting run to complete at requires_approval before continuing', async () => {
+    const client = fakeClient([], [
+      { id: 'run-active', status: 'running', conversation_id: 'conv-test' },
+      { id: 'run-active', status: 'completed', stop_reason: 'requires_approval', conversation_id: 'conv-test' },
+    ]);
+    await expect(waitForActiveConversationRun(client, 'run-active', 'conv-test', { pollIntervalMs: 0, timeoutMs: 100 })).resolves.toMatchObject({
+      status: 'completed',
+      stop_reason: 'requires_approval',
+    });
+    expect(client.runIds).toEqual(['run-active', 'run-active']);
+  });
+
+  it('retries the same tool-return continuation after a 409 active run completes', async () => {
+    const conflict = Object.assign(new Error('409 active run'), {
+      status: 409,
+      error: {
+        detail: 'CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation. Please wait for it to complete.',
+        run_id: 'run-active',
+      },
+    });
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"A"}', tool_call_id: 'search' } }], stop_reason: 'requires_approval' },
+      { throw: conflict },
+      { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
+    ], [
+      { id: 'run-active', status: 'completed', stop_reason: 'requires_approval', conversation_id: 'conv-test' },
+    ]);
+    const result = await runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { return { results: [] }; } }],
+    });
+    expect(result).toMatchObject({ clientToolFailure: false, terminal: 'completed' });
+    expect(client.runIds).toEqual(['run-active']);
+    expect(client.bodies).toHaveLength(3);
+    expect(client.bodies[2]).toEqual(client.bodies[1]);
+  });
+
+  it('fails closed if a conflicting run belongs to another conversation or terminates unsuccessfully', async () => {
+    const wrongConversation = fakeClient([], [
+      { id: 'run-active', status: 'completed', stop_reason: 'requires_approval', conversation_id: 'conv-other' },
+    ]);
+    await expect(waitForActiveConversationRun(wrongConversation, 'run-active', 'conv-test', { pollIntervalMs: 0, timeoutMs: 100 }))
+      .rejects.toThrow('different conversation');
+
+    const failed = fakeClient([], [
+      { id: 'run-active', status: 'failed', conversation_id: 'conv-test' },
+    ]);
+    await expect(waitForActiveConversationRun(failed, 'run-active', 'conv-test', { pollIntervalMs: 0, timeoutMs: 100 }))
+      .rejects.toThrow('status=failed');
   });
 
   it('keeps a malformed-arguments failure unresolved when the model never retries that client tool', async () => {

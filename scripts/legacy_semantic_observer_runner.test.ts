@@ -47,6 +47,7 @@ function fakeClient(responses: any[]): NativeLettaClientLike {
       tools: { async attach() { throw new Error('not used'); } },
     },
     tools: { async upsert() { throw new Error('not used'); } },
+    runs: { async retrieve(runId) { throw new Error(`unexpected run retrieve: ${runId}`); } },
     conversations: {
       messages: {
         async create() {
