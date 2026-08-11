@@ -1,17 +1,18 @@
 import type { AssistantRememberIntentRecord, CanonicalMessage } from '../relationship-memory/src/schema/index.js';
 import {
   appendTrustedRelationshipCatalog,
-  assertRelationshipClientToolInventory,
   buildRelationshipTools,
   createRuntime,
   relationshipMemoryRoot,
-  RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
-  RELATIONSHIP_DISALLOWED_CLIENT_TOOLS,
 } from '../relationship-memory/src/adapter/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { stableJson } from '../relationship-memory/src/store/index.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
-import { disableLettaCodeAutoUpdater } from './letta_code_runtime_env.js';
+import {
+  createNativeLettaClient,
+  runNativeClientToolConversation,
+  type NativeLettaClientLike,
+} from './native_letta_backfill.js';
 
 export interface RelationshipObserverBatchInput {
   agentId: string;
@@ -23,6 +24,7 @@ export interface RelationshipObserverBatchInput {
   assistantIntents?: AssistantRememberIntentRecord[];
   rootDir?: string;
   subjectId?: string;
+  client?: NativeLettaClientLike;
   log?: (message: string) => void;
 }
 
@@ -38,6 +40,13 @@ async function syncProjectionBlocks(apiKey: string, agentId: string, runtime: Re
   }
 }
 
+function assertNativeRelationshipAgentBoundary(agent: any): void {
+  const serverTools = Array.isArray(agent?.tools) ? agent.tools : [];
+  if (serverTools.length === 0) return;
+  const names = serverTools.map((tool: any) => tool?.name ?? tool?.id ?? 'unknown').join(', ');
+  throw new Error(`Relationship observer agent has unexpected server tools attached: ${names}`);
+}
+
 export async function runRelationshipObserverBatch(input: RelationshipObserverBatchInput): Promise<'completed' | 'retryable_failure'> {
   const log = input.log ?? (() => {});
   const subjectId = input.subjectId ?? process.env.RELATIONSHIP_MEMORY_SUBJECT_ID ?? 'local-user';
@@ -51,13 +60,16 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
   }
 
   runtime.store.beginBatch(input.batchId, new Date().toISOString());
-  let session: any = null;
   let sessionSucceeded = true;
 
   try {
-    disableLettaCodeAutoUpdater();
-    const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
-    const relationshipTools = buildRelationshipTools(runtime, input.batchId, jsonResult).map((tool) => {
+    const apiKey = process.env.LETTA_API_KEY;
+    if (!input.client && !apiKey) throw new Error('LETTA_API_KEY is required for native Letta relationship observer');
+    const client = input.client ?? createNativeLettaClient(apiKey!);
+    const agent = await client.agents.retrieve(input.agentId);
+    assertNativeRelationshipAgentBoundary(agent);
+
+    const relationshipTools = buildRelationshipTools(runtime, input.batchId).map((tool) => {
       if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
       const execute = tool.execute.bind(tool);
       return {
@@ -67,20 +79,6 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
         },
       };
     });
-    const resume = resumeSession as any;
-    session = resume(input.conversationId, {
-      disallowedTools: [...RELATIONSHIP_DISALLOWED_CLIENT_TOOLS],
-      allowedTools: [...RELATIONSHIP_ALLOWED_CLIENT_TOOLS],
-      tools: relationshipTools,
-      permissionMode: 'bypassPermissions',
-      cwd: input.cwd,
-      skillSources: [],
-      systemInfoReminder: false,
-      sleeptime: { trigger: 'off' },
-      memfsStartup: 'skip',
-    });
-    const init = await session.initialize();
-    assertRelationshipClientToolInventory(Array.isArray(init?.tools) ? init.tools : []);
 
     const durableAssistantIntents = assistantIntents.map((intent) => {
       const stored = runtime.store.getAssistantIntent(intent.intent_id);
@@ -90,19 +88,21 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
       return stored;
     });
     const observerMessage = appendTrustedRelationshipCatalog(input.message, input.canonicalMessages, durableAssistantIntents);
-    log(`Sending relationship-memory batch ${input.batchId} (${input.canonicalMessages.length} trusted evidence messages)`);
-    await session.send(observerMessage);
-    for await (const msg of session.stream()) {
-      if (msg.type === 'error') {
-        sessionSucceeded = false;
-        log(`Relationship-memory observer error: ${(msg as any).message}`);
-      }
+    log(`Sending relationship-memory batch ${input.batchId} through native Letta conversations API (${input.canonicalMessages.length} trusted evidence messages)`);
+    const native = await runNativeClientToolConversation({
+      client,
+      agentId: input.agentId,
+      conversationId: input.conversationId,
+      message: observerMessage,
+      tools: relationshipTools,
+    });
+    if (native.clientToolFailure) {
+      sessionSucceeded = false;
+      log('Relationship-memory native client-tool execution reported a failure');
     }
   } catch (error) {
     sessionSucceeded = false;
-    log(`Relationship-memory observer session failure: ${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    if (session) session.close();
+    log(`Relationship-memory native observer failure: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   const completion = runtime.store.withMutationBoundary(() => runtime.finalizeBatch(input.batchId, sessionSucceeded));

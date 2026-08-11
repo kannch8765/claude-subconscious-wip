@@ -3,7 +3,7 @@ import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 describe('Letta execution dependency contract', () => {
-  it('pins the native API client used by legacy backfill while leaving the unrelated realtime Code SDK lane intact', () => {
+  it('pins the native API client used by backfill and realtime relationship observer lanes', () => {
     const packageJson = JSON.parse(fs.readFileSync(path.resolve('package.json'), 'utf8')) as {
       engines?: Record<string, string>;
       dependencies?: Record<string, string>;
@@ -17,20 +17,26 @@ describe('Letta execution dependency contract', () => {
     expect(lock.packages?.['']?.dependencies?.['@letta-ai/letta-client']).toBe('1.12.1');
     expect(lock.packages?.['node_modules/@letta-ai/letta-client']?.version).toBe('1.12.1');
 
-    // Task 093AG migrates only the historical semantic backfill path. The realtime
-    // relationship observer still uses Letta Code and is intentionally not modernized here.
+    // The deprecated Code SDK package is still pinned for compatibility while this
+    // task migrates the production observer execution path itself. No realtime or
+    // legacy semantic runner may import it after this reconciliation.
     expect(packageJson.dependencies?.['@letta-ai/letta-code-sdk']).toBe('0.1.12');
     expect(lock.packages?.['node_modules/@letta-ai/letta-code-sdk']?.version).toBe('0.1.12');
   });
 
-  it('keeps the legacy backfill execution path off the Letta Code subprocess SDK', () => {
-    const runner = fs.readFileSync(path.resolve('scripts/legacy_semantic_observer_runner.ts'), 'utf8');
+  it('keeps both semantic observer execution paths off the Letta Code subprocess SDK', () => {
+    const legacyRunner = fs.readFileSync(path.resolve('scripts/legacy_semantic_observer_runner.ts'), 'utf8');
+    const realtimeRunner = fs.readFileSync(path.resolve('scripts/relationship_observer_runner.ts'), 'utf8');
     const entrypoint = fs.readFileSync(path.resolve('scripts/legacy_semantic_backfill.ts'), 'utf8');
     const nativeAdapter = fs.readFileSync(path.resolve('scripts/native_letta_backfill.ts'), 'utf8');
 
-    expect(runner).not.toContain('@letta-ai/letta-code-sdk');
-    expect(runner).not.toContain('resumeSession');
-    expect(runner).not.toContain('disableLettaCodeAutoUpdater');
+    for (const source of [legacyRunner, realtimeRunner]) {
+      expect(source).not.toContain('@letta-ai/letta-code-sdk');
+      expect(source).not.toContain('resumeSession');
+      expect(source).not.toContain('disableLettaCodeAutoUpdater');
+    }
+    expect(realtimeRunner).toContain('runNativeClientToolConversation');
+    expect(realtimeRunner).toContain('unexpected server tools attached');
     expect(entrypoint).not.toContain('--cwd');
     expect(nativeAdapter).toContain("from '@letta-ai/letta-client'");
     expect(nativeAdapter).toContain("type: 'required_before_exit'");
