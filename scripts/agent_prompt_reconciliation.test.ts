@@ -47,7 +47,11 @@ function installManagedFetch(initialSystem: string, patchStatus = 200) {
         name: 'Subconscious_093B_110855',
         tags: REQUIRED_TAGS,
         system: liveSystem,
-        llm_config: { handle: 'openai/gpt-5.2', model: 'gpt-5.2', provider_name: 'openai' },
+        model: 'opencode-deepseek/deepseek-v4-flash',
+        embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
+        context_window_limit: 400000,
+        model_settings: { parallel_tool_calls: true },
+        llm_config: { handle: 'opencode-deepseek/deepseek-v4-flash', model: 'deepseek-v4-flash', provider_name: 'opencode-deepseek', context_window: 400000, parallel_tool_calls: true },
       });
     }
 
@@ -94,6 +98,86 @@ describe('managed adopted-agent system prompt reconciliation', () => {
     expect(systemPatches[0].body).toEqual({ system: canonical });
     expect(getLiveSystem()).toBe(canonical);
     expect(requests.some((request) => request.pathname === '/v1/agents/import')).toBe(false);
+  });
+
+  it('does not let availability fallback undo canonical managed runtime reconciliation', async () => {
+    const home = makeHome();
+    writeSavedAgent(home);
+    const mod = await loadAgentConfig(home);
+    const canonical = mod.getCanonicalManagedAgentConfig();
+    const requests: Array<{ method: string; pathname: string; body?: Record<string, unknown> }> = [];
+    const live: {
+      id: string;
+      name: string;
+      tags: string[];
+      system: string;
+      model: string;
+      embedding: string;
+      context_window_limit: number;
+      model_settings: { parallel_tool_calls: boolean };
+      llm_config: Record<string, unknown>;
+    } = {
+      id: MANAGED_AGENT_ID,
+      name: 'Subconscious_093B_110855',
+      tags: REQUIRED_TAGS,
+      system: 'obsolete prompt',
+      model: 'z.ai/glm-5',
+      embedding: 'openai/text-embedding-3-small',
+      context_window_limit: 90000,
+      model_settings: { parallel_tool_calls: false },
+      llm_config: {
+        handle: 'z.ai/glm-5',
+        model: 'glm-5',
+        provider_name: 'z.ai',
+        context_window: 90000,
+        parallel_tool_calls: false,
+      },
+    };
+
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+      const method = init?.method || 'GET';
+      const body = typeof init?.body === 'string' ? JSON.parse(init.body) as Record<string, unknown> : undefined;
+      requests.push({ method, pathname: url.pathname, body });
+
+      if (url.pathname === `/v1/agents/${MANAGED_AGENT_ID}` && method === 'GET') {
+        return jsonResponse(live);
+      }
+      if (url.pathname === `/v1/agents/${MANAGED_AGENT_ID}` && method === 'PATCH') {
+        if (body?.system !== undefined) live.system = body.system as string;
+        if (body?.model !== undefined) live.model = body.model as string;
+        if (body?.embedding !== undefined) live.embedding = body.embedding as string;
+        if (body?.context_window_limit !== undefined) live.context_window_limit = body.context_window_limit as number;
+        if (body?.model_settings !== undefined) {
+          live.model_settings = { ...live.model_settings, ...(body.model_settings as { parallel_tool_calls?: boolean }) };
+        }
+        return jsonResponse({ id: MANAGED_AGENT_ID });
+      }
+      if (url.pathname === '/v1/models/' && method === 'GET') {
+        // The canonical DeepSeek handle is deliberately absent. Before R1 this
+        // caused ensureModelAvailable() to PATCH the just-reconciled agent back
+        // to the first available model in the same getAgentId() call.
+        return jsonResponse([
+          { model: 'gpt-5.2', name: 'gpt-5.2', provider_type: 'openai', handle: 'openai/gpt-5.2' },
+        ]);
+      }
+      throw new Error(`Unexpected request: ${method} ${url.pathname}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(mod.getAgentId('test-key', () => undefined)).resolves.toBe(MANAGED_AGENT_ID);
+
+    expect(live.system).toBe(canonical.system);
+    expect(live.model).toBe(canonical.model);
+    expect(live.embedding).toBe(canonical.embedding);
+    expect(live.context_window_limit).toBe(canonical.contextWindowLimit);
+    expect(live.model_settings.parallel_tool_calls).toBe(canonical.parallelToolCalls);
+
+    const modelPatches = requests.filter((request) => request.method === 'PATCH' && request.body?.model !== undefined);
+    expect(modelPatches).toHaveLength(1);
+    expect(modelPatches[0].body?.model).toBe(canonical.model);
+    expect(modelPatches.some((request) => request.body?.model === 'openai/gpt-5.2')).toBe(false);
+    expect(requests.filter((request) => request.pathname === '/v1/models/')).toHaveLength(1);
   });
 
   it('does not patch system when the saved managed agent is already canonical', async () => {
@@ -149,7 +233,7 @@ describe('managed adopted-agent system prompt reconciliation', () => {
     const mod = await loadAgentConfig(home);
     const { requests } = installManagedFetch('obsolete prompt', 500);
 
-    await expect(mod.getAgentId('test-key', () => undefined)).rejects.toThrow('Failed to reconcile managed Subconscious system prompt');
+    await expect(mod.getAgentId('test-key', () => undefined)).rejects.toThrow('Failed to reconcile managed Subconscious runtime configuration');
     expect(requests.some((request) => request.pathname === '/v1/agents/import')).toBe(false);
   });
 });

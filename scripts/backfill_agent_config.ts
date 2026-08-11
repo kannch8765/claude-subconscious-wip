@@ -9,9 +9,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import {
+  getCanonicalManagedAgentConfig,
   getCanonicalManagedSystemPrompt,
   getConfigPath,
   isValidAgentId,
+  reconcileManagedAgentConfiguration,
 } from './agent_config.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
 
@@ -85,9 +87,7 @@ async function reconcileDedicatedAgent(apiKey: string, agentId: string): Promise
     await patchAgent(apiKey, agentId, { tags: [...tags, ...missingTags] }, 'Failed to reconcile dedicated backfill agent tags');
   }
   const canonicalSystem = getCanonicalManagedSystemPrompt();
-  if (agent.system !== canonicalSystem) {
-    await patchAgent(apiKey, agentId, { system: canonicalSystem }, 'Failed to reconcile dedicated backfill agent system prompt');
-  }
+  await reconcileManagedAgentConfiguration(apiKey, agentId);
   const verified = await fetchAgent(apiKey, agentId);
   if (!Array.isArray(verified.tags) || !verified.tags.includes(BACKFILL_PURPOSE_TAG)) {
     throw new Error(`Dedicated backfill agent is missing required purpose tag: ${BACKFILL_PURPOSE_TAG}`);
@@ -100,6 +100,9 @@ async function importDedicatedAgent(apiKey: string): Promise<string> {
   const file = fs.readFileSync(DEFAULT_AGENT_FILE);
   const form = new FormData();
   form.append('file', new Blob([file], { type: 'application/json' }), 'Subconscious.af');
+  const canonical = getCanonicalManagedAgentConfig();
+  form.append('model', process.env.LETTA_MODEL || canonical.model);
+  form.append('embedding', canonical.embedding);
   const response = await fetch(buildLettaApiUrl('/agents/import'), {
     method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form,
   });

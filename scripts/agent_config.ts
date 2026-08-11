@@ -7,9 +7,10 @@
  * 3. Auto-import from bundled Subconscious.af
  * 
  * Model configuration:
- * - After agent creation, checks if the agent's model is available
- * - If not available, auto-selects from available models with preference order
- * - LETTA_MODEL environment variable can override (if available on server)
+ * - Managed saved/imported agents reconcile to canonical Subconscious.af runtime policy
+ * - Model availability discovery is diagnostic for managed agents and must not override that authority
+ * - Legacy auto-selection remains available only when a caller explicitly allows fallback
+ * - LETTA_MODEL environment variable remains an explicit operator override
  */
 
 import * as fs from 'fs';
@@ -71,7 +72,20 @@ interface AgentDetails {
   name: string;
   system?: string;
   tags?: string[];
+  model?: string | null;
+  embedding?: string | null;
+  embedding_config?: { handle?: string; embedding_model?: string; embedding_endpoint_type?: string } | null;
+  context_window_limit?: number | null;
+  model_settings?: { parallel_tool_calls?: boolean; [key: string]: unknown } | null;
   llm_config?: LlmConfig;
+}
+
+export interface CanonicalManagedAgentConfig {
+  system: string;
+  model: string;
+  embedding: string;
+  contextWindowLimit: number;
+  parallelToolCalls: boolean;
 }
 
 /**
@@ -219,12 +233,13 @@ async function renameAgent(apiKey: string, agentId: string, name: string): Promi
 }
 
 /**
- * Read the canonical managed-agent system prompt from the bundled .af file.
+ * Read the canonical managed-agent configuration from the bundled .af file.
  *
- * Subconscious.af is the single source of truth for the managed observer prompt;
- * do not duplicate the prompt in TypeScript or fixtures.
+ * Subconscious.af is the source of truth for project-managed observer runtime
+ * policy. Explicit operator overrides remain supported for model/context below,
+ * but imported/saved/owned agents otherwise converge to this configuration.
  */
-export function getCanonicalManagedSystemPrompt(): string {
+export function getCanonicalManagedAgentConfig(): CanonicalManagedAgentConfig {
   let content: unknown;
   try {
     content = JSON.parse(fs.readFileSync(DEFAULT_AGENT_FILE, 'utf-8'));
@@ -232,43 +247,86 @@ export function getCanonicalManagedSystemPrompt(): string {
     throw new Error(`Failed to read canonical Subconscious.af: ${error}`);
   }
 
-  const agents = (content as { agents?: Array<{ system?: unknown }> }).agents;
-  if (!Array.isArray(agents) || agents.length !== 1 || typeof agents[0]?.system !== 'string' || agents[0].system.length === 0) {
-    throw new Error('Canonical Subconscious.af must contain exactly one agent with a non-empty system prompt');
+  const agents = (content as { agents?: Array<Record<string, unknown>> }).agents;
+  if (!Array.isArray(agents) || agents.length !== 1) {
+    throw new Error('Canonical Subconscious.af must contain exactly one agent');
+  }
+  const agent = agents[0];
+  const modelSettings = agent.model_settings as { parallel_tool_calls?: unknown } | null | undefined;
+  if (
+    typeof agent.system !== 'string' || agent.system.length === 0
+    || typeof agent.model !== 'string' || agent.model.length === 0
+    || typeof agent.embedding !== 'string' || agent.embedding.length === 0
+    || typeof agent.context_window_limit !== 'number' || agent.context_window_limit <= 0
+    || modelSettings?.parallel_tool_calls !== true
+  ) {
+    throw new Error('Canonical Subconscious.af is missing managed runtime model/embedding/context/parallel-tool configuration');
   }
 
-  return agents[0].system;
+  return {
+    system: agent.system,
+    model: agent.model,
+    embedding: agent.embedding,
+    contextWindowLimit: agent.context_window_limit,
+    parallelToolCalls: true,
+  };
+}
+
+export function getCanonicalManagedSystemPrompt(): string {
+  return getCanonicalManagedAgentConfig().system;
+}
+
+function operatorContextWindow(defaultValue: number): number {
+  const raw = process.env.LETTA_CONTEXT_WINDOW;
+  if (!raw) return defaultValue;
+  const parsed = parseInt(raw, 10);
+  return !isNaN(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
+function currentEmbeddingHandle(agent: AgentDetails): string | null {
+  if (typeof agent.embedding === 'string' && agent.embedding.length > 0) return agent.embedding;
+  if (agent.embedding_config?.handle) return agent.embedding_config.handle;
+  if (agent.embedding_config?.embedding_endpoint_type && agent.embedding_config?.embedding_model) {
+    return `${agent.embedding_config.embedding_endpoint_type}/${agent.embedding_config.embedding_model}`;
+  }
+  return null;
 }
 
 /**
- * Reconcile a Subconscious-managed adopted agent with the canonical .af prompt.
- *
- * This is intentionally called only after resolution has established that the
- * selected agent is managed by Subconscious. It must never be used as a global
- * tag scan, and it must never mutate an ordinary external LETTA_AGENT_ID.
+ * Reconcile one already-established Subconscious-managed agent to canonical
+ * runtime policy. Ownership must be decided by the caller before invoking this.
  */
-async function reconcileManagedAgentSystem(
+export async function reconcileManagedAgentConfiguration(
   apiKey: string,
   agentId: string,
   log: (msg: string) => void = console.log,
 ): Promise<void> {
-  const canonicalSystem = getCanonicalManagedSystemPrompt();
+  const canonical = getCanonicalManagedAgentConfig();
+  const desiredModel = process.env.LETTA_MODEL || canonical.model;
+  const desiredContextWindow = operatorContextWindow(canonical.contextWindowLimit);
   const url = buildLettaApiUrl(`/agents/${agentId}`);
   const getResponse = await fetch(url, {
     method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-    },
+    headers: { 'Authorization': `Bearer ${apiKey}` },
   });
-
   if (!getResponse.ok) {
-    const errorText = await getResponse.text();
-    throw new Error(`Failed to read managed agent before system reconciliation: ${getResponse.status} ${errorText}`);
+    throw new Error(`Failed to read managed agent before configuration reconciliation: ${getResponse.status} ${await getResponse.text()}`);
   }
 
   const agent = await getResponse.json() as AgentDetails;
-  if (agent.system === canonicalSystem) {
-    log('Managed Subconscious system prompt already matches canonical Subconscious.af');
+  const patch: Record<string, unknown> = {};
+  if (agent.system !== canonical.system) patch.system = canonical.system;
+  if (getAgentModelHandle(agent) !== desiredModel) patch.model = desiredModel;
+  if (currentEmbeddingHandle(agent) !== canonical.embedding) patch.embedding = canonical.embedding;
+  const currentContext = agent.context_window_limit ?? agent.llm_config?.context_window;
+  if (currentContext !== desiredContextWindow) patch.context_window_limit = desiredContextWindow;
+  const currentParallel = agent.model_settings?.parallel_tool_calls ?? agent.llm_config?.parallel_tool_calls;
+  if (currentParallel !== canonical.parallelToolCalls) {
+    patch.model_settings = { ...(agent.model_settings ?? {}), parallel_tool_calls: canonical.parallelToolCalls };
+  }
+
+  if (Object.keys(patch).length === 0) {
+    log('Managed Subconscious runtime configuration already matches canonical Subconscious.af');
     return;
   }
 
@@ -278,15 +336,12 @@ async function reconcileManagedAgentSystem(
       'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ system: canonicalSystem }),
+    body: JSON.stringify(patch),
   });
-
   if (!patchResponse.ok) {
-    const errorText = await patchResponse.text();
-    throw new Error(`Failed to reconcile managed Subconscious system prompt: ${patchResponse.status} ${errorText}`);
+    throw new Error(`Failed to reconcile managed Subconscious runtime configuration: ${patchResponse.status} ${await patchResponse.text()}`);
   }
-
-  log('Reconciled managed Subconscious system prompt from canonical Subconscious.af');
+  log(`Reconciled managed Subconscious runtime configuration from canonical Subconscious.af: ${Object.keys(patch).join(', ')}`);
 }
 
 /**
@@ -361,6 +416,7 @@ async function getAgentDetails(apiKey: string, agentId: string): Promise<AgentDe
  * The handle format is "provider/model" (e.g., "openai/gpt-4o-mini")
  */
 function getAgentModelHandle(agent: AgentDetails): string | null {
+  if (typeof agent.model === 'string' && agent.model.length > 0) return agent.model;
   const llmConfig = agent.llm_config;
   if (!llmConfig) return null;
   
@@ -426,7 +482,8 @@ function selectBestModel(models: LettaModel[], preferences: string[]): string | 
 async function ensureModelAvailable(
   apiKey: string,
   agentId: string,
-  log: (msg: string) => void = console.log
+  log: (msg: string) => void = console.log,
+  allowAutoSelection = true,
 ): Promise<string | null> {
   try {
     // Get available models and agent details in parallel
@@ -468,8 +525,16 @@ async function ensureModelAvailable(
       return null; // No change needed
     }
 
-    // Model not available - need to select alternative
+    // Model not available. For Subconscious-managed agents, canonical .af /
+    // explicit operator configuration is authoritative even when /models is
+    // temporarily incomplete or represents the model differently. Availability
+    // discovery may warn, but must not silently PATCH the managed agent away
+    // from a configuration that was just reconciled successfully.
     log(`Agent's model "${currentModel}" is NOT available on this server`);
+    if (!allowAutoSelection) {
+      log('Preserving reconciled managed model; availability fallback is disabled for Subconscious-managed agents');
+      return null;
+    }
 
     const selectedModel = selectBestModel(models, PREFERRED_MODELS);
     if (!selectedModel) {
@@ -600,6 +665,11 @@ async function importDefaultAgent(apiKey: string): Promise<string> {
   const formData = new FormData();
   const blob = new Blob([agentFileContent], { type: 'application/json' });
   formData.append('file', blob, 'Subconscious.af');
+  // Import-time overrides prevent deprecated/stale serialized provider details
+  // from blocking creation before the managed post-import reconcile can run.
+  const canonical = getCanonicalManagedAgentConfig();
+  formData.append('model', process.env.LETTA_MODEL || canonical.model);
+  formData.append('embedding', canonical.embedding);
   
   const response = await fetch(url, {
     method: 'POST',
@@ -707,11 +777,11 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
     // Prompt reconciliation is authority-critical: a stale managed observer
     // must not silently continue under obsolete memory/tool rules. Let failures
     // propagate instead of importing/replacing the agent or pretending success.
-    await reconcileManagedAgentSystem(apiKey, agentId, log);
+    await reconcileManagedAgentConfiguration(apiKey, agentId, log);
 
-    // 5. Existing model auto-selection remains scoped to config-managed agents.
+    // 5. Availability discovery is diagnostic only after managed reconciliation.
     try {
-      const configuredModel = await ensureModelAvailable(apiKey, agentId, log);
+      const configuredModel = await ensureModelAvailable(apiKey, agentId, log, false);
       if (configuredModel && config.model !== configuredModel) {
         saveConfig({
           ...config,
@@ -722,8 +792,8 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
       log(`Warning: Could not verify model availability: ${error}`);
     }
   } else if (await isManagedEnvAgent(apiKey, agentId, log)) {
-    log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling system prompt only');
-    await reconcileManagedAgentSystem(apiKey, agentId, log);
+    log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling canonical runtime configuration');
+    await reconcileManagedAgentConfiguration(apiKey, agentId, log);
   } else {
     log('Using ordinary external LETTA_AGENT_ID; skipping all Subconscious-managed mutation');
   }
