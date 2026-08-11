@@ -1,0 +1,139 @@
+  const currentParallel = agent.model_settings?.parallel_tool_calls ?? agent.llm_config?.parallel_tool_calls;
+  if (currentParallel !== canonical.parallelToolCalls) {
+    patch.model_settings = { ...(agent.model_settings ?? {}), parallel_tool_calls: canonical.parallelToolCalls };
+  }
+
+  if (Object.keys(patch).length === 0) {
+    log('Managed Subconscious runtime configuration already matches canonical Subconscious.af');
+    return;
+  }
+
+  const patchResponse = await fetch(url, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(patch),
+  });
+  if (!patchResponse.ok) {
+    throw new Error(`Failed to reconcile managed Subconscious runtime configuration: ${patchResponse.status} ${await patchResponse.text()}`);
+  }
+  log(`Reconciled managed Subconscious runtime configuration from canonical Subconscious.af: ${Object.keys(patch).join(', ')}`);
+}
+
+'''
+p.write_text(text[:start] + new_block + text[end:])
+
+replace_once(p,
+"""function getAgentModelHandle(agent: AgentDetails): string | null {
+  const llmConfig = agent.llm_config;
+""",
+"""function getAgentModelHandle(agent: AgentDetails): string | null {
+  if (typeof agent.model === 'string' && agent.model.length > 0) return agent.model;
+  const llmConfig = agent.llm_config;
+""")
+
+replace_once(p,
+"""  formData.append('file', blob, 'Subconscious.af');
+  
+  const response = await fetch(url, {
+""",
+"""  formData.append('file', blob, 'Subconscious.af');
+  // Import-time overrides prevent deprecated/stale serialized provider details
+  // from blocking creation before the managed post-import reconcile can run.
+  const canonical = getCanonicalManagedAgentConfig();
+  formData.append('model', process.env.LETTA_MODEL || canonical.model);
+  formData.append('embedding', canonical.embedding);
+  
+  const response = await fetch(url, {
+""")
+
+text = p.read_text().replace('reconcileManagedAgentSystem(apiKey, agentId, log)', 'reconcileManagedAgentConfiguration(apiKey, agentId, log)')
+text = text.replace("log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling canonical system prompt')", "log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling canonical managed runtime configuration')")
+p.write_text(text)
+
+# 3) Dedicated backfill shares the same runtime authority and import-time override.
+p = ROOT / 'scripts/backfill_agent_config.ts'
+replace_once(p,
+"""import {
+  getCanonicalManagedSystemPrompt,
+  getConfigPath,
+  isValidAgentId,
+} from './agent_config.js';""",
+"""import {
+  getCanonicalManagedAgentConfig,
+  getCanonicalManagedSystemPrompt,
+  getConfigPath,
+  isValidAgentId,
+  reconcileManagedAgentConfiguration,
+} from './agent_config.js';""")
+replace_once(p,
+"""  const form = new FormData();
+  form.append('file', new Blob([file], { type: 'application/json' }), 'Subconscious.af');
+  const response = await fetch(buildLettaApiUrl('/agents/import'), {
+""",
+"""  const form = new FormData();
+  form.append('file', new Blob([file], { type: 'application/json' }), 'Subconscious.af');
+  const canonical = getCanonicalManagedAgentConfig();
+  form.append('model', process.env.LETTA_MODEL || canonical.model);
+  form.append('embedding', canonical.embedding);
+  const response = await fetch(buildLettaApiUrl('/agents/import'), {
+""")
+text = p.read_text()
+old = """  if (agent.system !== canonicalSystem) {
+    await patchAgent(apiKey, agentId, { system: canonicalSystem }, 'Failed to reconcile dedicated backfill agent system prompt');
+  }
+  const verified = await fetchAgent(apiKey, agentId);
+"""
+new = """  await reconcileManagedAgentConfiguration(apiKey, agentId);
+  const verified = await fetchAgent(apiKey, agentId);
+"""
+if old not in text:
+    raise SystemExit('backfill prompt reconciliation marker missing')
+p.write_text(text.replace(old, new, 1))
+
+# 4) Add focused tests for stale convergence, overrides, and the canonical file.
+test = ROOT / 'scripts/managed_runtime_config.test.ts'
+test.write_text(r'''import { afterEach, describe, expect, it, vi } from 'vitest';
+import { getCanonicalManagedAgentConfig, reconcileManagedAgentConfiguration } from './agent_config.js';
+
+const ID = 'agent-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  delete process.env.LETTA_MODEL;
+  delete process.env.LETTA_CONTEXT_WINDOW;
+});
+
+describe('Task 093AC managed runtime configuration authority', () => {
+  it('reads the intended runtime policy from canonical Subconscious.af', () => {
+    expect(getCanonicalManagedAgentConfig()).toEqual(expect.objectContaining({
+      model: 'opencode-deepseek/deepseek-v4-flash',
+      embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
+      contextWindowLimit: 400000,
+      parallelToolCalls: true,
+    }));
+  });
+
+  it('converges stale z.ai/OpenAI/parallel/context state in one managed PATCH', async () => {
+    const canonical = getCanonicalManagedAgentConfig();
+    const patches: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'PATCH') {
+        patches.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        id: ID, name: 'Subconscious', system: 'stale prompt',
+        llm_config: { handle: 'zai/glm-5', context_window: 90000, parallel_tool_calls: false },
+        embedding_config: { handle: 'openai/text-embedding-3-small' },
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    await reconcileManagedAgentConfiguration('test-key', ID, () => {});
+    expect(patches).toEqual([{
+      system: canonical.system,
+      model: canonical.model,
+      embedding: canonical.embedding,
+      context_window_limit: canonical.contextWindowLimit,
