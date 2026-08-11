@@ -1,0 +1,34 @@
+name: Task 093AE worker
+
+on:
+  push:
+    branches:
+      - task/093ae-legacy-semantic-zero-mutation-auto-retry-clean
+
+permissions:
+  contents: write
+
+jobs:
+  implement-and-test:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: python scripts/task_093ae_patch.py
+      - run: npm ci
+      - run: npx vitest run relationship-memory/tests/legacy-semantic-migration.test.ts
+      - run: npm test -- --runInBand || npm test
+      - name: Commit implementation and remove temporary worker files
+        run: |
+          rm .github/workflows/task-093ae-worker.yml scripts/task_093ae_patch.py
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add relationship-memory/src/legacy/semantic.ts scripts/legacy_semantic_observer_runner.ts relationship-memory/tests/legacy-semantic-migration.test.ts .github/workflows/task-093ae-worker.yml scripts/task_093ae_patch.py
+          git commit -m "task 093ae: bound zero-mutation semantic auto retry"
+          git push origin HEAD
