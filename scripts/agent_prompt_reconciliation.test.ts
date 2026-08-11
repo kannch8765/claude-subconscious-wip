@@ -47,7 +47,11 @@ function installManagedFetch(initialSystem: string, patchStatus = 200) {
         name: 'Subconscious_093B_110855',
         tags: REQUIRED_TAGS,
         system: liveSystem,
-        llm_config: { handle: 'openai/gpt-5.2', model: 'gpt-5.2', provider_name: 'openai' },
+        model: 'opencode-deepseek/deepseek-v4-flash',
+        embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
+        context_window_limit: 400000,
+        model_settings: { parallel_tool_calls: true },
+        llm_config: { handle: 'opencode-deepseek/deepseek-v4-flash', model: 'deepseek-v4-flash', provider_name: 'opencode-deepseek', context_window: 400000, parallel_tool_calls: true },
       });
     }
 
@@ -149,7 +153,7 @@ describe('managed adopted-agent system prompt reconciliation', () => {
     const mod = await loadAgentConfig(home);
     const { requests } = installManagedFetch('obsolete prompt', 500);
 
-    await expect(mod.getAgentId('test-key', () => undefined)).rejects.toThrow('Failed to reconcile managed Subconscious system prompt');
+    await expect(mod.getAgentId('test-key', () => undefined)).rejects.toThrow('Failed to reconcile managed Subconscious runtime configuration');
     expect(requests.some((request) => request.pathname === '/v1/agents/import')).toBe(false);
   });
 });
