@@ -45,7 +45,7 @@ function sourceMessage(source: LegacyAssistantMemorySourceRecord): string {
     '',
     'You are processing exactly one immutable legacy source in this run.',
     'Use memory_search before deciding duplicate/reinforcement versus creation when useful.',
-    'Preserve actor/action fidelity literally: assistant-authored provenance does NOT make an unstated actor the assistant. If the source omits who performed an action, keep the canonical prose actorless/neutral. Preserve explicit names as written unless this source itself establishes an identity mapping; never silently map Sol, Sonnet, 晴, ゆう, Claude, GPT, or another named actor onto user/assistant.',
+    'Preserve actor/action fidelity literally: assistant-authored provenance does NOT make an unstated actor the assistant. If the source omits who performed an action, keep the canonical prose actorless/neutral. Preserve explicit names as written unless this source itself establishes an identity mapping; never silently map Sol, Sonnet, 晴, ゆう, Claude, GPT, or another named actor onto user/assistant. Also preserve action strength literally: do not upgrade 管理/拥有/位于 into 建立/创建/迁移/提交/实现 or otherwise invent an action absent from the source.',
     'Use legacy_memory_create once per distinct canonical semantic item; one source may require several calls.',
     'The payload contract is fully specified below. Never make test/probe/placeholder create calls to discover schema fields; every create call mutates canonical memory and must be source-faithful.',
     LEGACY_MEMORY_PAYLOAD_GUIDE,

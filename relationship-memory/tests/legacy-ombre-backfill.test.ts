@@ -202,7 +202,7 @@ describe('Task 093X Ombre legacy source foundation', () => {
   });
 
   it('observer contract requires 0..N semantic judgment, historical feel temporality, and no fake transcript IDs', () => {
-    expect(LEGACY_OBSERVER_CONTRACT).toContain('zero, one, or many'); expect(LEGACY_OBSERVER_CONTRACT).toContain('naive paragraph splitting'); expect(LEGACY_OBSERVER_CONTRACT).toContain('feel/'); expect(LEGACY_OBSERVER_CONTRACT).toContain('historical temporality'); expect(LEGACY_OBSERVER_CONTRACT).toContain('Never invent conversation_id, message_id, or transcript evidence IDs'); expect(LEGACY_OBSERVER_CONTRACT).toContain('does not imply that the assistant performed an action whose actor is unstated'); expect(LEGACY_OBSERVER_CONTRACT).toContain('Never silently substitute one actor for another');
+    expect(LEGACY_OBSERVER_CONTRACT).toContain('zero, one, or many'); expect(LEGACY_OBSERVER_CONTRACT).toContain('naive paragraph splitting'); expect(LEGACY_OBSERVER_CONTRACT).toContain('feel/'); expect(LEGACY_OBSERVER_CONTRACT).toContain('historical temporality'); expect(LEGACY_OBSERVER_CONTRACT).toContain('Never invent conversation_id, message_id, or transcript evidence IDs'); expect(LEGACY_OBSERVER_CONTRACT).toContain('does not imply that the assistant performed an action whose actor is unstated'); expect(LEGACY_OBSERVER_CONTRACT).toContain('Never silently substitute one actor for another'); expect(LEGACY_OBSERVER_CONTRACT).toContain('do not strengthen, invent, or infer an action'); expect(LEGACY_OBSERVER_CONTRACT).toContain('X 管理的/拥有的/位于');
   });
 
   it('ignores derived embedding/dehydration databases as primary source inputs', () => {
