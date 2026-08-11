@@ -1,0 +1,26 @@
+name: Task 093AH tests
+
+on:
+  push:
+    branches:
+      - task/093ah-realtime-subcon-native-letta-client-adoption
+  pull_request:
+    branches: [main]
+    paths:
+      - 'relationship-memory/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
+      - '.github/workflows/task-093ah-tests.yml'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test

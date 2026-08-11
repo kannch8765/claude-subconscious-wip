@@ -9,21 +9,22 @@ import {
 import { configureVerifiedLegacyFillRuntime, getBackfillAgentId } from './backfill_agent_config.js';
 import { createConversation } from './conversation_utils.js';
 import { runLegacySemanticObserverSource } from './legacy_semantic_observer_runner.js';
+import { createNativeLettaClient, ensureLegacyCompletionTool } from './native_letta_backfill.js';
 
 interface Args {
   root?: string;
   state?: string;
-  cwd?: string;
   expectedManifestDigest?: string;
   agentId?: string;
   runtimeProfile?: 'verified-dsv4';
   maxRecords: number;
+  concurrency: number;
   sourceIds: string[];
   dryRun: boolean;
 }
 
 function usage(): never {
-  console.error('Usage: npx tsx scripts/legacy_semantic_backfill.ts [--root <relationship-memory-dir>] [--state <checkpoint.json>] [--cwd <dir>] [--expected-manifest-digest <sha256>] [--agent-id <agent-id>] [--runtime-profile verified-dsv4] [--max-records N] [--source-id <legacy_source_id> ...] [--dry-run]');
+  console.error('Usage: npx tsx scripts/legacy_semantic_backfill.ts [--root <relationship-memory-dir>] [--state <checkpoint.json>] [--expected-manifest-digest <sha256>] [--agent-id <agent-id>] [--runtime-profile verified-dsv4] [--max-records N] [--concurrency N] [--source-id <legacy_source_id> ...] [--dry-run]');
   process.exit(2);
 }
 
@@ -34,13 +35,12 @@ function positive(value: string | undefined, flag: string): number {
 }
 
 function parseArgs(argv: string[]): Args {
-  const result: Args = { maxRecords: 1, sourceIds: [], dryRun: false };
+  const result: Args = { maxRecords: 1, concurrency: 1, sourceIds: [], dryRun: false };
   for (let i = 0; i < argv.length; i += 1) {
     const flag = argv[i];
     const value = argv[i + 1];
     if (flag === '--root') { result.root = value; i += 1; }
     else if (flag === '--state') { result.state = value; i += 1; }
-    else if (flag === '--cwd') { result.cwd = value; i += 1; }
     else if (flag === '--expected-manifest-digest') {
       if (!value) usage();
       result.expectedManifestDigest = value; i += 1;
@@ -48,6 +48,7 @@ function parseArgs(argv: string[]): Args {
     else if (flag === '--agent-id') { if (!value) usage(); result.agentId = value; i += 1; }
     else if (flag === '--runtime-profile') { if (value !== 'verified-dsv4') usage(); result.runtimeProfile = value; i += 1; }
     else if (flag === '--max-records') { result.maxRecords = positive(value, flag); i += 1; }
+    else if (flag === '--concurrency') { result.concurrency = positive(value, flag); i += 1; }
     else if (flag === '--source-id') {
       if (!value) usage();
       result.sourceIds.push(value); i += 1;
@@ -61,7 +62,6 @@ async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const rootDir = path.resolve(args.root ?? relationshipMemoryRoot());
   const statePath = path.resolve(args.state ?? path.join(rootDir, 'legacy-semantic-migration-state.json'));
-  const cwd = path.resolve(args.cwd ?? process.cwd());
   const expectedManifestDigest = args.expectedManifestDigest
     ?? process.env.LEGACY_SEMANTIC_EXPECTED_MANIFEST_DIGEST
     ?? OMBRE_LEGACY_FROZEN_MANIFEST_DIGEST;
@@ -82,7 +82,7 @@ async function main(): Promise<void> {
 
   if (args.dryRun) {
     const result = await runLegacySemanticMigration({
-      rootDir, expectedManifestDigest, canonicalSubjectId: subjectId, statePath, maxRecords: args.maxRecords, sourceIds: args.sourceIds, dryRun: true,
+      rootDir, expectedManifestDigest, canonicalSubjectId: subjectId, statePath, maxRecords: args.maxRecords, concurrency: args.concurrency, sourceIds: args.sourceIds, dryRun: true,
       processor: async () => { throw new Error('dry-run must not invoke semantic processor'); },
     });
     console.log(JSON.stringify(result));
@@ -99,6 +99,10 @@ async function main(): Promise<void> {
   if (args.runtimeProfile === 'verified-dsv4') {
     await configureVerifiedLegacyFillRuntime(apiKey, agentId, (message) => console.error(`[legacy-backfill] ${message}`));
   }
+  const client = createNativeLettaClient(apiKey);
+  const completionTool = await ensureLegacyCompletionTool(client, agentId);
+  console.error(`[legacy-backfill] native terminal tool ready: ${completionTool.toolId} (attached=${completionTool.attached}, rulesChanged=${completionTool.rulesChanged})`);
+  console.error(`[legacy-backfill] source concurrency=${args.concurrency}`);
 
   const result = await runLegacySemanticMigration({
     rootDir,
@@ -106,11 +110,12 @@ async function main(): Promise<void> {
     canonicalSubjectId: subjectId,
     statePath,
     maxRecords: args.maxRecords,
+    concurrency: args.concurrency,
     sourceIds: args.sourceIds,
     processor: async (source, batchId) => {
       const conversationId = await createConversation(apiKey, agentId, () => {});
       return runLegacySemanticObserverSource({
-        agentId, conversationId, source, batchId, rootDir, subjectId, cwd,
+        agentId, conversationId, source, batchId, rootDir, subjectId, client,
         log: (message) => console.error(`[legacy-backfill] ${message}`),
       });
     },
