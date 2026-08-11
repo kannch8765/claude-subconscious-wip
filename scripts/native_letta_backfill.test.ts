@@ -100,6 +100,44 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.bodies[1].messages).toEqual([{ type: 'approval', approvals: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] }]);
   });
 
+  it('executes every parallel approval_request tool_calls entry exactly once', async () => {
+    const parallelCalls = [
+      { name: 'memory_search', arguments: '{\"query\":\"A\"}', tool_call_id: 'call-a' },
+      { name: 'memory_search', arguments: '{\"query\":\"B\"}', tool_call_id: 'call-b' },
+      { name: 'memory_search', arguments: '{\"query\":\"C\"}', tool_call_id: 'call-c' },
+    ];
+    const client = fakeClient([
+      {
+        messages: [{
+          message_type: 'approval_request_message',
+          tool_call: parallelCalls[0],
+          tool_calls: parallelCalls,
+        }],
+        stop_reason: 'requires_approval',
+      },
+      { messages: [{ message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{\"result\":\"no_memory_required\"}', tool_call_id: 'terminal' } }], stop_reason: 'tool_rule' },
+    ]);
+    const seen: unknown[] = [];
+    const result = await runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{
+        name: 'memory_search', description: 'search', parameters: {},
+        async execute(_id, args) { seen.push(args); return { results: [] }; },
+      }],
+    });
+
+    expect(seen).toEqual([{ query: 'A' }, { query: 'B' }, { query: 'C' }]);
+    expect(result.terminal).toBe('no_memory_required');
+    expect(client.bodies[1].messages).toEqual([{
+      type: 'approval',
+      approvals: [
+        { type: 'tool', tool_call_id: 'call-a', tool_return: '{\"results\":[]}', status: 'success' },
+        { type: 'tool', tool_call_id: 'call-b', tool_return: '{\"results\":[]}', status: 'success' },
+        { type: 'tool', tool_call_id: 'call-c', tool_return: '{\"results\":[]}', status: 'success' },
+      ],
+    }]);
+  });
+
   it('drains client approvals before accepting a terminal emitted in the same model turn', async () => {
     const client = fakeClient([
       {

@@ -136,11 +136,21 @@ export function extractLegacyCompletion(messages: readonly any[] = []): 'complet
 
 function approvalRequests(messages: readonly any[] = []): ToolCall[] {
   const result: ToolCall[] = [];
+  const seen = new Set<string>();
   for (const message of messages) {
     if (message?.message_type !== 'approval_request_message' && message?.type !== 'approval_request_message') continue;
-    const call = normalizeToolCall(message.tool_call);
-    if (!call?.toolCallId) throw new Error('Letta approval request is missing tool_call_id');
-    result.push(call);
+    const rawCalls = Array.isArray(message?.tool_calls) && message.tool_calls.length > 0
+      ? message.tool_calls
+      : message?.tool_call
+        ? [message.tool_call]
+        : [];
+    for (const raw of rawCalls) {
+      const call = normalizeToolCall(raw);
+      if (!call?.toolCallId) throw new Error('Letta approval request is missing tool_call_id');
+      if (seen.has(call.toolCallId)) continue;
+      seen.add(call.toolCallId);
+      result.push(call);
+    }
   }
   return result;
 }
