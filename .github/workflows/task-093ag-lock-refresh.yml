@@ -1,4 +1,4 @@
-name: Task 093AG lock refresh
+name: Task 093AG materialize candidate
 
 on:
   push:
@@ -8,25 +8,39 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: task-093ag-materialize
+  cancel-in-progress: true
+
 jobs:
-  refresh-lock:
+  materialize:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: npm
+      - name: Apply staged reconciliation patch
+        run: |
+          git pull --rebase origin task/093ag-native-letta-backfill-harness-reconciliation
+          if git apply --check .github/093ag-remaining.patch; then
+            git apply .github/093ag-remaining.patch
+          else
+            echo 'remaining patch already applied or no longer applicable'
+          fi
       - run: npm install --package-lock-only --ignore-scripts
-      - name: Commit refreshed package lock
+      - name: Commit materialized candidate
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add package-lock.json
+          git add package-lock.json relationship-memory scripts
           if git diff --cached --quiet; then
-            echo 'package-lock already current'
+            echo 'candidate already materialized'
           else
-            git commit -m 'chore: refresh 093AG dependency lock'
+            git commit -m 'chore: materialize 093AG candidate'
             git push
           fi
