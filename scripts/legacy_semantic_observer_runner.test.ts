@@ -52,7 +52,14 @@ function fakeClient(responses: any[]): NativeLettaClientLike {
         async create() {
           const response = responses.shift();
           if (!response) throw new Error('unexpected native Letta request');
-          return response;
+          return (async function* () {
+            for (const message of response.messages ?? []) yield message;
+            if (response.stop_reason) {
+              yield typeof response.stop_reason === 'string'
+                ? { message_type: 'stop_reason', stop_reason: response.stop_reason }
+                : response.stop_reason;
+            }
+          })();
         },
       },
     },

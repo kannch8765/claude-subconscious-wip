@@ -38,7 +38,15 @@ function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: an
           bodies.push(body);
           const response = responses.shift();
           if (!response) throw new Error('unexpected native Letta request');
-          return response;
+          return (async function* () {
+            for (const message of response.messages ?? []) yield message;
+            if (response.stop_reason) {
+              yield typeof response.stop_reason === 'string'
+                ? { message_type: 'stop_reason', stop_reason: response.stop_reason }
+                : response.stop_reason;
+            }
+            if (response.usage) yield { message_type: 'usage_statistics', ...response.usage };
+          })();
         },
       },
     },
@@ -97,7 +105,8 @@ describe('native Letta legacy backfill harness', () => {
     expect(extractLegacyCompletion(result.response.messages)).toBe('no_memory_required');
     expect(client.bodies).toHaveLength(2);
     expect(client.bodies[0].client_tools).toEqual([{ name: 'memory_search', description: 'search', parameters: { type: 'object' } }]);
-    expect(client.bodies[1].messages).toEqual([{ type: 'approval', approvals: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] }]);
+    expect(client.bodies[0]).toEqual(expect.objectContaining({ streaming: true }));
+    expect(client.bodies[1].messages).toEqual([{ type: 'tool_return', tool_returns: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] }]);
   });
 
   it('executes every parallel approval_request tool_calls entry exactly once', async () => {
@@ -129,8 +138,8 @@ describe('native Letta legacy backfill harness', () => {
     expect(seen).toEqual([{ query: 'A' }, { query: 'B' }, { query: 'C' }]);
     expect(result.terminal).toBe('no_memory_required');
     expect(client.bodies[1].messages).toEqual([{
-      type: 'approval',
-      approvals: [
+      type: 'tool_return',
+      tool_returns: [
         { type: 'tool', tool_call_id: 'call-a', tool_return: '{\"results\":[]}', status: 'success' },
         { type: 'tool', tool_call_id: 'call-b', tool_return: '{\"results\":[]}', status: 'success' },
         { type: 'tool', tool_call_id: 'call-c', tool_return: '{\"results\":[]}', status: 'success' },
@@ -162,8 +171,8 @@ describe('native Letta legacy backfill harness', () => {
     expect(result.clientToolFailure).toBe(false);
     expect(client.bodies).toHaveLength(2);
     expect(client.bodies[1].messages).toEqual([{
-      type: 'approval',
-      approvals: [{ type: 'tool', tool_call_id: 'mutation', tool_return: '{"outcome":"accepted"}', status: 'success' }],
+      type: 'tool_return',
+      tool_returns: [{ type: 'tool', tool_call_id: 'mutation', tool_return: '{"outcome":"accepted"}', status: 'success' }],
     }]);
   });
 });

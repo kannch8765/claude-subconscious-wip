@@ -25,7 +25,7 @@ export interface NativeLettaClientLike {
   };
   conversations: {
     messages: {
-      create(conversationId: string, body: Record<string, unknown>): Promise<any>;
+      create(conversationId: string, body: Record<string, unknown>): Promise<AsyncIterable<any>>;
     };
   };
 }
@@ -173,6 +173,29 @@ function toolReturn(value: unknown): string {
   catch { return String(value); }
 }
 
+async function collectLettaStream(stream: AsyncIterable<any>): Promise<{ messages: any[]; stop_reason?: any; usage?: any }> {
+  const messages: any[] = [];
+  let stopReason: any;
+  let usage: any;
+  for await (const event of stream) {
+    const type = event?.message_type ?? event?.type;
+    if (type === 'ping') continue;
+    if (type === 'stop_reason') {
+      stopReason = event;
+      continue;
+    }
+    if (type === 'usage_statistics') {
+      usage = event;
+      continue;
+    }
+    if (type === 'error' || (typeof event?.error_type === 'string' && typeof event?.message === 'string')) {
+      throw new Error(`Letta stream error${event?.error_type ? ` (${event.error_type})` : ''}: ${event?.message ?? 'unknown error'}`);
+    }
+    messages.push(event);
+  }
+  return { messages, stop_reason: stopReason, usage };
+}
+
 export async function runNativeClientToolConversation(input: {
   client: NativeLettaClientLike;
   agentId: string;
@@ -184,11 +207,12 @@ export async function runNativeClientToolConversation(input: {
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
   let clientToolFailure = false;
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
-  let response = await input.client.conversations.messages.create(input.conversationId, {
+  let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
     agent_id: input.agentId,
+    streaming: true,
     messages: [{ role: 'user', content: input.message }],
     client_tools: schemas,
-  });
+  }));
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const messages = Array.isArray(response?.messages) ? response.messages : [];
@@ -218,11 +242,12 @@ export async function runNativeClientToolConversation(input: {
       approvals.push({ type: 'tool', tool_call_id: request.toolCallId, tool_return: result, status });
     }
 
-    response = await input.client.conversations.messages.create(input.conversationId, {
+    response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
       agent_id: input.agentId,
-      messages: [{ type: 'approval', approvals }],
+      streaming: true,
+      messages: [{ type: 'tool_return', tool_returns: approvals }],
       client_tools: schemas,
-    });
+    }));
   }
   throw new Error(`legacy client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
 }
