@@ -87,10 +87,10 @@ describe('native legacy semantic observer integration', () => {
         stop_reason: 'requires_approval',
       },
       {
-        messages: [{
-          message_type: 'tool_call_message',
-          tool_call: { name: 'legacy_source_complete', arguments: '{"result":"completed"}', tool_call_id: 'terminal-1' },
-        }],
+        messages: [
+          { message_type: 'tool_call_message', tool_call: { name: 'legacy_source_complete', arguments: '{"result":"completed"}', tool_call_id: 'terminal-1' } },
+          { message_type: 'tool_return_message', tool_call_id: 'terminal-1', status: 'success', tool_return: 'completed' },
+        ],
         stop_reason: 'tool_rule',
       },
     ]);
@@ -123,10 +123,10 @@ describe('native legacy semantic observer integration', () => {
     const item = source();
     new LegacyMemorySourceStore(root).appendSource(item);
     const client = fakeClient([{
-      messages: [{
-        message_type: 'tool_call_message',
-        tool_call: { name: 'legacy_source_complete', arguments: '{"result":"completed"}', tool_call_id: 'terminal-1' },
-      }],
+      messages: [
+        { message_type: 'tool_call_message', tool_call: { name: 'legacy_source_complete', arguments: '{"result":"completed"}', tool_call_id: 'terminal-1' } },
+        { message_type: 'tool_return_message', tool_call_id: 'terminal-1', status: 'success', tool_return: 'completed' },
+      ],
       stop_reason: 'tool_rule',
     }]);
 
