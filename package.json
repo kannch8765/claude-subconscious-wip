@@ -24,7 +24,7 @@
   ],
   "type": "module",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "scripts": {
     "sync": "tsx scripts/sync_letta_memory.ts",
@@ -35,6 +35,7 @@
     "legacy-backfill": "tsx scripts/legacy_semantic_backfill.ts"
   },
   "dependencies": {
+    "@letta-ai/letta-client": "1.12.1",
     "@letta-ai/letta-code-sdk": "0.1.12",
     "tsx": "^4.7.0"
   },
