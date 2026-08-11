@@ -81,8 +81,8 @@ describe('native Letta legacy backfill harness', () => {
       enable_parallel_execution: false,
       args_json_schema: expect.objectContaining({ title: 'LegacySourceCompleteArgs' }),
       source_code: expect.stringContaining('getattr(result, \"value\", result)'),
-      source_code: expect.stringContaining('def legacy_source_complete(result) -> str:'),
     }));
+    expect(client.upserts[0].source_code).toContain('def legacy_source_complete(result) -> str:');
     expect(client.updates).toHaveLength(1);
     expect((client.updates[0].tool_rules as any[]).slice(-2)).toEqual([
       { type: 'required_before_exit', tool_name: LEGACY_COMPLETION_TOOL_NAME },
