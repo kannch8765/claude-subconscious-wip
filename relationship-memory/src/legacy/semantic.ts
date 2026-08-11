@@ -84,6 +84,7 @@ export interface LegacySemanticState {
 
 export interface LegacySemanticReceipt {
   schema_version: 1;
+  attempt?: number;
   receipt_id: string;
   manifest_digest: string;
   canonical_subject_id: string;
@@ -99,6 +100,7 @@ export interface LegacySemanticReceipt {
 export interface LegacySemanticProcessorResult {
   completion: LegacySemanticCompletion;
   reason?: string;
+  retry_class?: 'zero_mutation_missing_completion';
 }
 
 export interface RunLegacySemanticMigrationOptions {
@@ -442,6 +444,23 @@ function remainingCount(sources: LegacyAssistantMemorySourceRecord[], processed:
   return sources.filter((source) => (!selected || selected.has(source.legacy_source_id)) && !processed.has(source.legacy_source_id)).length;
 }
 
+const LEGACY_ZERO_MUTATION_MAX_ATTEMPTS = 2;
+
+function semanticMutationFingerprint(legacyStore: LegacyMemorySourceStore, canonicalStore: RelationshipMemoryStore): string {
+  return stableId('legacy_semantic_mutation_snapshot', {
+    memories: canonicalStore.listMemories(),
+    evidence: canonicalStore.listEvidence(),
+    reinforcements: canonicalStore.listReinforcements(),
+    provenance: legacyStore.listProvenance(),
+  });
+}
+
+function nextReceiptAttempt(rootDir: string, sourceId: string, manifestDigest: string, canonicalSubjectId: string): number {
+  return listLegacySemanticReceipts(rootDir).filter((item) =>
+    item.legacy_source_id === sourceId && item.manifest_digest === manifestDigest && item.canonical_subject_id === canonicalSubjectId
+  ).length + 1;
+}
+
 export async function runLegacySemanticMigration(options: RunLegacySemanticMigrationOptions): Promise<LegacySemanticRunResult> {
   const rootDir = path.resolve(options.rootDir);
   const statePath = path.resolve(options.statePath ?? path.join(rootDir, 'legacy-semantic-migration-state.json'));
@@ -495,51 +514,62 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
     }
 
     const batchId = legacySemanticBatchId(manifestDigest, source.legacy_source_id, canonicalSubjectId);
-    const result = await options.processor(source, batchId);
-    const provenance = provenanceForSubject(legacyStore, canonicalStore, canonicalSubjectId, source.legacy_source_id);
-    let failure: string | undefined;
-    if (result.completion === 'completed' && provenance.length === 0) failure = 'observer completed without canonical provenance';
-    if (result.completion === 'no_memory_required' && provenance.length > 0) failure = 'observer returned no_memory_required after canonical provenance was written';
-    const effectiveCompletion: LegacySemanticCompletion = failure ? 'retryable_failure' : result.completion;
-    const memoryIds = [...new Set(provenance.map((item) => item.canonical_memory_id))].sort();
-    const provenanceIds = provenance.map((item) => item.provenance_id).sort();
-    const receiptCore = {
-      manifest_digest: manifestDigest,
-      canonical_subject_id: canonicalSubjectId,
-      legacy_source_id: source.legacy_source_id,
-      batch_id: batchId,
-      result: effectiveCompletion,
-      provenance_ids: provenanceIds,
-      memory_ids: memoryIds,
-      ...((failure ?? result.reason) ? { reason: failure ?? result.reason } : {}),
-    } as const;
-    const receipt: LegacySemanticReceipt = {
-      schema_version: 1,
-      receipt_id: receiptId(receiptCore),
-      ...receiptCore,
-      recorded_at: new Date().toISOString(),
-    };
-
-    if (effectiveCompletion === 'retryable_failure') {
-      legacyStore.withMutationBoundary(() => appendSemanticReceipt(rootDir, receipt));
-      return {
-        status: 'blocked-failure', manifest_digest: manifestDigest, processed: completedCount,
-        remaining: remainingCount(sources, processed, selected), source_id: source.legacy_source_id,
-        detail: receipt.reason ?? 'legacy semantic observer retryable failure',
+    let sourceCompleted = false;
+    for (let attemptInRun = 1; attemptInRun <= LEGACY_ZERO_MUTATION_MAX_ATTEMPTS; attemptInRun += 1) {
+      const beforeMutation = semanticMutationFingerprint(legacyStore, canonicalStore);
+      const result = await options.processor(source, batchId);
+      const afterMutation = semanticMutationFingerprint(legacyStore, canonicalStore);
+      const provenance = provenanceForSubject(legacyStore, canonicalStore, canonicalSubjectId, source.legacy_source_id);
+      let failure: string | undefined;
+      if (result.completion === 'completed' && provenance.length === 0) failure = 'observer completed without canonical provenance';
+      if (result.completion === 'no_memory_required' && provenance.length > 0) failure = 'observer returned no_memory_required after canonical provenance was written';
+      const effectiveCompletion: LegacySemanticCompletion = failure ? 'retryable_failure' : result.completion;
+      const memoryIds = [...new Set(provenance.map((item) => item.canonical_memory_id))].sort();
+      const provenanceIds = provenance.map((item) => item.provenance_id).sort();
+      const receiptCore = {
+        attempt: nextReceiptAttempt(rootDir, source.legacy_source_id, manifestDigest, canonicalSubjectId),
+        manifest_digest: manifestDigest,
+        canonical_subject_id: canonicalSubjectId,
+        legacy_source_id: source.legacy_source_id,
+        batch_id: batchId,
+        result: effectiveCompletion,
+        provenance_ids: provenanceIds,
+        memory_ids: memoryIds,
+        ...((failure ?? result.reason) ? { reason: failure ?? result.reason } : {}),
+      } as const;
+      const receipt: LegacySemanticReceipt = {
+        schema_version: 1,
+        receipt_id: receiptId(receiptCore),
+        ...receiptCore,
+        recorded_at: new Date().toISOString(),
       };
-    }
 
-    legacyStore.withMutationBoundary(() => {
-      appendSemanticReceipt(rootDir, receipt);
-      const latestState = loadLegacySemanticState(statePath, manifestDigest, canonicalSubjectId);
-      if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
-        latestState.processed_source_ids.push(source.legacy_source_id);
-        saveLegacySemanticState(statePath, latestState);
+      if (effectiveCompletion === 'retryable_failure') {
+        legacyStore.withMutationBoundary(() => appendSemanticReceipt(rootDir, receipt));
+        const safeZeroMutationRetry = result.retry_class === 'zero_mutation_missing_completion' && beforeMutation === afterMutation;
+        if (safeZeroMutationRetry && attemptInRun < LEGACY_ZERO_MUTATION_MAX_ATTEMPTS) continue;
+        return {
+          status: 'blocked-failure', manifest_digest: manifestDigest, processed: completedCount,
+          remaining: remainingCount(sources, processed, selected), source_id: source.legacy_source_id,
+          detail: receipt.reason ?? 'legacy semantic observer retryable failure',
+        };
       }
-      state.processed_source_ids = latestState.processed_source_ids;
-      processed.add(source.legacy_source_id);
-    });
-    completedCount += 1;
+
+      legacyStore.withMutationBoundary(() => {
+        appendSemanticReceipt(rootDir, receipt);
+        const latestState = loadLegacySemanticState(statePath, manifestDigest, canonicalSubjectId);
+        if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
+          latestState.processed_source_ids.push(source.legacy_source_id);
+          saveLegacySemanticState(statePath, latestState);
+        }
+        state.processed_source_ids = latestState.processed_source_ids;
+        processed.add(source.legacy_source_id);
+      });
+      completedCount += 1;
+      sourceCompleted = true;
+      break;
+    }
+    if (!sourceCompleted) throw new Error(`legacy semantic retry loop exited without terminal result: ${source.legacy_source_id}`);
   }
 
   return {

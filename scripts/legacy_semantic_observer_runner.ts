@@ -75,6 +75,7 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
   let session: any = null;
   let sessionSucceeded = true;
   let toolRetryableFailure = false;
+  let toolPermanentlyRejected = false;
 
   try {
     disableLettaCodeAutoUpdater();
@@ -85,6 +86,7 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
     const wrapMutation = (fn: (args: any) => any) => async (_toolCallId: string, args: unknown) => {
       const result = fn(args);
       if (result?.outcome === 'retryable_failed') toolRetryableFailure = true;
+      if (result?.outcome === 'permanently_rejected') toolPermanentlyRejected = true;
       return jsonResult(result);
     };
     const tools: any[] = [
@@ -159,6 +161,15 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
     finalized_at: now,
     ...(!retryable && completion === 'no_memory_required' ? { detail: 'no_memory_required' as const } : {}),
   });
-  if (retryable) return { completion: 'retryable_failure', reason: !completion ? 'observer ended without explicit legacy_source_complete' : 'observer/tool session retryable failure' };
+  if (retryable) {
+    const pureMissingCompletion = !completion && sessionSucceeded && !toolRetryableFailure && !toolPermanentlyRejected;
+    return {
+      completion: 'retryable_failure',
+      reason: !completion
+        ? (toolPermanentlyRejected ? 'observer ended after permanently rejected legacy mutation tool call' : 'observer ended without explicit legacy_source_complete')
+        : 'observer/tool session retryable failure',
+      ...(pureMissingCompletion ? { retry_class: 'zero_mutation_missing_completion' as const } : {}),
+    };
+  }
   return { completion };
 }
