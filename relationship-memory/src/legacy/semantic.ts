@@ -108,6 +108,7 @@ export interface RunLegacySemanticMigrationOptions {
   canonicalSubjectId: string;
   statePath?: string;
   maxRecords?: number;
+  concurrency?: number;
   sourceIds?: string[];
   dryRun?: boolean;
   processor: (source: LegacyAssistantMemorySourceRecord, batchId: string) => Promise<LegacySemanticProcessorResult>;
@@ -235,52 +236,44 @@ export class LegacySemanticMutationRuntime {
     const content = validated.content;
     const sourceKey = stableId('legacy_memory_src', { legacy_source_id: this.source.legacy_source_id, semantic: content });
 
-    const recovered = this.canonicalStore.getMemoryBySourceKey(sourceKey);
-    if (recovered?.subject_id === this.subjectId) {
-      this.legacyStore.appendProvenance({
-        legacy_source_id: this.source.legacy_source_id,
-        canonical_memory_id: recovered.memory_id,
-        disposition: 'created',
-        recorded_at: this.now(),
-      });
-      return { outcome: 'duplicate_link', memory_id: recovered.memory_id };
-    }
-
-    const targetShape = semanticShape(content);
-    const effective = new RelationshipMemoryOwnerControlPlane(this.canonicalStore).listEffective()
-      .filter((candidate) => candidate.subject_id === this.subjectId);
-    const duplicate = effective.find((candidate) => semanticShape(candidate) === targetShape);
-    if (duplicate) {
-      this.legacyStore.appendProvenance({
-        legacy_source_id: this.source.legacy_source_id,
-        canonical_memory_id: duplicate.memory_id,
-        disposition: 'duplicate_link',
-        recorded_at: this.now(),
-      });
-      return { outcome: 'duplicate_link', memory_id: duplicate.memory_id };
-    }
-
-    const memoryId = stableId('mem', { subject_id: this.subjectId, source_key: sourceKey });
-    const memory: CanonicalMemoryRecord = {
-      schema_version: 1,
-      memory_id: memoryId,
-      subject_id: this.subjectId,
-      ...content,
-      status: 'active',
-      observed_at: this.source.created_at_utc,
-      created_at: this.now(),
-      source_key: sourceKey,
-      dedupe_key: stableId('dedupe', { subject_id: this.subjectId, semantic: content }),
-    };
     try {
-      this.canonicalStore.appendMemory(memory, []);
+      const committed = this.canonicalStore.withMutationBoundary(() => {
+        const recovered = this.canonicalStore.getMemoryBySourceKey(sourceKey);
+        if (recovered?.subject_id === this.subjectId) {
+          return { outcome: 'duplicate_link' as const, memoryId: recovered.memory_id, disposition: 'created' as const };
+        }
+
+        const targetShape = semanticShape(content);
+        const effective = new RelationshipMemoryOwnerControlPlane(this.canonicalStore).listEffective()
+          .filter((candidate) => candidate.subject_id === this.subjectId);
+        const duplicate = effective.find((candidate) => semanticShape(candidate) === targetShape);
+        if (duplicate) {
+          return { outcome: 'duplicate_link' as const, memoryId: duplicate.memory_id, disposition: 'duplicate_link' as const };
+        }
+
+        const memoryId = stableId('mem', { subject_id: this.subjectId, source_key: sourceKey });
+        const memory: CanonicalMemoryRecord = {
+          schema_version: 1,
+          memory_id: memoryId,
+          subject_id: this.subjectId,
+          ...content,
+          status: 'active',
+          observed_at: this.source.created_at_utc,
+          created_at: this.now(),
+          source_key: sourceKey,
+          dedupe_key: stableId('dedupe', { subject_id: this.subjectId, semantic: content }),
+        };
+        this.canonicalStore.appendMemory(memory, []);
+        return { outcome: 'created' as const, memoryId, disposition: 'created' as const };
+      });
+
       this.legacyStore.appendProvenance({
         legacy_source_id: this.source.legacy_source_id,
-        canonical_memory_id: memoryId,
-        disposition: 'created',
+        canonical_memory_id: committed.memoryId,
+        disposition: committed.disposition,
         recorded_at: this.now(),
       });
-      return { outcome: 'created', memory_id: memoryId };
+      return { outcome: committed.outcome, memory_id: committed.memoryId };
     } catch (error) {
       return { outcome: 'retryable_failed', reason: error instanceof Error ? error.message : String(error) };
     }
@@ -481,11 +474,14 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
   const candidates = sources.filter((source) => (!selected || selected.has(source.legacy_source_id)) && !processed.has(source.legacy_source_id));
   const maxRecords = options.maxRecords ?? Number.POSITIVE_INFINITY;
   const planned = candidates.slice(0, maxRecords);
+  const concurrency = options.concurrency ?? 1;
+  if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('legacy semantic concurrency must be a positive integer');
   if (options.dryRun) return { status: 'dry-run', manifest_digest: manifestDigest, processed: 0, remaining: candidates.length };
   if (planned.length === 0) return { status: 'no-op', manifest_digest: manifestDigest, processed: 0, remaining: 0 };
 
   let completedCount = 0;
-  for (const source of planned) {
+
+  const processSource = async (source: LegacyAssistantMemorySourceRecord): Promise<LegacySemanticRunResult | undefined> => {
     const recovered = terminalReceipt(rootDir, source.legacy_source_id, manifestDigest, canonicalSubjectId);
     if (recovered) {
       legacyStore.withMutationBoundary(() => {
@@ -498,57 +494,84 @@ export async function runLegacySemanticMigration(options: RunLegacySemanticMigra
         processed.add(source.legacy_source_id);
       });
       completedCount += 1;
-      continue;
+      return undefined;
     }
 
     const batchId = legacySemanticBatchId(manifestDigest, source.legacy_source_id, canonicalSubjectId);
-    {
-      const result = await options.processor(source, batchId);
-      const provenance = provenanceForSubject(legacyStore, canonicalStore, canonicalSubjectId, source.legacy_source_id);
-      let failure: string | undefined;
-      if (result.completion === 'completed' && provenance.length === 0) failure = 'observer completed without canonical provenance';
-      if (result.completion === 'no_memory_required' && provenance.length > 0) failure = 'observer returned no_memory_required after canonical provenance was written';
-      const effectiveCompletion: LegacySemanticCompletion = failure ? 'retryable_failure' : result.completion;
-      const memoryIds = [...new Set(provenance.map((item) => item.canonical_memory_id))].sort();
-      const provenanceIds = provenance.map((item) => item.provenance_id).sort();
-      const receiptCore = {
-        attempt: nextReceiptAttempt(rootDir, source.legacy_source_id, manifestDigest, canonicalSubjectId),
-        manifest_digest: manifestDigest,
-        canonical_subject_id: canonicalSubjectId,
-        legacy_source_id: source.legacy_source_id,
-        batch_id: batchId,
-        result: effectiveCompletion,
-        provenance_ids: provenanceIds,
-        memory_ids: memoryIds,
-        ...((failure ?? result.reason) ? { reason: failure ?? result.reason } : {}),
-      } as const;
-      const receipt: LegacySemanticReceipt = {
-        schema_version: 1,
-        receipt_id: receiptId(receiptCore),
-        ...receiptCore,
-        recorded_at: new Date().toISOString(),
+    const result = await options.processor(source, batchId);
+    const provenance = provenanceForSubject(legacyStore, canonicalStore, canonicalSubjectId, source.legacy_source_id);
+    let failure: string | undefined;
+    if (result.completion === 'completed' && provenance.length === 0) failure = 'observer completed without canonical provenance';
+    if (result.completion === 'no_memory_required' && provenance.length > 0) failure = 'observer returned no_memory_required after canonical provenance was written';
+    const effectiveCompletion: LegacySemanticCompletion = failure ? 'retryable_failure' : result.completion;
+    const memoryIds = [...new Set(provenance.map((item) => item.canonical_memory_id))].sort();
+    const provenanceIds = provenance.map((item) => item.provenance_id).sort();
+    const receiptCore = {
+      attempt: nextReceiptAttempt(rootDir, source.legacy_source_id, manifestDigest, canonicalSubjectId),
+      manifest_digest: manifestDigest,
+      canonical_subject_id: canonicalSubjectId,
+      legacy_source_id: source.legacy_source_id,
+      batch_id: batchId,
+      result: effectiveCompletion,
+      provenance_ids: provenanceIds,
+      memory_ids: memoryIds,
+      ...((failure ?? result.reason) ? { reason: failure ?? result.reason } : {}),
+    } as const;
+    const receipt: LegacySemanticReceipt = {
+      schema_version: 1,
+      receipt_id: receiptId(receiptCore),
+      ...receiptCore,
+      recorded_at: new Date().toISOString(),
+    };
+
+    if (effectiveCompletion === 'retryable_failure') {
+      legacyStore.withMutationBoundary(() => appendSemanticReceipt(rootDir, receipt));
+      return {
+        status: 'blocked-failure', manifest_digest: manifestDigest, processed: completedCount,
+        remaining: remainingCount(sources, processed, selected), source_id: source.legacy_source_id,
+        detail: receipt.reason ?? 'legacy semantic observer retryable failure',
       };
+    }
 
-      if (effectiveCompletion === 'retryable_failure') {
-        legacyStore.withMutationBoundary(() => appendSemanticReceipt(rootDir, receipt));
-        return {
-          status: 'blocked-failure', manifest_digest: manifestDigest, processed: completedCount,
-          remaining: remainingCount(sources, processed, selected), source_id: source.legacy_source_id,
-          detail: receipt.reason ?? 'legacy semantic observer retryable failure',
-        };
+    legacyStore.withMutationBoundary(() => {
+      appendSemanticReceipt(rootDir, receipt);
+      const latestState = loadLegacySemanticState(statePath, manifestDigest, canonicalSubjectId);
+      if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
+        latestState.processed_source_ids.push(source.legacy_source_id);
+        saveLegacySemanticState(statePath, latestState);
       }
+      state.processed_source_ids = latestState.processed_source_ids;
+      processed.add(source.legacy_source_id);
+    });
+    completedCount += 1;
+    return undefined;
+  };
 
-      legacyStore.withMutationBoundary(() => {
-        appendSemanticReceipt(rootDir, receipt);
-        const latestState = loadLegacySemanticState(statePath, manifestDigest, canonicalSubjectId);
-        if (!latestState.processed_source_ids.includes(source.legacy_source_id)) {
-          latestState.processed_source_ids.push(source.legacy_source_id);
-          saveLegacySemanticState(statePath, latestState);
-        }
-        state.processed_source_ids = latestState.processed_source_ids;
-        processed.add(source.legacy_source_id);
-      });
-      completedCount += 1;
+  if (concurrency === 1) {
+    for (const source of planned) {
+      const blocked = await processSource(source);
+      if (blocked) return blocked;
+    }
+  } else {
+    let cursor = 0;
+    let blocked: LegacySemanticRunResult | undefined;
+    const workers = Array.from({ length: Math.min(concurrency, planned.length) }, async () => {
+      while (true) {
+        if (blocked) return;
+        const index = cursor;
+        cursor += 1;
+        if (index >= planned.length) return;
+        const failure = await processSource(planned[index]);
+        if (failure && !blocked) blocked = failure;
+      }
+    });
+    await Promise.all(workers);
+    if (blocked) {
+      return {
+        ...blocked,
+        processed: completedCount,
+        remaining: remainingCount(sources, processed, selected),
+      };
     }
   }
 

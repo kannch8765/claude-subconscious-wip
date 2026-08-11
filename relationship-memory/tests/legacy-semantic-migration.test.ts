@@ -80,6 +80,86 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toEqual([s.legacy_source_id]);
   });
 
+  it('runs independent sources with bounded source concurrency and durable terminal state', async () => {
+    const root = temp();
+    const sources = [source('parallel-a'), source('parallel-b'), source('parallel-c'), source('parallel-d')];
+    seed(root, ...sources);
+    let active = 0;
+    let maxActive = 0;
+    const seen: string[] = [];
+
+    const result = await runLegacySemanticMigration({
+      rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject, maxRecords: 4, concurrency: 2,
+      processor: async (item) => {
+        seen.push(item.legacy_source_id);
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        active -= 1;
+        return { completion: 'no_memory_required' };
+      },
+    });
+
+    expect(result).toMatchObject({ status: 'completed', processed: 4, remaining: 0 });
+    expect(maxActive).toBe(2);
+    expect(new Set(seen)).toEqual(new Set(sources.map((item) => item.legacy_source_id)));
+    expect(listLegacySemanticReceipts(root)).toHaveLength(4);
+    expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toHaveLength(4);
+  });
+
+  it('stops scheduling new sources after a concurrent retryable failure is observed while draining in-flight work', async () => {
+    const root = temp();
+    const a = source('parallel-fail-a'); const b = source('parallel-fail-b'); const c = source('parallel-fail-c');
+    seed(root, a, b, c);
+    const calls: string[] = [];
+
+    const result = await runLegacySemanticMigration({
+      rootDir: root, expectedManifestDigest: manifest, canonicalSubjectId: canonicalSubject, maxRecords: 3, concurrency: 2,
+      processor: async (item) => {
+        calls.push(item.legacy_source_id);
+        if (item.legacy_source_id === a.legacy_source_id) return { completion: 'retryable_failure', reason: 'synthetic concurrent failure' };
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { completion: 'no_memory_required' };
+      },
+    });
+
+    expect(result).toMatchObject({ status: 'blocked-failure', processed: 1, remaining: 2, source_id: a.legacy_source_id, detail: 'synthetic concurrent failure' });
+    expect(calls).toEqual([a.legacy_source_id, b.legacy_source_id]);
+    expect(listLegacySemanticReceipts(root).map((receipt) => [receipt.legacy_source_id, receipt.result])).toEqual([
+      [a.legacy_source_id, 'retryable_failure'],
+      [b.legacy_source_id, 'no_memory_required'],
+    ]);
+    expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toEqual([b.legacy_source_id]);
+  });
+
+  it('keeps legacy semantic duplicate detection inside the canonical mutation boundary', () => {
+    const root = temp(); const a = source('legacy-atomic-a'); const b = source('legacy-atomic-b'); seed(root, a, b);
+    const runtime = new LegacySemanticMutationRuntime(root, canonicalSubject, a, legacySemanticBatchId(manifest, a.legacy_source_id, canonicalSubject), () => '2026-08-11T00:00:00Z');
+    const store = runtime.canonicalStore as any;
+    const originalBoundary = store.withMutationBoundary.bind(store);
+    const originalGetBySourceKey = store.getMemoryBySourceKey.bind(store);
+    const originalListMemories = store.listMemories.bind(store);
+    let boundaryDepth = 0;
+    store.withMutationBoundary = (operation: () => unknown) => originalBoundary(() => {
+      boundaryDepth += 1;
+      try { return operation(); }
+      finally { boundaryDepth -= 1; }
+    });
+    store.getMemoryBySourceKey = (sourceKey: string) => {
+      expect(boundaryDepth).toBeGreaterThan(0);
+      return originalGetBySourceKey(sourceKey);
+    };
+    store.listMemories = () => {
+      expect(boundaryDepth).toBeGreaterThan(0);
+      return originalListMemories();
+    };
+
+    expect(runtime.createMemory(sharedProposal('并发去重边界'))).toMatchObject({ outcome: 'created' });
+    const second = new LegacySemanticMutationRuntime(root, canonicalSubject, b, legacySemanticBatchId(manifest, b.legacy_source_id, canonicalSubject), () => '2026-08-11T00:01:00Z');
+    expect(second.createMemory(sharedProposal('并发去重边界'))).toMatchObject({ outcome: 'duplicate_link' });
+    expect(new RelationshipMemoryStore(root, canonicalSubject).listMemories()).toHaveLength(1);
+  });
+
   it('does not harness-auto-retry a missing native terminal result and resumes durably on the next invocation', async () => {
     const root = temp(); const a = source('native-terminal-a'); const b = source('native-terminal-b'); seed(root, a, b);
     const calls: string[] = [];
