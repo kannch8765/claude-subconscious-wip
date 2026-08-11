@@ -1,0 +1,37 @@
+name: task-093ac-r1
+
+on:
+  push:
+    branches:
+      - task/093ac-subcon-canonical-af-runtime-config-reconciliation
+
+permissions:
+  contents: write
+
+jobs:
+  fix-and-test:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Apply R1 fix
+        run: git apply .github/task-093ac-r1.patch
+      - name: Focused regression
+        run: npx vitest run scripts/agent_prompt_reconciliation.test.ts scripts/managed_runtime_config.test.ts scripts/backfill_agent_config.test.ts scripts/agent_config.test.ts
+      - name: Full suite
+        run: npm test
+      - name: Commit R1 fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm .github/task-093ac-r1.patch .github/workflows/task-093ac-r1.yml
+          git add scripts/agent_config.ts scripts/agent_prompt_reconciliation.test.ts
+          git commit -m "task 093ac: preserve canonical model after reconciliation"
+          git push
