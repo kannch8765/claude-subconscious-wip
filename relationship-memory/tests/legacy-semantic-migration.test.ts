@@ -138,6 +138,13 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(runtime.createMemory({ ...sharedProposal(), historical_temporality: LEGACY_FEEL_TEMPORALITY }).outcome).toBe('created');
     const schema = legacyMemoryCreateToolSchema(s) as any;
     expect(schema.required).toContain('historical_temporality');
+    expect(schema.properties.payload.additionalProperties).toBe(false);
+    expect(schema.properties.payload.properties).toMatchObject({
+      experience: { type: 'string' }, shared_meaning: { type: 'string' }, meaning: { type: 'string' },
+      trigger_phrases: { type: 'array' }, preference: { type: 'string' },
+    });
+    expect(schema.properties.payload.description).toContain('personal_experience requires: title, experience');
+    expect(schema.properties.payload.description).toContain('never probe the schema');
   });
 
   it('recovers idempotently after canonical mutation before source checkpoint', async () => {
@@ -159,6 +166,26 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(new RelationshipMemoryStore(root, 'subject-kohaku').listMemories()).toHaveLength(1);
     expect(new LegacyMemorySourceStore(root).listProvenance()).toHaveLength(1);
     expect(listLegacySemanticReceipts(root).map((r) => r.result)).toEqual(['retryable_failure', 'completed']);
+  });
+
+
+  it('treats historical agent UUID fields as non-authoritative checkpoint debris', () => {
+    const root = temp(); const s = source('agent-unbound-state'); seed(root, s);
+    const file = path.join(root, 'legacy-semantic-migration-state.json');
+    fs.writeFileSync(file, JSON.stringify({
+      schema_version: 1,
+      manifest_digest: manifest,
+      canonical_subject_id: canonicalSubject,
+      processed_source_ids: [],
+      agent_id: 'agent-old-historical-binding',
+      conversation_id: 'conv-old-historical-binding',
+    }));
+    expect(loadLegacySemanticState(file, manifest, canonicalSubject)).toEqual({
+      schema_version: 1,
+      manifest_digest: manifest,
+      canonical_subject_id: canonicalSubject,
+      processed_source_ids: [],
+    });
   });
 
   it('fails closed on manifest/state mismatch and processed-without-terminal-receipt corruption', async () => {

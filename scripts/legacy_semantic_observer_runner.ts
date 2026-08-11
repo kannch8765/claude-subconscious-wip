@@ -4,6 +4,7 @@ import {
 } from '../relationship-memory/src/legacy/index.js';
 import {
   LegacySemanticMutationRuntime,
+  LEGACY_MEMORY_PAYLOAD_GUIDE,
   legacyMemoryCreateToolSchema,
   legacyMemoryExistingToolSchema,
   legacySourceCompleteToolSchema,
@@ -44,7 +45,10 @@ function sourceMessage(source: LegacyAssistantMemorySourceRecord): string {
     '',
     'You are processing exactly one immutable legacy source in this run.',
     'Use memory_search before deciding duplicate/reinforcement versus creation when useful.',
+    'Preserve actor/action fidelity literally: assistant-authored provenance does NOT make an unstated actor the assistant. If the source omits who performed an action, keep the canonical prose actorless/neutral. Preserve explicit names as written unless this source itself establishes an identity mapping; never silently map Sol, Sonnet, 晴, ゆう, Claude, GPT, or another named actor onto user/assistant.',
     'Use legacy_memory_create once per distinct canonical semantic item; one source may require several calls.',
+    'The payload contract is fully specified below. Never make test/probe/placeholder create calls to discover schema fields; every create call mutates canonical memory and must be source-faithful.',
+    LEGACY_MEMORY_PAYLOAD_GUIDE,
     'Use legacy_memory_duplicate_link for an already-canonical semantic item that needs provenance but no reinforcement.',
     'Use legacy_memory_reinforce only when this historical source genuinely reinforces the same underlying canonical memory.',
     'When semantic processing is finished, you MUST call legacy_source_complete with completed, or no_memory_required if and only if no canonical provenance was written.',

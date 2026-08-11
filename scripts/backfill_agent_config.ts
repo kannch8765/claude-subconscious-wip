@@ -36,7 +36,29 @@ const REQUIRED_TAGS = [
 export const BACKFILL_PURPOSE_TAG = REQUIRED_TAGS[2];
 
 interface BackfillConfig { agentId?: string; importedAt?: string; }
-interface AgentDetails { id: string; name?: string; system?: string; tags?: string[]; }
+interface AgentDetails {
+  id: string;
+  name?: string;
+  system?: string;
+  tags?: string[];
+  model?: string | null;
+  embedding?: string | null;
+  llm_config?: { handle?: string; context_window?: number; parallel_tool_calls?: boolean };
+  embedding_config?: { handle?: string } | null;
+  model_settings?: { parallel_tool_calls?: boolean } | null;
+}
+
+export interface BackfillAgentResolveOptions {
+  agentId?: string;
+  reconcileCanonicalPrompt?: boolean;
+}
+
+export const LEGACY_FILL_VERIFIED_RUNTIME = {
+  model: 'opencode-deepseek/deepseek-v4-flash',
+  embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
+  contextWindow: 400_000,
+  parallelToolCalls: true,
+} as const;
 
 function configFile(): string {
   return process.env.LETTA_BACKFILL_CONFIG_FILE || DEFAULT_CONFIG_FILE;
@@ -79,22 +101,50 @@ async function patchAgent(apiKey: string, agentId: string, body: Record<string, 
   });
   if (!response.ok) throw new Error(`${reason}: ${response.status} ${await response.text()}`);
 }
-async function reconcileDedicatedAgent(apiKey: string, agentId: string): Promise<void> {
+async function reconcileDedicatedAgent(apiKey: string, agentId: string, reconcileCanonicalPrompt = true): Promise<void> {
   const agent = await fetchAgent(apiKey, agentId);
   const tags = Array.isArray(agent.tags) ? agent.tags : [];
   const missingTags = REQUIRED_TAGS.filter((tag) => !tags.includes(tag));
   if (missingTags.length) {
     await patchAgent(apiKey, agentId, { tags: [...tags, ...missingTags] }, 'Failed to reconcile dedicated backfill agent tags');
   }
-  const canonicalSystem = getCanonicalManagedSystemPrompt();
-  await reconcileManagedAgentConfiguration(apiKey, agentId);
+  const canonicalSystem = reconcileCanonicalPrompt ? getCanonicalManagedSystemPrompt() : undefined;
+  if (reconcileCanonicalPrompt) {
+    await reconcileManagedAgentConfiguration(apiKey, agentId);
+  }
   const verified = await fetchAgent(apiKey, agentId);
   if (!Array.isArray(verified.tags) || !verified.tags.includes(BACKFILL_PURPOSE_TAG)) {
     throw new Error(`Dedicated backfill agent is missing required purpose tag: ${BACKFILL_PURPOSE_TAG}`);
   }
-  if (verified.system !== canonicalSystem) {
+  if (canonicalSystem !== undefined && verified.system !== canonicalSystem) {
     throw new Error('Dedicated backfill agent system prompt does not match canonical Subconscious.af');
   }
+}
+
+export async function configureVerifiedLegacyFillRuntime(
+  apiKey: string,
+  agentId: string,
+  log: (message: string) => void = console.log,
+): Promise<void> {
+  const profile = LEGACY_FILL_VERIFIED_RUNTIME;
+  await patchAgent(apiKey, agentId, {
+    model: profile.model,
+    embedding: profile.embedding,
+    context_window_limit: profile.contextWindow,
+    model_settings: { provider_type: 'deepseek', parallel_tool_calls: profile.parallelToolCalls },
+  }, 'Failed to apply verified legacy fill runtime');
+
+  const verified = await fetchAgent(apiKey, agentId);
+  const modelHandle = verified.model ?? verified.llm_config?.handle;
+  const embeddingHandle = verified.embedding ?? verified.embedding_config?.handle;
+  if (modelHandle !== profile.model) throw new Error(`Legacy fill runtime model mismatch after PATCH: ${modelHandle ?? 'missing'}`);
+  if (embeddingHandle !== profile.embedding) throw new Error(`Legacy fill runtime embedding mismatch after PATCH: ${embeddingHandle ?? 'missing'}`);
+  if (verified.llm_config?.context_window !== profile.contextWindow) {
+    throw new Error(`Legacy fill runtime context mismatch after PATCH: ${verified.llm_config?.context_window ?? 'missing'}`);
+  }
+  const parallel = verified.model_settings?.parallel_tool_calls ?? verified.llm_config?.parallel_tool_calls;
+  if (parallel !== true) throw new Error('Legacy fill runtime parallel_tool_calls was not enabled');
+  log(`Verified legacy fill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=true`);
 }
 async function importDedicatedAgent(apiKey: string): Promise<string> {
   const file = fs.readFileSync(DEFAULT_AGENT_FILE);
@@ -114,14 +164,16 @@ async function importDedicatedAgent(apiKey: string): Promise<string> {
   return agentId;
 }
 
-export async function getBackfillAgentId(apiKey: string, log: (message: string) => void = console.log): Promise<string> {
+export async function getBackfillAgentId(apiKey: string, log: (message: string) => void = console.log, options: BackfillAgentResolveOptions = {}): Promise<string> {
   const liveAgentId = knownLiveAgentId();
-  const explicit = process.env.LETTA_BACKFILL_AGENT_ID;
+  const explicit = options.agentId ?? process.env.LETTA_BACKFILL_AGENT_ID;
   let agentId: string;
   if (explicit) {
     assertDedicated(explicit, liveAgentId);
     agentId = explicit;
-    log(`Using dedicated backfill agent from LETTA_BACKFILL_AGENT_ID: ${agentId}`);
+    log(options.agentId
+      ? `Using explicit dedicated backfill agent: ${agentId}`
+      : `Using dedicated backfill agent from LETTA_BACKFILL_AGENT_ID: ${agentId}`);
   } else {
     const config = readBackfillConfig();
     if (config.agentId) {
@@ -135,6 +187,6 @@ export async function getBackfillAgentId(apiKey: string, log: (message: string) 
       log(`Provisioned dedicated backfill agent: ${agentId}`);
     }
   }
-  await reconcileDedicatedAgent(apiKey, agentId);
+  await reconcileDedicatedAgent(apiKey, agentId, options.reconcileCanonicalPrompt ?? true);
   return agentId;
 }

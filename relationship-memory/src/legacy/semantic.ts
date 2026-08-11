@@ -14,6 +14,17 @@ import {
 export const LEGACY_FEEL_TEMPORALITY = 'historical_at_source_time' as const;
 export const OMBRE_LEGACY_FROZEN_MANIFEST_DIGEST = '5226a04525e4fef5bffa8e76b41526aa46d147ac1c861e22d79d04912314ae31' as const;
 
+
+export const LEGACY_MEMORY_PAYLOAD_GUIDE = [
+  'legacy_memory_create payload fields are kind-specific; never probe the schema with test or placeholder memories.',
+  'personal_experience requires: title, experience. Optional: time_text, places[], themes[], emotional_tone, why_memorable, recall_triggers[].',
+  'shared_experience requires: title, event, shared_meaning. Optional: symbols[], recall_triggers[].',
+  'relationship_event requires: event, meaning. Optional: prior_context, resulting_change.',
+  'inside_joke requires: name, meaning, trigger_phrases[] (non-empty). Optional: origin, callbacks[], tone.',
+  'user_preference requires: topic, preference. Optional: context, reason, recall_triggers[].',
+  'Only send fields allowed for the selected kind, and every create call must be a source-faithful canonical proposal.',
+].join('\n');
+
 export type LegacySemanticCompletion = 'completed' | 'no_memory_required' | 'retryable_failure';
 
 export interface LegacySemanticMutationResult {
@@ -27,8 +38,6 @@ export interface LegacySemanticState {
   manifest_digest: string;
   canonical_subject_id: string;
   processed_source_ids: string[];
-  agent_id?: string;
-  conversation_id?: string;
 }
 
 export interface LegacySemanticReceipt {
@@ -298,7 +307,33 @@ export function legacyMemoryCreateToolSchema(source: LegacyAssistantMemorySource
       historical_temporality: { type: 'string', enum: [LEGACY_FEEL_TEMPORALITY], description: 'Required for feel/ sources: this prose describes the historical source-time feeling, never a current-state assertion.' },
       payload: {
         type: 'object',
-        description: 'Kind-specific canonical relationship-memory payload. DS-authored semantic prose must be Chinese; source-faithful names/triggers may remain literal.',
+        additionalProperties: false,
+        description: `${LEGACY_MEMORY_PAYLOAD_GUIDE} DS-authored semantic prose must be Chinese; source-faithful names/triggers may remain literal.`,
+        properties: {
+          title: string,
+          experience: string,
+          time_text: string,
+          places: strings,
+          themes: strings,
+          emotional_tone: string,
+          why_memorable: string,
+          recall_triggers: strings,
+          event: string,
+          shared_meaning: string,
+          symbols: strings,
+          meaning: string,
+          prior_context: string,
+          resulting_change: string,
+          name: string,
+          trigger_phrases: strings,
+          origin: string,
+          callbacks: strings,
+          tone: string,
+          topic: string,
+          preference: string,
+          context: string,
+          reason: string,
+        },
       },
     },
   };
@@ -324,7 +359,12 @@ export function loadLegacySemanticState(file: string, manifestDigest: string, ca
   }
   if (parsed.manifest_digest !== manifestDigest) throw new Error('legacy semantic migration state is bound to a different manifest');
   if (parsed.canonical_subject_id !== canonicalSubjectId) throw new Error('legacy semantic migration state is bound to a different canonical subject');
-  return parsed;
+  return {
+    schema_version: 1,
+    manifest_digest: parsed.manifest_digest,
+    canonical_subject_id: parsed.canonical_subject_id,
+    processed_source_ids: [...parsed.processed_source_ids],
+  };
 }
 
 export function saveLegacySemanticState(file: string, state: LegacySemanticState): void { atomicWriteJson(file, state); }
