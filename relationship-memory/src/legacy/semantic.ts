@@ -25,6 +25,48 @@ export const LEGACY_MEMORY_PAYLOAD_GUIDE = [
   'Only send fields allowed for the selected kind, and every create call must be a source-faithful canonical proposal.',
 ].join('\n');
 
+const LEGACY_CREDENTIAL_PATTERNS = [
+  /(?:password|passwd|pwd|密码)\s*(?:[:=：]\s*)?["'`]?([^\s"'`,;，。]+)/giu,
+  /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|auth[_ -]?token|secret|密钥|令牌)\s*[:=：]\s*["'`]?([A-Za-z0-9._~+/=-]{4,})/giu,
+  /Bearer\s+([A-Za-z0-9._~+/=-]{4,})/giu,
+] as const;
+
+function sourceTextValues(source: LegacyAssistantMemorySourceRecord): string[] {
+  return [source.original_markdown, source.body_text, JSON.stringify(source.frontmatter)];
+}
+
+export function extractLegacyCredentialValues(source: LegacyAssistantMemorySourceRecord): string[] {
+  const values = new Set<string>();
+  for (const text of sourceTextValues(source)) {
+    for (const pattern of LEGACY_CREDENTIAL_PATTERNS) {
+      pattern.lastIndex = 0;
+      for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+        const value = match[1]?.trim();
+        if (value && value.length >= 4) values.add(value);
+      }
+    }
+  }
+  return [...values];
+}
+
+function redactLegacyCredentialValues(value: unknown, credentials: readonly string[]): unknown {
+  if (typeof value === 'string') {
+    return credentials.reduce((text, credential) => text.split(credential).join('[REDACTED]'), value);
+  }
+  if (Array.isArray(value)) return value.map((item) => redactLegacyCredentialValues(item, credentials));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .map(([key, item]) => [key, redactLegacyCredentialValues(item, credentials)]));
+  }
+  return value;
+}
+
+export function sanitizeLegacySourceForObserver(source: LegacyAssistantMemorySourceRecord): LegacyAssistantMemorySourceRecord {
+  const credentials = extractLegacyCredentialValues(source);
+  if (credentials.length === 0) return source;
+  return redactLegacyCredentialValues(source, credentials) as LegacyAssistantMemorySourceRecord;
+}
+
 export type LegacySemanticCompletion = 'completed' | 'no_memory_required' | 'retryable_failure';
 
 export interface LegacySemanticMutationResult {
@@ -174,6 +216,11 @@ export class LegacySemanticMutationRuntime {
       ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}),
     }, { requireChineseSemanticProse: true });
     if (!semantic.ok || !semantic.content) return { ok: false, reason: `${semantic.code ?? 'invalid_schema'}: ${semantic.reason ?? 'invalid semantic content'}` };
+    const sourceCredentials = extractLegacyCredentialValues(this.source);
+    const proposalText = stableJson(semantic.content);
+    if (sourceCredentials.some((credential) => proposalText.includes(credential))) {
+      return { ok: false, reason: 'legacy proposal contains source credential material' };
+    }
     for (const memoryId of semantic.content.linked_memory_ids ?? []) {
       if (!this.canonicalMemory(memoryId)) return { ok: false, reason: `unknown linked memory: ${memoryId}` };
     }

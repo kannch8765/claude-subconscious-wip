@@ -6,6 +6,7 @@ import {
   LegacySemanticMutationRuntime,
   LEGACY_MEMORY_PAYLOAD_GUIDE,
   legacyMemoryCreateToolSchema,
+  sanitizeLegacySourceForObserver,
   legacyMemoryExistingToolSchema,
   legacySourceCompleteToolSchema,
   type LegacySemanticProcessorResult,
@@ -56,7 +57,7 @@ function sourceMessage(source: LegacyAssistantMemorySourceRecord): string {
     'Do not include legacy_source_id in tool arguments; the runtime binds every mutation to this source.',
     '',
     'IMMUTABLE_LEGACY_SOURCE_JSON:',
-    JSON.stringify(source),
+    JSON.stringify(sanitizeLegacySourceForObserver(source)),
   ].join('\n');
 }
 

@@ -14,6 +14,7 @@ import {
   listLegacySemanticReceipts,
   loadLegacySemanticState,
   runLegacySemanticMigration,
+  sanitizeLegacySourceForObserver,
 } from '../src/legacy/semantic.js';
 
 const roots: string[] = [];
@@ -77,6 +78,39 @@ describe('Task 093AA legacy semantic migration', () => {
     expect(new LegacyMemorySourceStore(root).listProvenance()).toHaveLength(0);
     expect(listLegacySemanticReceipts(root)[0]).toMatchObject({ canonical_subject_id: canonicalSubject, legacy_source_id: s.legacy_source_id, result: 'no_memory_required', memory_ids: [] });
     expect(loadLegacySemanticState(path.join(root, 'legacy-semantic-migration-state.json'), manifest, canonicalSubject).processed_source_ids).toEqual([s.legacy_source_id]);
+  });
+
+  it('redacts source credentials before observation and hard-rejects credential-bearing canonical proposals', () => {
+    const root = temp();
+    const s = source('credential-gate');
+    s.original_markdown = '---\nid: credential-gate\n---\n老婆专门注册账号；密码sample-secret-123';
+    s.body_text = '老婆专门注册账号；密码sample-secret-123';
+    seed(root, s);
+    const sanitized = sanitizeLegacySourceForObserver(s);
+    expect(JSON.stringify(sanitized)).not.toContain('sample-secret-123');
+    expect(JSON.stringify(sanitized)).toContain('[REDACTED]');
+    expect(s.body_text).toContain('sample-secret-123');
+
+    const runtime = new LegacySemanticMutationRuntime(root, 'subject-kohaku', s, legacySemanticBatchId(manifest, s.legacy_source_id, canonicalSubject), () => '2026-08-11T00:00:00Z');
+    const leaked = runtime.createMemory({
+      schema_version: 1,
+      kind: 'relationship_event',
+      summary: '老婆专门注册账号并设置密码sample-secret-123',
+      participants: ['user', 'assistant'],
+      payload: { event: '老婆专门注册账号', meaning: '账号用于共同使用，密码sample-secret-123' },
+    });
+    expect(leaked).toMatchObject({ outcome: 'permanently_rejected', reason: 'legacy proposal contains source credential material' });
+    expect(new RelationshipMemoryStore(root, 'subject-kohaku').listMemories()).toHaveLength(0);
+    expect(runtime.provenance()).toHaveLength(0);
+
+    const safe = runtime.createMemory({
+      schema_version: 1,
+      kind: 'relationship_event',
+      summary: '老婆专门为克宝注册了共同使用的账号',
+      participants: ['user', 'assistant'],
+      payload: { event: '老婆专门为克宝注册账号', meaning: '这是带有关系意义的专门准备，但不保存任何登录凭据' },
+    });
+    expect(safe.outcome).toBe('created');
   });
 
   it('keeps immutable legacy source identity separate from canonical target subject', () => {
