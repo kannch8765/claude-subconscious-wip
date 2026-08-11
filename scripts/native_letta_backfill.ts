@@ -52,7 +52,7 @@ function stable(value: unknown): string {
   return JSON.stringify(value);
 }
 
-const COMPLETION_TOOL_SOURCE = `def legacy_source_complete(result: str) -> str:\n    \"\"\"Mark one legacy semantic source complete. The caller validates local provenance after the terminal call.\"\"\"\n    if result not in (\"completed\", \"no_memory_required\"):\n        raise ValueError(\"result must be completed or no_memory_required\")\n    return result\n`;
+const COMPLETION_TOOL_SOURCE = `def legacy_source_complete(result) -> str:\n    \"\"\"Mark one legacy semantic source complete. The caller validates local provenance after the terminal call.\"\"\"\n    normalized = getattr(result, \"value\", result)\n    if normalized not in (\"completed\", \"no_memory_required\"):\n        raise ValueError(\"result must be completed or no_memory_required\")\n    return normalized\n`;
 
 export async function ensureLegacyCompletionTool(
   client: NativeLettaClientLike,
@@ -121,15 +121,40 @@ export function extractToolCalls(messages: readonly any[] = []): ToolCall[] {
   return calls;
 }
 
-export function extractLegacyCompletion(messages: readonly any[] = []): 'completed' | 'no_memory_required' | undefined {
-  const completions = extractToolCalls(messages).filter((call) => call.name === LEGACY_COMPLETION_TOOL_NAME);
-  if (completions.length === 0) return undefined;
-  const values = completions.map((call) => {
+function toolReturns(messages: readonly any[] = []): Array<{ toolCallId: string; status: 'success' | 'error' }> {
+  const returns: Array<{ toolCallId: string; status: 'success' | 'error' }> = [];
+  for (const message of messages) {
+    const nested = Array.isArray(message?.tool_returns) ? message.tool_returns : [];
+    for (const item of nested) {
+      if (typeof item?.tool_call_id !== 'string') continue;
+      if (item?.status !== 'success' && item?.status !== 'error') continue;
+      returns.push({ toolCallId: item.tool_call_id, status: item.status });
+    }
+    if (typeof message?.tool_call_id === 'string' && (message?.status === 'success' || message?.status === 'error')) {
+      returns.push({ toolCallId: message.tool_call_id, status: message.status });
+    }
+  }
+  return returns;
+}
+
+function legacyCompletionCalls(messages: readonly any[] = []): Array<{ toolCallId: string; result: 'completed' | 'no_memory_required' }> {
+  const completionCalls = extractToolCalls(messages).filter((call) => call.name === LEGACY_COMPLETION_TOOL_NAME);
+  return completionCalls.map((call) => {
     const args = parseToolArguments(call.arguments);
-    return args?.result === 'no_memory_required' ? 'no_memory_required' : args?.result === 'completed' ? 'completed' : undefined;
+    const result = args?.result === 'no_memory_required' ? 'no_memory_required' : args?.result === 'completed' ? 'completed' : undefined;
+    if (!result) throw new Error('legacy_source_complete returned invalid arguments');
+    if (!call.toolCallId) throw new Error('legacy_source_complete is missing tool_call_id');
+    return { toolCallId: call.toolCallId, result };
   });
-  if (values.some((value) => !value)) throw new Error('legacy_source_complete returned invalid arguments');
-  const unique = [...new Set(values)];
+}
+
+export function extractLegacyCompletion(messages: readonly any[] = []): 'completed' | 'no_memory_required' | undefined {
+  const calls = legacyCompletionCalls(messages);
+  if (calls.length === 0) return undefined;
+  const returns = toolReturns(messages);
+  const successful = calls.filter((call) => returns.some((item) => item.toolCallId === call.toolCallId && item.status === 'success'));
+  if (successful.length === 0) return undefined;
+  const unique = [...new Set(successful.map((call) => call.result))];
   if (unique.length !== 1) throw new Error('legacy_source_complete returned conflicting terminal results');
   return unique[0];
 }
@@ -205,7 +230,9 @@ export async function runNativeClientToolConversation(input: {
 }): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
-  let clientToolFailure = false;
+  let hardClientToolFailure = false;
+  const unresolvedParseFailures = new Map<string, number>();
+  const pendingTerminalCalls = new Map<string, 'completed' | 'no_memory_required'>();
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
   let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
     agent_id: input.agentId,
@@ -216,30 +243,57 @@ export async function runNativeClientToolConversation(input: {
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const messages = Array.isArray(response?.messages) ? response.messages : [];
-    const terminal = extractLegacyCompletion(messages);
-    if (terminal) {
+    for (const call of legacyCompletionCalls(messages)) pendingTerminalCalls.set(call.toolCallId, call.result);
+    for (const returned of toolReturns(messages)) {
+      const terminal = pendingTerminalCalls.get(returned.toolCallId);
+      if (!terminal) continue;
+      pendingTerminalCalls.delete(returned.toolCallId);
+      if (returned.status !== 'success') continue;
       if (terminalSeen && terminalSeen !== terminal) {
         throw new Error('Letta returned conflicting legacy_source_complete results across approval rounds');
       }
       terminalSeen = terminal;
     }
     const requests = approvalRequests(messages);
-    if (requests.length === 0) return { response, clientToolFailure, terminal: terminalSeen };
+    if (requests.length === 0) {
+      const unresolvedParseFailure = [...unresolvedParseFailures.values()].some((count) => count > 0);
+      return { response, clientToolFailure: hardClientToolFailure || unresolvedParseFailure, terminal: terminalSeen };
+    }
 
     const approvals: any[] = [];
+    const successesThisRound = new Map<string, number>();
+    const parseFailuresThisRound = new Map<string, number>();
     for (const request of requests) {
       const tool = tools.get(request.name);
       if (!tool) throw new Error(`Letta requested unknown legacy client tool: ${request.name}`);
       let status: 'success' | 'error' = 'success';
       let result: string;
+      let args: any;
       try {
-        result = toolReturn(await tool.execute(request.toolCallId, parseToolArguments(request.arguments)));
+        args = parseToolArguments(request.arguments);
       } catch (error) {
         status = 'error';
-        clientToolFailure = true;
+        parseFailuresThisRound.set(request.name, (parseFailuresThisRound.get(request.name) ?? 0) + 1);
+        result = error instanceof Error ? error.message : String(error);
+        approvals.push({ type: 'tool', tool_call_id: request.toolCallId, tool_return: result, status });
+        continue;
+      }
+      try {
+        result = toolReturn(await tool.execute(request.toolCallId, args));
+        successesThisRound.set(request.name, (successesThisRound.get(request.name) ?? 0) + 1);
+      } catch (error) {
+        status = 'error';
+        hardClientToolFailure = true;
         result = error instanceof Error ? error.message : String(error);
       }
       approvals.push({ type: 'tool', tool_call_id: request.toolCallId, tool_return: result, status });
+    }
+    for (const [name, successes] of successesThisRound) {
+      const unresolved = unresolvedParseFailures.get(name) ?? 0;
+      if (unresolved > 0) unresolvedParseFailures.set(name, Math.max(0, unresolved - successes));
+    }
+    for (const [name, failures] of parseFailuresThisRound) {
+      unresolvedParseFailures.set(name, (unresolvedParseFailures.get(name) ?? 0) + failures);
     }
 
     response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {

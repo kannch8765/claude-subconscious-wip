@@ -53,6 +53,13 @@ function fakeClient(responses: any[] = []): NativeLettaClientLike & { bodies: an
   };
 }
 
+function terminalMessages(result: 'completed' | 'no_memory_required', toolCallId = 'terminal'): any[] {
+  return [
+    { message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: JSON.stringify({ result }), tool_call_id: toolCallId } },
+    { message_type: 'tool_return_message', tool_call_id: toolCallId, status: 'success', tool_return: result },
+  ];
+}
+
 describe('native Letta legacy backfill harness', () => {
   it('reconciles required-before-exit plus terminal rules without deleting unrelated rules', () => {
     expect(reconcileLegacyCompletionRules([
@@ -70,7 +77,12 @@ describe('native Letta legacy backfill harness', () => {
     const first = await ensureLegacyCompletionTool(client, 'agent-test');
     expect(first).toMatchObject({ toolId: 'tool-native-terminal', attached: true, rulesChanged: true });
     expect(client.attachments).toEqual(['tool-native-terminal']);
-    expect(client.upserts[0]).toEqual(expect.objectContaining({ enable_parallel_execution: false }));
+    expect(client.upserts[0]).toEqual(expect.objectContaining({
+      enable_parallel_execution: false,
+      args_json_schema: expect.objectContaining({ title: 'LegacySourceCompleteArgs' }),
+      source_code: expect.stringContaining('getattr(result, \"value\", result)'),
+    }));
+    expect(client.upserts[0].source_code).toContain('def legacy_source_complete(result) -> str:');
     expect(client.updates).toHaveLength(1);
     expect((client.updates[0].tool_rules as any[]).slice(-2)).toEqual([
       { type: 'required_before_exit', tool_name: LEGACY_COMPLETION_TOOL_NAME },
@@ -86,7 +98,7 @@ describe('native Letta legacy backfill harness', () => {
   it('executes local client tools through native approval returns then accepts a server terminal call', async () => {
     const client = fakeClient([
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"京都"}', tool_call_id: 'call-1' } }], stop_reason: 'requires_approval' },
-      { messages: [{ message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{"result":"no_memory_required"}', tool_call_id: 'call-2' } }], stop_reason: 'tool_rule' },
+      { messages: terminalMessages('no_memory_required', 'call-2'), stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
     const result = await runNativeClientToolConversation({
@@ -124,7 +136,7 @@ describe('native Letta legacy backfill harness', () => {
         }],
         stop_reason: 'requires_approval',
       },
-      { messages: [{ message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{\"result\":\"no_memory_required\"}', tool_call_id: 'terminal' } }], stop_reason: 'tool_rule' },
+      { messages: terminalMessages('no_memory_required'), stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
     const result = await runNativeClientToolConversation({
@@ -156,7 +168,7 @@ describe('native Letta legacy backfill harness', () => {
         ],
         stop_reason: 'requires_approval',
       },
-      { messages: [], stop_reason: 'tool_rule' },
+      { messages: [{ message_type: 'tool_return_message', tool_call_id: 'terminal', status: 'success', tool_return: 'completed' }], stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
     const result = await runNativeClientToolConversation({
@@ -175,4 +187,57 @@ describe('native Letta legacy backfill harness', () => {
       tool_returns: [{ type: 'tool', tool_call_id: 'mutation', tool_return: '{"outcome":"accepted"}', status: 'success' }],
     }]);
   });
+  it('requires a successful server tool return before accepting legacy_source_complete', async () => {
+    const messages = [
+      { message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{"result":"completed"}', tool_call_id: 'terminal-failed' } },
+      { message_type: 'tool_return_message', tool_call_id: 'terminal-failed', status: 'error', tool_return: 'server tool failed' },
+    ];
+    expect(extractLegacyCompletion(messages)).toBeUndefined();
+  });
+
+  it('clears a malformed-arguments client-tool failure only after a later round succeeds for the same tool', async () => {
+    const client = fakeClient([
+      {
+        messages: [{ message_type: 'approval_request_message', tool_calls: [
+          { name: 'legacy_memory_create', arguments: '{bad-json', tool_call_id: 'bad' },
+          { name: 'legacy_memory_create', arguments: '{"item":"other"}', tool_call_id: 'same-round-success' },
+        ] }],
+        stop_reason: 'requires_approval',
+      },
+      {
+        messages: [{ message_type: 'approval_request_message', tool_call: { name: 'legacy_memory_create', arguments: '{"item":"retry"}', tool_call_id: 'retry' } }],
+        stop_reason: 'requires_approval',
+      },
+      { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
+    ]);
+    const seen: unknown[] = [];
+    const result = await runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{
+        name: 'legacy_memory_create', description: 'create', parameters: {},
+        async execute(_id, args) { seen.push(args); return { outcome: 'accepted' }; },
+      }],
+    });
+    expect(seen).toEqual([{ item: 'other' }, { item: 'retry' }]);
+    expect(result.clientToolFailure).toBe(false);
+    expect(result.terminal).toBe('completed');
+    expect(client.bodies[1].messages[0].tool_returns).toEqual([
+      expect.objectContaining({ tool_call_id: 'bad', status: 'error' }),
+      expect.objectContaining({ tool_call_id: 'same-round-success', status: 'success' }),
+    ]);
+  });
+
+  it('keeps a malformed-arguments failure unresolved when the model never retries that client tool', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{bad-json', tool_call_id: 'bad' } }], stop_reason: 'requires_approval' },
+      { messages: terminalMessages('no_memory_required'), stop_reason: 'tool_rule' },
+    ]);
+    const result = await runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { return { results: [] }; } }],
+    });
+    expect(result.clientToolFailure).toBe(true);
+    expect(result.terminal).toBe('no_memory_required');
+  });
+
 });
