@@ -1,23 +1,21 @@
 import type { LegacyAssistantMemorySourceRecord } from '../relationship-memory/src/legacy/index.js';
-import {
-  LEGACY_OBSERVER_CONTRACT,
-} from '../relationship-memory/src/legacy/index.js';
+import { LEGACY_OBSERVER_CONTRACT } from '../relationship-memory/src/legacy/index.js';
 import {
   LegacySemanticMutationRuntime,
   LEGACY_MEMORY_PAYLOAD_GUIDE,
   legacyMemoryCreateToolSchema,
   sanitizeLegacySourceForObserver,
   legacyMemoryExistingToolSchema,
-  legacySourceCompleteToolSchema,
   type LegacySemanticProcessorResult,
 } from '../relationship-memory/src/legacy/semantic.js';
-import {
-  buildRelationshipTools,
-  createRuntime,
-  RELATIONSHIP_DISALLOWED_CLIENT_TOOLS,
-} from '../relationship-memory/src/adapter/index.js';
+import { buildRelationshipTools, createRuntime } from '../relationship-memory/src/adapter/index.js';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
-import { disableLettaCodeAutoUpdater } from './letta_code_runtime_env.js';
+import {
+  extractLegacyCompletion,
+  runNativeClientToolConversation,
+  type NativeClientTool,
+  type NativeLettaClientLike,
+} from './native_letta_backfill.js';
 
 export interface LegacySemanticObserverInput {
   agentId: string;
@@ -26,19 +24,9 @@ export interface LegacySemanticObserverInput {
   batchId: string;
   rootDir: string;
   subjectId: string;
-  cwd: string;
+  client: NativeLettaClientLike;
   log?: (message: string) => void;
 }
-
-const LEGACY_ALLOWED_TOOLS = [
-  'memory_search',
-  'legacy_memory_create',
-  'legacy_memory_duplicate_link',
-  'legacy_memory_reinforce',
-  'legacy_source_complete',
-] as const;
-
-const LEGACY_EXTRA_DISALLOWED = ['memory_remember', 'memory_reinforce', 'entity_search', 'entity_remember'] as const;
 
 function sourceMessage(source: LegacyAssistantMemorySourceRecord): string {
   return [
@@ -72,83 +60,63 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
 
   const mutationRuntime = new LegacySemanticMutationRuntime(input.rootDir, input.subjectId, input.source, input.batchId);
   const searchRuntime = createRuntime([], input.subjectId, input.rootDir);
-  let session: any = null;
   let sessionSucceeded = true;
   let toolRetryableFailure = false;
   let toolPermanentlyRejected = false;
 
   try {
-    disableLettaCodeAutoUpdater();
-    const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
-    const searchTool = buildRelationshipTools(searchRuntime, input.batchId, jsonResult).find((tool) => tool.name === 'memory_search');
+    const searchTool = buildRelationshipTools(searchRuntime, input.batchId).find((tool) => tool.name === 'memory_search');
     if (!searchTool) throw new Error('memory_search tool unavailable for legacy semantic observer');
 
     const wrapMutation = (fn: (args: any) => any) => async (_toolCallId: string, args: unknown) => {
       const result = fn(args);
       if (result?.outcome === 'retryable_failed') toolRetryableFailure = true;
       if (result?.outcome === 'permanently_rejected') toolPermanentlyRejected = true;
-      return jsonResult(result);
+      return result;
     };
-    const tools: any[] = [
+    const tools: NativeClientTool[] = [
       searchTool,
       {
-        label: 'legacy_memory_create', name: 'legacy_memory_create',
+        name: 'legacy_memory_create',
         description: 'Create or dedupe-link one canonical relationship memory derived from the currently bound immutable legacy source. The source identity is backend-bound. For feel/ sources historical_temporality is required.',
         parameters: legacyMemoryCreateToolSchema(input.source),
         execute: wrapMutation((args) => mutationRuntime.createMemory(args)),
       },
       {
-        label: 'legacy_memory_duplicate_link', name: 'legacy_memory_duplicate_link',
+        name: 'legacy_memory_duplicate_link',
         description: 'Link the currently bound immutable legacy source to one existing canonical memory that already represents this semantic item; does not create a new memory.',
         parameters: legacyMemoryExistingToolSchema(),
         execute: wrapMutation((args) => mutationRuntime.duplicateLink(typeof args?.memory_id === 'string' ? args.memory_id : '')),
       },
       {
-        label: 'legacy_memory_reinforce', name: 'legacy_memory_reinforce',
+        name: 'legacy_memory_reinforce',
         description: 'Reinforce one existing canonical memory from the currently bound immutable legacy source and record legacy provenance. Use only for the same underlying semantic memory, not lexical similarity.',
         parameters: legacyMemoryExistingToolSchema(),
         execute: wrapMutation((args) => mutationRuntime.reinforce(typeof args?.memory_id === 'string' ? args.memory_id : '')),
       },
-      {
-        label: 'legacy_source_complete', name: 'legacy_source_complete',
-        description: 'Explicitly finish semantic evaluation of the currently bound legacy source. Use completed only after at least one provenance outcome; use no_memory_required only when none was written.',
-        parameters: legacySourceCompleteToolSchema(),
-        async execute(_toolCallId: string, args: any) {
-          return jsonResult(mutationRuntime.complete(args?.result === 'no_memory_required' ? 'no_memory_required' : 'completed'));
-        },
-      },
     ];
 
-    const disallowedTools = [...RELATIONSHIP_DISALLOWED_CLIENT_TOOLS, ...LEGACY_EXTRA_DISALLOWED];
-    session = (resumeSession as any)(input.conversationId, {
-      disallowedTools,
-      allowedTools: [...LEGACY_ALLOWED_TOOLS],
+    log(`Sending legacy semantic source ${input.source.legacy_source_id} through native Letta conversations API`);
+    const native = await runNativeClientToolConversation({
+      client: input.client,
+      agentId: input.agentId,
+      conversationId: input.conversationId,
+      message: sourceMessage(input.source),
       tools,
-      permissionMode: 'bypassPermissions',
-      cwd: input.cwd,
-      skillSources: [],
-      systemInfoReminder: false,
-      sleeptime: { trigger: 'off' },
-      memfsStartup: 'skip',
     });
-    const init = await session.initialize();
-    const known = new Set<string>([...LEGACY_ALLOWED_TOOLS, ...disallowedTools]);
-    const unexpected = [...new Set((Array.isArray(init?.tools) ? init.tools : []).filter((name: string) => !known.has(name)))].sort();
-    if (unexpected.length) throw new Error(`Unexpected Letta Code tool inventory for legacy semantic observer: ${unexpected.join(', ')}`);
+    if (native.clientToolFailure) toolRetryableFailure = true;
 
-    log(`Sending legacy semantic source ${input.source.legacy_source_id}`);
-    await session.send(sourceMessage(input.source));
-    for await (const msg of session.stream()) {
-      if (msg.type === 'error') {
+    const terminal = extractLegacyCompletion(Array.isArray(native.response?.messages) ? native.response.messages : []);
+    if (terminal) {
+      const accepted = mutationRuntime.complete(terminal);
+      if ('error' in accepted) {
         sessionSucceeded = false;
-        log(`Legacy semantic observer error: ${(msg as any).message}`);
+        log(`Native legacy completion rejected by local provenance invariant: ${accepted.error}`);
       }
     }
   } catch (error) {
     sessionSucceeded = false;
-    log(`Legacy semantic observer session failure: ${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    if (session) session.close();
+    log(`Legacy semantic native observer failure: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   const completion = mutationRuntime.completionState();
@@ -162,13 +130,13 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
     ...(!retryable && completion === 'no_memory_required' ? { detail: 'no_memory_required' as const } : {}),
   });
   if (retryable) {
-    const pureMissingCompletion = !completion && sessionSucceeded && !toolRetryableFailure && !toolPermanentlyRejected;
     return {
       completion: 'retryable_failure',
       reason: !completion
-        ? (toolPermanentlyRejected ? 'observer ended after permanently rejected legacy mutation tool call' : 'observer ended without explicit legacy_source_complete')
-        : 'observer/tool session retryable failure',
-      ...(pureMissingCompletion ? { retry_class: 'zero_mutation_missing_completion' as const } : {}),
+        ? (toolPermanentlyRejected
+          ? 'native observer ended after permanently rejected legacy mutation tool call'
+          : 'native observer did not produce a locally valid legacy_source_complete terminal result')
+        : 'native observer/client-tool session retryable failure',
     };
   }
   return { completion };
