@@ -30,6 +30,7 @@
       "model": "opencode-deepseek/deepseek-v4-flash",
       "embedding": "local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768",
       "model_settings": {
+        "provider_type": "deepseek",
         "parallel_tool_calls": true
       },
       "compaction_settings": null,

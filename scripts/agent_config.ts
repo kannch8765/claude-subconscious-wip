@@ -76,7 +76,7 @@ interface AgentDetails {
   embedding?: string | null;
   embedding_config?: { handle?: string; embedding_model?: string; embedding_endpoint_type?: string } | null;
   context_window_limit?: number | null;
-  model_settings?: { parallel_tool_calls?: boolean; [key: string]: unknown } | null;
+  model_settings?: { provider_type?: string; parallel_tool_calls?: boolean; [key: string]: unknown } | null;
   llm_config?: LlmConfig;
 }
 
@@ -85,6 +85,7 @@ export interface CanonicalManagedAgentConfig {
   model: string;
   embedding: string;
   contextWindowLimit: number;
+  modelSettingsProviderType: string;
   parallelToolCalls: boolean;
 }
 
@@ -252,15 +253,16 @@ export function getCanonicalManagedAgentConfig(): CanonicalManagedAgentConfig {
     throw new Error('Canonical Subconscious.af must contain exactly one agent');
   }
   const agent = agents[0];
-  const modelSettings = agent.model_settings as { parallel_tool_calls?: unknown } | null | undefined;
+  const modelSettings = agent.model_settings as { provider_type?: unknown; parallel_tool_calls?: unknown } | null | undefined;
   if (
     typeof agent.system !== 'string' || agent.system.length === 0
     || typeof agent.model !== 'string' || agent.model.length === 0
     || typeof agent.embedding !== 'string' || agent.embedding.length === 0
     || typeof agent.context_window_limit !== 'number' || agent.context_window_limit <= 0
-    || modelSettings?.parallel_tool_calls !== true
+    || typeof modelSettings?.provider_type !== 'string' || modelSettings.provider_type.length === 0
+    || modelSettings.parallel_tool_calls !== true
   ) {
-    throw new Error('Canonical Subconscious.af is missing managed runtime model/embedding/context/parallel-tool configuration');
+    throw new Error('Canonical Subconscious.af is missing managed runtime model/embedding/context/model-settings-provider/parallel-tool configuration');
   }
 
   return {
@@ -268,6 +270,7 @@ export function getCanonicalManagedAgentConfig(): CanonicalManagedAgentConfig {
     model: agent.model,
     embedding: agent.embedding,
     contextWindowLimit: agent.context_window_limit,
+    modelSettingsProviderType: modelSettings.provider_type,
     parallelToolCalls: true,
   };
 }
@@ -320,9 +323,12 @@ export async function reconcileManagedAgentConfiguration(
   if (currentEmbeddingHandle(agent) !== canonical.embedding) patch.embedding = canonical.embedding;
   const currentContext = agent.context_window_limit ?? agent.llm_config?.context_window;
   if (currentContext !== desiredContextWindow) patch.context_window_limit = desiredContextWindow;
+  const currentProviderType = agent.model_settings?.provider_type;
   const currentParallel = agent.model_settings?.parallel_tool_calls ?? agent.llm_config?.parallel_tool_calls;
-  if (currentParallel !== canonical.parallelToolCalls) {
-    patch.model_settings = { ...(agent.model_settings ?? {}), parallel_tool_calls: canonical.parallelToolCalls };
+  if (currentProviderType !== canonical.modelSettingsProviderType || currentParallel !== canonical.parallelToolCalls) {
+    patch.model_settings = currentProviderType === canonical.modelSettingsProviderType
+      ? { ...(agent.model_settings ?? {}), provider_type: canonical.modelSettingsProviderType, parallel_tool_calls: canonical.parallelToolCalls }
+      : { provider_type: canonical.modelSettingsProviderType, parallel_tool_calls: canonical.parallelToolCalls };
   }
 
   if (Object.keys(patch).length === 0) {

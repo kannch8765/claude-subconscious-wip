@@ -15,6 +15,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: 'opencode-deepseek/deepseek-v4-flash',
       embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
       contextWindowLimit: 400000,
+      modelSettingsProviderType: 'deepseek',
       parallelToolCalls: true,
     }));
   });
@@ -40,7 +41,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { parallel_tool_calls: true },
+      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
     }]);
   });
 
@@ -57,7 +58,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       return new Response(JSON.stringify({
         id: ID, name: 'Subconscious', system: canonical.system, model: canonical.model,
         embedding: canonical.embedding, context_window_limit: canonical.contextWindowLimit,
-        model_settings: { parallel_tool_calls: true },
+        model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
       }), { status: 200, headers: { 'content-type': 'application/json' } });
     }));
     await reconcileManagedAgentConfiguration('test-key', ID, () => {});
