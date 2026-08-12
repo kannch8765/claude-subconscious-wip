@@ -2,7 +2,7 @@ import { strict as assert } from 'node:assert';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { test } from 'node:test';
+import { test } from 'vitest';
 
 import {
   isExactDarioTouchRecord,
@@ -75,7 +75,7 @@ test('streaming file stripe preserves line count and non-matched bytes', async (
       assistant('normal'),
       assistant('after'),
     ];
-    const rawLines = rows.map((row, index) => index === 0 ? JSON.stringify(row, null, 0) : JSON.stringify(row));
+    const rawLines = rows.map((row) => JSON.stringify(row));
     await writeFile(input, `${rawLines.join('\n')}\n`, 'utf8');
 
     const stats = await stripeHistoricalDarioTouchFile(input, output);
