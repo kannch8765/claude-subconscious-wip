@@ -33,7 +33,8 @@
     "test:watch": "vitest",
     "backfill": "tsx scripts/relationship_memory_backfill.ts",
     "legacy-backfill": "tsx scripts/legacy_semantic_backfill.ts",
-    "sanitize-transcript": "tsx scripts/sanitize_transcript.ts"
+    "sanitize-transcript": "tsx scripts/sanitize_transcript.ts",
+    "sanitize-transcripts": "tsx scripts/sanitize_transcript_batch.ts"
   },
   "dependencies": {
     "@letta-ai/letta-client": "1.12.1",
