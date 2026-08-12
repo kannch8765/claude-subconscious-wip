@@ -2,6 +2,16 @@
 
 This note records bounded runtime evidence for the transcript wrapper sanitizer and batch runner. It intentionally contains no transcript contents, sanitized transcript contents, or per-file private manifest entries.
 
+## Contract boundary
+
+Task 093AN produces a **lossless wrapper-compaction representation for the current relationship-memory historical consumers**. It is not a generic sanitized Claude transcript interchange format, a human-readable chat export, or a text-only transcript representation.
+
+Losslessness here is defined by semantic equivalence for the currently adopted historical consumers. In particular, Task 093U established canonical transcript evidence for `user_text`, `assistant_text`, `assistant_tool_use`, and `tool_result`. Relationship-relevant durable meaning may exist only in assistant tool input or textual tool results, so Task 093AN intentionally retains nested content blocks required to recover that evidence. It must not strip `tool_use` or `tool_result` merely to make the output more text-like or smaller.
+
+For records that current historical consumers do not consume, the sanitizer emits `{}` rather than deleting the record. Those placeholders intentionally preserve source record positions and batching stability while removing unused wrapper payloads.
+
+The sanitizer only promises equivalence for the current historical consumer surfaces exercised by this task. It does **not** promise that every Claude transcript wrapper field survives, nor that the compacted output is future-proof for arbitrary consumers. A future consumer that depends on a currently discarded wrapper field requires an explicit contract update and new equivalence coverage rather than silently assuming that field is retained.
+
 ## Candidate exercised on VPS
 
 The runtime strip described below exercised exact candidate head:
