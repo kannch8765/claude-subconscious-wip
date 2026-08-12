@@ -115,18 +115,25 @@ describe('cross-process canonical mutation boundary', () => {
   });
 
   it('surfaces lock contention as an explicit retryable failure', async () => {
-    const root = tempRoot(); const ready = path.join(root, 'holder-ready');
+    const root = tempRoot(); const ready = path.join(root, 'holder-ready'); const release = `${ready}.release`;
     const holder = spawnChild('hold', root, 'holder', ready);
     await waitForFile(ready);
-    const contender = spawnChild('contend', root, 'contender', undefined, { RELATIONSHIP_MEMORY_LOCK_TIMEOUT_MS: '50' });
-    const result = await finish(contender);
-    expect(result.code).toBe(0);
-    const parsed = JSON.parse(result.stdout);
-    expect(parsed.ok).toBe(false);
-    expect(parsed.name).toBe('CanonicalMutationLockError');
-    expect(parsed.retryable).toBe(true);
-    expect(parsed.message).toContain('contention timed out');
-    expect((await finish(holder)).code).toBe(0);
+
+    let holderResult: Awaited<ReturnType<typeof finish>> | undefined;
+    try {
+      const contender = spawnChild('contend', root, 'contender', undefined, { RELATIONSHIP_MEMORY_LOCK_TIMEOUT_MS: '50' });
+      const result = await finish(contender);
+      expect(result.code).toBe(0);
+      const parsed = JSON.parse(result.stdout);
+      expect(parsed.ok).toBe(false);
+      expect(parsed.name).toBe('CanonicalMutationLockError');
+      expect(parsed.retryable).toBe(true);
+      expect(parsed.message).toContain('contention timed out');
+    } finally {
+      fs.writeFileSync(release, 'release');
+      holderResult = await finish(holder);
+    }
+    expect(holderResult?.code).toBe(0);
   });
 
   it('deterministically recovers a crashed same-host owner', () => {

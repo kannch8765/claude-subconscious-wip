@@ -22,9 +22,18 @@ const reinforceMessage = {
 
 async function main(): Promise<void> {
   if (mode === 'hold') {
+    const releaseFile = startFile ? `${startFile}.release` : undefined;
     store.withMutationBoundary(() => {
       if (startFile) fs.writeFileSync(startFile, 'ready');
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+      if (!releaseFile) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+        return;
+      }
+      const deadline = Date.now() + 5_000;
+      while (!fs.existsSync(releaseFile)) {
+        if (Date.now() > deadline) throw new Error(`timed out waiting for holder release: ${releaseFile}`);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
     });
     console.log(JSON.stringify({ ok: true }));
     return;
