@@ -50,7 +50,7 @@ function installManagedFetch(initialSystem: string, patchStatus = 200) {
         model: 'opencode-deepseek/deepseek-v4-flash',
         embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
         context_window_limit: 400000,
-        model_settings: { parallel_tool_calls: true },
+        model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
         llm_config: { handle: 'opencode-deepseek/deepseek-v4-flash', model: 'deepseek-v4-flash', provider_name: 'opencode-deepseek', context_window: 400000, parallel_tool_calls: true },
       });
     }
@@ -114,7 +114,7 @@ describe('managed adopted-agent system prompt reconciliation', () => {
       model: string;
       embedding: string;
       context_window_limit: number;
-      model_settings: { parallel_tool_calls: boolean };
+      model_settings: { provider_type: string; parallel_tool_calls: boolean };
       llm_config: Record<string, unknown>;
     } = {
       id: MANAGED_AGENT_ID,
@@ -124,7 +124,7 @@ describe('managed adopted-agent system prompt reconciliation', () => {
       model: 'z.ai/glm-5',
       embedding: 'openai/text-embedding-3-small',
       context_window_limit: 90000,
-      model_settings: { parallel_tool_calls: false },
+      model_settings: { provider_type: 'zai', parallel_tool_calls: false },
       llm_config: {
         handle: 'z.ai/glm-5',
         model: 'glm-5',
