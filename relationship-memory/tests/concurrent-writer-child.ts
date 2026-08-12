@@ -21,24 +21,6 @@ const reinforceMessage = {
 } as const;
 
 async function main(): Promise<void> {
-  if (mode === 'hold') {
-    const releaseFile = startFile ? `${startFile}.release` : undefined;
-    store.withMutationBoundary(() => {
-      if (startFile) fs.writeFileSync(startFile, 'ready');
-      if (!releaseFile) {
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
-        return;
-      }
-      const deadline = Date.now() + 15_000;
-      while (!fs.existsSync(releaseFile)) {
-        if (Date.now() > deadline) throw new Error(`timed out waiting for holder release: ${releaseFile}`);
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-      }
-    });
-    console.log(JSON.stringify({ ok: true }));
-    return;
-  }
-
   if (mode === 'delay-before-remember') {
     if (startFile) fs.writeFileSync(startFile, 'ready');
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -83,17 +65,20 @@ async function main(): Promise<void> {
     return;
   }
   if (mode === 'contend') {
+    let result: Record<string, unknown>;
     try {
       store.appendOutcome({ batch_id: id, source_key: id, outcome: 'retryable_failed', reason: 'test', recorded_at: new Date().toISOString() });
-      console.log(JSON.stringify({ ok: true }));
+      result = { ok: true };
     } catch (error) {
-      console.log(JSON.stringify({
+      result = {
         ok: false,
         name: error instanceof Error ? error.name : 'unknown',
         retryable: !!(error as { retryable?: boolean })?.retryable,
         message: error instanceof Error ? error.message : String(error),
-      }));
+      };
     }
+    if (startFile) fs.writeFileSync(`${startFile}.result`, `${JSON.stringify(result)}\n`);
+    console.log(JSON.stringify(result));
     return;
   }
   throw new Error(`unknown mode: ${mode}`);
