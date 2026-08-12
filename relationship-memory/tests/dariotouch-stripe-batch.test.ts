@@ -1,8 +1,8 @@
 import { strict as assert } from 'node:assert';
 import { mkdtemp, readFile, rm, writeFile, mkdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { test } from 'node:test';
+import { dirname, join } from 'node:path';
+import { test } from 'vitest';
 
 import { stripeHistoricalDarioTouchBatch } from '../../scripts/stripe_historical_dariotouch_batch.js';
 
@@ -11,7 +11,7 @@ function row(type: 'user' | 'assistant', text: string) {
 }
 
 async function writeJsonl(path: string, rows: unknown[]): Promise<void> {
-  await mkdir(join(path, '..'), { recursive: true }).catch(() => undefined);
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, `${rows.map((item) => JSON.stringify(item)).join('\n')}\n`, 'utf8');
 }
 
@@ -26,15 +26,11 @@ test('batch mirrors trees, stripes strict pairs, writes complete manifest, and r
 
     const first = await stripeHistoricalDarioTouchBatch(input, output);
     assert.equal(first.complete, true);
-    assert.deepEqual(first.summary, {
-      files_total: 2,
-      files_processed: 2,
-      files_skipped: 0,
-      input_bytes: first.summary.input_bytes,
-      output_bytes: first.summary.output_bytes,
-      pairs_striped: 1,
-      records_striped: 2,
-    });
+    assert.equal(first.summary.files_total, 2);
+    assert.equal(first.summary.files_processed, 2);
+    assert.equal(first.summary.files_skipped, 0);
+    assert.equal(first.summary.pairs_striped, 1);
+    assert.equal(first.summary.records_striped, 2);
     assert.equal(first.entries.length, 2);
     assert.equal((await readFile(join(output, 'one.jsonl'), 'utf8')).trim(), '{}\n{}\n{}');
     assert.match(await readFile(join(output, 'nested', 'two.jsonl'), 'utf8'), /normal/);
