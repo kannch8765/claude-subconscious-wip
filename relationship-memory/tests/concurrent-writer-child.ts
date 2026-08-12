@@ -21,15 +21,6 @@ const reinforceMessage = {
 } as const;
 
 async function main(): Promise<void> {
-  if (mode === 'hold') {
-    store.withMutationBoundary(() => {
-      if (startFile) fs.writeFileSync(startFile, 'ready');
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
-    });
-    console.log(JSON.stringify({ ok: true }));
-    return;
-  }
-
   if (mode === 'delay-before-remember') {
     if (startFile) fs.writeFileSync(startFile, 'ready');
     await new Promise((resolve) => setTimeout(resolve, 500));
@@ -42,8 +33,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  waitForStart();
   if (mode === 'append') {
+    waitForStart();
     for (let i = 0; i < 100; i += 1) {
       store.appendOutcome({ batch_id: id, source_key: `${id}-${i}`, outcome: 'retryable_failed', reason: 'contention-test', recorded_at: new Date().toISOString() });
     }
@@ -51,6 +42,7 @@ async function main(): Promise<void> {
     return;
   }
   if (mode === 'remember') {
+    waitForStart();
     const runtime = new RelationshipMemoryRuntime(store, new Map([[message.message_id, message as any]]));
     console.log(JSON.stringify(store.withMutationBoundary(() => runtime.remember(id, {
       schema_version: 1, kind: 'user_preference', summary: '用户喜欢拉面。', participants: ['user'],
@@ -59,6 +51,7 @@ async function main(): Promise<void> {
     return;
   }
   if (mode === 'entity') {
+    waitForStart();
     const runtime = new RelationshipMemoryRuntime(store, new Map([[message.message_id, message as any]]));
     console.log(JSON.stringify(store.withMutationBoundary(() => runtime.rememberEntity(id, {
       schema_version: 1, canonical_name: '晴', aliases: ['晴', 'Haru'], entity_type: 'assistant',
@@ -67,6 +60,7 @@ async function main(): Promise<void> {
     return;
   }
   if (mode === 'reinforce') {
+    waitForStart();
     const runtime = new RelationshipMemoryRuntime(store, new Map([[reinforceMessage.message_id, reinforceMessage as any]]));
     console.log(JSON.stringify(store.withMutationBoundary(() => runtime.reinforce(id, {
       memory_id: 'mem-seed', evidence_ids: [reinforceMessage.evidence_id],
@@ -74,17 +68,22 @@ async function main(): Promise<void> {
     return;
   }
   if (mode === 'contend') {
+    // Parent writes start only after entering withMutationBoundary, so contention ordering is causal.
+    waitForStart();
+    let result: Record<string, unknown>;
     try {
       store.appendOutcome({ batch_id: id, source_key: id, outcome: 'retryable_failed', reason: 'test', recorded_at: new Date().toISOString() });
-      console.log(JSON.stringify({ ok: true }));
+      result = { ok: true };
     } catch (error) {
-      console.log(JSON.stringify({
+      result = {
         ok: false,
         name: error instanceof Error ? error.name : 'unknown',
         retryable: !!(error as { retryable?: boolean })?.retryable,
         message: error instanceof Error ? error.message : String(error),
-      }));
+      };
     }
+    if (startFile) fs.writeFileSync(`${startFile}.result`, `${JSON.stringify(result)}\n`);
+    console.log(JSON.stringify(result));
     return;
   }
   throw new Error(`unknown mode: ${mode}`);
