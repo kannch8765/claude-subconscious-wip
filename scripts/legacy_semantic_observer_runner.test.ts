@@ -50,6 +50,7 @@ function fakeClient(responses: any[]): NativeLettaClientLike {
     runs: { async retrieve(runId) { throw new Error(`unexpected run retrieve: ${runId}`); } },
     conversations: {
       messages: {
+        async stream() { throw new Error('unexpected recovery stream'); },
         async create() {
           const response = responses.shift();
           if (!response) throw new Error('unexpected native Letta request');

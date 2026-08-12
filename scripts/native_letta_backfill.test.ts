@@ -5,16 +5,27 @@ import {
   extractActiveConversationRunConflict,
   extractLegacyCompletion,
   reconcileLegacyCompletionRules,
+  adoptActiveConversationRun,
   runNativeClientToolConversation,
-  waitForActiveConversationRun,
   type NativeLettaClientLike,
 } from './native_letta_backfill.js';
 
 function fakeClient(
   responses: any[] = [],
   runResponses: any[] = [],
-): NativeLettaClientLike & { bodies: any[]; updates: any[]; attachments: string[]; upserts: any[]; runIds: string[] } {
+  recoveryResponses: any[] = [],
+): NativeLettaClientLike & {
+  bodies: any[];
+  createOptions: any[];
+  streamBodies: any[];
+  updates: any[];
+  attachments: string[];
+  upserts: any[];
+  runIds: string[];
+} {
   const bodies: any[] = [];
+  const createOptions: any[] = [];
+  const streamBodies: any[] = [];
   const updates: any[] = [];
   const attachments: string[] = [];
   const upserts: any[] = [];
@@ -23,8 +34,19 @@ function fakeClient(
     tools: [],
     tool_rules: [{ type: 'continue_loop', tool_name: 'existing_tool' }],
   };
+  const asStream = (response: any) => (async function* () {
+    for (const message of response.messages ?? []) yield message;
+    if (response.stop_reason) {
+      yield typeof response.stop_reason === 'string'
+        ? { message_type: 'stop_reason', stop_reason: response.stop_reason }
+        : response.stop_reason;
+    }
+    if (response.usage) yield { message_type: 'usage_statistics', ...response.usage };
+  })();
   return {
     bodies,
+    createOptions,
+    streamBodies,
     updates,
     attachments,
     upserts,
@@ -41,20 +63,19 @@ function fakeClient(
     },
     conversations: {
       messages: {
-        async create(_conversationId, body) {
+        async create(_conversationId, body, options) {
           bodies.push(body);
+          createOptions.push(options);
           const response = responses.shift();
           if (!response) throw new Error('unexpected native Letta request');
           if (response.throw) throw response.throw;
-          return (async function* () {
-            for (const message of response.messages ?? []) yield message;
-            if (response.stop_reason) {
-              yield typeof response.stop_reason === 'string'
-                ? { message_type: 'stop_reason', stop_reason: response.stop_reason }
-                : response.stop_reason;
-            }
-            if (response.usage) yield { message_type: 'usage_statistics', ...response.usage };
-          })();
+          return asStream(response);
+        },
+        async stream(_conversationId, body) {
+          streamBodies.push(body);
+          const response = recoveryResponses.shift();
+          if (!response) throw new Error('unexpected native Letta recovery stream');
+          return asStream(response);
         },
       },
     },
@@ -258,19 +279,21 @@ describe('native Letta legacy backfill harness', () => {
     }))).toBeUndefined();
   });
 
-  it('waits for the conflicting run to complete at requires_approval before continuing', async () => {
+  it('adopts an existing active run through Letta native recovery stream', async () => {
     const client = fakeClient([], [
       { id: 'run-active', status: 'running', conversation_id: 'conv-test' },
-      { id: 'run-active', status: 'completed', stop_reason: 'requires_approval', conversation_id: 'conv-test' },
+    ], [
+      { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
     ]);
-    await expect(waitForActiveConversationRun(client, 'run-active', 'conv-test', { pollIntervalMs: 0, timeoutMs: 100 })).resolves.toMatchObject({
-      status: 'completed',
-      stop_reason: 'requires_approval',
-    });
-    expect(client.runIds).toEqual(['run-active', 'run-active']);
+    const stream = await adoptActiveConversationRun(client, 'run-active', 'conv-test', 'agent-test');
+    const events: any[] = [];
+    for await (const event of stream) events.push(event);
+    expect(client.runIds).toEqual(['run-active']);
+    expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active' }]);
+    expect(events).toEqual(expect.arrayContaining(terminalMessages('completed')));
   });
 
-  it('retries the same tool-return continuation after a 409 active run completes', async () => {
+  it('adopts the conflicting run after a 409 instead of replaying stale tool returns', async () => {
     const conflict = Object.assign(new Error('409 active run'), {
       status: 409,
       error: {
@@ -281,9 +304,10 @@ describe('native Letta legacy backfill harness', () => {
     const client = fakeClient([
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"A"}', tool_call_id: 'search' } }], stop_reason: 'requires_approval' },
       { throw: conflict },
-      { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
     ], [
-      { id: 'run-active', status: 'completed', stop_reason: 'requires_approval', conversation_id: 'conv-test' },
+      { id: 'run-active', status: 'running', conversation_id: 'conv-test' },
+    ], [
+      { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
     ]);
     const result = await runNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
@@ -291,22 +315,25 @@ describe('native Letta legacy backfill harness', () => {
     });
     expect(result).toMatchObject({ clientToolFailure: false, terminal: 'completed' });
     expect(client.runIds).toEqual(['run-active']);
-    expect(client.bodies).toHaveLength(3);
-    expect(client.bodies[2]).toEqual(client.bodies[1]);
+    expect(client.bodies).toHaveLength(2);
+    expect(client.createOptions[1]).toEqual({ maxRetries: 0 });
+    expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active' }]);
   });
 
-  it('fails closed if a conflicting run belongs to another conversation or terminates unsuccessfully', async () => {
+  it('fails closed instead of adopting a conflicting run from another conversation or failed run', async () => {
     const wrongConversation = fakeClient([], [
       { id: 'run-active', status: 'completed', stop_reason: 'requires_approval', conversation_id: 'conv-other' },
     ]);
-    await expect(waitForActiveConversationRun(wrongConversation, 'run-active', 'conv-test', { pollIntervalMs: 0, timeoutMs: 100 }))
+    await expect(adoptActiveConversationRun(wrongConversation, 'run-active', 'conv-test', 'agent-test'))
       .rejects.toThrow('different conversation');
+    expect(wrongConversation.streamBodies).toHaveLength(0);
 
     const failed = fakeClient([], [
       { id: 'run-active', status: 'failed', conversation_id: 'conv-test' },
     ]);
-    await expect(waitForActiveConversationRun(failed, 'run-active', 'conv-test', { pollIntervalMs: 0, timeoutMs: 100 }))
+    await expect(adoptActiveConversationRun(failed, 'run-active', 'conv-test', 'agent-test'))
       .rejects.toThrow('status=failed');
+    expect(failed.streamBodies).toHaveLength(0);
   });
 
   it('keeps a malformed-arguments failure unresolved when the model never retries that client tool', async () => {

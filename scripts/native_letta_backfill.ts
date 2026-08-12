@@ -4,9 +4,6 @@ import { normalizeLettaBaseUrl } from './letta_api_url.js';
 
 export const LEGACY_COMPLETION_TOOL_NAME = 'legacy_source_complete';
 const MAX_CLIENT_TOOL_ROUNDS = 128;
-const MAX_ACTIVE_RUN_CONFLICT_RECOVERIES = 3;
-const ACTIVE_RUN_WAIT_TIMEOUT_MS = 120_000;
-const ACTIVE_RUN_POLL_INTERVAL_MS = 1_000;
 
 export interface NativeClientTool {
   name: string;
@@ -28,7 +25,8 @@ export interface NativeLettaClientLike {
   };
   conversations: {
     messages: {
-      create(conversationId: string, body: Record<string, unknown>): Promise<AsyncIterable<any>>;
+      create(conversationId: string, body: Record<string, unknown>, options?: Record<string, unknown>): Promise<AsyncIterable<any>>;
+      stream(conversationId: string, body?: Record<string, unknown>, options?: Record<string, unknown>): Promise<AsyncIterable<any>>;
     };
   };
   runs: {
@@ -239,56 +237,41 @@ export function extractActiveConversationRunConflict(error: unknown): { runId: s
   return { runId };
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
-export async function waitForActiveConversationRun(
+export async function adoptActiveConversationRun(
   client: NativeLettaClientLike,
   runId: string,
   conversationId: string,
-  options: { timeoutMs?: number; pollIntervalMs?: number } = {},
-): Promise<any> {
-  const timeoutMs = options.timeoutMs ?? ACTIVE_RUN_WAIT_TIMEOUT_MS;
-  const pollIntervalMs = options.pollIntervalMs ?? ACTIVE_RUN_POLL_INTERVAL_MS;
-  const deadline = Date.now() + timeoutMs;
-  while (true) {
-    const run = await client.runs.retrieve(runId);
-    if (run?.conversation_id && run.conversation_id !== conversationId) {
-      throw new Error(`Letta 409 referenced run ${runId} from a different conversation`);
-    }
-    if (run?.status === 'completed') {
-      if (run?.stop_reason !== 'requires_approval') {
-        throw new Error(`Letta conflicting run ${runId} completed with unexpected stop_reason=${String(run?.stop_reason)}`);
-      }
-      return run;
-    }
-    if (run?.status === 'failed' || run?.status === 'cancelled') {
-      throw new Error(`Letta conflicting run ${runId} ended with status=${run.status}`);
-    }
-    if (run?.status !== 'created' && run?.status !== 'running') {
-      throw new Error(`Letta conflicting run ${runId} returned unexpected status=${String(run?.status)}`);
-    }
-    if (Date.now() >= deadline) {
-      throw new Error(`Timed out waiting for Letta conflicting run ${runId} to finish`);
-    }
-    await sleep(pollIntervalMs);
+  agentId: string,
+): Promise<AsyncIterable<any>> {
+  const run = await client.runs.retrieve(runId);
+  if (run?.conversation_id && run.conversation_id !== conversationId) {
+    throw new Error(`Letta 409 referenced run ${runId} from a different conversation`);
   }
+  if (run?.status === 'failed' || run?.status === 'cancelled') {
+    throw new Error(`Letta conflicting run ${runId} ended with status=${run.status}`);
+  }
+  if (run?.status !== 'created' && run?.status !== 'running' && run?.status !== 'completed') {
+    throw new Error(`Letta conflicting run ${runId} returned unexpected status=${String(run?.status)}`);
+  }
+  return client.conversations.messages.stream(conversationId, { agent_id: agentId, run_id: runId });
 }
 
 async function createContinuationWithRunConflictRecovery(
   client: NativeLettaClientLike,
   conversationId: string,
+  agentId: string,
   body: Record<string, unknown>,
 ): Promise<AsyncIterable<any>> {
-  for (let recovery = 0; ; recovery += 1) {
-    try {
-      return await client.conversations.messages.create(conversationId, body);
-    } catch (error) {
-      const conflict = extractActiveConversationRunConflict(error);
-      if (!conflict || recovery >= MAX_ACTIVE_RUN_CONFLICT_RECOVERIES) throw error;
-      await waitForActiveConversationRun(client, conflict.runId, conversationId);
-    }
+  try {
+    // Conversation message creation is non-idempotent. Surface the first 409 so we can
+    // adopt the already-created run via Letta's native recovery stream rather than
+    // letting the SDK replay stale tool_returns.
+    return await client.conversations.messages.create(conversationId, body, { maxRetries: 0 });
+  } catch (error) {
+    const conflict = extractActiveConversationRunConflict(error);
+    if (!conflict) throw error;
+    return adoptActiveConversationRun(client, conflict.runId, conversationId, agentId);
   }
 }
 
@@ -367,7 +350,7 @@ export async function runNativeClientToolConversation(input: {
       unresolvedParseFailures.set(name, (unresolvedParseFailures.get(name) ?? 0) + failures);
     }
 
-    response = await collectLettaStream(await createContinuationWithRunConflictRecovery(input.client, input.conversationId, {
+    response = await collectLettaStream(await createContinuationWithRunConflictRecovery(input.client, input.conversationId, input.agentId, {
       agent_id: input.agentId,
       streaming: true,
       messages: [{ type: 'tool_return', tool_returns: approvals }],

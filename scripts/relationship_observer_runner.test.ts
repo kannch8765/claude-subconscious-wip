@@ -29,6 +29,7 @@ function fakeClient(responses: any[], serverTools: any[] = []): NativeLettaClien
     runs: { async retrieve(runId) { throw new Error(`unexpected run retrieve: ${runId}`); } },
     conversations: {
       messages: {
+        async stream() { throw new Error('unexpected recovery stream'); },
         async create(_conversationId, body) {
           bodies.push(body);
           const response = responses.shift();
