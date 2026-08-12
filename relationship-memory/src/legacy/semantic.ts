@@ -385,7 +385,7 @@ export function legacyMemoryExistingToolSchema(): Record<string, unknown> {
 }
 
 export function legacySourceCompleteToolSchema(): Record<string, unknown> {
-  return { type: 'object', additionalProperties: false, required: ['result'], properties: { result: { type: 'string', enum: ['completed', 'no_memory_required'] } } };
+  return { title: 'LegacySourceCompleteArgs', type: 'object', additionalProperties: false, required: ['result'], properties: { result: { type: 'string', enum: ['completed', 'no_memory_required'] } } };
 }
 
 export function legacySemanticBatchId(manifestDigest: string, sourceId: string, canonicalSubjectId: string): string {
