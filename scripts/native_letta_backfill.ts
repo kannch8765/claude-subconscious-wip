@@ -4,6 +4,7 @@ import { normalizeLettaBaseUrl } from './letta_api_url.js';
 
 export const LEGACY_COMPLETION_TOOL_NAME = 'legacy_source_complete';
 const MAX_CLIENT_TOOL_ROUNDS = 128;
+const NATIVE_STREAM_CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
 
 export interface NativeClientTool {
   name: string;
@@ -254,7 +255,11 @@ export async function adoptActiveConversationRun(
   if (run?.status !== 'created' && run?.status !== 'running' && run?.status !== 'completed') {
     throw new Error(`Letta conflicting run ${runId} returned unexpected status=${String(run?.status)}`);
   }
-  return client.conversations.messages.stream(conversationId, { agent_id: agentId, run_id: runId, include_pings: true });
+  return client.conversations.messages.stream(
+    conversationId,
+    { agent_id: agentId, run_id: runId, include_pings: true },
+    { maxRetries: 0, timeout: NATIVE_STREAM_CONNECT_TIMEOUT_MS },
+  );
 }
 
 async function createContinuationWithRunConflictRecovery(
@@ -267,7 +272,11 @@ async function createContinuationWithRunConflictRecovery(
     // Conversation message creation is non-idempotent. Surface the first 409 so we can
     // adopt the already-created run via Letta's native recovery stream rather than
     // letting the SDK replay stale tool_returns.
-    return await client.conversations.messages.create(conversationId, { ...body, include_pings: true }, { maxRetries: 0 });
+    return await client.conversations.messages.create(
+      conversationId,
+      { ...body, include_pings: true },
+      { maxRetries: 0, timeout: NATIVE_STREAM_CONNECT_TIMEOUT_MS },
+    );
   } catch (error) {
     const conflict = extractActiveConversationRunConflict(error);
     if (!conflict) throw error;
@@ -294,7 +303,7 @@ export async function runNativeClientToolConversation(input: {
     include_pings: true,
     messages: [{ role: 'user', content: input.message }],
     client_tools: schemas,
-  }, { maxRetries: 0 }));
+  }, { maxRetries: 0, timeout: NATIVE_STREAM_CONNECT_TIMEOUT_MS }));
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const messages = Array.isArray(response?.messages) ? response.messages : [];

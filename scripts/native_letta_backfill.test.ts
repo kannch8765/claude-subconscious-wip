@@ -18,6 +18,7 @@ function fakeClient(
   bodies: any[];
   createOptions: any[];
   streamBodies: any[];
+  streamOptions: any[];
   updates: any[];
   attachments: string[];
   upserts: any[];
@@ -26,6 +27,7 @@ function fakeClient(
   const bodies: any[] = [];
   const createOptions: any[] = [];
   const streamBodies: any[] = [];
+  const streamOptions: any[] = [];
   const updates: any[] = [];
   const attachments: string[] = [];
   const upserts: any[] = [];
@@ -47,6 +49,7 @@ function fakeClient(
     bodies,
     createOptions,
     streamBodies,
+    streamOptions,
     updates,
     attachments,
     upserts,
@@ -71,8 +74,9 @@ function fakeClient(
           if (response.throw) throw response.throw;
           return asStream(response);
         },
-        async stream(_conversationId, body) {
+        async stream(_conversationId, body, options) {
           streamBodies.push(body);
+          streamOptions.push(options);
           const response = recoveryResponses.shift();
           if (!response) throw new Error('unexpected native Letta recovery stream');
           return asStream(response);
@@ -154,7 +158,9 @@ describe('native Letta legacy backfill harness', () => {
     expect(extractLegacyCompletion(result.response.messages)).toBe('no_memory_required');
     expect(client.bodies).toHaveLength(2);
     expect(client.bodies[0].client_tools).toEqual([{ name: 'memory_search', description: 'search', parameters: { type: 'object' } }]);
-    expect(client.bodies[0]).toEqual(expect.objectContaining({ streaming: true }));
+    expect(client.bodies[0]).toEqual(expect.objectContaining({ streaming: true, include_pings: true }));
+    expect(client.createOptions[0]).toEqual({ maxRetries: 0, timeout: 300000 });
+    expect(client.createOptions[1]).toEqual({ maxRetries: 0, timeout: 300000 });
     expect(client.bodies[1].messages).toEqual([{ type: 'tool_return', tool_returns: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] }]);
   });
 
@@ -290,6 +296,7 @@ describe('native Letta legacy backfill harness', () => {
     for await (const event of stream) events.push(event);
     expect(client.runIds).toEqual(['run-active']);
     expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active', include_pings: true }]);
+    expect(client.streamOptions).toEqual([{ maxRetries: 0, timeout: 300000 }]);
     expect(events).toEqual(expect.arrayContaining(terminalMessages('completed')));
   });
 
@@ -316,8 +323,9 @@ describe('native Letta legacy backfill harness', () => {
     expect(result).toMatchObject({ clientToolFailure: false, terminal: 'completed' });
     expect(client.runIds).toEqual(['run-active']);
     expect(client.bodies).toHaveLength(2);
-    expect(client.createOptions[1]).toEqual({ maxRetries: 0 });
+    expect(client.createOptions[1]).toEqual({ maxRetries: 0, timeout: 300000 });
     expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active', include_pings: true }]);
+    expect(client.streamOptions).toEqual([{ maxRetries: 0, timeout: 300000 }]);
   });
 
   it('fails closed instead of adopting a conflicting run from another conversation or failed run', async () => {
