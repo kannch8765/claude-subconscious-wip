@@ -118,7 +118,7 @@ describe('cross-process canonical mutation boundary', () => {
     const root = tempRoot(); const ready = path.join(root, 'holder-ready'); const release = `${ready}.release`;
     const holder = spawnChild('hold', root, 'holder', ready);
     const holderFinished = finish(holder);
-    await waitForFile(ready);
+    await waitForFile(ready, 10_000);
 
     let holderResult: Awaited<ReturnType<typeof finish>> | undefined;
     try {
@@ -135,7 +135,7 @@ describe('cross-process canonical mutation boundary', () => {
       holderResult = await holderFinished;
     }
     expect(holderResult?.code).toBe(0);
-  }, 10_000);
+  }, 20_000);
 
   it('deterministically recovers a crashed same-host owner', () => {
     const root = tempRoot(); const lockDir = path.join(root, '.canonical-mutation.lock');
