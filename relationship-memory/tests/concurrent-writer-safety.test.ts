@@ -38,6 +38,13 @@ function waitForFile(file: string, timeoutMs = 2_000): Promise<void> {
     poll();
   });
 }
+function waitForFileSync(file: string, timeoutMs = 10_000): void {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${file}`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
 
 afterEach(() => {
   delete process.env.RELATIONSHIP_MEMORY_LOCK_TIMEOUT_MS;
@@ -115,19 +122,26 @@ describe('cross-process canonical mutation boundary', () => {
   });
 
   it('surfaces lock contention as an explicit retryable failure', async () => {
-    const root = tempRoot(); const ready = path.join(root, 'holder-ready');
-    const holder = spawnChild('hold', root, 'holder', ready);
-    await waitForFile(ready);
-    const contender = spawnChild('contend', root, 'contender', undefined, { RELATIONSHIP_MEMORY_LOCK_TIMEOUT_MS: '50' });
-    const result = await finish(contender);
+    const root = tempRoot(); const start = path.join(root, 'contender-start'); const resultFile = `${start}.result`;
+    const contender = spawnChild('contend', root, 'contender', start, { RELATIONSHIP_MEMORY_LOCK_TIMEOUT_MS: '50' });
+    const contenderFinished = finish(contender);
+    const store = new RelationshipMemoryStore(root, 'subject-test');
+
+    let parsed: { ok: boolean; name?: string; retryable?: boolean; message?: string } | undefined;
+    store.withMutationBoundary(() => {
+      fs.writeFileSync(start, 'go');
+      waitForFileSync(resultFile);
+      parsed = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
+    });
+
+    const result = await contenderFinished;
     expect(result.code).toBe(0);
-    const parsed = JSON.parse(result.stdout);
-    expect(parsed.ok).toBe(false);
-    expect(parsed.name).toBe('CanonicalMutationLockError');
-    expect(parsed.retryable).toBe(true);
-    expect(parsed.message).toContain('contention timed out');
-    expect((await finish(holder)).code).toBe(0);
-  });
+    expect(JSON.parse(result.stdout)).toEqual(parsed);
+    expect(parsed?.ok).toBe(false);
+    expect(parsed?.name).toBe('CanonicalMutationLockError');
+    expect(parsed?.retryable).toBe(true);
+    expect(parsed?.message).toContain('contention timed out');
+  }, 20_000);
 
   it('deterministically recovers a crashed same-host owner', () => {
     const root = tempRoot(); const lockDir = path.join(root, '.canonical-mutation.lock');

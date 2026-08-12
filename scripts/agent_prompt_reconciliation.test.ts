@@ -260,6 +260,10 @@ describe('canonical Subconscious prompt contract', () => {
     expect(prompt).toContain('literal Claude and Claude Code aliases');
     expect(prompt).toContain('source-faithful literal fields unchanged');
     expect(prompt).toContain('trusted current-batch evidence IDs');
+    expect(prompt).toContain("speak from Kohaku's own subconscious perspective");
+    expect(prompt).toContain('refer to 琥珀\'s own actions, decisions, and experiences naturally as 我');
+    expect(prompt).toContain('shared experiences may naturally be 我和猫');
+    expect(prompt).toContain('This response-voice rule changes presentation only and never changes canonical storage');
     expect(prompt).not.toContain('real current-batch message IDs');
   });
 });
