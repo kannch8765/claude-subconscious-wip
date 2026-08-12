@@ -254,7 +254,7 @@ export async function adoptActiveConversationRun(
   if (run?.status !== 'created' && run?.status !== 'running' && run?.status !== 'completed') {
     throw new Error(`Letta conflicting run ${runId} returned unexpected status=${String(run?.status)}`);
   }
-  return client.conversations.messages.stream(conversationId, { agent_id: agentId, run_id: runId });
+  return client.conversations.messages.stream(conversationId, { agent_id: agentId, run_id: runId, include_pings: true });
 }
 
 async function createContinuationWithRunConflictRecovery(
@@ -267,7 +267,7 @@ async function createContinuationWithRunConflictRecovery(
     // Conversation message creation is non-idempotent. Surface the first 409 so we can
     // adopt the already-created run via Letta's native recovery stream rather than
     // letting the SDK replay stale tool_returns.
-    return await client.conversations.messages.create(conversationId, body, { maxRetries: 0 });
+    return await client.conversations.messages.create(conversationId, { ...body, include_pings: true }, { maxRetries: 0 });
   } catch (error) {
     const conflict = extractActiveConversationRunConflict(error);
     if (!conflict) throw error;
@@ -291,9 +291,10 @@ export async function runNativeClientToolConversation(input: {
   let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
     agent_id: input.agentId,
     streaming: true,
+    include_pings: true,
     messages: [{ role: 'user', content: input.message }],
     client_tools: schemas,
-  }));
+  }, { maxRetries: 0 }));
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const messages = Array.isArray(response?.messages) ? response.messages : [];

@@ -289,7 +289,7 @@ describe('native Letta legacy backfill harness', () => {
     const events: any[] = [];
     for await (const event of stream) events.push(event);
     expect(client.runIds).toEqual(['run-active']);
-    expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active' }]);
+    expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active', include_pings: true }]);
     expect(events).toEqual(expect.arrayContaining(terminalMessages('completed')));
   });
 
@@ -317,7 +317,7 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.runIds).toEqual(['run-active']);
     expect(client.bodies).toHaveLength(2);
     expect(client.createOptions[1]).toEqual({ maxRetries: 0 });
-    expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active' }]);
+    expect(client.streamBodies).toEqual([{ agent_id: 'agent-test', run_id: 'run-active', include_pings: true }]);
   });
 
   it('fails closed instead of adopting a conflicting run from another conversation or failed run', async () => {
