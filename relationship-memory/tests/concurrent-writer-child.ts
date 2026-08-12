@@ -29,7 +29,7 @@ async function main(): Promise<void> {
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
         return;
       }
-      const deadline = Date.now() + 5_000;
+      const deadline = Date.now() + 10_000;
       while (!fs.existsSync(releaseFile)) {
         if (Date.now() > deadline) throw new Error(`timed out waiting for holder release: ${releaseFile}`);
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);

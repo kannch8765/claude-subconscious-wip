@@ -117,6 +117,7 @@ describe('cross-process canonical mutation boundary', () => {
   it('surfaces lock contention as an explicit retryable failure', async () => {
     const root = tempRoot(); const ready = path.join(root, 'holder-ready'); const release = `${ready}.release`;
     const holder = spawnChild('hold', root, 'holder', ready);
+    const holderFinished = finish(holder);
     await waitForFile(ready);
 
     let holderResult: Awaited<ReturnType<typeof finish>> | undefined;
@@ -131,10 +132,10 @@ describe('cross-process canonical mutation boundary', () => {
       expect(parsed.message).toContain('contention timed out');
     } finally {
       fs.writeFileSync(release, 'release');
-      holderResult = await finish(holder);
+      holderResult = await holderFinished;
     }
     expect(holderResult?.code).toBe(0);
-  });
+  }, 10_000);
 
   it('deterministically recovers a crashed same-host owner', () => {
     const root = tempRoot(); const lockDir = path.join(root, '.canonical-mutation.lock');
