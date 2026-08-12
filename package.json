@@ -34,7 +34,9 @@
     "backfill": "tsx scripts/relationship_memory_backfill.ts",
     "legacy-backfill": "tsx scripts/legacy_semantic_backfill.ts",
     "sanitize-transcript": "tsx scripts/sanitize_transcript.ts",
-    "sanitize-transcripts": "tsx scripts/sanitize_transcript_batch.ts"
+    "sanitize-transcripts": "tsx scripts/sanitize_transcript_batch.ts",
+    "stripe-dariotouch": "tsx scripts/stripe_historical_dariotouch.ts",
+    "stripe-dariotouch-transcripts": "tsx scripts/stripe_historical_dariotouch_batch.ts"
   },
   "dependencies": {
     "@letta-ai/letta-client": "1.12.1",
