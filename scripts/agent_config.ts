@@ -295,6 +295,38 @@ function currentEmbeddingHandle(agent: AgentDetails): string | null {
   return null;
 }
 
+function currentModelSettingsProviderType(agent: AgentDetails): string | null {
+  const providerType = agent.model_settings?.provider_type;
+  if (typeof providerType === 'string' && providerType.length > 0) return providerType;
+  const endpointType = agent.llm_config?.model_endpoint_type;
+  if (typeof endpointType === 'string' && endpointType.length > 0) return endpointType;
+  return null;
+}
+
+async function resolveManagedModelSettingsProviderType(
+  apiKey: string,
+  desiredModel: string,
+  canonical: CanonicalManagedAgentConfig,
+): Promise<string> {
+  // The canonical model/provider pair is authored together in Subconscious.af.
+  if (desiredModel === canonical.model) return canonical.modelSettingsProviderType;
+
+  // A cross-model operator override must obtain its discriminator from Letta's
+  // own model metadata. Handle prefixes are provider names, not necessarily the
+  // discriminated-union provider_type (for example openai-proxy/* -> openai).
+  let models: LettaModel[];
+  try {
+    models = await listAvailableModels(apiKey);
+  } catch (error) {
+    throw new Error(`Failed to resolve model_settings.provider_type for LETTA_MODEL="${desiredModel}" from Letta model metadata: ${error}`);
+  }
+  const model = findModel(models, desiredModel);
+  if (!model?.provider_type) {
+    throw new Error(`Cannot resolve model_settings.provider_type for LETTA_MODEL="${desiredModel}" from Letta model metadata`);
+  }
+  return model.provider_type;
+}
+
 /**
  * Reconcile one already-established Subconscious-managed agent to canonical
  * runtime policy. Ownership must be decided by the caller before invoking this.
@@ -317,18 +349,23 @@ export async function reconcileManagedAgentConfiguration(
   }
 
   const agent = await getResponse.json() as AgentDetails;
+  const desiredProviderType = await resolveManagedModelSettingsProviderType(apiKey, desiredModel, canonical);
   const patch: Record<string, unknown> = {};
+  const modelWillChange = getAgentModelHandle(agent) !== desiredModel;
   if (agent.system !== canonical.system) patch.system = canonical.system;
-  if (getAgentModelHandle(agent) !== desiredModel) patch.model = desiredModel;
+  if (modelWillChange) patch.model = desiredModel;
   if (currentEmbeddingHandle(agent) !== canonical.embedding) patch.embedding = canonical.embedding;
   const currentContext = agent.context_window_limit ?? agent.llm_config?.context_window;
-  if (currentContext !== desiredContextWindow) patch.context_window_limit = desiredContextWindow;
-  const currentProviderType = agent.model_settings?.provider_type;
+  // Letta can reset the effective context window to the new model's default
+  // when `model` changes, even if the pre-PATCH context already matched. Carry
+  // the desired limit in the same PATCH so model/provider/context converge atomically.
+  if (modelWillChange || currentContext !== desiredContextWindow) patch.context_window_limit = desiredContextWindow;
+  const currentProviderType = currentModelSettingsProviderType(agent);
   const currentParallel = agent.model_settings?.parallel_tool_calls ?? agent.llm_config?.parallel_tool_calls;
-  if (currentProviderType !== canonical.modelSettingsProviderType || currentParallel !== canonical.parallelToolCalls) {
-    patch.model_settings = currentProviderType === canonical.modelSettingsProviderType
-      ? { ...(agent.model_settings ?? {}), provider_type: canonical.modelSettingsProviderType, parallel_tool_calls: canonical.parallelToolCalls }
-      : { provider_type: canonical.modelSettingsProviderType, parallel_tool_calls: canonical.parallelToolCalls };
+  if (currentProviderType !== desiredProviderType || currentParallel !== canonical.parallelToolCalls) {
+    patch.model_settings = currentProviderType === desiredProviderType
+      ? { ...(agent.model_settings ?? {}), provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls }
+      : { provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls };
   }
 
   if (Object.keys(patch).length === 0) {

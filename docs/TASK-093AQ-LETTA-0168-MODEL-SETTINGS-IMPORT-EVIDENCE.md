@@ -69,3 +69,28 @@ Full suite under the tunnel cgroup used one Vitest file worker plus reduced Node
 Result: 34 test files passed, 282 tests passed.
 
 An unconstrained full-suite run hit the same cgroup `pthread_create`/EAGAIN limit in child Node processes used by the concurrent-writer tests; rerunning under the bounded harness passed those tests without code changes.
+
+## R1 follow-up — cross-provider operator override pairing
+
+Reviewer R1 identified one remaining compatibility seam at implementation head `202c3fbcaa1ed5612b92f00a937cb57fda940e0a`: `LETTA_MODEL` could select a cross-provider model while managed reconciliation still compared and emitted the canonical DeepSeek `model_settings.provider_type`.
+
+The repair treats the effective model and model-settings discriminator as one runtime choice. The canonical model still uses the provider discriminator authored in `Subconscious.af`. A non-canonical `LETTA_MODEL` override resolves its discriminator from Letta's own `/models` metadata; no static provider-name mapping is introduced. This matters because a handle prefix is not necessarily the discriminated provider type: on the canary server `openai-proxy/glm-5.2` reports `provider_type = openai`.
+
+When a model change is required, managed reconciliation now carries `model`, the desired `context_window_limit`, and provider-valid `model_settings` in the same PATCH. The context value is deliberately included even when the pre-change agent already had the desired limit, because real Letta 0.16.8 evidence showed that a model PATCH can otherwise reset the effective context window to the new model's default.
+
+The focused regression uses the genuinely cross-provider override `openai-proxy/glm-5.2`. Starting from canonical DeepSeek state, the first reconcile emits the override model plus `model_settings.provider_type = openai`, `parallel_tool_calls = true`, and canonical context. The second reconcile emits no PATCH. The override provider discriminator is re-resolved from Letta metadata rather than trusting potentially stale agent state, so a mismatched runtime discriminator remains repairable.
+
+### Real Letta 0.16.8 R1 canary
+
+Two disposable real-runtime scenarios passed without `LETTA_CONTEXT_WINDOW` being set:
+
+1. Existing canonical DeepSeek agent -> `LETTA_MODEL=openai-proxy/glm-5.2`: the first managed reconcile converged in one PATCH to model `openai-proxy/glm-5.2`, `model_settings.provider_type = openai`, `parallel_tool_calls = true`, and effective context 400000. A second reconcile reported that the managed runtime already matched and emitted no corrective PATCH.
+2. Fresh isolated HOME with `LETTA_MODEL=openai-proxy/glm-5.2`: `importDefaultAgent` succeeded, Letta materialized the matching OpenAI model-settings discriminator, and managed reconciliation preserved the override while applying effective context 400000.
+
+A real `session_start.ts` run against the fresh GLM 5.2 override agent created a Letta conversation containing system, user, reasoning, and assistant messages. Letta logged an HTTP 200 LLM request through the configured OpenCode Go chat-completions endpoint. This confirms that the cross-provider pairing is not merely schema-valid; the resulting agent can execute a Subconscious session turn.
+
+### R1 tests
+
+Focused managed-agent regression set: 50/50 passed.
+
+The final exact code was then exercised across all 34 repository test files. Because the tunnel backend service itself has a low task cgroup ceiling and can be evicted by one large Vitest invocation, the same suite was run in four sequential bounded batches with one Vitest worker; concurrency tests still spawned their own independent writer processes. Aggregate result: 34 test files passed, 282 tests passed.
