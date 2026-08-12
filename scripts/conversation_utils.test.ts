@@ -34,4 +34,27 @@ describe('createConversation', () => {
       }),
     );
   });
+
+
+  it('retries one transient 5xx only when explicitly enabled', async () => {
+    vi.stubEnv('LETTA_BASE_URL', 'https://letta.example.com');
+    fetchMock
+      .mockResolvedValueOnce({ ok: false, status: 500, text: async () => '{"detail":"temporary"}' })
+      .mockResolvedValueOnce({ ok: true, json: async () => ({ id: 'conversation-recovered' }) });
+
+    const { createConversation } = await import('./conversation_utils.js');
+    const conversationId = await createConversation('test-key', 'agent-123', () => {}, { transientRetries: 1, retryDelayMs: 0 });
+
+    expect(conversationId).toBe('conversation-recovered');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a transient 5xx by default', async () => {
+    vi.stubEnv('LETTA_BASE_URL', 'https://letta.example.com');
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 500, text: async () => '{"detail":"temporary"}' });
+
+    const { createConversation } = await import('./conversation_utils.js');
+    await expect(createConversation('test-key', 'agent-123')).rejects.toThrow('Failed to create conversation: 500');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
 });

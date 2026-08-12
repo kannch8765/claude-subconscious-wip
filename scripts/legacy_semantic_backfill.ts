@@ -113,7 +113,7 @@ async function main(): Promise<void> {
     concurrency: args.concurrency,
     sourceIds: args.sourceIds,
     processor: async (source, batchId) => {
-      const conversationId = await createConversation(apiKey, agentId, () => {});
+      const conversationId = await createConversation(apiKey, agentId, (message) => console.error(`[legacy-backfill] ${message}`), { transientRetries: 1 });
       return runLegacySemanticObserverSource({
         agentId, conversationId, source, batchId, rootDir, subjectId, client,
         log: (message) => console.error(`[legacy-backfill] ${message}`),

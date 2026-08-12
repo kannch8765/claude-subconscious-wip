@@ -103,6 +103,7 @@ export async function runLegacySemanticObserverSource(input: LegacySemanticObser
       conversationId: input.conversationId,
       message: sourceMessage(input.source),
       tools,
+      enableBackgroundOtidRecovery: true,
     });
     if (native.clientToolFailure) toolRetryableFailure = true;
 

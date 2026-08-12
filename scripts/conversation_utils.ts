@@ -219,27 +219,48 @@ export function saveConversationsMap(cwd: string, map: ConversationsMap): void {
 /**
  * Create a new conversation for an agent
  */
-export async function createConversation(apiKey: string, agentId: string, log: LogFn = noopLog): Promise<string> {
-  const url = buildLettaApiUrl('/conversations/', { agent_id: agentId });
-  
-  log(`Creating new conversation for agent ${agentId}`);
-  
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-  });
+export interface CreateConversationOptions {
+  transientRetries?: number;
+  retryDelayMs?: number;
+}
 
-  if (!response.ok) {
+export async function createConversation(
+  apiKey: string,
+  agentId: string,
+  log: LogFn = noopLog,
+  options: CreateConversationOptions = {},
+): Promise<string> {
+  const url = buildLettaApiUrl('/conversations/', { agent_id: agentId });
+  const transientRetries = options.transientRetries ?? 0;
+  const retryDelayMs = options.retryDelayMs ?? 250;
+  if (!Number.isInteger(transientRetries) || transientRetries < 0) throw new Error('transientRetries must be a non-negative integer');
+  if (!Number.isFinite(retryDelayMs) || retryDelayMs < 0) throw new Error('retryDelayMs must be a non-negative number');
+
+  for (let attempt = 0; ; attempt += 1) {
+    log(`Creating new conversation for agent ${agentId}`);
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (response.ok) {
+      const conversation: Conversation = await response.json();
+      log(`Created conversation: ${conversation.id}`);
+      return conversation.id;
+    }
+
     const errorText = await response.text();
+    const retryableServerFailure = response.status >= 500 && response.status <= 599;
+    if (retryableServerFailure && attempt < transientRetries) {
+      log(`Conversation create returned ${response.status}; retrying before source mutation`);
+      if (retryDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+      continue;
+    }
     throw new Error(`Failed to create conversation: ${response.status} ${errorText}`);
   }
-
-  const conversation: Conversation = await response.json();
-  log(`Created conversation: ${conversation.id}`);
-  return conversation.id;
 }
 
 /**

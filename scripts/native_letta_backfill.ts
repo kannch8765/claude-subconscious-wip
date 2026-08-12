@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import Letta from '@letta-ai/letta-client';
 import { legacySourceCompleteToolSchema } from '../relationship-memory/src/legacy/semantic.js';
 import { normalizeLettaBaseUrl } from './letta_api_url.js';
@@ -5,6 +6,7 @@ import { normalizeLettaBaseUrl } from './letta_api_url.js';
 export const LEGACY_COMPLETION_TOOL_NAME = 'legacy_source_complete';
 const MAX_CLIENT_TOOL_ROUNDS = 128;
 const NATIVE_STREAM_CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
+const NATIVE_TRANSIENT_RECOVERY_ATTEMPTS = 1;
 
 export interface NativeClientTool {
   name: string;
@@ -262,25 +264,52 @@ export async function adoptActiveConversationRun(
   );
 }
 
-async function createContinuationWithRunConflictRecovery(
+function isTransientNativeServerFailure(error: unknown): boolean {
+  const status = (error as any)?.status;
+  return typeof status === 'number' && status >= 500 && status <= 599;
+}
+
+function addNativeRequestIdentity(body: Record<string, unknown>): Record<string, unknown> {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  if (messages.length === 0) throw new Error('native Letta request identity requires at least one message');
+  const requestOtid = randomUUID();
+  return {
+    ...body,
+    background: true,
+    include_pings: true,
+    messages: messages.map((message, index) => ({
+      ...(message as Record<string, unknown>),
+      otid: index === 0 ? requestOtid : `${requestOtid}:${index}`,
+    })),
+  };
+}
+
+async function createNativeMessageWithRecovery(
   client: NativeLettaClientLike,
   conversationId: string,
   agentId: string,
   body: Record<string, unknown>,
+  enableBackgroundOtidRecovery: boolean,
 ): Promise<AsyncIterable<any>> {
-  try {
-    // Conversation message creation is non-idempotent. Surface the first 409 so we can
-    // adopt the already-created run via Letta's native recovery stream rather than
-    // letting the SDK replay stale tool_returns.
-    return await client.conversations.messages.create(
-      conversationId,
-      { ...body, include_pings: true },
-      { maxRetries: 0, timeout: NATIVE_STREAM_CONNECT_TIMEOUT_MS },
-    );
-  } catch (error) {
-    const conflict = extractActiveConversationRunConflict(error);
-    if (!conflict) throw error;
-    return adoptActiveConversationRun(client, conflict.runId, conversationId, agentId);
+  const requestBody = enableBackgroundOtidRecovery
+    ? addNativeRequestIdentity(body)
+    : { ...body, include_pings: true };
+  const transientRecoveryAttempts = enableBackgroundOtidRecovery ? NATIVE_TRANSIENT_RECOVERY_ATTEMPTS : 0;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      // Letta 0.16.8 background streaming deduplicates same-OTID retries through
+      // Redis. Keep SDK retries disabled so recovery remains explicit and bounded.
+      return await client.conversations.messages.create(
+        conversationId,
+        requestBody,
+        { maxRetries: 0, timeout: NATIVE_STREAM_CONNECT_TIMEOUT_MS },
+      );
+    } catch (error) {
+      const conflict = extractActiveConversationRunConflict(error);
+      if (conflict) return adoptActiveConversationRun(client, conflict.runId, conversationId, agentId);
+      if (isTransientNativeServerFailure(error) && attempt < transientRecoveryAttempts) continue;
+      throw error;
+    }
   }
 }
 
@@ -290,6 +319,7 @@ export async function runNativeClientToolConversation(input: {
   conversationId: string;
   message: string;
   tools: readonly NativeClientTool[];
+  enableBackgroundOtidRecovery?: boolean;
 }): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
@@ -297,13 +327,18 @@ export async function runNativeClientToolConversation(input: {
   const unresolvedParseFailures = new Map<string, number>();
   const pendingTerminalCalls = new Map<string, 'completed' | 'no_memory_required'>();
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
-  let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
-    agent_id: input.agentId,
-    streaming: true,
-    include_pings: true,
-    messages: [{ role: 'user', content: input.message }],
-    client_tools: schemas,
-  }, { maxRetries: 0, timeout: NATIVE_STREAM_CONNECT_TIMEOUT_MS }));
+  let response = await collectLettaStream(await createNativeMessageWithRecovery(
+    input.client,
+    input.conversationId,
+    input.agentId,
+    {
+      agent_id: input.agentId,
+      streaming: true,
+      messages: [{ role: 'user', content: input.message }],
+      client_tools: schemas,
+    },
+    input.enableBackgroundOtidRecovery === true,
+  ));
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const messages = Array.isArray(response?.messages) ? response.messages : [];
@@ -360,12 +395,12 @@ export async function runNativeClientToolConversation(input: {
       unresolvedParseFailures.set(name, (unresolvedParseFailures.get(name) ?? 0) + failures);
     }
 
-    response = await collectLettaStream(await createContinuationWithRunConflictRecovery(input.client, input.conversationId, input.agentId, {
+    response = await collectLettaStream(await createNativeMessageWithRecovery(input.client, input.conversationId, input.agentId, {
       agent_id: input.agentId,
       streaming: true,
       messages: [{ type: 'tool_return', tool_returns: approvals }],
       client_tools: schemas,
-    }));
+    }, input.enableBackgroundOtidRecovery === true));
   }
   throw new Error(`legacy client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
 }

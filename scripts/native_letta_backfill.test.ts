@@ -94,6 +94,12 @@ function fakeClient(
   };
 }
 
+function runLegacyNativeClientToolConversation(
+  input: Parameters<typeof runNativeClientToolConversation>[0],
+) {
+  return runNativeClientToolConversation({ ...input, enableBackgroundOtidRecovery: true });
+}
+
 function terminalMessages(result: 'completed' | 'no_memory_required', toolCallId = 'terminal'): any[] {
   return [
     { message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: JSON.stringify({ result }), tool_call_id: toolCallId } },
@@ -142,7 +148,7 @@ describe('native Letta legacy backfill harness', () => {
       { messages: terminalMessages('no_memory_required', 'call-2'), stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
-    const result = await runNativeClientToolConversation({
+    const result = await runLegacyNativeClientToolConversation({
       client,
       agentId: 'agent-test',
       conversationId: 'conv-test',
@@ -158,10 +164,13 @@ describe('native Letta legacy backfill harness', () => {
     expect(extractLegacyCompletion(result.response.messages)).toBe('no_memory_required');
     expect(client.bodies).toHaveLength(2);
     expect(client.bodies[0].client_tools).toEqual([{ name: 'memory_search', description: 'search', parameters: { type: 'object' } }]);
-    expect(client.bodies[0]).toEqual(expect.objectContaining({ streaming: true, include_pings: true }));
+    expect(client.bodies[0]).toEqual(expect.objectContaining({ streaming: true, include_pings: true, background: true }));
+    expect(client.bodies[0].messages[0]).toEqual(expect.objectContaining({ role: 'user', content: 'source', otid: expect.any(String) }));
     expect(client.createOptions[0]).toEqual({ maxRetries: 0, timeout: 300000 });
     expect(client.createOptions[1]).toEqual({ maxRetries: 0, timeout: 300000 });
-    expect(client.bodies[1].messages).toEqual([{ type: 'tool_return', tool_returns: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] }]);
+    expect(client.bodies[1]).toEqual(expect.objectContaining({ streaming: true, include_pings: true, background: true }));
+    expect(client.bodies[1].messages).toEqual([expect.objectContaining({ type: 'tool_return', otid: expect.any(String), tool_returns: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] })]);
+    expect(client.bodies[1].messages[0].otid).not.toBe(client.bodies[0].messages[0].otid);
   });
 
   it('executes every parallel approval_request tool_calls entry exactly once', async () => {
@@ -182,7 +191,7 @@ describe('native Letta legacy backfill harness', () => {
       { messages: terminalMessages('no_memory_required'), stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
-    const result = await runNativeClientToolConversation({
+    const result = await runLegacyNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
       tools: [{
         name: 'memory_search', description: 'search', parameters: {},
@@ -192,14 +201,15 @@ describe('native Letta legacy backfill harness', () => {
 
     expect(seen).toEqual([{ query: 'A' }, { query: 'B' }, { query: 'C' }]);
     expect(result.terminal).toBe('no_memory_required');
-    expect(client.bodies[1].messages).toEqual([{
+    expect(client.bodies[1].messages).toEqual([expect.objectContaining({
       type: 'tool_return',
+      otid: expect.any(String),
       tool_returns: [
         { type: 'tool', tool_call_id: 'call-a', tool_return: '{\"results\":[]}', status: 'success' },
         { type: 'tool', tool_call_id: 'call-b', tool_return: '{\"results\":[]}', status: 'success' },
         { type: 'tool', tool_call_id: 'call-c', tool_return: '{\"results\":[]}', status: 'success' },
       ],
-    }]);
+    })]);
   });
 
   it('drains client approvals before accepting a terminal emitted in the same model turn', async () => {
@@ -214,7 +224,7 @@ describe('native Letta legacy backfill harness', () => {
       { messages: [{ message_type: 'tool_return_message', tool_call_id: 'terminal', status: 'success', tool_return: 'completed' }], stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
-    const result = await runNativeClientToolConversation({
+    const result = await runLegacyNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
       tools: [{
         name: 'legacy_memory_create', description: 'create', parameters: {},
@@ -225,10 +235,11 @@ describe('native Letta legacy backfill harness', () => {
     expect(result.terminal).toBe('completed');
     expect(result.clientToolFailure).toBe(false);
     expect(client.bodies).toHaveLength(2);
-    expect(client.bodies[1].messages).toEqual([{
+    expect(client.bodies[1].messages).toEqual([expect.objectContaining({
       type: 'tool_return',
+      otid: expect.any(String),
       tool_returns: [{ type: 'tool', tool_call_id: 'mutation', tool_return: '{"outcome":"accepted"}', status: 'success' }],
-    }]);
+    })]);
   });
   it('requires a successful server tool return before accepting legacy_source_complete', async () => {
     const messages = [
@@ -254,7 +265,7 @@ describe('native Letta legacy backfill harness', () => {
       { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
-    const result = await runNativeClientToolConversation({
+    const result = await runLegacyNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
       tools: [{
         name: 'legacy_memory_create', description: 'create', parameters: {},
@@ -268,6 +279,46 @@ describe('native Letta legacy backfill harness', () => {
       expect.objectContaining({ tool_call_id: 'bad', status: 'error' }),
       expect.objectContaining({ tool_call_id: 'same-round-success', status: 'success' }),
     ]);
+  });
+
+  it('retries a transient native 5xx once with the same background OTID', async () => {
+    const transient = Object.assign(new Error('500 transient'), { status: 500, error: { detail: 'An unknown error occurred' } });
+    const client = fakeClient([
+      { throw: transient },
+      { messages: terminalMessages('no_memory_required'), stop_reason: 'tool_rule' },
+    ]);
+    const result = await runLegacyNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source', tools: [],
+    });
+    expect(result.terminal).toBe('no_memory_required');
+    expect(client.bodies).toHaveLength(2);
+    expect(client.bodies[0]).toEqual(expect.objectContaining({ background: true, include_pings: true }));
+    expect(client.bodies[0].messages[0].otid).toEqual(expect.any(String));
+    expect(client.bodies[1].messages[0].otid).toBe(client.bodies[0].messages[0].otid);
+    expect(client.createOptions).toEqual([
+      { maxRetries: 0, timeout: 300000 },
+      { maxRetries: 0, timeout: 300000 },
+    ]);
+  });
+
+  it('retries a transient tool-return 5xx with the same OTID without re-executing the client tool', async () => {
+    const transient = Object.assign(new Error('500 transient'), { status: 500, error: { detail: 'An unknown error occurred' } });
+    let executions = 0;
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"A"}', tool_call_id: 'search' } }], stop_reason: 'requires_approval' },
+      { throw: transient },
+      { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
+    ]);
+    const result = await runLegacyNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { executions += 1; return { results: [] }; } }],
+    });
+    expect(result.terminal).toBe('completed');
+    expect(executions).toBe(1);
+    expect(client.bodies).toHaveLength(3);
+    expect(client.bodies[1].messages[0].otid).toBe(client.bodies[2].messages[0].otid);
+    expect(client.bodies[1].messages[0].otid).not.toBe(client.bodies[0].messages[0].otid);
+    expect(client.bodies[1].messages[0].tool_returns).toEqual(client.bodies[2].messages[0].tool_returns);
   });
 
   it('recognizes only the active-run conversation conflict shape', () => {
@@ -316,7 +367,7 @@ describe('native Letta legacy backfill harness', () => {
     ], [
       { messages: terminalMessages('completed'), stop_reason: 'tool_rule' },
     ]);
-    const result = await runNativeClientToolConversation({
+    const result = await runLegacyNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
       tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { return { results: [] }; } }],
     });
@@ -349,7 +400,7 @@ describe('native Letta legacy backfill harness', () => {
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{bad-json', tool_call_id: 'bad' } }], stop_reason: 'requires_approval' },
       { messages: terminalMessages('no_memory_required'), stop_reason: 'tool_rule' },
     ]);
-    const result = await runNativeClientToolConversation({
+    const result = await runLegacyNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
       tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { return { results: [] }; } }],
     });
