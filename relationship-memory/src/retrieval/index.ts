@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 export interface SemanticDocument {
@@ -34,6 +35,16 @@ export const DEFAULT_QWEN_QUERY_INSTRUCTION = 'Retrieve canonical relationship m
 export const DEFAULT_QWEN_EMBEDDING_ENDPOINT = 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding';
 export const DEFAULT_QWEN_EMBEDDING_MODEL = 'qwen3.7-text-embedding';
 export const DEFAULT_QWEN_EMBEDDING_DIMENSIONS = 1024;
+const DEFAULT_SEMANTIC_LOCK_TIMEOUT_MS = 5_000;
+const DEFAULT_SEMANTIC_LOCK_STALE_MS = 300_000;
+const SEMANTIC_LOCK_POLL_MS = 25;
+
+interface SemanticIndexLockOwner {
+  pid: number;
+  hostname: string;
+  token: string;
+  acquired_at: string;
+}
 
 function sha256(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -172,26 +183,119 @@ function writeIndex(file: string, value: SemanticIndexFileV1): void {
   try { fs.chmodSync(file, 0o600); } catch { }
 }
 
+function positiveEnvMs(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function semanticLockDir(indexFile: string): string {
+  return `${indexFile}.lock`;
+}
+
+function semanticLockOwnerFile(indexFile: string): string {
+  return path.join(semanticLockDir(indexFile), 'owner.json');
+}
+
+function semanticLockOwnerIsAlive(owner: SemanticIndexLockOwner): boolean {
+  if (owner.hostname !== os.hostname()) return true;
+  try {
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function recoverStaleSemanticLock(indexFile: string, staleMs: number): boolean {
+  const lockDir = semanticLockDir(indexFile);
+  let stat: fs.Stats;
+  try { stat = fs.statSync(lockDir); } catch { return true; }
+
+  let owner: SemanticIndexLockOwner | undefined;
+  try { owner = JSON.parse(fs.readFileSync(semanticLockOwnerFile(indexFile), 'utf8')) as SemanticIndexLockOwner; }
+  catch { owner = undefined; }
+
+  const oldEnough = Date.now() - stat.mtimeMs >= staleMs;
+  const deadOwner = owner
+    ? Number.isInteger(owner.pid) && owner.pid > 0 && typeof owner.hostname === 'string' && !semanticLockOwnerIsAlive(owner)
+    : oldEnough;
+  if (!deadOwner) return false;
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function acquireSemanticLock(indexFile: string): Promise<string> {
+  fs.mkdirSync(path.dirname(indexFile), { recursive: true, mode: 0o700 });
+  const timeoutMs = positiveEnvMs('RELATIONSHIP_MEMORY_SEMANTIC_LOCK_TIMEOUT_MS', DEFAULT_SEMANTIC_LOCK_TIMEOUT_MS);
+  const staleMs = positiveEnvMs('RELATIONSHIP_MEMORY_SEMANTIC_LOCK_STALE_MS', DEFAULT_SEMANTIC_LOCK_STALE_MS);
+  const deadline = Date.now() + timeoutMs;
+  const token = `${process.pid}-${crypto.randomUUID()}`;
+  while (true) {
+    try {
+      fs.mkdirSync(semanticLockDir(indexFile));
+      const owner: SemanticIndexLockOwner = { pid: process.pid, hostname: os.hostname(), token, acquired_at: new Date().toISOString() };
+      fs.writeFileSync(semanticLockOwnerFile(indexFile), `${JSON.stringify(owner)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      return token;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        try { fs.rmSync(semanticLockDir(indexFile), { recursive: true, force: true }); } catch { }
+        throw new Error(`semantic index lock acquisition failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      recoverStaleSemanticLock(indexFile, staleMs);
+      if (Date.now() >= deadline) throw new Error(`semantic index lock contention timed out after ${timeoutMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(SEMANTIC_LOCK_POLL_MS, Math.max(1, deadline - Date.now()))));
+    }
+  }
+}
+
+function releaseSemanticLock(indexFile: string, token: string): void {
+  try {
+    const owner = JSON.parse(fs.readFileSync(semanticLockOwnerFile(indexFile), 'utf8')) as SemanticIndexLockOwner;
+    if (owner.token !== token) throw new Error('semantic index lock ownership changed before release');
+    fs.rmSync(semanticLockDir(indexFile), { recursive: true, force: false });
+  } catch (error) {
+    throw new Error(`semantic index lock release failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export class FileBackedSemanticRetriever implements SemanticRetriever {
   constructor(readonly provider: EmbeddingProvider, readonly indexFile: string) {}
 
+  private async ensureDocuments(documents: SemanticDocument[]): Promise<SemanticIndexFileV1> {
+    const token = await acquireSemanticLock(this.indexFile);
+    try {
+      const index = readIndex(this.indexFile, this.provider.fingerprint);
+      const missing: SemanticDocument[] = [];
+      for (const document of documents) {
+        const contentHash = sha256(document.text);
+        const cached = index.documents[document.id];
+        if (!cached || cached.content_hash !== contentHash || cached.vector.length !== this.provider.dimensions || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) missing.push(document);
+      }
+      for (let offset = 0; offset < missing.length; offset += 20) {
+        const batch = missing.slice(offset, offset + 20);
+        const vectors = await this.provider.embedDocuments(batch.map((document) => document.text));
+        batch.forEach((document, indexInBatch) => {
+          index.documents[document.id] = { content_hash: sha256(document.text), vector: vectors[indexInBatch] };
+        });
+        // Checkpoint every successful provider batch. If a later batch fails, the next
+        // search resumes from this durable boundary instead of re-billing prior texts.
+        writeIndex(this.indexFile, index);
+      }
+      return index;
+    } finally {
+      releaseSemanticLock(this.indexFile, token);
+    }
+  }
+
   async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
     if (!query.trim() || documents.length === 0) return new Map();
-    const index = readIndex(this.indexFile, this.provider.fingerprint);
-    const missing: SemanticDocument[] = [];
-    for (const document of documents) {
-      const contentHash = sha256(document.text);
-      const cached = index.documents[document.id];
-      if (!cached || cached.content_hash !== contentHash || cached.vector.length !== this.provider.dimensions || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) missing.push(document);
-    }
-    for (let offset = 0; offset < missing.length; offset += 20) {
-      const batch = missing.slice(offset, offset + 20);
-      const vectors = await this.provider.embedDocuments(batch.map((document) => document.text));
-      batch.forEach((document, indexInBatch) => {
-        index.documents[document.id] = { content_hash: sha256(document.text), vector: vectors[indexInBatch] };
-      });
-    }
-    if (missing.length > 0) writeIndex(this.indexFile, index);
+    // Serialize derivative-cache refreshes across live MCP/Subcon processes. A waiter
+    // re-reads the index after acquiring the lock, so already-built vectors are reused.
+    const index = await this.ensureDocuments(documents);
     const queryVector = await this.provider.embedQuery(query);
     return new Map(documents.map((document) => [document.id, cosine(queryVector, index.documents[document.id].vector)]));
   }
