@@ -36,7 +36,8 @@
     "sanitize-transcript": "tsx scripts/sanitize_transcript.ts",
     "sanitize-transcripts": "tsx scripts/sanitize_transcript_batch.ts",
     "stripe-dariotouch": "tsx scripts/stripe_historical_dariotouch.ts",
-    "stripe-dariotouch-transcripts": "tsx scripts/stripe_historical_dariotouch_batch.ts"
+    "stripe-dariotouch-transcripts": "tsx scripts/stripe_historical_dariotouch_batch.ts",
+    "prewarm-semantic-index": "tsx scripts/prewarm_relationship_semantic_index.ts"
   },
   "dependencies": {
     "@letta-ai/letta-client": "1.12.1",
