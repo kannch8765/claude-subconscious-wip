@@ -21,15 +21,18 @@ function searchCacheFile(cwd: string, sessionId: string): string {
   const key = crypto.createHash('sha256').update(sessionId).digest('hex').slice(0, 24);
   return path.join(getDurableStateDir(cwd), `prompt-memory-search-${key}.json`);
 }
-function semanticReady(rootDir: string): boolean {
+function semanticReady(rootDir: string, subjectId: string): boolean {
   try {
     const retriever = createSemanticRetrieverFromEnvironment(rootDir) as any;
     if (!retriever?.provider?.fingerprint || !retriever?.indexFile) return false;
     const index = JSON.parse(fs.readFileSync(retriever.indexFile, 'utf8'));
+    const indexedMemories = index?.documents
+      ? Object.keys(index.documents).filter((id) => id.startsWith('memory:')).length
+      : 0;
+    const activeMemories = createRuntime([], subjectId, rootDir).memorySearch({}).length;
     return index?.schema_version === 1
       && index?.provider_fingerprint === retriever.provider.fingerprint
-      && index?.documents
-      && Object.keys(index.documents).length > 0;
+      && indexedMemories >= Math.max(1, activeMemories - 20);
   } catch { return false; }
 }
 async function deleteConversation(apiKey: string, conversationId: string): Promise<void> {
@@ -55,7 +58,7 @@ if (!prompt || !input.session_id || !input.cwd) process.exit(0);
 const apiKey = process.env.LETTA_API_KEY;
 const rootDir = process.env.RELATIONSHIP_MEMORY_DIR?.trim();
 const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID?.trim();
-if (!apiKey || !rootDir || !subjectId || !semanticReady(rootDir)) process.exit(0);
+if (!apiKey || !rootDir || !subjectId || !semanticReady(rootDir, subjectId)) process.exit(0);
 
 const searchedAt = new Date().toISOString();
 const runtime = createRuntime([], subjectId, rootDir);

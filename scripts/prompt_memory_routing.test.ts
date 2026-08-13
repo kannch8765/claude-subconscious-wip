@@ -24,6 +24,7 @@ describe('prompt-time subconscious relationship-memory routing', () => {
     expect(source).toContain("allowedTools: ['memory_search','deliver_subcon_whisper']");
     expect(source).toContain('createSemanticRetrieverFromEnvironment');
     expect(source).toContain('provider_fingerprint === retriever.provider.fingerprint');
+    expect(source).toContain('activeMemories - 20');
     expect(source).toContain("phase: 'user_prompt'");
     expect(source).not.toContain('fetchAssistantMessages');
   });
@@ -39,6 +40,8 @@ describe('prompt-time subconscious relationship-memory routing', () => {
     expect(worker).toContain('RELATIONSHIP_DISALLOWED_CLIENT_TOOLS');
     expect(worker).not.toContain('deliver_whisper');
     expect(worker).not.toContain('mirrorSubconVisibility');
+    expect(worker).toContain("existing?.status === 'completed'");
+    expect(worker).toContain('cleanup(apiKey, payload.conversationId)');
   });
 
   it('disables PreToolUse message surfacing in whisper mode and provides out-of-band Qwen prewarm', () => {

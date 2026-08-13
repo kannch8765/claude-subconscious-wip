@@ -19,7 +19,7 @@ async function run(payload: Payload): Promise<'completed'|'retryable_failure'> {
   const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
   const runtime = createRuntime(payload.canonicalMessages, subjectId, relationshipMemoryRoot(), payload.assistantIntents ?? []);
   const existing = [...runtime.store.listBatches()].reverse().find((item) => item.batch_id === payload.batchId);
-  if (existing?.status === 'completed') return 'completed';
+  if (existing?.status === 'completed') { await cleanup(apiKey, payload.conversationId); return 'completed'; }
   runtime.store.beginBatch(payload.batchId, new Date().toISOString());
   let ok = true; let session: any;
   try {
