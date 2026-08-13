@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest';
 describe('live async relationship-memory surfacing contract', () => {
   it('uses one post-turn search for both next-turn association and silent maintenance', () => {
     const send = fs.readFileSync(path.join(process.cwd(), 'scripts/send_messages_to_letta.ts'), 'utf8');
-    const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_sdk.ts'), 'utf8');
+    const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
     expect(send).toContain('<latest_user_message>');
     expect(send).toContain('worker already runs the exact text');
     expect(send).toContain('Reuse the same search results');
@@ -18,13 +18,14 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(worker).toContain('memory_remember');
   });
 
-  it('delegates approval recovery and terminal success to SDK runTurn', () => {
-    const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_sdk.ts'), 'utf8');
-    expect(worker).toContain('session.runTurn(liveMessage)');
-    expect(worker).not.toContain('await session.send(liveMessage)');
-    expect(worker).not.toContain('for await (const msg of session.stream())');
-    expect(worker).toContain('sessionSucceeded = result.success === true');
-    expect(worker).toContain('result.recoveryAttempts');
+  it('keeps live delivery on the native Letta client-tool conversation loop', () => {
+    const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
+    expect(worker).toContain('createNativeLettaClient');
+    expect(worker).toContain('runNativeClientToolConversation');
+    expect(worker).toContain('turnSucceeded = !result.clientToolFailure');
+    expect(worker).not.toContain('@letta-ai/letta-code-sdk');
+    expect(worker).not.toContain('resumeSession');
+    expect(worker).not.toContain('runTurn(');
   });
 
   it('prevents raw Letta assistant history from becoming foreground context', () => {

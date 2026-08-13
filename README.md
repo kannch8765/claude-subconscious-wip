@@ -122,7 +122,6 @@ export LETTA_BASE_URL="http://localhost:8283"  # For self-hosted Letta
 export LETTA_MODEL="anthropic/claude-sonnet-4-5"  # Model override
 export LETTA_CONTEXT_WINDOW="1048576"             # Context window size (e.g. 1M tokens)
 export LETTA_HOME="$HOME"      # Consolidate .letta state to ~/.letta/
-export LETTA_SDK_TOOLS="read-only"       # Or "full", "off"
 ```
 
 - `LETTA_MODE` - Controls what gets injected. `whisper` (default, messages only), `full` (blocks + messages), `off` (disable). See [Modes](#modes).
@@ -131,7 +130,6 @@ export LETTA_SDK_TOOLS="read-only"       # Or "full", "off"
 - `LETTA_MODEL` - Override the agent's model. Optional - the plugin auto-detects and selects from available models. See [Model Configuration](#model-configuration) below.
 - `LETTA_CONTEXT_WINDOW` - Override the agent's context window size (in tokens). Useful when `LETTA_MODEL` is set to a model with a large context window that differs from the server default. Example: `1048576` for 1M tokens.
 - `LETTA_HOME` - Base directory for plugin state files. Creates `{LETTA_HOME}/.letta/claude/` for session data and conversation mappings. Defaults to current working directory. Set to `$HOME` to consolidate all state in one location.
-- `LETTA_SDK_TOOLS` - Controls client-side tool access for the Subconscious agent. `read-only` (default), `full`, or `off`. See [SDK Tools](#sdk-tools).
 
 ### Modes
 
@@ -296,21 +294,15 @@ Before each tool use:
 - If updates found, injects them via `additionalContext`
 - Silent no-op if nothing changed
 
-### SDK Tools
+### Live Subconscious Tools and Transport
 
-By default, the Subconscious agent now gets **client-side tool access** via the [Letta Code SDK](https://docs.letta.com/letta-code/sdk/). Instead of being limited to memory operations, Sub can read your files, search the web, and explore your codebase while processing transcripts.
+Live background Subconscious execution uses the native `@letta-ai/letta-client` conversations API. It does not use the Letta Code SDK transport and does not expose Claude Code filesystem tools such as `Read`, `Grep`, or `Glob`.
 
-**Configuration via `LETTA_SDK_TOOLS`:**
+The live agent keeps its persistent Letta working-memory tools (`memory`, `memory_insert`, `memory_replace`, `memory_rethink`) plus `conversation_search`. Each asynchronous transcript turn supplies only the trusted relationship client tools: `memory_search`, `memory_reinforce`, `memory_remember`, `entity_search`, `entity_remember`, and `deliver_whisper`. Letta parallel tool calls remain enabled and client tool returns are matched to their original `tool_call_id`.
 
-| Mode | Tools Available | Use Case |
-|------|----------------|----------|
-| `read-only` (default) | `Read`, `Grep`, `Glob`, `web_search`, `fetch_webpage` | Safe background research and file reading |
-| `full` | All tools (Bash, Edit, Write, Task, etc.) | Full autonomy — Sub can make changes and spawn sub-agents |
-| `off` | None (memory-only) | Listen-only — Sub processes transcripts but has no client-side tools |
+`LETTA_MODE=whisper|full|off` controls foreground context injection only. It does not switch the live execution transport or client-tool inventory.
 
-In `full` mode, Sub can spawn sub-agents via the `Task` tool — dispatching parallel research or delegating work to other agents while Claude Code continues working.
-
-> **Note:** Requires `@letta-ai/letta-code-sdk` (installed as a dependency).
+The repository still carries `@letta-ai/letta-code-sdk` for the separate explicit recall runtime; that dependency is not part of live Subconscious transcript processing.
 
 ### Stop
 

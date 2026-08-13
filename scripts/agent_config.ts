@@ -366,10 +366,11 @@ async function resolveManagedModelSettingsProviderType(
   return model.provider_type;
 }
 
-interface AttachedBlock { id: string; label: string; }
+interface AttachedBlock { id: string; label: string; value?: string; }
 interface AttachedTool { id: string; name: string; }
 const OBSERVER_ONLY_BLOCK_LABELS = new Set(['shared_language', 'remembered_experiences', 'relationship_context']);
-const BACKFILL_ONLY_SERVER_TOOL_NAMES = new Set(['legacy_source_complete']);
+const LIVE_POLICY_BLOCK_LABELS = new Set(['core_directives', 'tool_guidelines']);
+const OBSOLETE_LIVE_SERVER_TOOL_NAMES = new Set(['legacy_source_complete', 'web_search', 'fetch_webpage']);
 
 async function fetchJsonArray(apiKey: string, pathname: string, reason: string): Promise<any[]> {
   const response = await fetch(buildLettaApiUrl(pathname), { headers: { 'Authorization': `Bearer ${apiKey}` } });
@@ -412,7 +413,19 @@ export async function reconcileManagedLiveAgentSurface(
   }
 
   for (const block of canonical.blocks) {
-    if (attachedByLabel.has(block.label)) continue;
+    const existing = attachedByLabel.get(block.label);
+    if (existing) {
+      if (LIVE_POLICY_BLOCK_LABELS.has(block.label) && existing.value !== block.value) {
+        const response = await fetch(buildLettaApiUrl(`/agents/${agentId}/core-memory/blocks/${block.label}`), {
+          method: 'PATCH',
+          headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ value: block.value }),
+        });
+        if (!response.ok) throw new Error(`Failed to reconcile live policy block ${block.label}: ${response.status} ${await response.text()}`);
+        log(`Reconciled live Subconscious policy block: ${block.label}`);
+      }
+      continue;
+    }
     const createResponse = await fetch(buildLettaApiUrl('/blocks/'), {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
@@ -439,9 +452,9 @@ export async function reconcileManagedLiveAgentSurface(
   const attachedByName = new Map(attachedTools.map((tool) => [tool.name, tool]));
 
   for (const tool of attachedTools) {
-    if (!desiredTools.has(tool.name) && BACKFILL_ONLY_SERVER_TOOL_NAMES.has(tool.name)) {
-      await patchEmpty(apiKey, `/agents/${agentId}/tools/detach/${tool.id}`, `Failed to detach backfill-only live tool ${tool.name}`);
-      log(`Detached backfill-only live Subconscious tool: ${tool.name}`);
+    if (!desiredTools.has(tool.name) && OBSOLETE_LIVE_SERVER_TOOL_NAMES.has(tool.name)) {
+      await patchEmpty(apiKey, `/agents/${agentId}/tools/detach/${tool.id}`, `Failed to detach obsolete live tool ${tool.name}`);
+      log(`Detached obsolete live Subconscious tool: ${tool.name}`);
     }
   }
   for (const name of canonical.toolNames) {

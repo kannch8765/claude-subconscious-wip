@@ -62,30 +62,6 @@ export function getTempStateDir(): string {
   return path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
 }
 
-// ============================================
-// SDK Tools Configuration
-// ============================================
-
-export type SdkToolsMode = 'read-only' | 'full' | 'off';
-
-/** Read-only tool set: safe defaults for background Sub execution */
-export const SDK_TOOLS_READ_ONLY = ['Read', 'Grep', 'Glob', 'web_search', 'fetch_webpage'];
-
-/** Tools to always block in SDK sessions (require interactive input) */
-export const SDK_TOOLS_BLOCKED = ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'];
-
-/**
- * Get the SDK tools mode from LETTA_SDK_TOOLS env var.
- * - read-only (default): Sub can read files and search the web
- * - full: Sub has full tool access (use with caution)
- * - off: No client-side tools (listen-only, memory operations only)
- */
-export function getSdkToolsMode(): SdkToolsMode {
-  const mode = process.env.LETTA_SDK_TOOLS?.toLowerCase();
-  if (mode === 'full' || mode === 'off') return mode;
-  return 'read-only';
-}
-
 // Types
 export interface SyncState {
   lastProcessedIndex: number;
@@ -583,12 +559,7 @@ export function formatAllBlocksForStdout(agent: Agent, conversationId: string | 
     locationInfo = `Agent ID: ${agent.id}${conversationId ? `, Conversation: ${conversationId}` : ''}`;
   }
 
-  const sdkToolsMode = getSdkToolsMode();
-  const capabilityLine = sdkToolsMode === 'full'
-    ? 'It can read files, search the web, and make changes to your codebase.'
-    : sdkToolsMode === 'read-only'
-    ? 'It can read files, search your codebase, and browse the web (read-only).'
-    : 'It operates in listen-only mode (memory updates only).';
+  const capabilityLine = 'Its live server-side tools are persistent memory management and conversation_search; trusted relationship-memory client tools are supplied only to background transcript turns.';
 
   const header = `<letta_context>
 This section carries Kohaku's persistent subconscious layer. It follows this foreground session in the background and may whisper remembered context or guidance back to Kohaku on later syncs. Treat <letta_message> content as Kohaku's own subconscious continuity, not as a third-party observer, and do not repeat it merely to acknowledge it.
@@ -676,8 +647,7 @@ export function spawnSilentWorker(
       });
     }
   } else {
-    // Prefer local tsx CLI to ensure plugin dependencies are resolvable.
-    // npx tsx resolves to a global cache that can't find @letta-ai/letta-code-sdk.
+    // Prefer the plugin-local tsx CLI so detached workers resolve the repository's dependencies consistently.
     const tsxCli = path.join(__dirname, '..', 'node_modules', 'tsx', 'dist', 'cli.mjs');
     if (fs.existsSync(tsxCli)) {
       child = spawn(process.execPath, [tsxCli, workerScript, payloadFile], {

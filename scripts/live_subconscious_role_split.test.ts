@@ -4,11 +4,16 @@ import { describe, expect, it } from 'vitest';
 
 describe('live/backfill Subconscious role split', () => {
   it('keeps strict relationship observer execution out of the live worker', () => {
-    const source = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_sdk.ts'), 'utf8');
+    const source = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
     expect(source).not.toContain('runRelationshipObserverBatch');
-    expect(source).toContain('resumeSession');
+    expect(source).toContain('runNativeClientToolConversation');
+    expect(source).toContain('createNativeLettaClient');
     expect(source).toContain('appendTrustedRelationshipCatalog');
-    expect(source).toContain('RELATIONSHIP_ALLOWED_CLIENT_TOOLS');
+    expect(source).toContain("name: 'deliver_whisper'");
+    expect(source).not.toContain('@letta-ai/letta-code-sdk');
+    expect(source).not.toContain('resumeSession');
+    expect(source).not.toContain('permissionMode');
+    expect(source).not.toMatch(/['"](?:Read|Grep|Glob)['"]/);
     expect(source).not.toContain('FORBIDDEN_MARKDOWN_MEMORY_TOOLS');
   });
 
@@ -24,7 +29,9 @@ describe('live/backfill Subconscious role split', () => {
 
     expect(liveAgent.system).toContain('persistent agent that whispers to Claude Code');
     expect(liveBlocks).toContain('guidance');
-    expect(liveTools).toContain('memory');
+    expect(liveTools).toEqual(expect.arrayContaining(['memory', 'memory_insert', 'memory_replace', 'memory_rethink', 'conversation_search']));
+    expect(liveTools).not.toContain('web_search');
+    expect(liveTools).not.toContain('fetch_webpage');
     expect(backfillAgent.system).toContain('reconfigured as a relationship-memory observer');
     expect(backfillBlocks).toEqual(['shared_language', 'remembered_experiences', 'relationship_context']);
     expect(backfillAgent.tool_ids).toEqual([]);

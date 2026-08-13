@@ -33,7 +33,6 @@ import {
   spawnSilentWorker,
   getMode,
   getTempStateDir,
-  getSdkToolsMode,
 } from './conversation_utils.js';
 import {
   readTranscript,
@@ -193,8 +192,6 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
 </instructions>
 </claude_code_session_update>`;
 
-    const sdkToolsMode = getSdkToolsMode();
-    log(`SDK tools mode: ${sdkToolsMode}`);
     const payloadFile = path.join(TEMP_STATE_DIR, `payload-${hookInput.session_id}-${Date.now()}.json`);
     const stateFile = getSyncStateFile(hookInput.cwd, hookInput.session_id);
 
@@ -202,7 +199,7 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
     const canonicalMessages = buildCanonicalMessages(messages, state.lastProcessedIndex, conversationId);
     log(`Relationship-memory batch: ${batchId} (${canonicalMessages.length} canonical evidence messages)`);
 
-    const sdkPayload = {
+    const nativePayload = {
       agentId,
       conversationId,
       sessionId: hookInput.session_id,
@@ -210,18 +207,17 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
       stateFile,
       newLastProcessedIndex: messages.length - 1,
       cwd: hookInput.cwd,
-      sdkToolsMode,
       batchId,
       canonicalMessages,
       assistantIntents,
       latestUserMessage,
     };
-    fs.writeFileSync(payloadFile, JSON.stringify(sdkPayload), 'utf-8');
-    log(`Wrote SDK payload to ${payloadFile}`);
+    fs.writeFileSync(payloadFile, JSON.stringify(nativePayload), 'utf-8');
+    log(`Wrote native live payload to ${payloadFile}`);
 
-    const workerScript = path.join(__dirname, 'send_worker_sdk.ts');
+    const workerScript = path.join(__dirname, 'send_worker_native.ts');
     const child = spawnSilentWorker(workerScript, payloadFile, hookInput.cwd);
-    log(`Spawned SDK worker (PID: ${child.pid})`);
+    log(`Spawned native live worker (PID: ${child.pid})`);
     log('Hook completed (worker running in background)');
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

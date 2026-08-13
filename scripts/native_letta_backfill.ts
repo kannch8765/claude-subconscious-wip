@@ -229,7 +229,7 @@ export async function runNativeClientToolConversation(input: {
     const approvals: any[] = [];
     for (const request of requests) {
       const tool = tools.get(request.name);
-      if (!tool) throw new Error(`Letta requested unknown legacy client tool: ${request.name}`);
+      if (!tool) throw new Error(`Letta requested unknown client tool: ${request.name}`);
       let status: 'success' | 'error' = 'success';
       let result: string;
       try {
@@ -249,5 +249,5 @@ export async function runNativeClientToolConversation(input: {
       client_tools: schemas,
     }));
   }
-  throw new Error(`legacy client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
+  throw new Error(`native client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
 }
