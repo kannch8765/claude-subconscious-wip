@@ -215,6 +215,10 @@ export async function runNativeClientToolConversation(input: {
   }));
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
+    const stopReason = response?.stop_reason?.stop_reason ?? response?.stop_reason?.reason ?? response?.stop_reason;
+    if (stopReason === 'error') {
+      throw new Error('Letta native conversation terminated with stop_reason=error');
+    }
     const messages = Array.isArray(response?.messages) ? response.messages : [];
     const terminal = extractLegacyCompletion(messages);
     if (terminal) {
