@@ -14,16 +14,14 @@
  *   1 - Non-blocking error
  */
 
-import * as fs from 'fs';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
+import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
 import {
   loadSyncState,
   saveSyncState,
-  lookupConversation,
-  SyncState,
   getMode,
 } from './conversation_utils.js';
 
@@ -53,19 +51,6 @@ interface Agent {
   blocks: MemoryBlock[];
 }
 
-interface LettaMessage {
-  id: string;
-  message_type: string;
-  content?: string;
-  text?: string;
-  date?: string;
-}
-
-interface MessageInfo {
-  id: string;
-  text: string;
-  date: string | null;
-}
 
 /**
  * Read hook input from stdin
@@ -120,65 +105,6 @@ async function fetchAgent(apiKey: string, agentId: string): Promise<Agent> {
   return response.json();
 }
 
-/**
- * Fetch new assistant messages from the conversation
- */
-async function fetchNewMessages(
-  apiKey: string, 
-  conversationId: string | null,
-  lastSeenMessageId: string | null
-): Promise<{ messages: MessageInfo[], lastMessageId: string | null }> {
-  if (!conversationId) {
-    return { messages: [], lastMessageId: null };
-  }
-
-  const url = buildLettaApiUrl(`/conversations/${conversationId}/messages`, {
-    limit: 20,
-  });
-
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  if (!response.ok) {
-    return { messages: [], lastMessageId: lastSeenMessageId };
-  }
-
-  const allMessages: LettaMessage[] = await response.json();
-  const assistantMessages = allMessages.filter(msg => msg.message_type === 'assistant_message');
-
-  // Find new messages (API returns newest first)
-  let endIndex = assistantMessages.length;
-  if (lastSeenMessageId) {
-    const lastSeenIndex = assistantMessages.findIndex(msg => msg.id === lastSeenMessageId);
-    if (lastSeenIndex !== -1) {
-      endIndex = lastSeenIndex;
-    }
-  }
-
-  const newMessages: MessageInfo[] = [];
-  for (let i = 0; i < endIndex; i++) {
-    const msg = assistantMessages[i];
-    const text = msg.content || msg.text;
-    if (text && typeof text === 'string') {
-      newMessages.push({
-        id: msg.id,
-        text,
-        date: msg.date || null,
-      });
-    }
-  }
-
-  const lastMessageId = assistantMessages.length > 0 
-    ? assistantMessages[0].id 
-    : lastSeenMessageId;
-
-  return { messages: newMessages, lastMessageId };
-}
 
 /**
  * Detect changed memory blocks
@@ -201,20 +127,10 @@ function detectChangedBlocks(
  * Format output for PreToolUse additionalContext
  */
 function formatOutput(
-  agentName: string,
-  messages: MessageInfo[],
   changedBlocks: MemoryBlock[],
   lastBlockValues: { [label: string]: string } | null
 ): string {
   const parts: string[] = [];
-
-  // Format new messages
-  if (messages.length > 0) {
-    for (const msg of messages) {
-      const timestamp = msg.date || 'unknown';
-      parts.push(`<letta_message from="${agentName}" timestamp="${timestamp}">\n${msg.text}\n</letta_message>`);
-    }
-  }
 
   // Format changed blocks with diffs
   if (changedBlocks.length > 0) {
@@ -262,13 +178,6 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const apiKey = process.env.LETTA_API_KEY;
-  
-  if (!apiKey) {
-    debug('No LETTA_API_KEY set, skipping');
-    process.exit(0);
-  }
-
   try {
     const hookInput = await readHookInput();
     
@@ -282,55 +191,40 @@ async function main(): Promise<void> {
     // Load state
     const state = loadSyncState(hookInput.cwd, hookInput.session_id);
     
-    // Need existing state to detect changes
-    if (!state.lastBlockValues && !state.lastSeenMessageId) {
-      debug('No previous state, skipping (UserPromptSubmit will handle first sync)');
-      process.exit(0);
+    const pendingWhispers = readPendingSubconWhispers(hookInput.cwd, hookInput.session_id);
+    let agent: Agent | null = null;
+    let changedBlocks: MemoryBlock[] = [];
+
+    // Raw Letta assistant messages are private background reasoning. Full mode may
+    // additionally expose working-memory block diffs, but never maintenance prose.
+    if (mode === 'full') {
+      const apiKey = process.env.LETTA_API_KEY;
+      if (!apiKey) {
+        debug('No LETTA_API_KEY set for full mode, skipping block synchronization');
+      } else {
+        const agentId = await getAgentId(apiKey);
+        agent = await fetchAgent(apiKey, agentId);
+        changedBlocks = detectChangedBlocks(agent.blocks || [], state.lastBlockValues || null);
+      }
     }
 
-    // Get agent ID
-    const agentId = await getAgentId(apiKey);
-    
-    // Get conversation ID
-    let conversationId = state.conversationId || null;
-    if (!conversationId) {
-      conversationId = lookupConversation(hookInput.cwd, hookInput.session_id);
-    }
-
-    // Fetch current state from Letta
-    const [agent, messagesResult] = await Promise.all([
-      fetchAgent(apiKey, agentId),
-      fetchNewMessages(apiKey, conversationId, state.lastSeenMessageId || null),
-    ]);
-
-    const { messages: newMessages, lastMessageId } = messagesResult;
-    const changedBlocks = detectChangedBlocks(agent.blocks || [], state.lastBlockValues || null);
-
-    debug(`New messages: ${newMessages.length}, Changed blocks: ${changedBlocks.length}`);
-
-    // If nothing changed, exit silently
-    if (newMessages.length === 0 && changedBlocks.length === 0) {
+    debug(`Pending whispers: ${pendingWhispers.length}, Changed blocks: ${changedBlocks.length}`);
+    if (pendingWhispers.length === 0 && changedBlocks.length === 0) {
       debug('No updates, exiting silently');
       process.exit(0);
     }
 
-    // Format and output
-    const additionalContext = formatOutput(
-      agent.name || 'Subconscious',
-      newMessages,
-      changedBlocks,
-      state.lastBlockValues || null
-    );
-
-    // Update state
-    if (lastMessageId) {
-      state.lastSeenMessageId = lastMessageId;
+    const parts: string[] = [];
+    const whisperOutput = formatPendingSubconWhispers(pendingWhispers);
+    if (whisperOutput) parts.push(whisperOutput);
+    if (mode === 'full' && agent && changedBlocks.length > 0) {
+      parts.push(formatOutput(changedBlocks, state.lastBlockValues || null));
     }
-    if (agent.blocks) {
+    const additionalContext = parts.join('\n\n');
+
+    if (agent?.blocks) {
       state.lastBlockValues = {};
-      for (const block of agent.blocks) {
-        state.lastBlockValues[block.label] = block.value;
-      }
+      for (const block of agent.blocks) state.lastBlockValues[block.label] = block.value;
     }
     saveSyncState(hookInput.cwd, state);
 
@@ -352,6 +246,7 @@ async function main(): Promise<void> {
       payload: contextWithInstruction,
     });
     console.log(JSON.stringify(output));
+    if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
     
   } catch (error) {
     debug(`Error: ${error}`);

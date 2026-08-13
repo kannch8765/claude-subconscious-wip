@@ -20,6 +20,7 @@ import {
 } from '../relationship-memory/src/adapter/index.js';
 import { stableJson } from '../relationship-memory/src/store/index.js';
 import { cursorShouldAdvance } from '../relationship-memory/src/tools/index.js';
+import { queueSubconWhisper } from './subcon_whisper_queue.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -76,6 +77,27 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
       };
     });
 
+    let whisperDelivered = false;
+    const deliverWhisperTool = {
+      label: 'deliver_whisper',
+      name: 'deliver_whisper',
+      description: 'Deliver at most one concise subconscious memory whisper for foreground Kohaku on a later sync. Include only useful remembered context or association; never include search/storage/tool bookkeeping. Do not call when nothing is meaningfully useful.',
+      parameters: {
+        type: 'object', additionalProperties: false, required: ['text'],
+        properties: { text: { type: 'string', minLength: 1, maxLength: 1200 } },
+      },
+      async execute(_toolCallId: string, args: unknown) {
+        if (whisperDelivered) throw new Error('deliver_whisper may be called at most once per batch');
+        const text = typeof (args as any)?.text === 'string' ? (args as any).text.trim() : '';
+        if (!text) throw new Error('deliver_whisper.text must be non-empty');
+        const queued = queueSubconWhisper(payload.cwd, payload.sessionId, payload.batchId, text);
+        whisperDelivered = true;
+        log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${text.length} chars)`);
+        return jsonResult({ status: 'ok', whisper_id: queued?.whisper_id });
+      },
+    };
+    relationshipTools.push(deliverWhisperTool as any);
+
     const durableAssistantIntents = assistantIntents.map((intent) => {
       const stored = runtime.store.getAssistantIntent(intent.intent_id);
       if (!stored || stableJson(stored) !== stableJson(intent)) {
@@ -98,9 +120,9 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     };
 
     if (payload.sdkToolsMode === 'off') {
-      sessionOptions.allowedTools = [...RELATIONSHIP_ALLOWED_CLIENT_TOOLS];
+      sessionOptions.allowedTools = [...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, 'deliver_whisper'];
     } else if (payload.sdkToolsMode === 'read-only') {
-      sessionOptions.allowedTools = [...readOnlyTools, ...RELATIONSHIP_ALLOWED_CLIENT_TOOLS];
+      sessionOptions.allowedTools = [...readOnlyTools, ...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, 'deliver_whisper'];
     }
     // full mode deliberately leaves client-side tool access unrestricted.
     // The live agent's server-side memory/guidance tools remain available in
@@ -115,7 +137,7 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     log(`Creating live SDK session for conversation ${payload.conversationId} (mode: ${payload.sdkToolsMode})`);
     log(`  agent: ${payload.agentId}`);
     log(`  cwd: ${payload.cwd}`);
-    log(`  relationship tools: ${RELATIONSHIP_ALLOWED_CLIENT_TOOLS.join(', ')}`);
+    log(`  relationship tools: ${[...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, 'deliver_whisper'].join(', ')}`);
 
     session = resumeSession(payload.conversationId, sessionOptions);
     await session.send(liveMessage);
