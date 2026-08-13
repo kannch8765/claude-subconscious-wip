@@ -17,16 +17,13 @@
  *   2 - Blocking error (prevents prompt processing)
  */
 
-import * as fs from 'fs';
-import * as path from 'path';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
-import { buildLettaApiUrl } from './letta_api_url.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
+import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import {
   loadSyncState,
   saveSyncState,
-  getOrCreateConversation,
   lookupConversation,
   SyncState,
   Agent,
@@ -36,7 +33,6 @@ import {
   formatAllBlocksForStdout,
   cleanLettaFromClaudeMd,
   getMode,
-  getTempStateDir,
 } from './conversation_utils.js';
 
 // Configuration
@@ -48,19 +44,6 @@ function debug(...args: unknown[]): void {
   }
 }
 
-interface LettaMessage {
-  id: string;
-  message_type: string;
-  content?: string;
-  text?: string;
-  date?: string;
-}
-
-interface MessageInfo {
-  id: string;
-  text: string;
-  date: string | null;
-}
 
 interface HookInput {
   session_id: string;
@@ -69,8 +52,6 @@ interface HookInput {
   transcript_path?: string;  // Path to transcript JSONL
 }
 
-// Temp state directory for logs
-const TEMP_STATE_DIR = getTempStateDir();
 
 /**
  * Read hook input from stdin
@@ -184,225 +165,84 @@ ${formatted}
 </letta_memory_update>`;
 }
 
-/**
- * Fetch all assistant messages from the conversation history since last seen
- */
-async function fetchAssistantMessages(
-  apiKey: string, 
-  conversationId: string | null,
-  lastSeenMessageId: string | null
-): Promise<{ messages: MessageInfo[], lastMessageId: string | null }> {
-  if (!conversationId) {
-    // No conversation yet, return empty
-    return { messages: [], lastMessageId: null };
-  }
-
-  // Use a high limit because Letta returns multiple entries per logical message
-  // (hidden_reasoning + assistant_message pairs), so limit=50 may not reach newest messages
-  const url = buildLettaApiUrl(`/conversations/${conversationId}/messages`, {
-    limit: 300,
-  });
-
-  const response = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-    },
-  });
-
-  if (!response.ok) {
-    // Don't fail if we can't fetch messages, just return empty
-    return { messages: [], lastMessageId: lastSeenMessageId };
-  }
-
-  const allMessages: LettaMessage[] = await response.json();
-
-  // Filter to assistant messages only, then sort by date descending (newest first)
-  // The API does NOT guarantee newest-first ordering — newer messages can appear at the end
-  const assistantMessages = allMessages
-    .filter(msg => msg.message_type === 'assistant_message')
-    .sort((a, b) => {
-      const da = a.date ? new Date(a.date).getTime() : 0;
-      const db = b.date ? new Date(b.date).getTime() : 0;
-      return db - da; // newest first
-    });
-
-  // Find the index of the last seen message
-  // Since messages are newest-first, new messages are BEFORE lastSeenIndex (indices 0 to lastSeenIndex-1)
-  let endIndex = assistantMessages.length; // Default: return all messages
-  if (lastSeenMessageId) {
-    const lastSeenIndex = assistantMessages.findIndex(msg => msg.id === lastSeenMessageId);
-    if (lastSeenIndex !== -1) {
-      // Only return messages newer than the last seen one (before it in the array)
-      endIndex = lastSeenIndex;
-    }
-  }
-  debug(`endIndex=${endIndex}, will return messages from index 0 to ${endIndex - 1}`);
-
-  // Get new messages (from 0 to endIndex, which are the newest messages)
-  const newMessages: MessageInfo[] = [];
-  for (let i = 0; i < endIndex; i++) {
-    const msg = assistantMessages[i];
-    const text = msg.content || msg.text;
-    if (text && typeof text === 'string') {
-      newMessages.push({
-        id: msg.id,
-        text,
-        date: msg.date || null,
-      });
-    }
-  }
-  debug(`Returning ${newMessages.length} new messages`);
-
-  // Get the last message ID for tracking (the NEWEST message, which is first in the array)
-  const lastMessageId = assistantMessages.length > 0
-    ? assistantMessages[0].id
-    : lastSeenMessageId;
-  debug(`Setting lastMessageId=${lastMessageId}`);
-
-  return { messages: newMessages, lastMessageId };
-}
-
-/**
- * Format assistant messages for stdout injection
- */
-function formatMessagesForStdout(agent: Agent, messages: MessageInfo[]): string {
-  const agentName = agent.name || 'Letta Agent';
-  
-  if (messages.length === 0) {
-    return `<!-- No new messages from ${agentName} -->`;
-  }
-  
-  // Format each message
-  const formattedMessages = messages.map((msg, index) => {
-    const timestamp = msg.date || 'unknown';
-    const msgNum = messages.length > 1 ? ` (${index + 1}/${messages.length})` : '';
-    return `<letta_message from="${agentName}"${msgNum} timestamp="${timestamp}">
-${msg.text}
-</letta_message>`;
-  });
-  
-  return formattedMessages.join('\n\n');
-}
 
 /**
  * Main function
  */
 async function main(): Promise<void> {
-  // Check mode
   const mode = getMode();
-  if (mode === 'off') {
-    process.exit(0);
-  }
+  if (mode === 'off') process.exit(0);
 
-  // Get environment variables
-  const apiKey = process.env.LETTA_API_KEY;
   const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 
-  // Validate required environment variables
-  if (!apiKey) {
-    console.error('Error: LETTA_API_KEY environment variable is not set');
-    process.exit(1);
-  }
-
   try {
-    // Get agent ID (from env, saved config, or auto-import)
-    const agentId = await getAgentId(apiKey);
-    // Read hook input to get session ID for conversation lookup
     const hookInput = await readHookInput();
     const cwd = hookInput?.cwd || projectDir;
     const sessionId = hookInput?.session_id;
-    
-    // Load state using shared utility
-    let state: SyncState | null = null;
-    if (sessionId) {
-      state = loadSyncState(cwd, sessionId);
+    const pendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
+
+    // Whisper mode is a local transport only: background Subcon explicitly wrote
+    // deliver_whisper payloads into the durable queue. Do not contact Letta, fetch
+    // agent state, or inspect conversation history on the foreground hot path.
+    if (mode === 'whisper') {
+      cleanLettaFromClaudeMd(cwd);
+      const injectionPayload = formatPendingSubconWhispers(pendingWhispers);
+      if (sessionId && injectionPayload) {
+        mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: injectionPayload });
+      }
+      if (injectionPayload) console.log(injectionPayload);
+      if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
+      return;
     }
-    
-    // Recover conversationId from conversations.json if state doesn't have it
+
+    // Full mode retains working-memory block synchronization in addition to the
+    // dedicated whisper queue, so it still requires Letta agent access.
+    const apiKey = process.env.LETTA_API_KEY;
+    if (!apiKey) {
+      console.error('Error: LETTA_API_KEY environment variable is not set');
+      process.exit(1);
+    }
+
+    const agentId = await getAgentId(apiKey);
+    let state: SyncState | null = null;
+    if (sessionId) state = loadSyncState(cwd, sessionId);
+
     let conversationId = state?.conversationId || null;
     if (!conversationId && sessionId) {
       conversationId = lookupConversation(cwd, sessionId);
-      // Update state so we don't have to look it up again
-      if (conversationId && state) {
-        state.conversationId = conversationId;
-      }
+      if (conversationId && state) state.conversationId = conversationId;
     }
     const lastBlockValues = state?.lastBlockValues || null;
-    const lastSeenMessageId = state?.lastSeenMessageId || null;
-
-    // Fetch agent data and messages in parallel
-    const [agent, messagesResult] = await Promise.all([
-      fetchAgent(apiKey, agentId),
-      fetchAssistantMessages(apiKey, conversationId, lastSeenMessageId),
-    ]);
-    
-    const { messages: newMessages, lastMessageId } = messagesResult;
-
-    // Detect which blocks have changed since last sync
+    const agent = await fetchAgent(apiKey, agentId);
     const changedBlocks = detectChangedBlocks(agent.blocks || [], lastBlockValues);
-    
-    // Clean up any existing <letta> section from CLAUDE.md (legacy migration)
+
     cleanLettaFromClaudeMd(cwd);
-    
-    // Update state with block values and last seen message ID
     if (state) {
       state.lastBlockValues = {};
-      for (const block of agent.blocks || []) {
-        state.lastBlockValues[block.label] = block.value;
-      }
-      // Track the last message we've seen
-      if (lastMessageId) {
-        state.lastSeenMessageId = lastMessageId;
-      }
+      for (const block of agent.blocks || []) state.lastBlockValues[block.label] = block.value;
     }
-    
-    // Output to stdout - this gets injected before the user's prompt
-    // (UserPromptSubmit hooks add stdout to context)
+
     const outputs: string[] = [];
-    
-    if (mode === 'full') {
-      // Full mode: inject memory blocks + messages
-      const isFirstPrompt = !lastBlockValues;
-      
-      if (isFirstPrompt) {
-        outputs.push(formatAllBlocksForStdout(agent, conversationId));
-      } else {
-        const changedBlocksOutput = formatChangedBlocksForStdout(changedBlocks, lastBlockValues);
-        if (changedBlocksOutput) {
-          outputs.push(changedBlocksOutput);
-        }
-      }
+    const isFirstPrompt = !lastBlockValues;
+    if (isFirstPrompt) {
+      outputs.push(formatAllBlocksForStdout(agent, conversationId));
+    } else {
+      const changedBlocksOutput = formatChangedBlocksForStdout(changedBlocks, lastBlockValues);
+      if (changedBlocksOutput) outputs.push(changedBlocksOutput);
     }
-    
-    // Both modes: inject messages from Sub
-    const messageOutput = formatMessagesForStdout(agent, newMessages);
-    outputs.push(messageOutput);
-    
-    // Subcon messages are injected as context only. The UI has a dedicated Subcon section,
-    // so the foreground Claude must not be instructed to repeat or acknowledge them.
-    
+    const messageOutput = formatPendingSubconWhispers(pendingWhispers);
+    if (messageOutput) outputs.push(messageOutput);
+
     const injectionPayload = outputs.join('\n\n');
     if (sessionId && injectionPayload) {
-      mirrorSubconVisibility({
-        sessionId,
-        phase: 'user_prompt',
-        payload: injectionPayload,
-      });
+      mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: injectionPayload });
     }
-    console.log(injectionPayload);
-    
-    // Save state
-    if (state && sessionId) {
-      saveSyncState(cwd, state);
-    }
-    
+    if (injectionPayload) console.log(injectionPayload);
+    if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
+    if (state && sessionId) saveSyncState(cwd, state);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error(`Error syncing Letta memory: ${errorMessage}`);
-    // Exit with code 1 for non-blocking error
-    // Change to exit(2) if you want to block prompt processing on sync failures
     process.exit(1);
   }
 }

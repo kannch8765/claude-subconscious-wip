@@ -159,6 +159,8 @@ async function main(): Promise<void> {
       const escaped = m.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       return `<message role="${role}">\n${escaped}\n</message>`;
     }).join('\n');
+    const latestUserMessage = [...newMessages].reverse().find((message) => message.role === 'user')?.text.trim() || '';
+    const latestUserEscaped = latestUserMessage.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
     const userMessage = `<claude_code_session_update>
 <session_id>${hookInput.session_id}</session_id>
@@ -167,14 +169,26 @@ async function main(): Promise<void> {
 ${transcriptEntries}
 </transcript>
 
-<instructions>
-You may provide commentary or guidance for Claude Code. Your response will be added to Claude's context window on the next prompt. Use this to:
-- Offer observations about the user's work
-- Provide reminders or context from your memory
-- Suggest approaches or flag potential issues
-- Send async messages/guidance to Claude Code
+<latest_user_message>
+${latestUserEscaped}
+</latest_user_message>
 
-Write your response as if speaking directly to Claude Code.
+<instructions>
+This is the normal asynchronous Subconscious pass after a foreground Kohaku turn. Do both jobs in one pass:
+
+1. MEMORY SURFACING FOR THE NEXT FOREGROUND TURN
+- Use the exact text inside <latest_user_message> as your first relationship memory_search query. Do not alter, summarize, or keyword-extract it before that first search.
+- Treat returned relationship memories as associations surfacing into Kohaku's subconscious. Select only context genuinely useful for continuity on the next foreground turn.
+- If something useful surfaced, call deliver_whisper once with a short natural first-person Kohaku note containing the remembered context itself. Example: "咖啡让我想起猫之前京都那次的高木珈琲。"
+- If nothing useful surfaced, do not call deliver_whisper. Silence is correct.
+- A whisper must never mention memory_search, IDs, evidence, reinforce/remember/create/dedupe, archival status, or whether anything deserves storage.
+
+2. SILENT LONG-TERM MEMORY MAINTENANCE
+- Reuse the same search results when applicable to decide whether trusted new evidence should reinforce an existing relationship memory, create a genuinely new durable memory, or do nothing.
+- Perform memory_reinforce / memory_remember / entity operations as needed. This work is private maintenance.
+- Never report maintenance decisions in deliver_whisper, ordinary prose, guidance, or any other foreground-visible channel.
+
+The foreground sees only explicit deliver_whisper output. Ordinary assistant prose from this background pass is not a whisper and will not be injected.
 </instructions>
 </claude_code_session_update>`;
 
