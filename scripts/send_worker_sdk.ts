@@ -87,7 +87,7 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
 
   runtime.store.beginBatch(payload.batchId, new Date().toISOString());
   let session: any = null;
-  let sessionSucceeded = true;
+  let sessionSucceeded = false;
 
   try {
     log('Loading Letta Code SDK for live Subconscious delivery...');
@@ -167,23 +167,25 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     log(`  relationship tools: ${[...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, 'deliver_whisper'].join(', ')}`);
 
     session = resumeSession(payload.conversationId, sessionOptions);
-    await session.send(liveMessage);
+    const result = await session.runTurn(liveMessage);
+    sessionSucceeded = result.success === true;
 
-    let assistantResponse = '';
-    let messageCount = 0;
-    for await (const msg of session.stream()) {
-      messageCount += 1;
-      if (msg.type === 'assistant' && msg.content) {
-        assistantResponse += msg.content;
-        log(`  Assistant chunk: ${msg.content.substring(0, 100)}...`);
-      } else if (msg.type === 'tool_call') {
-        log(`  Tool call: ${(msg as any).toolName}`);
-      } else if (msg.type === 'error') {
-        sessionSucceeded = false;
-        log(`  Error: ${(msg as any).message}`);
-      }
+    const assistantResponse = typeof result.result === 'string' ? result.result : '';
+    if (result.recoveryAttempts) {
+      log(`SDK recovered pending approval before completing turn: attempts=${result.recoveryAttempts}`);
     }
-    log(`Live stream complete: ${messageCount} messages, assistant response: ${assistantResponse.length} chars`);
+    if (!sessionSucceeded) {
+      log(
+        `Live turn failed: errorCode=${result.errorCode ?? 'unknown'}, `
+        + `approvalConflict=${result.approvalConflict === true}, `
+        + `recoverable=${result.recoverable === true}, `
+        + `detail=${result.errorDetail ?? result.error ?? 'none'}`,
+      );
+    }
+    log(
+      `Live turn complete: success=${sessionSucceeded}, `
+      + `assistant response: ${assistantResponse.length} chars`,
+    );
   } catch (error) {
     sessionSucceeded = false;
     log(`Live Subconscious SDK failure: ${error instanceof Error ? error.message : String(error)}`);

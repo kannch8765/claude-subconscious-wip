@@ -18,6 +18,15 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(worker).toContain('memory_remember');
   });
 
+  it('delegates approval recovery and terminal success to SDK runTurn', () => {
+    const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_sdk.ts'), 'utf8');
+    expect(worker).toContain('session.runTurn(liveMessage)');
+    expect(worker).not.toContain('await session.send(liveMessage)');
+    expect(worker).not.toContain('for await (const msg of session.stream())');
+    expect(worker).toContain('sessionSucceeded = result.success === true');
+    expect(worker).toContain('result.recoveryAttempts');
+  });
+
   it('prevents raw Letta assistant history from becoming foreground context', () => {
     const sync = fs.readFileSync(path.join(process.cwd(), 'scripts/sync_letta_memory.ts'), 'utf8');
     const pretool = fs.readFileSync(path.join(process.cwd(), 'scripts/pretool_sync.ts'), 'utf8');
