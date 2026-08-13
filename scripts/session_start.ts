@@ -31,7 +31,6 @@ import {
   fetchAgent,
   getMode,
   getTempStateDir,
-  getSdkToolsMode,
   expandPath,
 } from './conversation_utils.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
@@ -179,25 +178,15 @@ async function sendSessionStartMessage(
   const projectName = path.basename(cwd);
   const timestamp = new Date().toISOString();
 
-  const sdkToolsMode = getSdkToolsMode();
-  const toolAccessDescription = sdkToolsMode === 'full'
-    ? 'Full tool access enabled — you can Read, Grep, Glob, Edit, Write, Bash, and search the web.'
-    : sdkToolsMode === 'read-only'
-    ? 'Read-only tool access — you can Read, Grep, Glob files and search the web. No writes.'
-    : 'Listen-only mode — no client-side tools. You can only update your memory blocks.';
-
   const message = `<claude_code_session_start>
 <project>${projectName}</project>
 <path>${cwd}</path>
 <session_id>${sessionId}</session_id>
 <timestamp>${timestamp}</timestamp>
-<sdk_tools_mode>${sdkToolsMode}</sdk_tools_mode>
-
 <context>
 A new foreground Claude Code session for Kohaku has begun. This is another foreground session of the same Kohaku whose persistent subconscious layer you are; it is not a separate person for you to observe from outside. Session updates will be sent here as the session progresses.
 
-Tool access: ${toolAccessDescription}
-${sdkToolsMode !== 'off' ? `Use your tools to explore the codebase at ${cwd} when processing transcripts.` : ''}
+Live tool boundary: use Letta's persistent memory tools and conversation_search for working continuity. Relationship-memory client tools are supplied on asynchronous transcript turns. Foreground filesystem/code exploration remains foreground Kohaku's job.
 </context>
 </claude_code_session_start>`;
 
@@ -301,11 +290,9 @@ async function main(): Promise<void> {
     writeTty('\n');
 
     // Settings
-    const sdkTools = process.env.LETTA_SDK_TOOLS || 'read-only';
     const baseUrl = process.env.LETTA_BASE_URL || 'https://api.letta.com';
     writeTty(`  Model:      ${modelHandle}\n`);
     writeTty(`  Mode:       ${mode}\n`);
-    writeTty(`  SDK Tools:  ${sdkTools}\n`);
     if (process.env.LETTA_BASE_URL) {
       writeTty(`  Server:     ${baseUrl}\n`);
     }

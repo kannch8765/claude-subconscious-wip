@@ -27,6 +27,8 @@ describe('managed live agent surface reconciliation', () => {
       if (method === 'GET' && url.pathname.endsWith(`/agents/${AGENT}/core-memory/blocks`)) {
         return response([
           { id: 'block-existing-guidance', label: 'guidance', value: 'keep my learned guidance' },
+          { id: 'block-stale-core', label: 'core_directives', value: 'stale SDK-era core' },
+          { id: 'block-stale-tools', label: 'tool_guidelines', value: 'Client-Side Tools (via Letta Code SDK)' },
           { id: 'block-old-projection', label: 'relationship_context', value: 'observer projection' },
           { id: 'block-custom', label: 'operator_notes', value: 'preserve me' },
         ]);
@@ -39,6 +41,8 @@ describe('managed live agent surface reconciliation', () => {
         return response([
           { id: globalTools.find((tool) => tool.name === 'memory')!.id, name: 'memory' },
           { id: 'tool-obsolete', name: 'legacy_source_complete' },
+          { id: 'tool-old-web', name: 'web_search' },
+          { id: 'tool-old-fetch', name: 'fetch_webpage' },
           { id: 'tool-custom', name: 'operator_custom_tool' },
         ]);
       }
@@ -50,19 +54,27 @@ describe('managed live agent surface reconciliation', () => {
     await expect(reconcileManagedLiveAgentSurface('key', AGENT, () => {}, LIVE_AF)).resolves.toBeUndefined();
 
     const creates = calls.filter((call) => call.method === 'POST' && call.pathname.endsWith('/blocks/'));
-    expect(creates).toHaveLength(canonical.blocks.length - 1);
+    expect(creates).toHaveLength(canonical.blocks.length - 3);
     expect(creates.some((call) => call.body?.label === guidance.label)).toBe(false);
     expect(calls.some((call) => call.pathname.endsWith('/core-memory/blocks/detach/block-old-projection'))).toBe(true);
     expect(calls.some((call) => call.pathname.endsWith('/tools/detach/tool-obsolete'))).toBe(true);
+    expect(calls.some((call) => call.pathname.endsWith('/tools/detach/tool-old-web'))).toBe(true);
+    expect(calls.some((call) => call.pathname.endsWith('/tools/detach/tool-old-fetch'))).toBe(true);
+    expect(calls.some((call) => call.pathname.endsWith(`/core-memory/blocks/core_directives`) && call.method === 'PATCH')).toBe(true);
+    expect(calls.some((call) => call.pathname.endsWith(`/core-memory/blocks/tool_guidelines`) && call.method === 'PATCH')).toBe(true);
     expect(calls.some((call) => call.pathname.endsWith('/core-memory/blocks/detach/block-custom'))).toBe(false);
     expect(calls.some((call) => call.pathname.endsWith('/tools/detach/tool-custom'))).toBe(false);
-    expect(calls.filter((call) => call.pathname.includes('/core-memory/blocks/attach/'))).toHaveLength(canonical.blocks.length - 1);
+    expect(calls.filter((call) => call.pathname.includes('/core-memory/blocks/attach/'))).toHaveLength(canonical.blocks.length - 3);
     expect(calls.filter((call) => call.pathname.includes('/tools/attach/'))).toHaveLength(canonical.toolNames.length - 1);
   });
 
   it('is idempotent when the adopted live agent already has the canonical surface', async () => {
     const canonical = getCanonicalManagedAgentSurface(LIVE_AF);
-    const blocks = canonical.blocks.map((block, i) => ({ id: `block-${i}`, label: block.label, value: `learned-${block.label}` }));
+    const blocks = canonical.blocks.map((block, i) => ({
+      id: `block-${i}`,
+      label: block.label,
+      value: ['core_directives', 'tool_guidelines'].includes(block.label) ? block.value : `learned-${block.label}`,
+    }));
     const tools = canonical.toolNames.map((name, i) => ({ id: `tool-${i}`, name }));
     const mutations: string[] = [];
 
@@ -83,7 +95,7 @@ describe('managed live agent surface reconciliation', () => {
 
   it('fails closed rather than silently omitting a required live tool', async () => {
     const canonical = getCanonicalManagedAgentSurface(LIVE_AF);
-    const blocks = canonical.blocks.map((block, i) => ({ id: `block-${i}`, label: block.label }));
+    const blocks = canonical.blocks.map((block, i) => ({ id: `block-${i}`, label: block.label, value: block.value }));
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = new URL(String(input));
       if (url.pathname.endsWith(`/agents/${AGENT}/core-memory/blocks`)) return response(blocks);

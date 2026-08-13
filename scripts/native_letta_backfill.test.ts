@@ -83,6 +83,20 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.updates).toHaveLength(1);
   });
 
+  it('fails closed on terminal stop_reason=error even without a stream error event', async () => {
+    const client = fakeClient([{ messages: [], stop_reason: 'error' }]);
+
+    await expect(runNativeClientToolConversation({
+      client,
+      agentId: 'agent-test',
+      conversationId: 'conv-test',
+      message: 'source',
+      tools: [],
+    })).rejects.toThrow('Letta native conversation terminated with stop_reason=error');
+
+    expect(client.bodies).toHaveLength(1);
+  });
+
   it('executes local client tools through native approval returns then accepts a server terminal call', async () => {
     const client = fakeClient([
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"京都"}', tool_call_id: 'call-1' } }], stop_reason: 'requires_approval' },

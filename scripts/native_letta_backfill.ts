@@ -215,6 +215,10 @@ export async function runNativeClientToolConversation(input: {
   }));
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
+    const stopReason = response?.stop_reason?.stop_reason ?? response?.stop_reason?.reason ?? response?.stop_reason;
+    if (stopReason === 'error') {
+      throw new Error('Letta native conversation terminated with stop_reason=error');
+    }
     const messages = Array.isArray(response?.messages) ? response.messages : [];
     const terminal = extractLegacyCompletion(messages);
     if (terminal) {
@@ -229,7 +233,7 @@ export async function runNativeClientToolConversation(input: {
     const approvals: any[] = [];
     for (const request of requests) {
       const tool = tools.get(request.name);
-      if (!tool) throw new Error(`Letta requested unknown legacy client tool: ${request.name}`);
+      if (!tool) throw new Error(`Letta requested unknown client tool: ${request.name}`);
       let status: 'success' | 'error' = 'success';
       let result: string;
       try {
@@ -249,5 +253,5 @@ export async function runNativeClientToolConversation(input: {
       client_tools: schemas,
     }));
   }
-  throw new Error(`legacy client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
+  throw new Error(`native client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
 }

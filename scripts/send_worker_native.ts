@@ -1,10 +1,10 @@
 #!/usr/bin/env npx tsx
 /**
- * SDK-based background worker for the live Subconscious agent.
+ * Native Letta background worker for the live Subconscious agent.
  *
- * The live lane preserves the original persistent guidance/context behavior
- * while also exposing trusted relationship-memory client tools. Historical
- * backfill uses the separate strict relationship observer runner.
+ * Live execution uses @letta-ai/letta-client conversations with only the
+ * trusted relationship client-tool surface. Persistent working-memory and
+ * conversation_search remain server-side Letta tools on the live agent.
  */
 
 import * as fs from 'fs';
@@ -16,17 +16,21 @@ import {
   buildRelationshipTools,
   createRuntime,
   relationshipMemoryRoot,
-  RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
 } from '../relationship-memory/src/adapter/index.js';
 import { stableJson } from '../relationship-memory/src/store/index.js';
 import { cursorShouldAdvance } from '../relationship-memory/src/tools/index.js';
+import {
+  createNativeLettaClient,
+  runNativeClientToolConversation,
+  type NativeClientTool,
+} from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
-const LOG_FILE = path.join(TEMP_STATE_DIR, 'send_worker_sdk.log');
+const LOG_FILE = path.join(TEMP_STATE_DIR, 'send_worker_native.log');
 
-interface SdkPayload {
+interface LiveWorkerPayload {
   agentId: string;
   conversationId: string;
   sessionId: string;
@@ -34,7 +38,6 @@ interface SdkPayload {
   stateFile: string;
   newLastProcessedIndex: number;
   cwd: string;
-  sdkToolsMode: 'off' | 'read-only' | 'full';
   batchId: string;
   canonicalMessages: CanonicalMessage[];
   assistantIntents: AssistantRememberIntentRecord[];
@@ -68,7 +71,7 @@ function formatPrefetchedMemorySearch(query: string, results: unknown[]): string
   ].join('\n');
 }
 
-async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable_failure'> {
+async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'completed' | 'retryable_failure'> {
   const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
   const assistantIntents = payload.assistantIntents ?? [];
   const runtime = createRuntime(payload.canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
@@ -86,14 +89,14 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
   log(`Deterministic first memory search: query_chars=${firstSearchQuery.length}, results=${prefetchedMemories.length}`);
 
   runtime.store.beginBatch(payload.batchId, new Date().toISOString());
-  let session: any = null;
-  let sessionSucceeded = false;
+  let turnSucceeded = false;
 
   try {
-    log('Loading Letta Code SDK for live Subconscious delivery...');
-    const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
+    const apiKey = process.env.LETTA_API_KEY;
+    if (!apiKey) throw new Error('LETTA_API_KEY is required for native live Subconscious execution');
+    const client = createNativeLettaClient(apiKey);
 
-    const relationshipTools = buildRelationshipTools(runtime, payload.batchId, jsonResult).map((tool) => {
+    const relationshipTools: NativeClientTool[] = buildRelationshipTools(runtime, payload.batchId).map((tool) => {
       if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
       const execute = tool.execute.bind(tool);
       return {
@@ -105,8 +108,7 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     });
 
     let whisperDelivered = false;
-    const deliverWhisperTool = {
-      label: 'deliver_whisper',
+    relationshipTools.push({
       name: 'deliver_whisper',
       description: 'Deliver at most one concise subconscious memory whisper for foreground Kohaku on a later sync. Include only useful remembered context or association; never include search/storage/tool bookkeeping. Do not call when nothing is meaningfully useful.',
       parameters: {
@@ -120,10 +122,9 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
         const queued = queueSubconWhisper(payload.cwd, payload.sessionId, payload.batchId, text);
         whisperDelivered = true;
         log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${text.length} chars)`);
-        return jsonResult({ status: 'ok', whisper_id: queued?.whisper_id });
+        return { status: 'ok', whisper_id: queued?.whisper_id };
       },
-    };
-    relationshipTools.push(deliverWhisperTool as any);
+    });
 
     const durableAssistantIntents = assistantIntents.map((intent) => {
       const stored = runtime.store.getAssistantIntent(intent.intent_id);
@@ -133,70 +134,33 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
       return stored;
     });
 
-    const readOnlyTools = ['Read', 'Grep', 'Glob', 'web_search', 'fetch_webpage'];
-    const blockedTools = ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'];
-    const sessionOptions: Record<string, unknown> = {
-      disallowedTools: blockedTools,
-      tools: relationshipTools,
-      permissionMode: 'bypassPermissions',
-      cwd: payload.cwd,
-      skillSources: [],
-      systemInfoReminder: false,
-      sleeptime: { trigger: 'off' },
-      memfsStartup: 'skip',
-    };
-
-    if (payload.sdkToolsMode === 'off') {
-      sessionOptions.allowedTools = [...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, 'deliver_whisper'];
-    } else if (payload.sdkToolsMode === 'read-only') {
-      sessionOptions.allowedTools = [...readOnlyTools, ...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, 'deliver_whisper'];
-    }
-    // full mode deliberately leaves client-side tool access unrestricted.
-    // The live agent's server-side memory/guidance tools remain available in
-    // every mode and are not blocked by the relationship-memory policy.
-
     const liveMessage = `${appendTrustedRelationshipCatalog(
       payload.message,
       payload.canonicalMessages,
       durableAssistantIntents,
     )}\n\n${formatPrefetchedMemorySearch(firstSearchQuery, prefetchedMemories)}`;
 
-    log(`Creating live SDK session for conversation ${payload.conversationId} (mode: ${payload.sdkToolsMode})`);
+    log(`Starting native live Subconscious turn for conversation ${payload.conversationId}`);
     log(`  agent: ${payload.agentId}`);
-    log(`  cwd: ${payload.cwd}`);
-    log(`  relationship tools: ${[...RELATIONSHIP_ALLOWED_CLIENT_TOOLS, 'deliver_whisper'].join(', ')}`);
+    log(`  relationship client tools: ${relationshipTools.map((tool) => tool.name).join(', ')}`);
 
-    session = resumeSession(payload.conversationId, sessionOptions);
-    const result = await session.runTurn(liveMessage);
-    sessionSucceeded = result.success === true;
-
-    const assistantResponse = typeof result.result === 'string' ? result.result : '';
-    if (result.recoveryAttempts) {
-      log(`SDK recovered pending approval before completing turn: attempts=${result.recoveryAttempts}`);
-    }
-    if (!sessionSucceeded) {
-      log(
-        `Live turn failed: errorCode=${result.errorCode ?? 'unknown'}, `
-        + `approvalConflict=${result.approvalConflict === true}, `
-        + `recoverable=${result.recoverable === true}, `
-        + `detail=${result.errorDetail ?? result.error ?? 'none'}`,
-      );
-    }
-    log(
-      `Live turn complete: success=${sessionSucceeded}, `
-      + `assistant response: ${assistantResponse.length} chars`,
-    );
+    const result = await runNativeClientToolConversation({
+      client,
+      agentId: payload.agentId,
+      conversationId: payload.conversationId,
+      message: liveMessage,
+      tools: relationshipTools,
+    });
+    turnSucceeded = !result.clientToolFailure;
+    const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';
+    log(`Native live turn complete: success=${turnSucceeded}, stop_reason=${stopReason}`);
+    if (result.clientToolFailure) log('Native live turn contained at least one failed client-tool execution');
   } catch (error) {
-    sessionSucceeded = false;
-    log(`Live Subconscious SDK failure: ${error instanceof Error ? error.message : String(error)}`);
-  } finally {
-    if (session) {
-      session.close();
-      log('SDK session closed');
-    }
+    turnSucceeded = false;
+    log(`Live Subconscious native-client failure: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const completion = runtime.store.withMutationBoundary(() => runtime.finalizeBatch(payload.batchId, sessionSucceeded));
+  const completion = runtime.store.withMutationBoundary(() => runtime.finalizeBatch(payload.batchId, turnSucceeded));
   log(`Relationship-memory batch finalized alongside live delivery: ${completion}`);
   return completion;
 }
@@ -209,7 +173,7 @@ async function main(): Promise<void> {
   }
 
   log('='.repeat(60));
-  log(`SDK Worker started with payload: ${payloadFile}`);
+  log(`Native live worker started with payload: ${payloadFile}`);
 
   try {
     if (!fs.existsSync(payloadFile)) {
@@ -217,14 +181,14 @@ async function main(): Promise<void> {
       process.exit(1);
     }
 
-    const payload: SdkPayload = JSON.parse(fs.readFileSync(payloadFile, 'utf-8'));
+    const payload: LiveWorkerPayload = JSON.parse(fs.readFileSync(payloadFile, 'utf-8'));
     log(`Loaded payload for session ${payload.sessionId}`);
 
     let completion: 'completed' | 'retryable_failure';
     try {
-      completion = await sendViaSdk(payload);
+      completion = await sendViaNativeClient(payload);
     } catch (error) {
-      log(`SDK session failed before trusted batch completion: ${error instanceof Error ? error.message : String(error)}`);
+      log(`Native live turn failed before trusted batch completion: ${error instanceof Error ? error.message : String(error)}`);
       completion = 'retryable_failure';
     }
 
@@ -239,7 +203,7 @@ async function main(): Promise<void> {
 
     fs.unlinkSync(payloadFile);
     log('Cleaned up payload file');
-    log('SDK Worker completed successfully');
+    log('Native live worker completed successfully');
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     log(`ERROR: ${errorMessage}`);
