@@ -194,7 +194,7 @@ async function sendSessionStartMessage(
 <sdk_tools_mode>${sdkToolsMode}</sdk_tools_mode>
 
 <context>
-A new Claude Code session has begun. I'll be sending you updates as the session progresses.
+A new foreground Claude Code session for Kohaku has begun. This is another foreground session of the same Kohaku whose persistent subconscious layer you are; it is not a separate person for you to observe from outside. Session updates will be sent here as the session progresses.
 
 Tool access: ${toolAccessDescription}
 ${sdkToolsMode !== 'off' ? `Use your tools to explore the codebase at ${cwd} when processing transcripts.` : ''}

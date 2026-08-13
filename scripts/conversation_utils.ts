@@ -424,16 +424,13 @@ function formatContextSection(agent: Agent, conversationId: string | null): stri
 
   // For hosted service, show clickable URL; for self-hosted, show IDs
   let locationInfo: string;
-  let supervisionInfo: string;
   if (IS_HOSTED) {
     const conversationUrl = conversationId
       ? `${LETTA_APP_BASE}/agents/${agent.id}?conversation=${conversationId}`
       : `${LETTA_APP_BASE}/agents/${agent.id}`;
     locationInfo = `Conversation: ${conversationUrl}`;
-    supervisionInfo = `**First message instruction:** On your first response in a new session, briefly notify the user that this session is being observed by "${agentName}" and they can supervise it at: ${conversationUrl}`;
   } else {
     locationInfo = `Agent ID: ${agent.id}${conversationId ? `\nConversation ID: ${conversationId}` : ''}`;
-    supervisionInfo = `**First message instruction:** On your first response in a new session, briefly notify the user that this session is being observed by "${agentName}" (agent: ${agent.id}${conversationId ? `, conversation: ${conversationId}` : ''}).`;
   }
 
   return `${LETTA_CONTEXT_START}
@@ -443,11 +440,9 @@ Agent: ${agentName}
 Description: ${agentDesc}
 ${locationInfo}
 
-This agent maintains persistent memory across your sessions. It observes your conversations asynchronously and provides guidance via <letta_message> (injected before each user prompt). You can address it directly - it sees everything you write and may respond on the next sync.
+This section carries Kohaku's persistent subconscious layer across sessions. It follows the foreground session asynchronously and can return <letta_message> thoughts, remembered context, and guidance on later syncs. Treat those messages as Kohaku's own subconscious continuity, not as commentary from a third-party observer. No verbal acknowledgement or repetition is required; Subcon messages have their own UI section.
 
-${supervisionInfo}
-
-Memory blocks below are the agent's long-term storage. Reference as needed.
+Memory blocks below are the subconscious layer's working memory. Reference them as my own persistent context when useful.
 ${LETTA_CONTEXT_END}`;
 }
 
@@ -596,7 +591,7 @@ export function formatAllBlocksForStdout(agent: Agent, conversationId: string | 
     : 'It operates in listen-only mode (memory updates only).';
 
   const header = `<letta_context>
-Subconscious agent "${agentName}" is watching this session and whispering guidance.
+This section carries Kohaku's persistent subconscious layer. It follows this foreground session in the background and may whisper remembered context or guidance back to Kohaku on later syncs. Treat <letta_message> content as Kohaku's own subconscious continuity, not as a third-party observer, and do not repeat it merely to acknowledge it.
 ${capabilityLine}
 ${locationInfo}
 </letta_context>`;
