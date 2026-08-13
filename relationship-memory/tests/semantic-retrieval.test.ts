@@ -121,6 +121,66 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(replacement.documentCalls[0]).toEqual(docs.map((item) => item.text));
   });
 
+  it('checkpoints successful document batches so a later provider failure resumes without re-embedding earlier texts', async () => {
+    const root = temp('rm-semantic-checkpoint-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    let failSecondBatch = true;
+    const originalEmbedDocuments = provider.embedDocuments.bind(provider);
+    provider.embedDocuments = async (texts: string[]) => {
+      if (provider.documentCalls.length === 1 && failSecondBatch) {
+        provider.documentCalls.push(texts);
+        failSecondBatch = false;
+        throw new Error('synthetic provider failure after first billed batch');
+      }
+      return originalEmbedDocuments(texts);
+    };
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    const docs = Array.from({ length: 25 }, (_, index) => ({ id: `m${index}`, text: `gift document ${index}` }));
+
+    await expect(retriever.rank(docs, 'first attempt')).rejects.toThrow('synthetic provider failure');
+    const partial = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+    expect(Object.keys(partial.documents)).toHaveLength(20);
+
+    await retriever.rank(docs, 'resume');
+    expect(provider.documentCalls).toHaveLength(3);
+    expect(provider.documentCalls[0]).toEqual(docs.slice(0, 20).map((item) => item.text));
+    expect(provider.documentCalls[1]).toEqual(docs.slice(20).map((item) => item.text));
+    expect(provider.documentCalls[2]).toEqual(docs.slice(20).map((item) => item.text));
+    expect(Object.keys(JSON.parse(fs.readFileSync(indexFile, 'utf8')).documents)).toHaveLength(25);
+  });
+
+  it('serializes concurrent semantic index bootstraps so waiters reuse vectors instead of duplicating provider calls', async () => {
+    const root = temp('rm-semantic-concurrent-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    let releaseFirst!: () => void;
+    let startedFirst!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { startedFirst = resolve; });
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const originalEmbedDocuments = provider.embedDocuments.bind(provider);
+    provider.embedDocuments = async (texts: string[]) => {
+      const call = originalEmbedDocuments(texts);
+      if (provider.documentCalls.length === 1) {
+        startedFirst();
+        await firstRelease;
+      }
+      return call;
+    };
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }, { id: 'm2', text: 'ramen preference' }];
+    const first = new FileBackedSemanticRetriever(provider, indexFile).rank(docs, 'first query');
+    await firstStarted;
+    const second = new FileBackedSemanticRetriever(provider, indexFile).rank(docs, 'second query');
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(provider.documentCalls).toHaveLength(1);
+    releaseFirst();
+
+    await Promise.all([first, second]);
+    expect(provider.documentCalls).toHaveLength(1);
+    expect(provider.queryCalls).toEqual(expect.arrayContaining(['first query', 'second query']));
+    expect(fs.existsSync(`${indexFile}.lock`)).toBe(false);
+  });
+
   it('uses document/query modes and query instruction without binding the provider fingerprint to the secret', async () => {
     const requests: any[] = [];
     const fakeFetch = (async (_url: any, init: any) => {
