@@ -334,13 +334,9 @@ async function main(): Promise<void> {
     }
     saveSyncState(hookInput.cwd, state);
 
-    // Build the additional context with instruction to surface messages
-    let contextWithInstruction = `<letta_update>\n${additionalContext}\n</letta_update>`;
-    
-    if (newMessages.length > 0) {
-      const agentName = agent.name || 'Subconscious';
-      contextWithInstruction += `\n\n<instruction>Your Subconscious (${agentName}) just sent a message mid-workflow. Briefly acknowledge what ${agentName} said in your next response - just a short note like "Sub notes: [key point]" so the user knows.</instruction>`;
-    }
+    // Inject Subcon updates as context only. Visibility is handled by the dedicated UI section;
+    // do not force the foreground Claude to repeat Subcon messages.
+    const contextWithInstruction = `<letta_update>\n${additionalContext}\n</letta_update>`;
 
     // Output JSON for PreToolUse
     const output: Record<string, unknown> = {

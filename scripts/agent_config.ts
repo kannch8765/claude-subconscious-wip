@@ -89,6 +89,17 @@ export interface CanonicalManagedAgentConfig {
   parallelToolCalls: boolean;
 }
 
+export interface CanonicalManagedAgentSurface {
+  blocks: Array<{
+    label: string;
+    value: string;
+    limit: number;
+    description?: string;
+    readOnly: boolean;
+  }>;
+  toolNames: string[];
+}
+
 /**
  * Regex for validating Letta agent ID format
  * Format: agent-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (UUID v4 with 'agent-' prefix)
@@ -236,14 +247,14 @@ async function renameAgent(apiKey: string, agentId: string, name: string): Promi
 /**
  * Read the canonical managed-agent configuration from the bundled .af file.
  *
- * Subconscious.af is the source of truth for project-managed observer runtime
+ * Subconscious.af is the source of truth for project-managed live runtime
  * policy. Explicit operator overrides remain supported for model/context below,
  * but imported/saved/owned agents otherwise converge to this configuration.
  */
-export function getCanonicalManagedAgentConfig(): CanonicalManagedAgentConfig {
+export function getCanonicalManagedAgentConfig(agentFile: string = DEFAULT_AGENT_FILE): CanonicalManagedAgentConfig {
   let content: unknown;
   try {
-    content = JSON.parse(fs.readFileSync(DEFAULT_AGENT_FILE, 'utf-8'));
+    content = JSON.parse(fs.readFileSync(agentFile, 'utf-8'));
   } catch (error) {
     throw new Error(`Failed to read canonical Subconscious.af: ${error}`);
   }
@@ -275,8 +286,36 @@ export function getCanonicalManagedAgentConfig(): CanonicalManagedAgentConfig {
   };
 }
 
-export function getCanonicalManagedSystemPrompt(): string {
-  return getCanonicalManagedAgentConfig().system;
+export function getCanonicalManagedAgentSurface(agentFile: string = DEFAULT_AGENT_FILE): CanonicalManagedAgentSurface {
+  let content: any;
+  try {
+    content = JSON.parse(fs.readFileSync(agentFile, 'utf-8'));
+  } catch (error) {
+    throw new Error(`Failed to read managed AgentFile surface from ${path.basename(agentFile)}: ${error}`);
+  }
+  const agents = content?.agents;
+  if (!Array.isArray(agents) || agents.length !== 1) throw new Error(`Managed ${path.basename(agentFile)} must contain exactly one agent`);
+  const agent = agents[0];
+  const blocks = Array.isArray(content.blocks) ? content.blocks : [];
+  const tools = Array.isArray(content.tools) ? content.tools : [];
+  const byBlockId = new Map(blocks.map((block: any) => [block.id, block]));
+  const byToolId = new Map(tools.map((tool: any) => [tool.id, tool]));
+  const desiredBlocks = (Array.isArray(agent.block_ids) ? agent.block_ids : []).map((id: string) => byBlockId.get(id)).filter(Boolean).map((block: any) => ({
+    label: String(block.label),
+    value: String(block.value ?? ''),
+    limit: typeof block.limit === 'number' && block.limit > 0 ? block.limit : 3000,
+    ...(typeof block.description === 'string' ? { description: block.description } : {}),
+    readOnly: block.read_only === true,
+  }));
+  const toolNames = (Array.isArray(agent.tool_ids) ? agent.tool_ids : []).map((id: string) => byToolId.get(id)?.name).filter((name: unknown): name is string => typeof name === 'string' && name.length > 0);
+  if (desiredBlocks.length !== (agent.block_ids?.length ?? 0) || toolNames.length !== (agent.tool_ids?.length ?? 0)) {
+    throw new Error(`Managed ${path.basename(agentFile)} references missing block/tool definitions`);
+  }
+  return { blocks: desiredBlocks, toolNames };
+}
+
+export function getCanonicalManagedSystemPrompt(agentFile: string = DEFAULT_AGENT_FILE): string {
+  return getCanonicalManagedAgentConfig(agentFile).system;
 }
 
 function operatorContextWindow(defaultValue: number): number {
@@ -327,6 +366,93 @@ async function resolveManagedModelSettingsProviderType(
   return model.provider_type;
 }
 
+interface AttachedBlock { id: string; label: string; }
+interface AttachedTool { id: string; name: string; }
+const OBSERVER_ONLY_BLOCK_LABELS = new Set(['shared_language', 'remembered_experiences', 'relationship_context']);
+const BACKFILL_ONLY_SERVER_TOOL_NAMES = new Set(['legacy_source_complete']);
+
+async function fetchJsonArray(apiKey: string, pathname: string, reason: string): Promise<any[]> {
+  const response = await fetch(buildLettaApiUrl(pathname), { headers: { 'Authorization': `Bearer ${apiKey}` } });
+  if (!response.ok) throw new Error(`${reason}: ${response.status} ${await response.text()}`);
+  const value = await response.json();
+  if (!Array.isArray(value)) throw new Error(`${reason}: expected an array response`);
+  return value;
+}
+
+async function patchEmpty(apiKey: string, pathname: string, reason: string): Promise<void> {
+  const response = await fetch(buildLettaApiUrl(pathname), { method: 'PATCH', headers: { 'Authorization': `Bearer ${apiKey}` } });
+  if (!response.ok) throw new Error(`${reason}: ${response.status} ${await response.text()}`);
+}
+
+/**
+ * Reconcile the live Subconscious working-memory/tool surface without changing
+ * the adopted agent identity. Existing desired blocks are preserved verbatim;
+ * only missing blocks are created from the AgentFile defaults. Known observer-
+ * only projection blocks are detached from this agent, never deleted globally;
+ * unrelated operator-added blocks/tools are preserved.
+ */
+export async function reconcileManagedLiveAgentSurface(
+  apiKey: string,
+  agentId: string,
+  log: (msg: string) => void = console.log,
+  agentFile: string = DEFAULT_AGENT_FILE,
+): Promise<void> {
+  const canonical = getCanonicalManagedAgentSurface(agentFile);
+  const desiredLabels = new Set(canonical.blocks.map((block) => block.label));
+  const desiredTools = new Set(canonical.toolNames);
+
+  const attachedBlocks = await fetchJsonArray(apiKey, `/agents/${agentId}/core-memory/blocks`, 'Failed to list managed live memory blocks') as AttachedBlock[];
+  const attachedByLabel = new Map(attachedBlocks.map((block) => [block.label, block]));
+
+  for (const block of attachedBlocks) {
+    if (!desiredLabels.has(block.label) && OBSERVER_ONLY_BLOCK_LABELS.has(block.label)) {
+      await patchEmpty(apiKey, `/agents/${agentId}/core-memory/blocks/detach/${block.id}`, `Failed to detach observer-only live block ${block.label}`);
+      log(`Detached observer-only live Subconscious block: ${block.label}`);
+    }
+  }
+
+  for (const block of canonical.blocks) {
+    if (attachedByLabel.has(block.label)) continue;
+    const createResponse = await fetch(buildLettaApiUrl('/blocks/'), {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: block.label,
+        value: block.value,
+        limit: block.limit,
+        ...(block.description ? { description: block.description } : {}),
+        read_only: block.readOnly,
+      }),
+    });
+    if (!createResponse.ok) throw new Error(`Failed to create missing live block ${block.label}: ${createResponse.status} ${await createResponse.text()}`);
+    const created = await createResponse.json() as { id?: string };
+    if (!created.id) throw new Error(`Failed to create missing live block ${block.label}: response had no block ID`);
+    await patchEmpty(apiKey, `/agents/${agentId}/core-memory/blocks/attach/${created.id}`, `Failed to attach restored live block ${block.label}`);
+    log(`Restored missing live Subconscious block: ${block.label}`);
+  }
+
+  const [attachedTools, globalTools] = await Promise.all([
+    fetchJsonArray(apiKey, `/agents/${agentId}/tools`, 'Failed to list managed live tools') as Promise<AttachedTool[]>,
+    fetchJsonArray(apiKey, '/tools/', 'Failed to list available Letta tools') as Promise<AttachedTool[]>,
+  ]);
+  const globalByName = new Map(globalTools.map((tool) => [tool.name, tool]));
+  const attachedByName = new Map(attachedTools.map((tool) => [tool.name, tool]));
+
+  for (const tool of attachedTools) {
+    if (!desiredTools.has(tool.name) && BACKFILL_ONLY_SERVER_TOOL_NAMES.has(tool.name)) {
+      await patchEmpty(apiKey, `/agents/${agentId}/tools/detach/${tool.id}`, `Failed to detach backfill-only live tool ${tool.name}`);
+      log(`Detached backfill-only live Subconscious tool: ${tool.name}`);
+    }
+  }
+  for (const name of canonical.toolNames) {
+    if (attachedByName.has(name)) continue;
+    const tool = globalByName.get(name);
+    if (!tool?.id) throw new Error(`Required live Subconscious tool is unavailable on Letta server: ${name}`);
+    await patchEmpty(apiKey, `/agents/${agentId}/tools/attach/${tool.id}`, `Failed to attach restored live tool ${name}`);
+    log(`Restored live Subconscious tool: ${name}`);
+  }
+}
+
 /**
  * Reconcile one already-established Subconscious-managed agent to canonical
  * runtime policy. Ownership must be decided by the caller before invoking this.
@@ -335,8 +461,9 @@ export async function reconcileManagedAgentConfiguration(
   apiKey: string,
   agentId: string,
   log: (msg: string) => void = console.log,
+  agentFile: string = DEFAULT_AGENT_FILE,
 ): Promise<void> {
-  const canonical = getCanonicalManagedAgentConfig();
+  const canonical = getCanonicalManagedAgentConfig(agentFile);
   const desiredModel = process.env.LETTA_MODEL || canonical.model;
   const desiredContextWindow = operatorContextWindow(canonical.contextWindowLimit);
   const url = buildLettaApiUrl(`/agents/${agentId}`);
@@ -384,7 +511,7 @@ export async function reconcileManagedAgentConfiguration(
   if (!patchResponse.ok) {
     throw new Error(`Failed to reconcile managed Subconscious runtime configuration: ${patchResponse.status} ${await patchResponse.text()}`);
   }
-  log(`Reconciled managed Subconscious runtime configuration from canonical Subconscious.af: ${Object.keys(patch).join(', ')}`);
+  log(`Reconciled managed Subconscious runtime configuration from ${path.basename(agentFile)}: ${Object.keys(patch).join(', ')}`);
 }
 
 /**
@@ -817,10 +944,11 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
       log(`Warning: Could not ensure required tags: ${error}`);
     }
 
-    // Prompt reconciliation is authority-critical: a stale managed observer
+    // Live runtime/surface reconciliation is authority-critical: a stale managed agent
     // must not silently continue under obsolete memory/tool rules. Let failures
     // propagate instead of importing/replacing the agent or pretending success.
     await reconcileManagedAgentConfiguration(apiKey, agentId, log);
+    await reconcileManagedLiveAgentSurface(apiKey, agentId, log);
 
     // 5. Availability discovery is diagnostic only after managed reconciliation.
     try {
@@ -837,6 +965,7 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
   } else if (await isManagedEnvAgent(apiKey, agentId, log)) {
     log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling canonical runtime configuration');
     await reconcileManagedAgentConfiguration(apiKey, agentId, log);
+    await reconcileManagedLiveAgentSurface(apiKey, agentId, log);
   } else {
     log('Using ordinary external LETTA_AGENT_ID; skipping all Subconscious-managed mutation');
   }

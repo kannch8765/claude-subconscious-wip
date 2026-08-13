@@ -347,8 +347,8 @@ describe('adopted SDK/configuration boundary', () => {
     expect((searched as any).results).toHaveLength(1);
   });
 
-  it('keeps the adopted agent identity while removing Markdown mutation tools and attaching read-only projection blocks', () => {
-    const af = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf8'));
+  it('keeps the dedicated backfill observer boundary isolated from the live Subconscious AgentFile', () => {
+    const af = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'SubconsciousBackfill.af'), 'utf8'));
     const agent = af.agents[0];
     expect(agent.id).toBe('agent-0');
     const toolNames = agent.tool_ids.map((id: string) => af.tools.find((tool: any) => tool.id === id)?.name);

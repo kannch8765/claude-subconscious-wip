@@ -1,20 +1,25 @@
 #!/usr/bin/env npx tsx
 /**
- * SDK-based background worker that sends messages to Letta via Letta Code SDK.
- * Gives the Subconscious agent client-side tool access (Read, Grep, Glob, etc.).
+ * SDK-based background worker for the live Subconscious agent.
  *
- * Spawned by send_messages_to_letta.ts as a detached process.
- * Falls back gracefully if the SDK is not available.
- *
- * Usage: npx tsx send_worker_sdk.ts <payload_file>
+ * The live lane preserves the original persistent guidance/context behavior
+ * while also exposing trusted relationship-memory client tools. Historical
+ * backfill uses the separate strict relationship observer runner.
  */
 
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { AssistantRememberIntentRecord, CanonicalMessage } from '../relationship-memory/src/schema/index.js';
+import {
+  appendTrustedRelationshipCatalog,
+  buildRelationshipTools,
+  createRuntime,
+  relationshipMemoryRoot,
+  RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
+} from '../relationship-memory/src/adapter/index.js';
+import { stableJson } from '../relationship-memory/src/store/index.js';
 import { cursorShouldAdvance } from '../relationship-memory/src/tools/index.js';
-import { runRelationshipObserverBatch } from './relationship_observer_runner.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -42,16 +47,107 @@ function log(message: string): void {
 }
 
 async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable_failure'> {
-  return runRelationshipObserverBatch({
-    agentId: payload.agentId,
-    conversationId: payload.conversationId,
-    message: payload.message,
-    cwd: payload.cwd,
-    batchId: payload.batchId,
-    canonicalMessages: payload.canonicalMessages,
-    assistantIntents: payload.assistantIntents ?? [],
-    log,
-  });
+  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
+  const assistantIntents = payload.assistantIntents ?? [];
+  const runtime = createRuntime(payload.canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
+
+  const latest = [...runtime.store.listBatches()].reverse().find((item) => item.batch_id === payload.batchId);
+  if (latest?.status === 'completed') {
+    log(`Relationship-memory batch already durably completed: ${payload.batchId}`);
+    return 'completed';
+  }
+
+  runtime.store.beginBatch(payload.batchId, new Date().toISOString());
+  let session: any = null;
+  let sessionSucceeded = true;
+
+  try {
+    log('Loading Letta Code SDK for live Subconscious delivery...');
+    const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
+
+    const relationshipTools = buildRelationshipTools(runtime, payload.batchId, jsonResult).map((tool) => {
+      if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
+      const execute = tool.execute.bind(tool);
+      return {
+        ...tool,
+        async execute(toolCallId: string, args: unknown) {
+          return runtime.store.withMutationBoundary(() => execute(toolCallId, args));
+        },
+      };
+    });
+
+    const durableAssistantIntents = assistantIntents.map((intent) => {
+      const stored = runtime.store.getAssistantIntent(intent.intent_id);
+      if (!stored || stableJson(stored) !== stableJson(intent)) {
+        throw new Error(`Trusted assistant intent payload/store mismatch: ${intent.intent_id}`);
+      }
+      return stored;
+    });
+
+    const readOnlyTools = ['Read', 'Grep', 'Glob', 'web_search', 'fetch_webpage'];
+    const blockedTools = ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'];
+    const sessionOptions: Record<string, unknown> = {
+      disallowedTools: blockedTools,
+      tools: relationshipTools,
+      permissionMode: 'bypassPermissions',
+      cwd: payload.cwd,
+      skillSources: [],
+      systemInfoReminder: false,
+      sleeptime: { trigger: 'off' },
+      memfsStartup: 'skip',
+    };
+
+    if (payload.sdkToolsMode === 'off') {
+      sessionOptions.allowedTools = [...RELATIONSHIP_ALLOWED_CLIENT_TOOLS];
+    } else if (payload.sdkToolsMode === 'read-only') {
+      sessionOptions.allowedTools = [...readOnlyTools, ...RELATIONSHIP_ALLOWED_CLIENT_TOOLS];
+    }
+    // full mode deliberately leaves client-side tool access unrestricted.
+    // The live agent's server-side memory/guidance tools remain available in
+    // every mode and are not blocked by the relationship-memory policy.
+
+    const liveMessage = appendTrustedRelationshipCatalog(
+      payload.message,
+      payload.canonicalMessages,
+      durableAssistantIntents,
+    );
+
+    log(`Creating live SDK session for conversation ${payload.conversationId} (mode: ${payload.sdkToolsMode})`);
+    log(`  agent: ${payload.agentId}`);
+    log(`  cwd: ${payload.cwd}`);
+    log(`  relationship tools: ${RELATIONSHIP_ALLOWED_CLIENT_TOOLS.join(', ')}`);
+
+    session = resumeSession(payload.conversationId, sessionOptions);
+    await session.send(liveMessage);
+
+    let assistantResponse = '';
+    let messageCount = 0;
+    for await (const msg of session.stream()) {
+      messageCount += 1;
+      if (msg.type === 'assistant' && msg.content) {
+        assistantResponse += msg.content;
+        log(`  Assistant chunk: ${msg.content.substring(0, 100)}...`);
+      } else if (msg.type === 'tool_call') {
+        log(`  Tool call: ${(msg as any).toolName}`);
+      } else if (msg.type === 'error') {
+        sessionSucceeded = false;
+        log(`  Error: ${(msg as any).message}`);
+      }
+    }
+    log(`Live stream complete: ${messageCount} messages, assistant response: ${assistantResponse.length} chars`);
+  } catch (error) {
+    sessionSucceeded = false;
+    log(`Live Subconscious SDK failure: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    if (session) {
+      session.close();
+      log('SDK session closed');
+    }
+  }
+
+  const completion = runtime.store.withMutationBoundary(() => runtime.finalizeBatch(payload.batchId, sessionSucceeded));
+  log(`Relationship-memory batch finalized alongside live delivery: ${completion}`);
+  return completion;
 }
 
 async function main(): Promise<void> {
