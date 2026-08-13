@@ -38,6 +38,7 @@ interface SdkPayload {
   batchId: string;
   canonicalMessages: CanonicalMessage[];
   assistantIntents: AssistantRememberIntentRecord[];
+  latestUserMessage: string;
 }
 
 function log(message: string): void {
@@ -45,6 +46,26 @@ function log(message: string): void {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   const timestamp = new Date().toISOString();
   fs.appendFileSync(LOG_FILE, `[${timestamp}] ${message}\n`);
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function formatPrefetchedMemorySearch(query: string, results: unknown[]): string {
+  const body = results.map((result, index) => (
+    `  <result rank="${index + 1}">${escapeXml(stableJson(result))}</result>`
+  )).join('\n');
+  return [
+    `<prefetched_relationship_memory_search query="${escapeXml(query)}" count="${results.length}">`,
+    body,
+    '</prefetched_relationship_memory_search>',
+  ].join('\n');
 }
 
 async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable_failure'> {
@@ -57,6 +78,12 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     log(`Relationship-memory batch already durably completed: ${payload.batchId}`);
     return 'completed';
   }
+
+  const firstSearchQuery = payload.latestUserMessage?.trim() || '';
+  const prefetchedMemories = firstSearchQuery
+    ? await runtime.memorySearchHybrid({ query: firstSearchQuery, limit: 8 })
+    : [];
+  log(`Deterministic first memory search: query_chars=${firstSearchQuery.length}, results=${prefetchedMemories.length}`);
 
   runtime.store.beginBatch(payload.batchId, new Date().toISOString());
   let session: any = null;
@@ -128,11 +155,11 @@ async function sendViaSdk(payload: SdkPayload): Promise<'completed' | 'retryable
     // The live agent's server-side memory/guidance tools remain available in
     // every mode and are not blocked by the relationship-memory policy.
 
-    const liveMessage = appendTrustedRelationshipCatalog(
+    const liveMessage = `${appendTrustedRelationshipCatalog(
       payload.message,
       payload.canonicalMessages,
       durableAssistantIntents,
-    );
+    )}\n\n${formatPrefetchedMemorySearch(firstSearchQuery, prefetchedMemories)}`;
 
     log(`Creating live SDK session for conversation ${payload.conversationId} (mode: ${payload.sdkToolsMode})`);
     log(`  agent: ${payload.agentId}`);

@@ -7,10 +7,13 @@ describe('live async relationship-memory surfacing contract', () => {
     const send = fs.readFileSync(path.join(process.cwd(), 'scripts/send_messages_to_letta.ts'), 'utf8');
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_sdk.ts'), 'utf8');
     expect(send).toContain('<latest_user_message>');
-    expect(send).toContain('first relationship memory_search query');
+    expect(send).toContain('worker already runs the exact text');
     expect(send).toContain('Reuse the same search results');
     expect(send).toContain('deliver_whisper');
     expect(worker).toContain("name: 'deliver_whisper'");
+    expect(worker).toContain('runtime.memorySearchHybrid({ query: firstSearchQuery, limit: 8 })');
+    expect(worker).toContain('prefetched_relationship_memory_search');
+    expect(send).toContain('latestUserMessage,');
     expect(worker).toContain('memory_reinforce');
     expect(worker).toContain('memory_remember');
   });
