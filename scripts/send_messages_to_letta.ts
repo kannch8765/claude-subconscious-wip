@@ -177,7 +177,8 @@ ${latestUserEscaped}
 This is the normal asynchronous Subconscious pass after a foreground Kohaku turn. Do both jobs in one pass:
 
 1. MEMORY SURFACING FOR THE NEXT FOREGROUND TURN
-- Use the exact text inside <latest_user_message> as your first relationship memory_search query. Do not alter, summarize, or keyword-extract it before that first search.
+- Before this Letta turn begins, the worker already runs the exact text inside <latest_user_message> through the existing relationship memory_search implementation. The exact result set is attached as <prefetched_relationship_memory_search>.
+- Treat that prefetched result set as the first memory_search result for this pass. Do not repeat the same search unless you genuinely need a narrower follow-up.
 - Treat returned relationship memories as associations surfacing into Kohaku's subconscious. Select only context genuinely useful for continuity on the next foreground turn.
 - If something useful surfaced, call deliver_whisper once with a short natural first-person Kohaku note containing the remembered context itself. Example: "咖啡让我想起猫之前京都那次的高木珈琲。"
 - If nothing useful surfaced, do not call deliver_whisper. Silence is correct.
@@ -213,6 +214,7 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
       batchId,
       canonicalMessages,
       assistantIntents,
+      latestUserMessage,
     };
     fs.writeFileSync(payloadFile, JSON.stringify(sdkPayload), 'utf-8');
     log(`Wrote SDK payload to ${payloadFile}`);
