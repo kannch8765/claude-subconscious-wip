@@ -19,7 +19,7 @@ import { buildLettaApiUrl } from './letta_api_url.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const DEFAULT_AGENT_FILE = path.join(__dirname, '..', 'Subconscious.af');
+const DEFAULT_AGENT_FILE = path.join(__dirname, '..', 'SubconsciousBackfill.af');
 const DEFAULT_CONFIG_FILE = path.join(
   process.env.HOME || '~',
   '.letta',
@@ -108,16 +108,16 @@ async function reconcileDedicatedAgent(apiKey: string, agentId: string, reconcil
   if (missingTags.length) {
     await patchAgent(apiKey, agentId, { tags: [...tags, ...missingTags] }, 'Failed to reconcile dedicated backfill agent tags');
   }
-  const canonicalSystem = reconcileCanonicalPrompt ? getCanonicalManagedSystemPrompt() : undefined;
+  const canonicalSystem = reconcileCanonicalPrompt ? getCanonicalManagedSystemPrompt(DEFAULT_AGENT_FILE) : undefined;
   if (reconcileCanonicalPrompt) {
-    await reconcileManagedAgentConfiguration(apiKey, agentId);
+    await reconcileManagedAgentConfiguration(apiKey, agentId, () => {}, DEFAULT_AGENT_FILE);
   }
   const verified = await fetchAgent(apiKey, agentId);
   if (!Array.isArray(verified.tags) || !verified.tags.includes(BACKFILL_PURPOSE_TAG)) {
     throw new Error(`Dedicated backfill agent is missing required purpose tag: ${BACKFILL_PURPOSE_TAG}`);
   }
   if (canonicalSystem !== undefined && verified.system !== canonicalSystem) {
-    throw new Error('Dedicated backfill agent system prompt does not match canonical Subconscious.af');
+    throw new Error('Dedicated backfill agent system prompt does not match canonical SubconsciousBackfill.af');
   }
 }
 
@@ -159,8 +159,8 @@ export async function configureVerifiedLegacyFillRuntime(
 async function importDedicatedAgent(apiKey: string): Promise<string> {
   const file = fs.readFileSync(DEFAULT_AGENT_FILE);
   const form = new FormData();
-  form.append('file', new Blob([file], { type: 'application/json' }), 'Subconscious.af');
-  const canonical = getCanonicalManagedAgentConfig();
+  form.append('file', new Blob([file], { type: 'application/json' }), 'SubconsciousBackfill.af');
+  const canonical = getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE);
   form.append('model', process.env.LETTA_MODEL || canonical.model);
   form.append('embedding', canonical.embedding);
   const response = await fetch(buildLettaApiUrl('/agents/import'), {

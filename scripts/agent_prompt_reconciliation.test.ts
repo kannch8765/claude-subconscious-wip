@@ -24,6 +24,20 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function canonicalSurfaceFixtures() {
+  const af = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf-8'));
+  const agent = af.agents[0];
+  const blocks = agent.block_ids.map((id: string, i: number) => {
+    const block = af.blocks.find((item: any) => item.id === id);
+    return { id: `block-fixture-${i}`, label: block.label, value: block.value };
+  });
+  const tools = agent.tool_ids.map((id: string, i: number) => {
+    const tool = af.tools.find((item: any) => item.id === id);
+    return { id: `tool-fixture-${i}`, name: tool.name };
+  });
+  return { blocks, tools };
+}
+
 async function loadAgentConfig(home: string) {
   process.env.HOME = home;
   process.env.LETTA_BASE_URL = 'http://letta.test:8283';
@@ -33,6 +47,7 @@ async function loadAgentConfig(home: string) {
 
 function installManagedFetch(initialSystem: string, patchStatus = 200) {
   let liveSystem = initialSystem;
+  const surface = canonicalSurfaceFixtures();
   const requests: Array<{ method: string; pathname: string; body?: Record<string, unknown> }> = [];
 
   const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -60,6 +75,10 @@ function installManagedFetch(initialSystem: string, patchStatus = 200) {
       if (typeof body?.system === 'string') liveSystem = body.system;
       return jsonResponse({ id: MANAGED_AGENT_ID });
     }
+
+    if (url.pathname === `/v1/agents/${MANAGED_AGENT_ID}/core-memory/blocks` && method === 'GET') return jsonResponse(surface.blocks);
+    if (url.pathname === `/v1/agents/${MANAGED_AGENT_ID}/tools` && method === 'GET') return jsonResponse(surface.tools);
+    if (url.pathname === '/v1/tools/' && method === 'GET') return jsonResponse(surface.tools);
 
     if (url.pathname === '/v1/models/' && method === 'GET') {
       return jsonResponse([
@@ -134,6 +153,7 @@ describe('managed adopted-agent system prompt reconciliation', () => {
       },
     };
 
+    const surface = canonicalSurfaceFixtures();
     const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
       const method = init?.method || 'GET';
@@ -153,6 +173,9 @@ describe('managed adopted-agent system prompt reconciliation', () => {
         }
         return jsonResponse({ id: MANAGED_AGENT_ID });
       }
+      if (url.pathname === `/v1/agents/${MANAGED_AGENT_ID}/core-memory/blocks` && method === 'GET') return jsonResponse(surface.blocks);
+      if (url.pathname === `/v1/agents/${MANAGED_AGENT_ID}/tools` && method === 'GET') return jsonResponse(surface.tools);
+      if (url.pathname === '/v1/tools/' && method === 'GET') return jsonResponse(surface.tools);
       if (url.pathname === '/v1/models/' && method === 'GET') {
         // The canonical DeepSeek handle is deliberately absent. Before R1 this
         // caused ensureModelAvailable() to PATCH the just-reconciled agent back
@@ -192,7 +215,7 @@ describe('managed adopted-agent system prompt reconciliation', () => {
     expect(requests.filter((request) => request.method === 'PATCH' && request.body?.system !== undefined)).toHaveLength(0);
   });
 
-  it('reconciles only system for an env-selected origin-tagged managed agent', async () => {
+  it('reconciles runtime without replacing an env-selected origin-tagged managed agent', async () => {
     const home = makeHome();
     process.env.LETTA_AGENT_ID = MANAGED_AGENT_ID;
     const mod = await loadAgentConfig(home);
@@ -239,31 +262,44 @@ describe('managed adopted-agent system prompt reconciliation', () => {
 });
 
 describe('canonical Subconscious prompt contract', () => {
-  it('loads the prompt directly from Subconscious.af as the single source of truth', async () => {
+  it('loads the live prompt directly from Subconscious.af as the default source of truth', async () => {
     const home = makeHome();
     const mod = await loadAgentConfig(home);
     const af = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf-8'));
 
     expect(mod.getCanonicalManagedSystemPrompt()).toBe(af.agents[0].system);
-    expect(af.agents[0].messages[0].content[0].text.startsWith(`${af.agents[0].system}\n\n<relationship_memory_projections>`)).toBe(true);
+    expect(af.agents[0].messages[0].content[0].text.startsWith(`${af.agents[0].system}\n\n<memory_blocks>`)).toBe(true);
   });
 
-  it('matches the published observer tool boundary and separates role provenance from 琥珀 prose naming', async () => {
+  it('restores the live guidance/context role instead of the historical observer contract', async () => {
     const home = makeHome();
     const mod = await loadAgentConfig(home);
+    const live = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf-8'));
     const prompt = mod.getCanonicalManagedSystemPrompt();
+    const labels = live.agents[0].block_ids.map((id: string) => live.blocks.find((block: any) => block.id === id)?.label);
+    const toolNames = live.agents[0].tool_ids.map((id: string) => live.tools.find((tool: any) => tool.id === id)?.name);
 
-    expect(prompt).not.toContain('Read, Grep, and Glob remain available');
+    expect(prompt).toContain('persistent agent that whispers to Claude Code');
+    expect(prompt).toContain('Write to guidance when you have something useful to whisper back');
+    expect(prompt).toContain('keep this secondary to your live Subconscious role');
+    expect(prompt).not.toContain('reconfigured as a relationship-memory observer');
+    expect(labels).toEqual(expect.arrayContaining(['guidance', 'user_preferences', 'project_context', 'session_patterns', 'pending_items']));
+    expect(toolNames).toEqual(expect.arrayContaining(['memory', 'memory_insert', 'memory_replace', 'memory_rethink', 'conversation_search']));
+  });
+
+  it('keeps the strict observer prompt in the dedicated backfill AgentFile', async () => {
+    const home = makeHome();
+    const mod = await loadAgentConfig(home);
+    const file = path.join(process.cwd(), 'SubconsciousBackfill.af');
+    const af = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    const prompt = mod.getCanonicalManagedSystemPrompt(file);
+
+    expect(prompt).toBe(af.agents[0].system);
+    expect(prompt).toContain('reconfigured as a relationship-memory observer');
     expect(prompt).toContain('no Claude builtin filesystem, shell, or task tools');
     expect(prompt).toContain('role=assistant');
     expect(prompt).toContain('琥珀');
-    expect(prompt).toContain('literal Claude and Claude Code aliases');
-    expect(prompt).toContain('source-faithful literal fields unchanged');
     expect(prompt).toContain('trusted current-batch evidence IDs');
     expect(prompt).toContain("speak from Kohaku's own subconscious perspective");
-    expect(prompt).toContain('refer to 琥珀\'s own actions, decisions, and experiences naturally as 我');
-    expect(prompt).toContain('shared experiences may naturally be 我和猫');
-    expect(prompt).toContain('This response-voice rule changes presentation only and never changes canonical storage');
-    expect(prompt).not.toContain('real current-batch message IDs');
   });
 });
