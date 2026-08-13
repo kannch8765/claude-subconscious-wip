@@ -23,6 +23,8 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(worker).toContain('createNativeLettaClient');
     expect(worker).toContain('runNativeClientToolConversation');
     expect(worker).toContain('turnSucceeded = !result.clientToolFailure');
+    expect(worker).toContain('turnSucceeded = false');
+    expect(worker).toContain('runtime.finalizeBatch(payload.batchId, turnSucceeded)');
     expect(worker).not.toContain('@letta-ai/letta-code-sdk');
     expect(worker).not.toContain('resumeSession');
     expect(worker).not.toContain('runTurn(');
