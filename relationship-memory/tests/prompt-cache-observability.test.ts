@@ -23,6 +23,7 @@ describe('prompt cache effectiveness abstraction', () => {
   it('derives prompt-cache tokens from the canonical mapUsage semantics', () => {
     const raw = {
       id: 's-canonical',
+      context_window_limit: 400000,
       usage: {
         prompt_tokens: 120,
         completion_tokens: 7,
@@ -35,8 +36,10 @@ describe('prompt cache effectiveness abstraction', () => {
     expect(canonical).toMatchObject({ promptTokens: 120, cachedInputTokens: 90, cacheWriteTokens: 4 });
     expect(sample).toMatchObject({
       promptTokens: canonical.promptTokens,
+      completionTokens: canonical.completionTokens,
       cachedInputTokens: canonical.cachedInputTokens,
       cacheWriteTokens: canonical.cacheWriteTokens,
+      contextWindowLimit: 400000,
       cachedInputRatio: 0.75,
       telemetryQuality: 'covered',
     });
@@ -138,12 +141,20 @@ describe('prompt cache effectiveness abstraction', () => {
   it('returns metadata only even when raw step fixtures contain secret payloads', () => {
     const sample = mapPromptCacheStepSample({
       id: 's-secret', run_id: 'r-secret', model: 'deepseek-v4-flash', model_handle: 'provider/model',
-      prompt_tokens: 100, cached_input_tokens: 75, cache_write_tokens: 2,
+      prompt_tokens: 100, completion_tokens: 9, cached_input_tokens: 75, cache_write_tokens: 2, context_window_limit: 400000,
       prompt: 'SECRET PROMPT', system_prompt: 'SECRET SYSTEM', reasoning: 'SECRET REASONING',
       messages: [{ content: 'SECRET MESSAGE' }], tool_args: { password: 'SECRET TOOL ARG' }, tool_return: 'SECRET TOOL RETURN',
     }, { runId: 'r-secret', conversationId: 'c-secret' });
     const serialized = JSON.stringify(sample);
-    expect(sample).toMatchObject({ model: 'deepseek-v4-flash', modelHandle: 'provider/model', promptTokens: 100, cachedInputTokens: 75, cacheWriteTokens: 2 });
+    expect(sample).toMatchObject({
+      model: 'deepseek-v4-flash',
+      modelHandle: 'provider/model',
+      promptTokens: 100,
+      completionTokens: 9,
+      cachedInputTokens: 75,
+      cacheWriteTokens: 2,
+      contextWindowLimit: 400000,
+    });
     expect(serialized).not.toContain('SECRET');
     expect(serialized).not.toContain('system_prompt');
     expect(serialized).not.toContain('tool_args');
