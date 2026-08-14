@@ -11,6 +11,7 @@ import {
 } from '../relationship-memory/src/backfill/index.js';
 import { relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { resolveBackfillTranscriptInput } from '../relationship-memory/src/backfill/snapshot.js';
+import { assertPrivilegedSnapshotRuntimeSafety } from './backfill_runtime_safety.js';
 
 interface Args {
   transcript?: string;
@@ -18,13 +19,14 @@ interface Args {
   state?: string;
   root?: string;
   cwd?: string;
+  agentId?: string;
   maxBatches: number;
   maxRecords: number;
   maxBytes: number;
 }
 
 function usage(): never {
-  console.error('Usage: npx tsx scripts/relationship_memory_backfill.ts (--snapshot-manifest <manifest.json> | --transcript <file-or-root>) --state <checkpoint.json> [--root <relationship-memory-dir>] [--cwd <dir>] [--max-batches N] [--max-records N] [--max-bytes N]');
+  console.error('Usage: npx tsx scripts/relationship_memory_backfill.ts (--snapshot-manifest <manifest.json> | --transcript <file-or-root>) --state <checkpoint.json> [--root <relationship-memory-dir>] [--cwd <dir>] [--agent-id <dedicated-agent-id>] [--max-batches N] [--max-records N] [--max-bytes N]');
   process.exit(2);
 }
 function positive(value: string | undefined, flag: string): number {
@@ -41,6 +43,7 @@ function parseArgs(argv: string[]): Args {
     else if (flag === '--state') { result.state = value; i += 1; }
     else if (flag === '--root') { result.root = value; i += 1; }
     else if (flag === '--cwd') { result.cwd = value; i += 1; }
+    else if (flag === '--agent-id') { result.agentId = value; i += 1; }
     else if (flag === '--max-batches') { result.maxBatches = positive(value, flag); i += 1; }
     else if (flag === '--max-records') { result.maxRecords = positive(value, flag); i += 1; }
     else if (flag === '--max-bytes') { result.maxBytes = positive(value, flag); i += 1; }
@@ -52,15 +55,16 @@ function parseArgs(argv: string[]): Args {
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const transcript = resolveBackfillTranscriptInput({ transcript: args.transcript, snapshotManifest: args.snapshotManifest });
   const statePath = path.resolve(args.state!);
   const rootDir = path.resolve(args.root ?? relationshipMemoryRoot());
+  assertPrivilegedSnapshotRuntimeSafety({ snapshotManifest: args.snapshotManifest, statePath, rootDir, agentId: args.agentId });
+  const transcript = resolveBackfillTranscriptInput({ transcript: args.transcript, snapshotManifest: args.snapshotManifest });
   const cwd = path.resolve(args.cwd ?? process.cwd());
   const apiKey = process.env.LETTA_API_KEY;
   if (!apiKey) throw new Error('LETTA_API_KEY is required for relationship-memory historical backfill.');
 
   const state = loadBackfillState(statePath);
-  const agentId = await getBackfillAgentId(apiKey, () => {});
+  const agentId = await getBackfillAgentId(apiKey, () => {}, { agentId: args.agentId });
   if (state.agent_id && state.agent_id !== agentId) {
     throw new Error(`Backfill state is bound to a different agent (${state.agent_id}); use a new checkpoint file.`);
   }
