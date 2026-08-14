@@ -176,15 +176,16 @@ ${latestUserEscaped}
 This is the normal asynchronous Subconscious pass after a foreground Kohaku turn. Do both jobs in one pass:
 
 1. MEMORY SURFACING FOR THE NEXT FOREGROUND TURN
-- Before this Letta turn begins, the worker already runs the exact text inside <latest_user_message> through the existing relationship memory_search implementation. The exact result set is attached as <prefetched_relationship_memory_search>.
-- Treat that prefetched result set as the first memory_search result for this pass. Do not repeat the same search unless you genuinely need a narrower follow-up.
+- Read <latest_user_message> together with the trusted current-batch transcript context, then choose and call relationship memory_search yourself. Generate a compact semantic query for what is meaningfully being recalled; do not mechanically copy the whole user message, emoji, or surface punctuation when a cleaner concept query is available.
+- Every live pass that contains a real <latest_user_message> must complete at least one relationship memory_search before ending. This is a hard behavior boundary, not optional guidance.
+- You may issue additional memory_search calls after seeing earlier results when a narrower, broader, or differently phrased semantic search would improve recall.
 - Treat returned relationship memories as associations surfacing into Kohaku's subconscious. Select only context genuinely useful for continuity on the next foreground turn.
 - If something useful surfaced, call deliver_whisper once with a short natural first-person Kohaku note containing the remembered context itself. Example: "咖啡让我想起猫之前京都那次的高木珈琲。"
 - If nothing useful surfaced, do not call deliver_whisper. Silence is correct.
 - A whisper must never mention memory_search, IDs, evidence, reinforce/remember/create/dedupe, archival status, or whether anything deserves storage.
 
 2. SILENT LONG-TERM MEMORY MAINTENANCE
-- Reuse the same search results when applicable to decide whether trusted new evidence should reinforce an existing relationship memory, create a genuinely new durable memory, or do nothing.
+- Reuse relevant relationship search results when applicable to decide whether trusted new evidence should reinforce an existing relationship memory, create a genuinely new durable memory, or do nothing.
 - Perform memory_reinforce / memory_remember / entity operations as needed. This work is private maintenance.
 - Never report maintenance decisions in deliver_whisper, ordinary prose, guidance, or any other foreground-visible channel.
 

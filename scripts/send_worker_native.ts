@@ -51,26 +51,6 @@ function log(message: string): void {
   fs.appendFileSync(LOG_FILE, `[${timestamp}] ${message}\n`);
 }
 
-function escapeXml(value: string): string {
-  return value
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
-}
-
-function formatPrefetchedMemorySearch(query: string, results: unknown[]): string {
-  const body = results.map((result, index) => (
-    `  <result rank="${index + 1}">${escapeXml(stableJson(result))}</result>`
-  )).join('\n');
-  return [
-    `<prefetched_relationship_memory_search query="${escapeXml(query)}" count="${results.length}">`,
-    body,
-    '</prefetched_relationship_memory_search>',
-  ].join('\n');
-}
-
 async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'completed' | 'retryable_failure'> {
   const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
   const assistantIntents = payload.assistantIntents ?? [];
@@ -82,11 +62,7 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     return 'completed';
   }
 
-  const firstSearchQuery = payload.latestUserMessage?.trim() || '';
-  const prefetchedMemories = firstSearchQuery
-    ? await runtime.memorySearchHybrid({ query: firstSearchQuery, limit: 8 })
-    : [];
-  log(`Deterministic first memory search: query_chars=${firstSearchQuery.length}, results=${prefetchedMemories.length}`);
+  const hasRealUserMessage = Boolean(payload.latestUserMessage?.trim());
 
   runtime.store.beginBatch(payload.batchId, new Date().toISOString());
   let turnSucceeded = false;
@@ -97,8 +73,18 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     const client = createNativeLettaClient(apiKey);
 
     const relationshipTools: NativeClientTool[] = buildRelationshipTools(runtime, payload.batchId).map((tool) => {
-      if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
       const execute = tool.execute.bind(tool);
+      if (tool.name === 'memory_search') {
+        return {
+          ...tool,
+          async execute(toolCallId: string, args: unknown) {
+            const query = typeof (args as any)?.query === 'string' ? (args as any).query.trim() : '';
+            log(`Model relationship memory_search: query=${JSON.stringify(query)}`);
+            return execute(toolCallId, args);
+          },
+        };
+      }
+      if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
       return {
         ...tool,
         async execute(toolCallId: string, args: unknown) {
@@ -134,11 +120,11 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
       return stored;
     });
 
-    const liveMessage = `${appendTrustedRelationshipCatalog(
+    const liveMessage = appendTrustedRelationshipCatalog(
       payload.message,
       payload.canonicalMessages,
       durableAssistantIntents,
-    )}\n\n${formatPrefetchedMemorySearch(firstSearchQuery, prefetchedMemories)}`;
+    );
 
     log(`Starting native live Subconscious turn for conversation ${payload.conversationId}`);
     log(`  agent: ${payload.agentId}`);
@@ -150,6 +136,7 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
       conversationId: payload.conversationId,
       message: liveMessage,
       tools: relationshipTools,
+      requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
     });
     turnSucceeded = !result.clientToolFailure;
     const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';

@@ -97,6 +97,73 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.bodies).toHaveLength(1);
   });
 
+  it('fails closed when a required live memory_search never completes', async () => {
+    const client = fakeClient([{ messages: [], stop_reason: 'end_turn' }]);
+
+    await expect(runNativeClientToolConversation({
+      client,
+      agentId: 'agent-test',
+      conversationId: 'conv-test',
+      message: '今天又在喝咖啡><🐾',
+      tools: [{
+        name: 'memory_search', description: 'search', parameters: { type: 'object' },
+        async execute() { return { results: [] }; },
+      }],
+      requiredClientToolNames: ['memory_search'],
+    })).rejects.toThrow('ended before required client tool completion: memory_search');
+  });
+
+  it('does not count a failed required memory_search execution as completion', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{\"query\":\"咖啡\"}', tool_call_id: 'coffee-fail' } }], stop_reason: 'requires_approval' },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+
+    await expect(runNativeClientToolConversation({
+      client,
+      agentId: 'agent-test',
+      conversationId: 'conv-test',
+      message: '今天又在喝咖啡><🐾',
+      tools: [{
+        name: 'memory_search', description: 'search', parameters: { type: 'object' },
+        async execute() { throw new Error('search backend unavailable'); },
+      }],
+      requiredClientToolNames: ['memory_search'],
+    })).rejects.toThrow('ended before required client tool completion: memory_search');
+
+    expect(client.bodies[1].messages[0].tool_returns[0]).toEqual(expect.objectContaining({
+      tool_call_id: 'coffee-fail',
+      status: 'error',
+    }));
+  });
+
+  it('accepts a model-authored semantic memory_search query and allows follow-up searches', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"咖啡 喝咖啡 相关回忆"}', tool_call_id: 'coffee-1' } }], stop_reason: 'requires_approval' },
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"京都 咖啡 高木珈琲"}', tool_call_id: 'coffee-2' } }], stop_reason: 'requires_approval' },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+    const seen: unknown[] = [];
+    const result = await runNativeClientToolConversation({
+      client,
+      agentId: 'agent-test',
+      conversationId: 'conv-test',
+      message: '今天又在喝咖啡><🐾',
+      tools: [{
+        name: 'memory_search', description: 'search', parameters: { type: 'object' },
+        async execute(_id, args) { seen.push(args); return { results: [] }; },
+      }],
+      requiredClientToolNames: ['memory_search'],
+    });
+
+    expect(seen).toEqual([
+      { query: '咖啡 喝咖啡 相关回忆' },
+      { query: '京都 咖啡 高木珈琲' },
+    ]);
+    expect(seen[0]).not.toEqual({ query: '今天又在喝咖啡><🐾' });
+    expect(result.clientToolFailure).toBe(false);
+  });
+
   it('executes local client tools through native approval returns then accepts a server terminal call', async () => {
     const client = fakeClient([
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"京都"}', tool_call_id: 'call-1' } }], stop_reason: 'requires_approval' },
@@ -125,9 +192,9 @@ describe('native Letta legacy backfill harness', () => {
 
   it('executes every parallel approval_request tool_calls entry exactly once', async () => {
     const parallelCalls = [
-      { name: 'memory_search', arguments: '{\"query\":\"A\"}', tool_call_id: 'call-a' },
-      { name: 'memory_search', arguments: '{\"query\":\"B\"}', tool_call_id: 'call-b' },
-      { name: 'memory_search', arguments: '{\"query\":\"C\"}', tool_call_id: 'call-c' },
+      { name: 'memory_search', arguments: '{"query":"A"}', tool_call_id: 'call-a' },
+      { name: 'memory_search', arguments: '{"query":"B"}', tool_call_id: 'call-b' },
+      { name: 'memory_search', arguments: '{"query":"C"}', tool_call_id: 'call-c' },
     ];
     const client = fakeClient([
       {
@@ -138,7 +205,7 @@ describe('native Letta legacy backfill harness', () => {
         }],
         stop_reason: 'requires_approval',
       },
-      { messages: [{ message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{\"result\":\"no_memory_required\"}', tool_call_id: 'terminal' } }], stop_reason: 'tool_rule' },
+      { messages: [{ message_type: 'tool_call_message', tool_call: { name: LEGACY_COMPLETION_TOOL_NAME, arguments: '{"result":"no_memory_required"}', tool_call_id: 'terminal' } }], stop_reason: 'tool_rule' },
     ]);
     const seen: unknown[] = [];
     const result = await runNativeClientToolConversation({
@@ -154,9 +221,9 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.bodies[1].messages).toEqual([{
       type: 'tool_return',
       tool_returns: [
-        { type: 'tool', tool_call_id: 'call-a', tool_return: '{\"results\":[]}', status: 'success' },
-        { type: 'tool', tool_call_id: 'call-b', tool_return: '{\"results\":[]}', status: 'success' },
-        { type: 'tool', tool_call_id: 'call-c', tool_return: '{\"results\":[]}', status: 'success' },
+        { type: 'tool', tool_call_id: 'call-a', tool_return: '{"results":[]}', status: 'success' },
+        { type: 'tool', tool_call_id: 'call-b', tool_return: '{"results":[]}', status: 'success' },
+        { type: 'tool', tool_call_id: 'call-c', tool_return: '{"results":[]}', status: 'success' },
       ],
     }]);
   });
