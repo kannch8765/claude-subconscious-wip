@@ -1,5 +1,6 @@
 import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 
 export interface SemanticDocument {
@@ -11,6 +12,7 @@ export interface EmbeddingProvider {
   readonly fingerprint: string;
   readonly model: string;
   readonly dimensions: number;
+  readonly maxBatchSize: number;
   embedDocuments(texts: string[]): Promise<number[][]>;
   embedQuery(text: string): Promise<number[]>;
 }
@@ -32,8 +34,30 @@ interface SemanticIndexFileV1 {
 
 export const DEFAULT_QWEN_QUERY_INSTRUCTION = 'Retrieve canonical relationship memories or identity records that describe the same underlying preference, shared experience, relationship event, inside joke, or identity as the query. Prefer semantic equivalence over surface word overlap.';
 export const DEFAULT_QWEN_EMBEDDING_ENDPOINT = 'https://dashscope.aliyuncs.com/api/v1/services/embeddings/text-embedding/text-embedding';
-export const DEFAULT_QWEN_EMBEDDING_MODEL = 'qwen3.7-text-embedding';
+export const DEFAULT_QWEN_EMBEDDING_MODEL = 'text-embedding-v4';
 export const DEFAULT_QWEN_EMBEDDING_DIMENSIONS = 1024;
+const DEFAULT_SEMANTIC_LOCK_TIMEOUT_MS = 5_000;
+const DEFAULT_SEMANTIC_LOCK_STALE_MS = 300_000;
+const DEFAULT_EMBEDDING_QUOTA_COOLDOWN_MS = 86_400_000;
+const DEFAULT_EMBEDDING_THROTTLE_COOLDOWN_MS = 60_000;
+const DEFAULT_EMBEDDING_PROVIDER_COOLDOWN_MS = 30_000;
+const SEMANTIC_LOCK_POLL_MS = 25;
+
+interface EmbeddingProviderCooldownFileV1 {
+  schema_version: 1;
+  provider_fingerprint: string;
+  reason: 'quota' | 'throttle' | 'provider';
+  code: string;
+  created_at: string;
+  retry_after: string;
+}
+
+interface SemanticIndexLockOwner {
+  pid: number;
+  hostname: string;
+  token: string;
+  acquired_at: string;
+}
 
 function sha256(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
@@ -50,17 +74,32 @@ function readSecretFile(file: string): string {
   return value;
 }
 
+class EmbeddingProviderRequestError extends Error {
+  constructor(readonly status: number, readonly code: string, message: string) {
+    super(`Embedding provider failed (${status}, ${code}): ${message}`.slice(0, 500));
+    this.name = 'EmbeddingProviderRequestError';
+  }
+}
+
 function providerError(status: number, payload: unknown): Error {
-  const record = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
-  const code = typeof record.code === 'string' ? record.code : 'unknown_error';
-  const message = typeof record.message === 'string' ? record.message : 'Embedding provider request failed.';
-  return new Error(`Embedding provider failed (${status}, ${code}): ${message}`.slice(0, 500));
+  const outer = payload && typeof payload === 'object' && !Array.isArray(payload) ? payload as Record<string, unknown> : {};
+  const nested = outer.error && typeof outer.error === 'object' && !Array.isArray(outer.error) ? outer.error as Record<string, unknown> : {};
+  const code = typeof outer.code === 'string' ? outer.code : typeof nested.code === 'string' ? nested.code : 'unknown_error';
+  const message = typeof outer.message === 'string' ? outer.message : typeof nested.message === 'string' ? nested.message : 'Embedding provider request failed.';
+  return new EmbeddingProviderRequestError(status, code, message);
+}
+
+function dashScopeBatchSize(model: string): number {
+  if (model === 'text-embedding-v4' || model === 'text-embedding-v3') return 10;
+  if (model === 'qwen3.7-text-embedding') return 20;
+  return 10;
 }
 
 export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
   readonly fingerprint: string;
   readonly model: string;
   readonly dimensions: number;
+  readonly maxBatchSize: number;
   private readonly apiKey: string;
   private readonly endpoint: string;
   private readonly queryInstruction: string;
@@ -78,6 +117,7 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
     this.endpoint = options.endpoint ?? DEFAULT_QWEN_EMBEDDING_ENDPOINT;
     this.model = options.model ?? DEFAULT_QWEN_EMBEDDING_MODEL;
     this.dimensions = options.dimensions ?? DEFAULT_QWEN_EMBEDDING_DIMENSIONS;
+    this.maxBatchSize = dashScopeBatchSize(this.model);
     this.queryInstruction = options.queryInstruction ?? DEFAULT_QWEN_QUERY_INSTRUCTION;
     this.fetchFn = options.fetchFn ?? fetch;
     this.fingerprint = sha256(JSON.stringify({
@@ -92,7 +132,7 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
 
   private async embed(texts: string[], textType: 'document' | 'query'): Promise<number[][]> {
     if (texts.length === 0) return [];
-    if (texts.length > 20) throw new Error('DashScope qwen3.7-text-embedding accepts at most 20 texts per request.');
+    if (texts.length > this.maxBatchSize) throw new Error(`DashScope ${this.model} accepts at most ${this.maxBatchSize} texts per request.`);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(new Error('embedding request timeout')), 30_000);
     try {
@@ -172,27 +212,196 @@ function writeIndex(file: string, value: SemanticIndexFileV1): void {
   try { fs.chmodSync(file, 0o600); } catch { }
 }
 
+function positiveEnvMs(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function providerCooldownFile(indexFile: string, fingerprint: string): string {
+  return `${indexFile}.provider-cooldown.${fingerprint}.json`;
+}
+
+function readProviderCooldown(indexFile: string, fingerprint: string): EmbeddingProviderCooldownFileV1 | undefined {
+  const file = providerCooldownFile(indexFile, fingerprint);
+  try {
+    const value = JSON.parse(fs.readFileSync(file, 'utf8')) as EmbeddingProviderCooldownFileV1;
+    if (value?.schema_version !== 1 || value.provider_fingerprint !== fingerprint || !Number.isFinite(Date.parse(value.retry_after))) return undefined;
+    if (Date.parse(value.retry_after) <= Date.now()) {
+      try { fs.rmSync(file, { force: true }); } catch { }
+      return undefined;
+    }
+    return value;
+  } catch {
+    return undefined;
+  }
+}
+
+function cooldownForProviderError(error: unknown): { reason: EmbeddingProviderCooldownFileV1['reason']; code: string; durationMs: number } {
+  if (error instanceof EmbeddingProviderRequestError) {
+    if (error.status === 403 && error.code === 'AllocationQuota.FreeTierOnly') {
+      return { reason: 'quota', code: error.code, durationMs: positiveEnvMs('RELATIONSHIP_MEMORY_EMBEDDING_QUOTA_COOLDOWN_MS', DEFAULT_EMBEDDING_QUOTA_COOLDOWN_MS) };
+    }
+    if (error.status === 429 || error.code.startsWith('Throttling')) {
+      return { reason: 'throttle', code: error.code, durationMs: positiveEnvMs('RELATIONSHIP_MEMORY_EMBEDDING_THROTTLE_COOLDOWN_MS', DEFAULT_EMBEDDING_THROTTLE_COOLDOWN_MS) };
+    }
+    return { reason: 'provider', code: error.code, durationMs: positiveEnvMs('RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS', DEFAULT_EMBEDDING_PROVIDER_COOLDOWN_MS) };
+  }
+  const code = error instanceof Error ? error.name || 'provider_error' : 'provider_error';
+  return { reason: 'provider', code, durationMs: positiveEnvMs('RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS', DEFAULT_EMBEDDING_PROVIDER_COOLDOWN_MS) };
+}
+
+function writeProviderCooldown(indexFile: string, fingerprint: string, error: unknown): EmbeddingProviderCooldownFileV1 {
+  const policy = cooldownForProviderError(error);
+  const now = Date.now();
+  const value: EmbeddingProviderCooldownFileV1 = {
+    schema_version: 1,
+    provider_fingerprint: fingerprint,
+    reason: policy.reason,
+    code: policy.code,
+    created_at: new Date(now).toISOString(),
+    retry_after: new Date(now + policy.durationMs).toISOString(),
+  };
+  const file = providerCooldownFile(indexFile, fingerprint);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  const current = readProviderCooldown(indexFile, fingerprint);
+  if (current && Date.parse(current.retry_after) >= Date.parse(value.retry_after)) return current;
+  const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  fs.renameSync(temp, file);
+  try { fs.chmodSync(file, 0o600); } catch { }
+  return value;
+}
+
+function assertProviderNotCoolingDown(indexFile: string, fingerprint: string): void {
+  const cooldown = readProviderCooldown(indexFile, fingerprint);
+  if (!cooldown) return;
+  throw new Error(`Embedding provider cooldown active (${cooldown.reason}, ${cooldown.code}) until ${cooldown.retry_after}.`);
+}
+
+function semanticLockDir(indexFile: string): string {
+  return `${indexFile}.lock`;
+}
+
+function semanticLockOwnerFile(indexFile: string): string {
+  return path.join(semanticLockDir(indexFile), 'owner.json');
+}
+
+function semanticLockOwnerIsAlive(owner: SemanticIndexLockOwner): boolean {
+  if (owner.hostname !== os.hostname()) return true;
+  try {
+    process.kill(owner.pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+function recoverStaleSemanticLock(indexFile: string, staleMs: number): boolean {
+  const lockDir = semanticLockDir(indexFile);
+  let stat: fs.Stats;
+  try { stat = fs.statSync(lockDir); } catch { return true; }
+
+  let owner: SemanticIndexLockOwner | undefined;
+  try { owner = JSON.parse(fs.readFileSync(semanticLockOwnerFile(indexFile), 'utf8')) as SemanticIndexLockOwner; }
+  catch { owner = undefined; }
+
+  const oldEnough = Date.now() - stat.mtimeMs >= staleMs;
+  const deadOwner = owner
+    ? Number.isInteger(owner.pid) && owner.pid > 0 && typeof owner.hostname === 'string' && !semanticLockOwnerIsAlive(owner)
+    : oldEnough;
+  if (!deadOwner) return false;
+  try {
+    fs.rmSync(lockDir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function acquireSemanticLock(indexFile: string): Promise<string> {
+  fs.mkdirSync(path.dirname(indexFile), { recursive: true, mode: 0o700 });
+  const timeoutMs = positiveEnvMs('RELATIONSHIP_MEMORY_SEMANTIC_LOCK_TIMEOUT_MS', DEFAULT_SEMANTIC_LOCK_TIMEOUT_MS);
+  const staleMs = positiveEnvMs('RELATIONSHIP_MEMORY_SEMANTIC_LOCK_STALE_MS', DEFAULT_SEMANTIC_LOCK_STALE_MS);
+  const deadline = Date.now() + timeoutMs;
+  const token = `${process.pid}-${crypto.randomUUID()}`;
+  while (true) {
+    try {
+      fs.mkdirSync(semanticLockDir(indexFile));
+      const owner: SemanticIndexLockOwner = { pid: process.pid, hostname: os.hostname(), token, acquired_at: new Date().toISOString() };
+      fs.writeFileSync(semanticLockOwnerFile(indexFile), `${JSON.stringify(owner)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
+      return token;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        try { fs.rmSync(semanticLockDir(indexFile), { recursive: true, force: true }); } catch { }
+        throw new Error(`semantic index lock acquisition failed: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      recoverStaleSemanticLock(indexFile, staleMs);
+      if (Date.now() >= deadline) throw new Error(`semantic index lock contention timed out after ${timeoutMs}ms`);
+      await new Promise((resolve) => setTimeout(resolve, Math.min(SEMANTIC_LOCK_POLL_MS, Math.max(1, deadline - Date.now()))));
+    }
+  }
+}
+
+function releaseSemanticLock(indexFile: string, token: string): void {
+  try {
+    const owner = JSON.parse(fs.readFileSync(semanticLockOwnerFile(indexFile), 'utf8')) as SemanticIndexLockOwner;
+    if (owner.token !== token) throw new Error('semantic index lock ownership changed before release');
+    fs.rmSync(semanticLockDir(indexFile), { recursive: true, force: false });
+  } catch (error) {
+    throw new Error(`semantic index lock release failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export class FileBackedSemanticRetriever implements SemanticRetriever {
   constructor(readonly provider: EmbeddingProvider, readonly indexFile: string) {}
 
+  private async ensureDocuments(documents: SemanticDocument[]): Promise<SemanticIndexFileV1> {
+    const token = await acquireSemanticLock(this.indexFile);
+    try {
+      const index = readIndex(this.indexFile, this.provider.fingerprint);
+      const missing: SemanticDocument[] = [];
+      for (const document of documents) {
+        const contentHash = sha256(document.text);
+        const cached = index.documents[document.id];
+        if (!cached || cached.content_hash !== contentHash || cached.vector.length !== this.provider.dimensions || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) missing.push(document);
+      }
+      for (let offset = 0; offset < missing.length; offset += this.provider.maxBatchSize) {
+        assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
+        const batch = missing.slice(offset, offset + this.provider.maxBatchSize);
+        let vectors: number[][];
+        try {
+          vectors = await this.provider.embedDocuments(batch.map((document) => document.text));
+        } catch (error) {
+          writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+          throw error;
+        }
+        batch.forEach((document, indexInBatch) => {
+          index.documents[document.id] = { content_hash: sha256(document.text), vector: vectors[indexInBatch] };
+        });
+        // Checkpoint every successful provider batch. If a later batch fails, the next
+        // search resumes from this durable boundary instead of re-billing prior texts.
+        writeIndex(this.indexFile, index);
+      }
+      return index;
+    } finally {
+      releaseSemanticLock(this.indexFile, token);
+    }
+  }
+
   async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
     if (!query.trim() || documents.length === 0) return new Map();
-    const index = readIndex(this.indexFile, this.provider.fingerprint);
-    const missing: SemanticDocument[] = [];
-    for (const document of documents) {
-      const contentHash = sha256(document.text);
-      const cached = index.documents[document.id];
-      if (!cached || cached.content_hash !== contentHash || cached.vector.length !== this.provider.dimensions || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) missing.push(document);
+    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
+    // Serialize derivative-cache refreshes across live MCP/Subcon processes. A waiter
+    // re-reads the index after acquiring the lock, so already-built vectors are reused.
+    const index = await this.ensureDocuments(documents);
+    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
+    let queryVector: number[];
+    try {
+      queryVector = await this.provider.embedQuery(query);
+    } catch (error) {
+      writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+      throw error;
     }
-    for (let offset = 0; offset < missing.length; offset += 20) {
-      const batch = missing.slice(offset, offset + 20);
-      const vectors = await this.provider.embedDocuments(batch.map((document) => document.text));
-      batch.forEach((document, indexInBatch) => {
-        index.documents[document.id] = { content_hash: sha256(document.text), vector: vectors[indexInBatch] };
-      });
-    }
-    if (missing.length > 0) writeIndex(this.indexFile, index);
-    const queryVector = await this.provider.embedQuery(query);
     return new Map(documents.map((document) => [document.id, cosine(queryVector, index.documents[document.id].vector)]));
   }
 }

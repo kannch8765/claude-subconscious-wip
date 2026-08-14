@@ -20,13 +20,19 @@ function temp(prefix: string): string {
   dirs.push(dir);
   return dir;
 }
-afterEach(() => { while (dirs.length) fs.rmSync(dirs.pop()!, { recursive: true, force: true }); });
+afterEach(() => {
+  while (dirs.length) fs.rmSync(dirs.pop()!, { recursive: true, force: true });
+  delete process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS;
+  delete process.env.RELATIONSHIP_MEMORY_EMBEDDING_THROTTLE_COOLDOWN_MS;
+  delete process.env.RELATIONSHIP_MEMORY_EMBEDDING_QUOTA_COOLDOWN_MS;
+});
 
 class FakeProvider implements EmbeddingProvider {
   fingerprint: string;
   constructor(fingerprint = 'fake-provider-v1') { this.fingerprint = fingerprint; };
   model = 'fake';
   dimensions = 2;
+  maxBatchSize = 10;
   documentCalls: string[][] = [];
   queryCalls: string[] = [];
   async embedDocuments(texts: string[]): Promise<number[][]> {
@@ -119,6 +125,149 @@ describe('relationship-memory semantic retrieval foundation', () => {
     await new FileBackedSemanticRetriever(replacement, indexFile).rank(docs, 'new fingerprint');
     expect(replacement.documentCalls).toHaveLength(1);
     expect(replacement.documentCalls[0]).toEqual(docs.map((item) => item.text));
+  });
+
+  it('checkpoints successful provider-sized batches so a later failure resumes without re-embedding earlier texts', async () => {
+    process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS = '1';
+    const root = temp('rm-semantic-checkpoint-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    let failSecondBatch = true;
+    const originalEmbedDocuments = provider.embedDocuments.bind(provider);
+    provider.embedDocuments = async (texts: string[]) => {
+      if (provider.documentCalls.length === 1 && failSecondBatch) {
+        provider.documentCalls.push(texts);
+        failSecondBatch = false;
+        throw new Error('synthetic provider failure after first billed batch');
+      }
+      return originalEmbedDocuments(texts);
+    };
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    const docs = Array.from({ length: 25 }, (_, index) => ({ id: `m${index}`, text: `gift document ${index}` }));
+
+    await expect(retriever.rank(docs, 'first attempt')).rejects.toThrow('synthetic provider failure');
+    const partial = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+    expect(Object.keys(partial.documents)).toHaveLength(10);
+
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await retriever.rank(docs, 'resume');
+    expect(provider.documentCalls).toHaveLength(4);
+    expect(provider.documentCalls[0]).toEqual(docs.slice(0, 10).map((item) => item.text));
+    expect(provider.documentCalls[1]).toEqual(docs.slice(10, 20).map((item) => item.text));
+    expect(provider.documentCalls[2]).toEqual(docs.slice(10, 20).map((item) => item.text));
+    expect(provider.documentCalls[3]).toEqual(docs.slice(20).map((item) => item.text));
+    expect(Object.keys(JSON.parse(fs.readFileSync(indexFile, 'utf8')).documents)).toHaveLength(25);
+  });
+
+  it('serializes concurrent semantic index bootstraps so waiters reuse vectors instead of duplicating provider calls', async () => {
+    const root = temp('rm-semantic-concurrent-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    let releaseFirst!: () => void;
+    let startedFirst!: () => void;
+    const firstStarted = new Promise<void>((resolve) => { startedFirst = resolve; });
+    const firstRelease = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const originalEmbedDocuments = provider.embedDocuments.bind(provider);
+    provider.embedDocuments = async (texts: string[]) => {
+      const call = originalEmbedDocuments(texts);
+      if (provider.documentCalls.length === 1) {
+        startedFirst();
+        await firstRelease;
+      }
+      return call;
+    };
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }, { id: 'm2', text: 'ramen preference' }];
+    const first = new FileBackedSemanticRetriever(provider, indexFile).rank(docs, 'first query');
+    await firstStarted;
+    const second = new FileBackedSemanticRetriever(provider, indexFile).rank(docs, 'second query');
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    expect(provider.documentCalls).toHaveLength(1);
+    releaseFirst();
+
+    await Promise.all([first, second]);
+    expect(provider.documentCalls).toHaveLength(1);
+    expect(provider.queryCalls).toEqual(expect.arrayContaining(['first query', 'second query']));
+    expect(fs.existsSync(`${indexFile}.lock`)).toBe(false);
+  });
+
+  it('defaults DashScope semantic retrieval to text-embedding-v4 and enforces its 10-text request limit', async () => {
+    const requests: any[] = [];
+    const fakeFetch = (async (_url: any, init: any) => {
+      const body = JSON.parse(init.body);
+      requests.push(body);
+      const count = body.input.texts.length;
+      return new Response(JSON.stringify({ output: { embeddings: Array.from({ length: count }, (_, index) => ({ text_index: index, embedding: [1, 0] })) } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const provider = new DashScopeQwenEmbeddingProvider({ apiKey: 'secret', dimensions: 2, fetchFn: fakeFetch });
+    expect(provider.model).toBe('text-embedding-v4');
+    expect(provider.maxBatchSize).toBe(10);
+    await provider.embedDocuments(Array.from({ length: 10 }, (_, index) => `doc-${index}`));
+    await expect(provider.embedDocuments(Array.from({ length: 11 }, (_, index) => `too-many-${index}`))).rejects.toThrow('at most 10 texts');
+    expect(requests).toHaveLength(1);
+    expect(requests[0].model).toBe('text-embedding-v4');
+  });
+
+  it('persists free-tier exhaustion cooldown across retrievers while a new provider fingerprint can proceed immediately', async () => {
+    const root = temp('rm-semantic-quota-cooldown-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    let exhaustedCalls = 0;
+    const exhaustedFetch = (async () => {
+      exhaustedCalls += 1;
+      return new Response(JSON.stringify({ code: 'AllocationQuota.FreeTierOnly', message: 'free tier exhausted' }), {
+        status: 403,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const exhausted = new DashScopeQwenEmbeddingProvider({ apiKey: 'secret', dimensions: 2, fetchFn: exhaustedFetch });
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }];
+
+    await expect(new FileBackedSemanticRetriever(exhausted, indexFile).rank(docs, 'first')).rejects.toThrow('AllocationQuota.FreeTierOnly');
+    await expect(new FileBackedSemanticRetriever(exhausted, indexFile).rank(docs, 'second')).rejects.toThrow('cooldown active');
+    expect(exhaustedCalls).toBe(1);
+    const cooldownFile = fs.readdirSync(path.dirname(indexFile)).find((name) => name.includes('.provider-cooldown.'))!;
+    const cooldown = JSON.parse(fs.readFileSync(path.join(path.dirname(indexFile), cooldownFile), 'utf8'));
+    expect(cooldown).toEqual(expect.objectContaining({ reason: 'quota', code: 'AllocationQuota.FreeTierOnly', provider_fingerprint: exhausted.fingerprint }));
+
+    let replacementCalls = 0;
+    const replacementFetch = (async (_url: any, init: any) => {
+      replacementCalls += 1;
+      const body = JSON.parse(init.body);
+      const count = body.input.texts.length;
+      return new Response(JSON.stringify({ output: { embeddings: Array.from({ length: count }, (_, index) => ({ text_index: index, embedding: [1, 0] })) } }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const replacement = new DashScopeQwenEmbeddingProvider({ apiKey: 'secret', model: 'text-embedding-v3', dimensions: 2, fetchFn: replacementFetch });
+    await new FileBackedSemanticRetriever(replacement, indexFile).rank(docs, 'replacement');
+    expect(replacement.fingerprint).not.toBe(exhausted.fingerprint);
+    expect(replacementCalls).toBe(2);
+  });
+
+  it('puts 429 throttling on a shared short cooldown instead of retrying every search', async () => {
+    const root = temp('rm-semantic-throttle-cooldown-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    let calls = 0;
+    const throttledFetch = (async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ error: { code: 'Throttling.RateQuota', message: 'slow down' } }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }) as typeof fetch;
+    const provider = new DashScopeQwenEmbeddingProvider({ apiKey: 'secret', dimensions: 2, fetchFn: throttledFetch });
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }];
+
+    await expect(retriever.rank(docs, 'first')).rejects.toThrow('Throttling.RateQuota');
+    await expect(retriever.rank(docs, 'second')).rejects.toThrow('cooldown active');
+    expect(calls).toBe(1);
+    const cooldownFile = fs.readdirSync(path.dirname(indexFile)).find((name) => name.includes('.provider-cooldown.'))!;
+    const cooldown = JSON.parse(fs.readFileSync(path.join(path.dirname(indexFile), cooldownFile), 'utf8'));
+    expect(cooldown).toEqual(expect.objectContaining({ reason: 'throttle', code: 'Throttling.RateQuota' }));
   });
 
   it('uses document/query modes and query instruction without binding the provider fingerprint to the secret', async () => {
