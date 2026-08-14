@@ -501,8 +501,15 @@ export async function reconcileManagedAgentConfiguration(
   // the desired limit in the same PATCH so model/provider/context converge atomically.
   if (modelWillChange || currentContext !== desiredContextWindow) patch.context_window_limit = desiredContextWindow;
   const currentProviderType = currentModelSettingsProviderType(agent);
-  const currentParallel = agent.model_settings?.parallel_tool_calls ?? agent.llm_config?.parallel_tool_calls;
-  if (currentProviderType !== desiredProviderType || currentParallel !== canonical.parallelToolCalls) {
+  const modelSettingsParallel = agent.model_settings?.parallel_tool_calls;
+  const legacyConfigParallel = agent.llm_config?.parallel_tool_calls;
+  const parallelIsEffective = modelSettingsParallel === canonical.parallelToolCalls
+    && legacyConfigParallel === canonical.parallelToolCalls;
+  // Letta 0.16.8 rebuilds effective llm_config when model/context changes. Carry
+  // canonical model_settings in the same PATCH even when both parallel flags are
+  // already true, otherwise that rebuild can silently drop provider parallelism.
+  const effectiveLlmConfigWillRebuild = modelWillChange || currentContext !== desiredContextWindow;
+  if (currentProviderType !== desiredProviderType || !parallelIsEffective || effectiveLlmConfigWillRebuild) {
     patch.model_settings = currentProviderType === desiredProviderType
       ? { ...(agent.model_settings ?? {}), provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls }
       : { provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls };
@@ -523,6 +530,25 @@ export async function reconcileManagedAgentConfiguration(
   });
   if (!patchResponse.ok) {
     throw new Error(`Failed to reconcile managed Subconscious runtime configuration: ${patchResponse.status} ${await patchResponse.text()}`);
+  }
+
+  if (patch.model_settings) {
+    const verifyResponse = await fetch(url, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${apiKey}` },
+    });
+    if (!verifyResponse.ok) {
+      throw new Error(`Failed to verify managed Subconscious runtime configuration after reconciliation: ${verifyResponse.status} ${await verifyResponse.text()}`);
+    }
+    const verified = await verifyResponse.json() as AgentDetails;
+    const verifiedModelSettingsParallel = verified.model_settings?.parallel_tool_calls;
+    const verifiedLegacyConfigParallel = verified.llm_config?.parallel_tool_calls;
+    if (verifiedModelSettingsParallel !== canonical.parallelToolCalls
+      || verifiedLegacyConfigParallel !== canonical.parallelToolCalls) {
+      throw new Error(
+        `Managed Subconscious effective parallel_tool_calls reconciliation failed: model_settings=${String(verifiedModelSettingsParallel)}, llm_config=${String(verifiedLegacyConfigParallel)}, expected=${String(canonical.parallelToolCalls)}`,
+      );
+    }
   }
   log(`Reconciled managed Subconscious runtime configuration from ${path.basename(agentFile)}: ${Object.keys(patch).join(', ')}`);
 }
