@@ -505,7 +505,11 @@ export async function reconcileManagedAgentConfiguration(
   const legacyConfigParallel = agent.llm_config?.parallel_tool_calls;
   const parallelIsEffective = modelSettingsParallel === canonical.parallelToolCalls
     && legacyConfigParallel === canonical.parallelToolCalls;
-  if (currentProviderType !== desiredProviderType || !parallelIsEffective) {
+  // Letta 0.16.8 rebuilds effective llm_config when model/context changes. Carry
+  // canonical model_settings in the same PATCH even when both parallel flags are
+  // already true, otherwise that rebuild can silently drop provider parallelism.
+  const effectiveLlmConfigWillRebuild = modelWillChange || currentContext !== desiredContextWindow;
+  if (currentProviderType !== desiredProviderType || !parallelIsEffective || effectiveLlmConfigWillRebuild) {
     patch.model_settings = currentProviderType === desiredProviderType
       ? { ...(agent.model_settings ?? {}), provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls }
       : { provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls };
