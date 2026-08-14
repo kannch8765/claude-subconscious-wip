@@ -9,8 +9,10 @@ export interface PromptCacheStepSample {
   model?: string;
   modelHandle?: string;
   promptTokens?: number;
+  completionTokens?: number;
   cachedInputTokens?: number;
   cacheWriteTokens?: number;
+  contextWindowLimit?: number;
   cachedInputRatio?: number;
   telemetryQuality: PromptCacheTelemetryQuality;
   invalidReason?: string;
@@ -56,6 +58,7 @@ type RawRecord = Record<string, unknown>;
 
 const asRecord = (value: unknown): RawRecord => value && typeof value === 'object' ? value as RawRecord : {};
 const maybeString = (value: unknown): string | undefined => typeof value === 'string' ? value : undefined;
+const maybeNumber = (value: unknown): number | undefined => typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 
 export function mapPromptCacheStepSample(
   raw: unknown,
@@ -65,7 +68,7 @@ export function mapPromptCacheStepSample(
   const stepId = maybeString(step.id);
   if (!stepId) throw new Error('Letta step is missing id');
 
-  const { promptTokens, cachedInputTokens, cacheWriteTokens } = mapUsage(step);
+  const { promptTokens, completionTokens, cachedInputTokens, cacheWriteTokens } = mapUsage(step);
   const base: PromptCacheStepSample = {
     stepId,
     runId: maybeString(step.run_id) ?? parent.runId,
@@ -73,8 +76,10 @@ export function mapPromptCacheStepSample(
     model: maybeString(step.model),
     modelHandle: maybeString(step.model_handle),
     promptTokens,
+    completionTokens,
     cachedInputTokens,
     cacheWriteTokens,
+    contextWindowLimit: maybeNumber(step.context_window_limit),
     telemetryQuality: 'uncovered',
   };
 
