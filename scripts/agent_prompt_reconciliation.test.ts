@@ -169,7 +169,13 @@ describe('managed adopted-agent system prompt reconciliation', () => {
         if (body?.embedding !== undefined) live.embedding = body.embedding as string;
         if (body?.context_window_limit !== undefined) live.context_window_limit = body.context_window_limit as number;
         if (body?.model_settings !== undefined) {
-          live.model_settings = { ...live.model_settings, ...(body.model_settings as { parallel_tool_calls?: boolean }) };
+          live.model_settings = { ...live.model_settings, ...(body.model_settings as { provider_type?: string; parallel_tool_calls?: boolean }) };
+          if ((body.model_settings as { provider_type?: string }).provider_type !== undefined) {
+            live.llm_config.model_endpoint_type = (body.model_settings as { provider_type?: string }).provider_type;
+          }
+          if ((body.model_settings as { parallel_tool_calls?: boolean }).parallel_tool_calls !== undefined) {
+            live.llm_config.parallel_tool_calls = (body.model_settings as { parallel_tool_calls?: boolean }).parallel_tool_calls;
+          }
         }
         return jsonResponse({ id: MANAGED_AGENT_ID });
       }
@@ -195,6 +201,7 @@ describe('managed adopted-agent system prompt reconciliation', () => {
     expect(live.embedding).toBe(canonical.embedding);
     expect(live.context_window_limit).toBe(canonical.contextWindowLimit);
     expect(live.model_settings.parallel_tool_calls).toBe(canonical.parallelToolCalls);
+    expect(live.llm_config.parallel_tool_calls).toBe(canonical.parallelToolCalls);
 
     const modelPatches = requests.filter((request) => request.method === 'PATCH' && request.body?.model !== undefined);
     expect(modelPatches).toHaveLength(1);
