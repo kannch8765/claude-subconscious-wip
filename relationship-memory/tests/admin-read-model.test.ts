@@ -127,7 +127,8 @@ function healthyFixtures(stepOverrides: Record<string, unknown | Error> = {}) {
     '/runs/run-1/usage': { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_tokens_details: { cache_read_tokens: 0 } },
     '/runs/run-1/metrics': { num_steps: 1, tools_used: [] },
     '/runs/run-2/steps': [{
-      id: 'step-2', run_id: 'run-2', prompt_tokens: 100, cached_input_tokens: 80,
+      id: 'step-2', run_id: 'run-2', model: 'deepseek-v4-flash', model_handle: 'opencode/deepseek-v4-flash',
+      prompt_tokens: 100, completion_tokens: 10, cached_input_tokens: 80, context_window_limit: 400000,
       reasoning: 'SECRET STEP REASONING', tool_args: 'SECRET STEP TOOL ARGS', tool_return: 'SECRET STEP TOOL RETURN',
     }],
     '/runs/run-1/steps': [{ id: 'step-1', run_id: 'run-1', prompt_tokens: 100, cached_input_tokens: 0 }],
@@ -169,6 +170,21 @@ describe('Subconscious admin read-model composition', () => {
     expect(snapshot.promptCache.availability).toBe('available');
     expect(snapshot.promptCache.aggregate).toMatchObject({
       eligibleSteps: 2, coveredSteps: 2, uncoveredSteps: 0, cachedInputRatio: 0.4, coverageRatio: 1, tokenCoverageRatio: 1,
+    });
+    expect(snapshot.promptCache.lastRun).toEqual({
+      runId: 'run-2',
+      stepCount: 1,
+      peakPromptStep: {
+        stepId: 'step-2',
+        runId: 'run-2',
+        promptTokens: 100,
+        completionTokens: 10,
+        cachedInputTokens: 80,
+        cachedInputRatio: 0.8,
+        contextWindowLimit: 400000,
+        model: 'deepseek-v4-flash',
+        modelHandle: 'opencode/deepseek-v4-flash',
+      },
     });
     expect(snapshot.promptCache.conversations).toEqual([
       expect.objectContaining({
@@ -218,6 +234,32 @@ describe('Subconscious admin read-model composition', () => {
     expect(serialized).not.toContain('payload');
     expect(serialized).not.toContain('SECRET MEMORY PAYLOAD');
     expect(serialized).not.toContain('SECRET EVIDENCE QUOTE');
+  });
+
+  it('projects the last run peak LLM prompt context instead of the agent retained-context snapshot', async () => {
+    const { owner } = memoryFixture();
+    const fixtures = healthyFixtures({
+      '/runs/run-2/steps': [
+        { id: 'step-2a', run_id: 'run-2', prompt_tokens: 120, completion_tokens: 3, cached_input_tokens: 100, context_window_limit: 400000 },
+        { id: 'step-2b', run_id: 'run-2', prompt_tokens: 900, completion_tokens: 11, cached_input_tokens: 810, context_window_limit: 400000 },
+      ],
+    });
+    const snapshot = await composeSubconsciousAdminSnapshot({ owner, transport: new FixtureTransport(fixtures), agentId: 'agent-a' });
+
+    expect(snapshot.runtime.overview.context?.currentTokens).toBe(250000);
+    expect(snapshot.promptCache.lastRun).toEqual({
+      runId: 'run-2',
+      stepCount: 2,
+      peakPromptStep: {
+        stepId: 'step-2b',
+        runId: 'run-2',
+        promptTokens: 900,
+        completionTokens: 11,
+        cachedInputTokens: 810,
+        cachedInputRatio: 0.9,
+        contextWindowLimit: 400000,
+      },
+    });
   });
 
   it('preserves provider usage provenance unchanged and keeps unavailable usage unknown', async () => {
