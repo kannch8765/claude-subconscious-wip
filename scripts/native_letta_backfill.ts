@@ -202,9 +202,12 @@ export async function runNativeClientToolConversation(input: {
   conversationId: string;
   message: string;
   tools: readonly NativeClientTool[];
+  requiredClientToolNames?: readonly string[];
 }): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
+  const requiredClientToolNames = new Set(input.requiredClientToolNames ?? []);
+  const completedRequiredClientTools = new Set<string>();
   let clientToolFailure = false;
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
   let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
@@ -228,7 +231,13 @@ export async function runNativeClientToolConversation(input: {
       terminalSeen = terminal;
     }
     const requests = approvalRequests(messages);
-    if (requests.length === 0) return { response, clientToolFailure, terminal: terminalSeen };
+    if (requests.length === 0) {
+      const missingRequired = [...requiredClientToolNames].filter((name) => !completedRequiredClientTools.has(name));
+      if (missingRequired.length > 0) {
+        throw new Error(`Letta native conversation ended before required client tool completion: ${missingRequired.join(', ')}`);
+      }
+      return { response, clientToolFailure, terminal: terminalSeen };
+    }
 
     const approvals: any[] = [];
     for (const request of requests) {
@@ -238,6 +247,7 @@ export async function runNativeClientToolConversation(input: {
       let result: string;
       try {
         result = toolReturn(await tool.execute(request.toolCallId, parseToolArguments(request.arguments)));
+        if (requiredClientToolNames.has(request.name)) completedRequiredClientTools.add(request.name);
       } catch (error) {
         status = 'error';
         clientToolFailure = true;
