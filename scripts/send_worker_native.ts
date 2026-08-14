@@ -24,6 +24,7 @@ import {
   runNativeClientToolConversation,
   type NativeClientTool,
 } from './native_letta_backfill.js';
+import { reconcileLiveSemanticSearchPolicy } from './live_semantic_search_policy.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
@@ -71,6 +72,11 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     const apiKey = process.env.LETTA_API_KEY;
     if (!apiKey) throw new Error('LETTA_API_KEY is required for native live Subconscious execution');
     const client = createNativeLettaClient(apiKey);
+
+    // Compatibility migration for already-adopted live agents. It only rewrites
+    // the stale exact-message/prefetch policy text before the native turn; it
+    // does not alter model, embedding, tool inventory, or relationship storage.
+    await reconcileLiveSemanticSearchPolicy(apiKey, payload.agentId, log);
 
     const relationshipTools: NativeClientTool[] = buildRelationshipTools(runtime, payload.batchId).map((tool) => {
       const execute = tool.execute.bind(tool);
