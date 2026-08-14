@@ -14,12 +14,57 @@ export interface PrivilegedBackfillSafetyOptions {
   privilegedSnapshotRoot?: string;
   currentUid?: number;
   env?: NodeJS.ProcessEnv;
+  accessSync?: (target: fs.PathLike, mode?: number) => void;
 }
+
+/**
+ * Files that the historical relationship observer can append through the current
+ * RelationshipMemoryStore mutation surface: begin/finalize batch plus
+ * memory_remember, memory_reinforce, and entity_remember outcomes/evidence.
+ * Missing files are creatable when the canonical root itself is writable; only
+ * already-existing targets need an independent effective-write check.
+ */
+export const HISTORICAL_CANONICAL_MUTATION_TARGETS = [
+  'batches.jsonl',
+  'memories.jsonl',
+  'evidence.jsonl',
+  'outcomes.jsonl',
+  'reinforcements.jsonl',
+  'entities.jsonl',
+  'entity-evidence.jsonl',
+  'entity-outcomes.jsonl',
+] as const;
 
 export function pathWithin(candidate: string, root: string): boolean {
   const absolute = path.resolve(candidate);
   const boundary = path.resolve(root);
   return absolute === boundary || absolute.startsWith(`${boundary}${path.sep}`);
+}
+
+export function assertCanonicalStoreWriterAccess(
+  rootDir: string,
+  accessSync: (target: fs.PathLike, mode?: number) => void = fs.accessSync,
+): void {
+  const canonicalRoot = path.resolve(rootDir);
+  try {
+    // RelationshipMemoryStore acquires .canonical-mutation.lock with mkdirSync,
+    // so the process needs effective write+execute access on the parent root.
+    accessSync(canonicalRoot, fs.constants.W_OK | fs.constants.X_OK);
+  } catch (error) {
+    throw new Error(`Backfill process lacks effective write+execute access to canonical mutation root ${canonicalRoot}; cannot create .canonical-mutation.lock (${error instanceof Error ? error.message : String(error)}).`);
+  }
+
+  for (const name of HISTORICAL_CANONICAL_MUTATION_TARGETS) {
+    const target = path.join(canonicalRoot, name);
+    if (!fs.existsSync(target)) continue;
+    try {
+      // accessSync asks the kernel about process filesystem permissions,
+      // including ACL grants; ownership is intentionally irrelevant.
+      accessSync(target, fs.constants.W_OK);
+    } catch (error) {
+      throw new Error(`Backfill process lacks effective write access to existing canonical mutation target ${target} (${error instanceof Error ? error.message : String(error)}).`);
+    }
+  }
 }
 
 export function assertSemanticIndexWriterOwnership(indexDir: string, currentUid = process.getuid?.()): void {
@@ -52,6 +97,7 @@ export function assertPrivilegedSnapshotRuntimeSafety(
   if (path.resolve(configuredRoot) !== path.resolve(input.rootDir)) {
     throw new Error(`Backfill canonical root mismatch: RELATIONSHIP_MEMORY_DIR=${path.resolve(configuredRoot)} but effective root is ${path.resolve(input.rootDir)}.`);
   }
+  assertCanonicalStoreWriterAccess(path.resolve(configuredRoot), options.accessSync);
 
   const semanticIndexDir = env.RELATIONSHIP_MEMORY_SEMANTIC_INDEX_DIR?.trim();
   if (!semanticIndexDir) {
