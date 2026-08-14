@@ -9,6 +9,8 @@ import {
   type AgentRuntimeOverview,
   type LettaReadTransport,
   type PromptCacheAggregate,
+  type PromptCacheRunSummary,
+  type PromptCacheStepSample,
   type ProviderUsageSlot,
   type RecentRunSummary,
 } from '../observability/index.js';
@@ -45,8 +47,28 @@ export interface AdminPromptCacheConversation {
   aggregate: PromptCacheAggregate;
 }
 
+export interface AdminPromptCacheStepContext {
+  stepId: string;
+  runId: string;
+  promptTokens: number;
+  completionTokens?: number;
+  cachedInputTokens?: number;
+  cacheWriteTokens?: number;
+  cachedInputRatio?: number;
+  contextWindowLimit?: number;
+  model?: string;
+  modelHandle?: string;
+}
+
+export interface AdminPromptCacheLastRun {
+  runId: string;
+  stepCount: number;
+  peakPromptStep?: AdminPromptCacheStepContext;
+}
+
 export interface AdminPromptCacheSection extends AdminSectionState {
   aggregate?: PromptCacheAggregate;
+  lastRun?: AdminPromptCacheLastRun;
   conversations: AdminPromptCacheConversation[];
 }
 
@@ -109,6 +131,44 @@ function sectionError(error: unknown): AdminSectionState {
       kind: unreachable ? 'unreachable' : 'query_error',
       message: error instanceof Error ? error.message : String(error),
     },
+  };
+}
+
+function projectPromptStepContext(sample: PromptCacheStepSample): AdminPromptCacheStepContext | undefined {
+  if (sample.promptTokens === undefined || sample.promptTokens <= 0) return undefined;
+  const cacheCovered = sample.telemetryQuality === 'covered';
+  return {
+    stepId: sample.stepId,
+    runId: sample.runId,
+    promptTokens: sample.promptTokens,
+    ...(sample.completionTokens !== undefined ? { completionTokens: sample.completionTokens } : {}),
+    ...(cacheCovered && sample.cachedInputTokens !== undefined ? { cachedInputTokens: sample.cachedInputTokens } : {}),
+    ...(sample.cacheWriteTokens !== undefined && sample.cacheWriteTokens >= 0 ? { cacheWriteTokens: sample.cacheWriteTokens } : {}),
+    ...(cacheCovered && sample.cachedInputRatio !== undefined ? { cachedInputRatio: sample.cachedInputRatio } : {}),
+    ...(sample.contextWindowLimit !== undefined && sample.contextWindowLimit > 0 ? { contextWindowLimit: sample.contextWindowLimit } : {}),
+    ...(sample.model ? { model: sample.model } : {}),
+    ...(sample.modelHandle ? { modelHandle: sample.modelHandle } : {}),
+  };
+}
+
+export function summarizeLastRunPromptContext(
+  runs: readonly PromptCacheRunSummary[],
+  lastRunId?: string,
+): AdminPromptCacheLastRun | undefined {
+  if (!lastRunId) return undefined;
+  const run = runs.find(candidate => candidate.runId === lastRunId);
+  if (!run) return undefined;
+  const projected = run.steps
+    .map(projectPromptStepContext)
+    .filter((step): step is AdminPromptCacheStepContext => Boolean(step));
+  const peakPromptStep = projected.reduce<AdminPromptCacheStepContext | undefined>(
+    (peak, step) => !peak || step.promptTokens > peak.promptTokens ? step : peak,
+    undefined,
+  );
+  return {
+    runId: run.runId,
+    stepCount: run.steps.length,
+    ...(peakPromptStep ? { peakPromptStep } : {}),
   };
 }
 
@@ -220,10 +280,15 @@ export class SubconsciousAdminReadModel {
       ? { availability: 'available', items: recentRunsResult.value }
       : { ...sectionError(recentRunsResult.reason), items: [] };
 
+    const lastRunPromptContext = cacheResult.status === 'fulfilled'
+      ? summarizeLastRunPromptContext(cacheResult.value.runs, runtime.overview.lastRun?.id)
+      : undefined;
+
     const promptCache: AdminPromptCacheSection = cacheResult.status === 'fulfilled'
       ? {
           availability: 'available',
           aggregate: cacheResult.value.aggregate,
+          ...(lastRunPromptContext ? { lastRun: lastRunPromptContext } : {}),
           conversations: cacheResult.value.conversations.map(conversation => ({
             conversationId: conversation.conversationId,
             runIds: [...conversation.runIds],
