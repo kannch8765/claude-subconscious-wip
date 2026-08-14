@@ -113,6 +113,30 @@ describe('native Letta legacy backfill harness', () => {
     })).rejects.toThrow('ended before required client tool completion: memory_search');
   });
 
+  it('does not count a failed required memory_search execution as completion', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{\"query\":\"咖啡\"}', tool_call_id: 'coffee-fail' } }], stop_reason: 'requires_approval' },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+
+    await expect(runNativeClientToolConversation({
+      client,
+      agentId: 'agent-test',
+      conversationId: 'conv-test',
+      message: '今天又在喝咖啡><🐾',
+      tools: [{
+        name: 'memory_search', description: 'search', parameters: { type: 'object' },
+        async execute() { throw new Error('search backend unavailable'); },
+      }],
+      requiredClientToolNames: ['memory_search'],
+    })).rejects.toThrow('ended before required client tool completion: memory_search');
+
+    expect(client.bodies[1].messages[0].tool_returns[0]).toEqual(expect.objectContaining({
+      tool_call_id: 'coffee-fail',
+      status: 'error',
+    }));
+  });
+
   it('accepts a model-authored semantic memory_search query and allows follow-up searches', async () => {
     const client = fakeClient([
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"咖啡 喝咖啡 相关回忆"}', tool_call_id: 'coffee-1' } }], stop_reason: 'requires_approval' },
