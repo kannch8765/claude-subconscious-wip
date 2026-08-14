@@ -3,16 +3,20 @@ import * as path from 'path';
 import { describe, expect, it } from 'vitest';
 
 describe('live async relationship-memory surfacing contract', () => {
-  it('uses one post-turn search for both next-turn association and silent maintenance', () => {
+  it('lets the live model choose semantic relationship searches while requiring at least one real search', () => {
     const send = fs.readFileSync(path.join(process.cwd(), 'scripts/send_messages_to_letta.ts'), 'utf8');
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
     expect(send).toContain('<latest_user_message>');
-    expect(send).toContain('worker already runs the exact text');
-    expect(send).toContain('Reuse the same search results');
+    expect(send).toContain('choose and call relationship memory_search yourself');
+    expect(send).toContain('compact semantic query');
+    expect(send).toContain('must complete at least one relationship memory_search');
+    expect(send).toContain('additional memory_search calls after seeing earlier results');
     expect(send).toContain('deliver_whisper');
     expect(worker).toContain("name: 'deliver_whisper'");
-    expect(worker).toContain('runtime.memorySearchHybrid({ query: firstSearchQuery, limit: 8 })');
-    expect(worker).toContain('prefetched_relationship_memory_search');
+    expect(worker).toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");
+    expect(worker).toContain('Model relationship memory_search: query=');
+    expect(worker).not.toContain('runtime.memorySearchHybrid({ query: firstSearchQuery');
+    expect(worker).not.toContain('prefetched_relationship_memory_search');
     expect(send).toContain('latestUserMessage,');
     expect(worker).toContain('memory_reinforce');
     expect(worker).toContain('memory_remember');
