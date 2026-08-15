@@ -23,6 +23,10 @@ export { LETTA_API_BASE };
 const IS_HOSTED = !process.env.LETTA_BASE_URL;
 const LETTA_APP_BASE = 'https://app.letta.com';
 const LIVE_CONVERSATION_RETRY_ROTATION_GRACE_MS = 10 * 60 * 1000;
+const SYNC_STATE_LOCK_TIMEOUT_MS = 5_000;
+const SYNC_STATE_LOCK_STALE_MS = 30_000;
+const SYNC_STATE_LOCK_RETRY_MS = 10;
+const SYNC_STATE_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
 // CLAUDE.md constants
 export const CLAUDE_MD_PATH = '.claude/CLAUDE.md';
@@ -136,6 +140,10 @@ export function getSyncStateFile(cwd: string, sessionId: string): string {
   return path.join(getDurableStateDir(cwd), `session-${sessionId}.json`);
 }
 
+export function getSyncStateLockFile(cwd: string, sessionId: string): string {
+  return path.join(getDurableStateDir(cwd), `session-${encodeURIComponent(sessionId)}.state.lock`);
+}
+
 /**
  * Get the durable retry marker used to rotate a poisoned live Letta conversation
  * without touching the transcript cursor from a detached worker.
@@ -174,14 +182,118 @@ export function loadSyncState(cwd: string, sessionId: string, log: LogFn = noopL
   return { lastProcessedIndex: -1, sessionId };
 }
 
-/**
- * Save sync state for a session
- */
-export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLog): void {
+function readSyncStateForMutation(cwd: string, sessionId: string): SyncState | null {
+  const statePath = getSyncStateFile(cwd, sessionId);
+  if (!fs.existsSync(statePath)) return null;
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf-8')) as SyncState;
+  if (state.sessionId !== sessionId || !Number.isInteger(state.lastProcessedIndex)) {
+    throw new Error(`Invalid durable sync state for session ${sessionId}`);
+  }
+  return state;
+}
+
+function writeSyncStateUnlocked(cwd: string, state: SyncState, log: LogFn = noopLog): void {
   ensureDurableStateDir(cwd);
   const statePath = getSyncStateFile(cwd, state.sessionId);
   fs.writeFileSync(statePath, JSON.stringify(state, null, 2), 'utf-8');
   log(`Saved state: lastProcessedIndex=${state.lastProcessedIndex}, conversationId=${state.conversationId}`);
+}
+
+function waitForSyncStateLock(): void {
+  Atomics.wait(SYNC_STATE_LOCK_WAIT, 0, 0, SYNC_STATE_LOCK_RETRY_MS);
+}
+
+function withSyncStateLock<T>(cwd: string, sessionId: string, fn: () => T): T {
+  ensureDurableStateDir(cwd);
+  const lockPath = getSyncStateLockFile(cwd, sessionId);
+  const deadline = Date.now() + SYNC_STATE_LOCK_TIMEOUT_MS;
+  let lockFd: number | null = null;
+
+  while (lockFd === null) {
+    try {
+      lockFd = fs.openSync(lockPath, 'wx', 0o600);
+      try {
+        fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), 'utf-8');
+      } catch (writeError) {
+        fs.closeSync(lockFd);
+        lockFd = null;
+        try { fs.unlinkSync(lockPath); } catch {}
+        throw writeError;
+      }
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+      try {
+        const stat = fs.statSync(lockPath);
+        let ownerAlive = false;
+        try {
+          const owner = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
+          if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+            try { process.kill(owner.pid, 0); ownerAlive = true; }
+            catch (probeError: any) { if (probeError?.code !== 'ESRCH') ownerAlive = true; }
+          }
+        } catch {}
+        if (!ownerAlive || Date.now() - stat.mtimeMs >= SYNC_STATE_LOCK_STALE_MS) {
+          fs.unlinkSync(lockPath);
+          continue;
+        }
+      } catch (statError: any) {
+        if (statError?.code === 'ENOENT') continue;
+        throw statError;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out acquiring durable sync-state lock for session ${sessionId}`);
+      }
+      waitForSyncStateLock();
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    fs.closeSync(lockFd);
+    try { fs.unlinkSync(lockPath); }
+    catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+/**
+ * Save sync state without allowing a stale writer to move the transcript cursor
+ * or live conversation backwards across overlapping hook/worker processes.
+ */
+export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLog): void {
+  withSyncStateLock(cwd, state.sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, state.sessionId);
+    const merged: SyncState = durable
+      ? { ...durable, ...state, lastProcessedIndex: Math.max(durable.lastProcessedIndex, state.lastProcessedIndex) }
+      : { ...state };
+
+    if (durable?.conversationId && state.conversationId && durable.conversationId !== state.conversationId) {
+      merged.conversationId = durable.conversationId;
+    }
+
+    writeSyncStateUnlocked(cwd, merged, log);
+    Object.assign(state, merged);
+  });
+}
+
+/** Advance only the durable transcript cursor, monotonically, under the session lock. */
+export function advanceSyncStateCursor(
+  cwd: string,
+  sessionId: string,
+  lastProcessedIndex: number,
+  log: LogFn = noopLog,
+): SyncState {
+  return withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
+    const next: SyncState = {
+      ...durable,
+      lastProcessedIndex: Math.max(durable.lastProcessedIndex, lastProcessedIndex),
+    };
+    writeSyncStateUnlocked(cwd, next, log);
+    return next;
+  });
 }
 
 /**
@@ -250,34 +362,36 @@ export function markConversationForRetryRotation(
   throughIndex: number,
   log: LogFn = noopLog,
 ): boolean {
-  const state = loadSyncState(cwd, sessionId, log);
-  if (state.lastProcessedIndex >= throughIndex) {
-    log(`Conversation retry marker not needed: cursor already advanced through index ${throughIndex}`);
-    return false;
-  }
-  if (state.conversationId && state.conversationId !== conversationId) {
-    log(`Conversation retry marker not needed: live conversation already changed from ${conversationId} to ${state.conversationId}`);
-    return false;
-  }
+  return withSyncStateLock(cwd, sessionId, () => {
+    const state = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
+    if (state.lastProcessedIndex >= throughIndex) {
+      log(`Conversation retry marker not needed: cursor already advanced through index ${throughIndex}`);
+      return false;
+    }
+    if (state.conversationId && state.conversationId !== conversationId) {
+      log(`Conversation retry marker not needed: live conversation already changed from ${conversationId} to ${state.conversationId}`);
+      return false;
+    }
 
-  const existing = readConversationRetryMarker(cwd, sessionId, log);
-  const marker: ConversationRetryMarker = {
-    conversationId,
-    throughIndex: existing?.conversationId === conversationId
-      ? Math.max(existing.throughIndex, throughIndex)
-      : throughIndex,
-    markedAt: existing?.conversationId === conversationId
-      ? existing.markedAt
-      : new Date().toISOString(),
-  };
+    const existing = readConversationRetryMarker(cwd, sessionId, log);
+    const marker: ConversationRetryMarker = {
+      conversationId,
+      throughIndex: existing?.conversationId === conversationId
+        ? Math.max(existing.throughIndex, throughIndex)
+        : throughIndex,
+      markedAt: existing?.conversationId === conversationId
+        ? existing.markedAt
+        : new Date().toISOString(),
+    };
 
-  ensureDurableStateDir(cwd);
-  const markerPath = getConversationRetryMarkerFile(cwd, sessionId);
-  const tempPath = `${markerPath}.tmp-${process.pid}-${Date.now()}`;
-  fs.writeFileSync(tempPath, JSON.stringify(marker, null, 2), { encoding: 'utf-8', mode: 0o600 });
-  fs.renameSync(tempPath, markerPath);
-  log(`Marked live conversation ${conversationId} for retry rotation through index ${marker.throughIndex}`);
-  return true;
+    ensureDurableStateDir(cwd);
+    const markerPath = getConversationRetryMarkerFile(cwd, sessionId);
+    const tempPath = `${markerPath}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tempPath, JSON.stringify(marker, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(tempPath, markerPath);
+    log(`Marked live conversation ${conversationId} for retry rotation through index ${marker.throughIndex}`);
+    return true;
+  });
 }
 
 function conversationRetryMarkerIsAged(marker: ConversationRetryMarker): boolean {
@@ -328,47 +442,105 @@ export async function getOrCreateConversation(
   state: SyncState,
   log: LogFn = noopLog
 ): Promise<string> {
-  const retryMarker = readConversationRetryMarker(cwd, sessionId, log);
-  if (retryMarker) {
-    if (state.lastProcessedIndex >= retryMarker.throughIndex) {
+  type RecoveryDecision =
+    | { action: 'none' }
+    | { action: 'use'; conversationId: string }
+    | { action: 'rotate'; marker: ConversationRetryMarker };
+
+  const evaluateRetryRecovery = (): RecoveryDecision => withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId);
+    if (durable) Object.assign(state, durable);
+
+    const retryMarker = readConversationRetryMarker(cwd, sessionId, log);
+    if (!retryMarker) return { action: 'none' };
+
+    const authoritativeState = durable ?? state;
+    if (authoritativeState.lastProcessedIndex >= retryMarker.throughIndex) {
       log(`Discarding stale conversation retry marker because cursor advanced through index ${retryMarker.throughIndex}`);
       clearConversationRetryMarker(cwd, sessionId);
-    } else if (state.conversationId && state.conversationId !== retryMarker.conversationId) {
-      log(`Discarding stale conversation retry marker because conversation already changed to ${state.conversationId}`);
+      return { action: 'none' };
+    }
+    if (authoritativeState.conversationId && authoritativeState.conversationId !== retryMarker.conversationId) {
+      log(`Discarding stale conversation retry marker because conversation already changed to ${authoritativeState.conversationId}`);
       clearConversationRetryMarker(cwd, sessionId);
-    } else {
+      return { action: 'use', conversationId: authoritativeState.conversationId };
+    }
+
+    const conversationsMap = loadConversationsMap(cwd, log);
+    const mapped = conversationEntryDetails(conversationsMap[sessionId]);
+    if (mapped && mapped.conversationId !== retryMarker.conversationId && (!mapped.agentId || mapped.agentId === agentId)) {
+      const nextState: SyncState = { ...authoritativeState, sessionId, conversationId: mapped.conversationId };
+      writeSyncStateUnlocked(cwd, nextState, log);
+      Object.assign(state, nextState);
+      clearConversationRetryMarker(cwd, sessionId);
+      log(`Adopted already-rotated live conversation ${mapped.conversationId} for retry`);
+      return { action: 'use', conversationId: mapped.conversationId };
+    }
+
+    if (!conversationRetryMarkerIsAged(retryMarker)) {
+      state.conversationId = retryMarker.conversationId;
+      log(`Deferring live conversation rotation for ${retryMarker.conversationId}; retry marker is still within the overlap grace window`);
+      return { action: 'use', conversationId: retryMarker.conversationId };
+    }
+
+    return { action: 'rotate', marker: retryMarker };
+  });
+
+  let recovery = evaluateRetryRecovery();
+  if (recovery.action === 'use') return recovery.conversationId;
+  if (recovery.action === 'rotate') {
+    const candidateConversationId = await createConversation(apiKey, agentId, log);
+
+    recovery = withSyncStateLock(cwd, sessionId, () => {
+      const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
+      const currentMarker = readConversationRetryMarker(cwd, sessionId, log);
       const conversationsMap = loadConversationsMap(cwd, log);
       const mapped = conversationEntryDetails(conversationsMap[sessionId]);
 
-      // A manual or concurrent recovery may have updated the map before the
-      // session state. Adopt that newer conversation rather than rotating twice.
-      if (mapped && mapped.conversationId !== retryMarker.conversationId && (!mapped.agentId || mapped.agentId === agentId)) {
-        state.conversationId = mapped.conversationId;
-        saveSyncState(cwd, state, log);
+      // The network create above deliberately runs outside the lock. Re-check all
+      // durable authority before committing so a healthy overlapping worker can
+      // advance the cursor or complete a concurrent/manual recovery safely.
+      if (!currentMarker) {
+        Object.assign(state, durable);
+        const existingConversation = durable.conversationId ?? mapped?.conversationId;
+        return existingConversation
+          ? { action: 'use', conversationId: existingConversation } as RecoveryDecision
+          : { action: 'none' } as RecoveryDecision;
+      }
+      if (durable.lastProcessedIndex >= currentMarker.throughIndex) {
         clearConversationRetryMarker(cwd, sessionId);
-        log(`Adopted already-rotated live conversation ${mapped.conversationId} for retry`);
-        return mapped.conversationId;
+        Object.assign(state, durable);
+        const existingConversation = durable.conversationId ?? mapped?.conversationId ?? currentMarker.conversationId;
+        return { action: 'use', conversationId: existingConversation } as RecoveryDecision;
+      }
+      if (durable.conversationId && durable.conversationId !== currentMarker.conversationId) {
+        clearConversationRetryMarker(cwd, sessionId);
+        Object.assign(state, durable);
+        return { action: 'use', conversationId: durable.conversationId } as RecoveryDecision;
+      }
+      if (mapped && mapped.conversationId !== currentMarker.conversationId && (!mapped.agentId || mapped.agentId === agentId)) {
+        const adoptedState: SyncState = { ...durable, conversationId: mapped.conversationId };
+        writeSyncStateUnlocked(cwd, adoptedState, log);
+        Object.assign(state, adoptedState);
+        clearConversationRetryMarker(cwd, sessionId);
+        return { action: 'use', conversationId: mapped.conversationId } as RecoveryDecision;
+      }
+      if (!conversationRetryMarkerIsAged(currentMarker)) {
+        Object.assign(state, durable, { conversationId: currentMarker.conversationId });
+        return { action: 'use', conversationId: currentMarker.conversationId } as RecoveryDecision;
       }
 
-      if (!conversationRetryMarkerIsAged(retryMarker)) {
-        state.conversationId = retryMarker.conversationId;
-        log(`Deferring live conversation rotation for ${retryMarker.conversationId}; retry marker is still within the overlap grace window`);
-        return retryMarker.conversationId;
-      }
-
-      const conversationId = await createConversation(apiKey, agentId, log);
-      conversationsMap[sessionId] = { conversationId, agentId };
+      conversationsMap[sessionId] = { conversationId: candidateConversationId, agentId };
       saveConversationsMap(cwd, conversationsMap);
-      state.conversationId = conversationId;
-
-      // Persist the new conversation before clearing the marker. If the process
-      // dies between these writes, the surviving marker makes the next hook
-      // recover deterministically instead of falling back to the poisoned ID.
-      saveSyncState(cwd, state, log);
+      const rotatedState: SyncState = { ...durable, sessionId, conversationId: candidateConversationId };
+      writeSyncStateUnlocked(cwd, rotatedState, log);
+      Object.assign(state, rotatedState);
       clearConversationRetryMarker(cwd, sessionId);
-      log(`Rotated live conversation ${retryMarker.conversationId} -> ${conversationId} before retrying held cursor through index ${retryMarker.throughIndex}`);
-      return conversationId;
-    }
+      log(`Rotated live conversation ${currentMarker.conversationId} -> ${candidateConversationId} before retrying held cursor through index ${currentMarker.throughIndex}`);
+      return { action: 'use', conversationId: candidateConversationId } as RecoveryDecision;
+    });
+
+    if (recovery.action === 'use') return recovery.conversationId;
   }
   // Check if we already have a conversation ID in state
   if (state.conversationId) {
