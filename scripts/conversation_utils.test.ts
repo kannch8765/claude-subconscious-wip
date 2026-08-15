@@ -66,13 +66,43 @@ describe('live retryable conversation recovery', () => {
     const before = fs.readFileSync(statePath, 'utf8');
 
     expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 20)).toBe(true);
+    const firstMarker = JSON.parse(fs.readFileSync(getConversationRetryMarkerFile(cwd, sessionId), 'utf8'));
     expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 25)).toBe(true);
 
     expect(fs.readFileSync(statePath, 'utf8')).toBe(before);
     expect(JSON.parse(fs.readFileSync(getConversationRetryMarkerFile(cwd, sessionId), 'utf8'))).toMatchObject({
       conversationId: 'conv-old',
       throughIndex: 25,
+      markedAt: firstMarker.markedAt,
     });
+  });
+
+  it('keeps a fresh retry marker on the same conversation during the overlap grace window', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+
+    const {
+      getConversationRetryMarkerFile,
+      getOrCreateConversation,
+      loadSyncState,
+      markConversationForRetryRotation,
+      saveConversationsMap,
+      saveSyncState,
+    } = await import('./conversation_utils.js');
+
+    const cwd = '/workspace';
+    const sessionId = 'session-1';
+    saveSyncState(cwd, { lastProcessedIndex: 10, sessionId, conversationId: 'conv-old' });
+    saveConversationsMap(cwd, { [sessionId]: { conversationId: 'conv-old', agentId: 'agent-1' } });
+    expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 20)).toBe(true);
+
+    const state = loadSyncState(cwd, sessionId);
+    const conversationId = await getOrCreateConversation('test-key', 'agent-1', sessionId, cwd, state);
+
+    expect(conversationId).toBe('conv-old');
+    expect(state.lastProcessedIndex).toBe(10);
+    expect(fs.existsSync(getConversationRetryMarkerFile(cwd, sessionId))).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('rotates before replaying a held cursor and durably preserves lastProcessedIndex', async () => {
@@ -101,6 +131,10 @@ describe('live retryable conversation recovery', () => {
     saveSyncState(cwd, { lastProcessedIndex: 10, sessionId, conversationId: 'conv-old' });
     saveConversationsMap(cwd, { [sessionId]: { conversationId: 'conv-old', agentId: 'agent-1' } });
     expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 20)).toBe(true);
+    const markerPath = getConversationRetryMarkerFile(cwd, sessionId);
+    const marker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    marker.markedAt = new Date(0).toISOString();
+    fs.writeFileSync(markerPath, JSON.stringify(marker));
 
     const state = loadSyncState(cwd, sessionId);
     const conversationId = await getOrCreateConversation('test-key', 'agent-1', sessionId, cwd, state);
