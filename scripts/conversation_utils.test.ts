@@ -48,7 +48,7 @@ describe('createConversation', () => {
 });
 
 describe('live retryable conversation recovery', () => {
-  it('marks a poisoned conversation without modifying the durable transcript cursor state', async () => {
+  it('marks a poisoned conversation without modifying the durable transcript cursor state or resetting its first-failure age', async () => {
     const home = tempHome();
     vi.stubEnv('LETTA_HOME', home);
 
@@ -66,11 +66,15 @@ describe('live retryable conversation recovery', () => {
     const before = fs.readFileSync(statePath, 'utf8');
 
     expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 20)).toBe(true);
-    const firstMarker = JSON.parse(fs.readFileSync(getConversationRetryMarkerFile(cwd, sessionId), 'utf8'));
+    const markerPath = getConversationRetryMarkerFile(cwd, sessionId);
+    const firstMarker = JSON.parse(fs.readFileSync(markerPath, 'utf8'));
+    firstMarker.markedAt = new Date(0).toISOString();
+    fs.writeFileSync(markerPath, JSON.stringify(firstMarker));
+
     expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 25)).toBe(true);
 
     expect(fs.readFileSync(statePath, 'utf8')).toBe(before);
-    expect(JSON.parse(fs.readFileSync(getConversationRetryMarkerFile(cwd, sessionId), 'utf8'))).toMatchObject({
+    expect(JSON.parse(fs.readFileSync(markerPath, 'utf8'))).toMatchObject({
       conversationId: 'conv-old',
       throughIndex: 25,
       markedAt: firstMarker.markedAt,
