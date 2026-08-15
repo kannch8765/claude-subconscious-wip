@@ -193,7 +193,7 @@ async function main(): Promise<void> {
         payload.newLastProcessedIndex,
         log,
       );
-      log(`Held state cursor at current index because batch ${payload.batchId} is retryable; next live pass will rotate the poisoned conversation before replay.`);
+      log(`Held state cursor at current index because batch ${payload.batchId} is retryable; armed live-conversation recovery marker for a later pass after overlap grace.`);
     }
 
     fs.unlinkSync(payloadFile);
