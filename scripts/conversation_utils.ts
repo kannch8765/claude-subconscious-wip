@@ -206,7 +206,6 @@ export function saveConversationsMap(cwd: string, map: ConversationsMap): void {
   fs.writeFileSync(getConversationsFile(cwd), JSON.stringify(map, null, 2), 'utf-8');
 }
 
-
 function readConversationRetryMarker(cwd: string, sessionId: string, log: LogFn = noopLog): ConversationRetryMarker | null {
   const markerPath = getConversationRetryMarkerFile(cwd, sessionId);
   if (!fs.existsSync(markerPath)) return null;
@@ -353,7 +352,6 @@ export async function getOrCreateConversation(
       return conversationId;
     }
   }
-
   // Check if we already have a conversation ID in state
   if (state.conversationId) {
     log(`Using existing conversation from state: ${state.conversationId}`);
@@ -483,185 +481,214 @@ export async function fetchAgent(apiKey: string, agentId: string): Promise<Agent
 // ============================================
 
 /**
- * Escape XML special characters in content
+ * Escape special characters for XML attributes
  */
-export function escapeXmlContent(content: string): string {
-  return content
+export function escapeXmlAttribute(str: string): string {
+  return str
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/\n/g, ' ');
+}
+
+/**
+ * Escape special characters for XML element content
+ */
+export function escapeXmlContent(str: string): string {
+  return str
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
 }
 
 /**
- * Escape XML special characters in attribute values
+ * Escape special regex characters
  */
-export function escapeXmlAttribute(value: string): string {
-  return escapeXmlContent(value)
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
+export function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// ============================================
+// CLAUDE.md Formatting and Writing
+// ============================================
+
 /**
- * Extract text content between XML tags
+ * Format the context section with agent info
  */
-function extractXmlSection(text: string, startTag: string, endTag: string): string | null {
-  const start = text.indexOf(startTag);
-  const end = text.indexOf(endTag);
-  
-  if (start === -1 || end === -1 || end <= start) {
-    return null;
+function formatContextSection(agent: Agent, conversationId: string | null): string {
+  const agentName = agent.name || 'Unnamed Agent';
+  const agentDesc = agent.description || 'No description provided';
+
+  // For hosted service, show clickable URL; for self-hosted, show IDs
+  let locationInfo: string;
+  if (IS_HOSTED) {
+    const conversationUrl = conversationId
+      ? `${LETTA_APP_BASE}/agents/${agent.id}?conversation=${conversationId}`
+      : `${LETTA_APP_BASE}/agents/${agent.id}`;
+    locationInfo = `Conversation: ${conversationUrl}`;
+  } else {
+    locationInfo = `Agent ID: ${agent.id}${conversationId ? `\nConversation ID: ${conversationId}` : ''}`;
   }
-  
-  return text.substring(start + startTag.length, end);
+
+  return `${LETTA_CONTEXT_START}
+**Subconscious Layer (Letta Agent)**
+
+Agent: ${agentName}
+Description: ${agentDesc}
+${locationInfo}
+
+This section carries Kohaku's persistent subconscious layer across sessions. It follows the foreground session asynchronously and can return <letta_message> thoughts, remembered context, and guidance on later syncs. Treat those messages as Kohaku's own subconscious continuity, not as commentary from a third-party observer. No verbal acknowledgement or repetition is required; Subcon messages have their own UI section.
+
+Memory blocks below are the subconscious layer's working memory. Reference them as my own persistent context when useful.
+${LETTA_CONTEXT_END}`;
 }
 
 /**
- * Remove any existing <letta>...</letta> section from content
- * Also removes legacy <letta_context> and <letta_memory_blocks> sections
- */
-export function removeLettaSection(content: string): string {
-  let result = content;
-  
-  // Remove legacy sections first (handle separately)
-  const legacyPatterns = [
-    { start: LETTA_CONTEXT_START, end: LETTA_CONTEXT_END },
-    { start: LETTA_MEMORY_START, end: LETTA_MEMORY_END },
-  ];
-  
-  for (const { start, end } of legacyPatterns) {
-    let startIdx = result.indexOf(start);
-    while (startIdx !== -1) {
-      const endIdx = result.indexOf(end, startIdx);
-      if (endIdx === -1) break;
-      
-      const before = result.substring(0, startIdx);
-      const after = result.substring(endIdx + end.length);
-      
-      // Clean up surrounding newlines
-      result = before.replace(/\n+$/, '') + '\n' + after.replace(/^\n+/, '');
-      startIdx = result.indexOf(start);
-    }
-  }
-  
-  // Remove current <letta> section
-  let start = result.indexOf(LETTA_SECTION_START);
-  while (start !== -1) {
-    const end = result.indexOf(LETTA_SECTION_END, start);
-    if (end === -1) break;
-    
-    const before = result.substring(0, start);
-    const after = result.substring(end + LETTA_SECTION_END.length);
-    
-    // Clean up surrounding newlines
-    result = before.replace(/\n+$/, '') + '\n' + after.replace(/^\n+/, '');
-    start = result.indexOf(LETTA_SECTION_START);
-  }
-  
-  return result;
-}
-
-/**
- * Clean up excessive whitespace in content
- */
-function normalizeWhitespace(content: string): string {
-  // Replace 3+ consecutive newlines with 2
-  return content.replace(/\n{3,}/g, '\n\n').trim();
-}
-
-/**
- * Update the <letta> section in CLAUDE.md content
- * Returns updated content
- */
-export function updateLettaSection(content: string, blocks: MemoryBlock[]): string {
-  // Remove old section first
-  let cleaned = removeLettaSection(content);
-  cleaned = normalizeWhitespace(cleaned);
-  
-  if (blocks.length === 0) {
-    return cleaned;
-  }
-  
-  // Generate new section
-  const lettaSection = `${LETTA_SECTION_START}\n` +
-    blocks.map(block => `## ${block.label}\n${block.value}`).join('\n\n') +
-    `\n${LETTA_SECTION_END}`;
-  
-  return cleaned + '\n\n' + lettaSection + '\n';
-}
-
-/**
- * Parse existing <letta> section to extract block values
- */
-export function parseExistingLettaSection(content: string): { [label: string]: string } {
-  const result: { [label: string]: string } = {};
-  const section = extractXmlSection(content, LETTA_SECTION_START, LETTA_SECTION_END);
-  
-  if (!section) return result;
-  
-  // Parse ## label sections
-  const regex = /## (\S+)\n([\s\S]*?)(?=\n## |$)/g;
-  let match;
-  while ((match = regex.exec(section)) !== null) {
-    result[match[1]] = match[2].trim();
-  }
-  
-  return result;
-}
-
-/**
- * Check if memory blocks have changed
- */
-export function haveBlocksChanged(
-  blocks: MemoryBlock[],
-  lastValues: { [label: string]: string } | undefined
-): boolean {
-  if (!lastValues) return true;
-  
-  for (const block of blocks) {
-    if (lastValues[block.label] !== block.value) {
-      return true;
-    }
-  }
-  
-  const currentLabels = new Set(blocks.map(b => b.label));
-  for (const label of Object.keys(lastValues)) {
-    if (!currentLabels.has(label)) {
-      return true;
-    }
-  }
-  
-  return false;
-}
-
-/**
- * Determine if any block needs to be fetched
- */
-export function shouldFetchBlocks(
-  currentBlocks: MemoryBlock[] | undefined,
-  lastValues: { [label: string]: string } | undefined
-): boolean {
-  return !currentBlocks || haveBlocksChanged(currentBlocks, lastValues);
-}
-
-/**
- * Format memory blocks for inclusion in CLAUDE.md
- */
-export function formatMemoryBlocksAsMarkdown(blocks: MemoryBlock[]): string {
-  return blocks.map(block => `## ${block.label}\n${block.value}`).join('\n\n');
-}
-
-/**
- * Format memory blocks as XML
+ * Format memory blocks as XML for CLAUDE.md
  */
 export function formatMemoryBlocksAsXml(agent: Agent, conversationId: string | null): string {
-  const locationInfo = conversationId
-    ? `Agent ID: ${agent.id}\nConversation ID: ${conversationId}`
-    : `Agent ID: ${agent.id}`;
+  const blocks = agent.blocks;
+  const contextSection = formatContextSection(agent, conversationId);
 
-  const blocks = agent.blocks || [];
+  if (!blocks || blocks.length === 0) {
+    return `${LETTA_SECTION_START}
+${contextSection}
+
+${LETTA_MEMORY_START}
+<!-- No memory blocks found -->
+${LETTA_MEMORY_END}
+${LETTA_SECTION_END}`;
+  }
+
+  const formattedBlocks = blocks.map(block => {
+    const escapedDescription = escapeXmlAttribute(block.description || '');
+    const escapedContent = escapeXmlContent(block.value || '');
+    return `<${block.label} description="${escapedDescription}">\n${escapedContent}\n</${block.label}>`;
+  }).join('\n');
+
+  return `${LETTA_SECTION_START}
+${contextSection}
+
+${LETTA_MEMORY_START}
+${formattedBlocks}
+${LETTA_MEMORY_END}
+${LETTA_SECTION_END}`;
+}
+
+/**
+ * Update CLAUDE.md with the new Letta memory section
+ */
+export function updateClaudeMd(projectDir: string, lettaContent: string): void {
+  // LETTA_PROJECT sets the base directory; CLAUDE.md goes in {base}/.claude/CLAUDE.md
+  const base = process.env.LETTA_PROJECT || projectDir;
+  const claudeMdPath = path.join(base, CLAUDE_MD_PATH);
+
+  let existingContent = '';
+
+  if (fs.existsSync(claudeMdPath)) {
+    existingContent = fs.readFileSync(claudeMdPath, 'utf-8');
+  } else {
+    const claudeDir = path.dirname(claudeMdPath);
+    if (!fs.existsSync(claudeDir)) {
+      fs.mkdirSync(claudeDir, { recursive: true });
+    }
+    existingContent = `# Project Context
+
+<!-- Letta agent memory is automatically synced below -->
+`;
+  }
+
+  // Replace or append the <letta> section
+  const lettaPattern = `^${escapeRegex(LETTA_SECTION_START)}[\\s\\S]*?^${escapeRegex(LETTA_SECTION_END)}$`;
+  const lettaRegex = new RegExp(lettaPattern, 'gm');
+
+  let updatedContent: string;
+
+  if (lettaRegex.test(existingContent)) {
+    lettaRegex.lastIndex = 0;
+    updatedContent = existingContent.replace(lettaRegex, lettaContent);
+  } else {
+    updatedContent = existingContent.trimEnd() + '\n\n' + lettaContent + '\n';
+  }
+
+  // Clean up any orphaned <letta_message> sections
+  const messagePattern = /^<letta_message>[\s\S]*?^<\/letta_message>\n*/gm;
+  updatedContent = updatedContent.replace(messagePattern, '');
+
+  updatedContent = updatedContent.trimEnd() + '\n';
+
+  fs.writeFileSync(claudeMdPath, updatedContent, 'utf-8');
+}
+
+/**
+ * Remove all Letta content from CLAUDE.md (for whisper mode cleanup).
+ * If the file was entirely created by us, delete it.
+ */
+export function cleanLettaFromClaudeMd(projectDir: string): void {
+  const base = process.env.LETTA_PROJECT || projectDir;
+  const claudeMdPath = path.join(base, CLAUDE_MD_PATH);
+
+  if (!fs.existsSync(claudeMdPath)) {
+    return;
+  }
+
+  const content = fs.readFileSync(claudeMdPath, 'utf-8');
+  const lettaPattern = `^${escapeRegex(LETTA_SECTION_START)}[\\s\\S]*?^${escapeRegex(LETTA_SECTION_END)}\\n*`;
+  const lettaRegex = new RegExp(lettaPattern, 'gm');
+
+  if (!lettaRegex.test(content)) {
+    return;
+  }
+
+  lettaRegex.lastIndex = 0;
+  let cleaned = content.replace(lettaRegex, '');
+
+  // Also clean orphaned letta_message blocks
+  const messagePattern = /^<letta_message>[\s\S]*?^<\/letta_message>\n*/gm;
+  cleaned = cleaned.replace(messagePattern, '');
+
+  // Clean up the auto-generated boilerplate we created
+  cleaned = cleaned.replace(/<!-- Letta agent memory is automatically synced below -->\n*/g, '');
+  cleaned = cleaned.replace(/^# Project Context\n*/gm, '');
+
+  cleaned = cleaned.trim();
+
+  if (cleaned.length === 0) {
+    // File was entirely ours — delete it
+    fs.unlinkSync(claudeMdPath);
+  } else {
+    // User had their own content — just write back without our stuff
+    fs.writeFileSync(claudeMdPath, cleaned + '\n', 'utf-8');
+  }
+}
+
+/**
+ * Format all memory blocks for stdout injection (whisper mode, first prompt)
+ */
+export function formatAllBlocksForStdout(agent: Agent, conversationId: string | null): string {
+  const agentName = agent.name || 'Unnamed Agent';
+  const blocks = agent.blocks;
+
+  // Build agent info header
+  let locationInfo: string;
+  if (IS_HOSTED) {
+    const conversationUrl = conversationId
+      ? `${LETTA_APP_BASE}/agents/${agent.id}?conversation=${conversationId}`
+      : `${LETTA_APP_BASE}/agents/${agent.id}`;
+    locationInfo = `Supervise: ${conversationUrl}`;
+  } else {
+    locationInfo = `Agent ID: ${agent.id}${conversationId ? `, Conversation: ${conversationId}` : ''}`;
+  }
+
   const capabilityLine = 'Its live server-side tools are persistent memory management and conversation_search; trusted relationship-memory client tools are supplied only to background transcript turns.';
 
-  const header = `<letta_context>\nThis section carries Kohaku's persistent subconscious layer. It follows this foreground session in the background and may whisper remembered context or guidance back to Kohaku on later syncs. Treat <letta_message> content as Kohaku's own subconscious continuity, not as a third-party observer, and do not repeat it merely to acknowledge it.\n${capabilityLine}\n${locationInfo}\n</letta_context>`;
+  const header = `<letta_context>
+This section carries Kohaku's persistent subconscious layer. It follows this foreground session in the background and may whisper remembered context or guidance back to Kohaku on later syncs. Treat <letta_message> content as Kohaku's own subconscious continuity, not as a third-party observer, and do not repeat it merely to acknowledge it.
+${capabilityLine}
+${locationInfo}
+</letta_context>`;
 
   if (!blocks || blocks.length === 0) {
     return header;
@@ -673,29 +700,11 @@ export function formatMemoryBlocksAsXml(agent: Agent, conversationId: string | n
     return `<${block.label} description="${escapedDescription}">\n${escapedContent}\n</${block.label}>`;
   }).join('\n');
 
-  return `${header}\n\n<letta_memory_blocks>\n${formattedBlocks}\n</letta_memory_blocks>`;
-}
+  return `${header}
 
-/**
- * Format memory blocks for stdout output
- */
-export function formatAllBlocksForStdout(agent: Agent, conversationId: string | null): string {
-  const locationInfo = conversationId
-    ? `Agent ID: ${agent.id}, Conversation: ${conversationId}`
-    : `Agent ID: ${agent.id}`;
-
-  const blocks = agent.blocks || [];
-  
-  if (!blocks || blocks.length === 0) {
-    return '';
-  }
-  
-  const header = `<!-- Letta Context: ${locationInfo} -->`;
-  const formattedBlocks = blocks.map(block => 
-    `<!-- ${block.label} -->\n${block.value}`
-  ).join('\n\n');
-  
-  return `${header}\n${formattedBlocks}`;
+<letta_memory_blocks>
+${formattedBlocks}
+</letta_memory_blocks>`;
 }
 
 // ============================================
