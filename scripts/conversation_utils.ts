@@ -22,6 +22,7 @@ export { LETTA_API_BASE };
 // Only show app URL for hosted service; self-hosted users get IDs directly
 const IS_HOSTED = !process.env.LETTA_BASE_URL;
 const LETTA_APP_BASE = 'https://app.letta.com';
+const LIVE_CONVERSATION_RETRY_ROTATION_GRACE_MS = 10 * 60 * 1000;
 
 // CLAUDE.md constants
 export const CLAUDE_MD_PATH = '.claude/CLAUDE.md';
@@ -211,7 +212,12 @@ function readConversationRetryMarker(cwd: string, sessionId: string, log: LogFn 
   if (!fs.existsSync(markerPath)) return null;
   try {
     const marker = JSON.parse(fs.readFileSync(markerPath, 'utf-8')) as ConversationRetryMarker;
-    if (typeof marker?.conversationId !== 'string' || !Number.isInteger(marker?.throughIndex)) {
+    if (
+      typeof marker?.conversationId !== 'string'
+      || !Number.isInteger(marker?.throughIndex)
+      || typeof marker?.markedAt !== 'string'
+      || !Number.isFinite(Date.parse(marker.markedAt))
+    ) {
       throw new Error('invalid conversation retry marker');
     }
     return marker;
@@ -260,7 +266,9 @@ export function markConversationForRetryRotation(
     throughIndex: existing?.conversationId === conversationId
       ? Math.max(existing.throughIndex, throughIndex)
       : throughIndex,
-    markedAt: new Date().toISOString(),
+    markedAt: existing?.conversationId === conversationId
+      ? existing.markedAt
+      : new Date().toISOString(),
   };
 
   ensureDurableStateDir(cwd);
@@ -270,6 +278,10 @@ export function markConversationForRetryRotation(
   fs.renameSync(tempPath, markerPath);
   log(`Marked live conversation ${conversationId} for retry rotation through index ${marker.throughIndex}`);
   return true;
+}
+
+function conversationRetryMarkerIsAged(marker: ConversationRetryMarker): boolean {
+  return Date.now() - Date.parse(marker.markedAt) >= LIVE_CONVERSATION_RETRY_ROTATION_GRACE_MS;
 }
 
 function conversationEntryDetails(entry: string | ConversationEntry | undefined): { conversationId: string; agentId: string | null } | null {
@@ -336,6 +348,12 @@ export async function getOrCreateConversation(
         clearConversationRetryMarker(cwd, sessionId);
         log(`Adopted already-rotated live conversation ${mapped.conversationId} for retry`);
         return mapped.conversationId;
+      }
+
+      if (!conversationRetryMarkerIsAged(retryMarker)) {
+        state.conversationId = retryMarker.conversationId;
+        log(`Deferring live conversation rotation for ${retryMarker.conversationId}; retry marker is still within the overlap grace window`);
+        return retryMarker.conversationId;
       }
 
       const conversationId = await createConversation(apiKey, agentId, log);
