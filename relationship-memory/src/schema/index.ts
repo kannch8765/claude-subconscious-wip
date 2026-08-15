@@ -79,6 +79,7 @@ export interface EntityEvidenceRecord {
 
 export interface EntityOutcome {
   batch_id: string;
+  attempt_id?: string;
   source_key: string;
   outcome: RememberOutcomeKind;
   entity_id?: string;
@@ -110,6 +111,7 @@ export interface AssistantRememberIntentRecord {
 export interface AssistantIntentOutcome {
   intent_id: string;
   batch_id: string;
+  attempt_id?: string;
   outcome: AssistantIntentOutcomeKind;
   memory_id?: string;
   rejection_code?: string;
@@ -160,6 +162,7 @@ export interface EvidenceRecord {
 
 export interface RememberOutcome {
   batch_id: string;
+  attempt_id?: string;
   source_key: string;
   outcome: RememberOutcomeKind;
   memory_id?: string;
@@ -170,6 +173,7 @@ export interface RememberOutcome {
 
 export interface BatchRecord {
   batch_id: string;
+  attempt_id?: string;
   status: 'pending' | BatchCompletion;
   created_at: string;
   finalized_at?: string;

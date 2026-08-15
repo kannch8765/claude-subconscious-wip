@@ -256,6 +256,82 @@ describe('batch completion and cursor', () => {
     expect(rt.remember('retry', joke()).outcome).toBe('accepted');
     expect(rt.store.listMemories()).toHaveLength(2);
   });
+
+
+  it('lets a fresh successful attempt supersede stale retryables without deleting audit history', () => {
+    const dir = tempDir();
+    const first = runtime(dir, (phase) => phase === 'memory_commit');
+    const firstPending = first.store.beginBatch('attempt-scope', '2026-01-01T00:00:00.000Z');
+    expect(firstPending.attempt_id).toBeTruthy();
+    expect(first.remember('attempt-scope', joke()).outcome).toBe('retryable_failed');
+    expect(first.finalizeBatch('attempt-scope', true)).toBe('retryable_failure');
+
+    const retry = runtime(dir);
+    const retryPending = retry.store.beginBatch('attempt-scope', '2026-01-01T00:01:00.000Z');
+    expect(retryPending.attempt_id).toBeTruthy();
+    expect(retryPending.attempt_id).not.toBe(firstPending.attempt_id);
+    expect(retry.remember('attempt-scope', personal()).outcome).toBe('accepted');
+    expect(retry.finalizeBatch('attempt-scope', true)).toBe('completed');
+
+    const outcomes = retry.store.listOutcomes().filter((item) => item.batch_id === 'attempt-scope');
+    expect(outcomes.map((item) => [item.attempt_id, item.outcome])).toEqual([
+      [firstPending.attempt_id, 'retryable_failed'],
+      [retryPending.attempt_id, 'accepted'],
+    ]);
+    expect(retry.store.listBatches().at(-1)).toEqual(expect.objectContaining({
+      batch_id: 'attempt-scope', attempt_id: retryPending.attempt_id, status: 'completed', created_at: '2026-01-01T00:01:00.000Z',
+    }));
+  });
+
+  it('keeps a retry attempt fail-closed when that current attempt is retryable', () => {
+    const dir = tempDir();
+    const first = runtime(dir, (phase) => phase === 'memory_commit');
+    first.store.beginBatch('attempt-current-failure', '2026-01-01T00:00:00.000Z');
+    expect(first.remember('attempt-current-failure', joke()).outcome).toBe('retryable_failed');
+    expect(first.finalizeBatch('attempt-current-failure', true)).toBe('retryable_failure');
+
+    const retry = runtime(dir, (phase) => phase === 'memory_commit');
+    const pending = retry.store.beginBatch('attempt-current-failure', '2026-01-01T00:01:00.000Z');
+    expect(retry.remember('attempt-current-failure', personal()).outcome).toBe('retryable_failed');
+    expect(retry.finalizeBatch('attempt-current-failure', true)).toBe('retryable_failure');
+    expect(retry.store.listOutcomes().at(-1)).toEqual(expect.objectContaining({ attempt_id: pending.attempt_id, outcome: 'retryable_failed' }));
+  });
+
+  it('preserves fail-closed legacy behavior for pending batches without attempt provenance', () => {
+    const rt = runtime();
+    rt.store.finalizeBatch({ batch_id: 'legacy-attemptless', status: 'pending', created_at: '2025-12-31T23:59:00.000Z' });
+    rt.store.appendOutcome({
+      batch_id: 'legacy-attemptless', source_key: 'legacy-retryable', outcome: 'retryable_failed', reason: 'legacy failure', recorded_at: '2025-12-31T23:59:30.000Z',
+    });
+    expect(rt.finalizeBatch('legacy-attemptless', true)).toBe('retryable_failure');
+  });
+
+
+  it('upgrades an attemptless retry history at the next pending boundary', () => {
+    const dir = tempDir();
+    const legacy = runtime(dir);
+    legacy.store.finalizeBatch({ batch_id: 'legacy-upgrade', status: 'pending', created_at: '2025-12-31T23:58:00.000Z' });
+    legacy.store.appendOutcome({
+      batch_id: 'legacy-upgrade', source_key: 'old-retryable-a', outcome: 'retryable_failed', reason: 'old failure a', recorded_at: '2025-12-31T23:58:10.000Z',
+    });
+    legacy.store.finalizeBatch({ batch_id: 'legacy-upgrade', status: 'retryable_failure', created_at: '2025-12-31T23:58:00.000Z', finalized_at: '2025-12-31T23:58:20.000Z' });
+    legacy.store.finalizeBatch({ batch_id: 'legacy-upgrade', status: 'pending', created_at: '2025-12-31T23:59:00.000Z' });
+    legacy.store.appendOutcome({
+      batch_id: 'legacy-upgrade', source_key: 'old-retryable-b', outcome: 'retryable_failed', reason: 'old failure b', recorded_at: '2025-12-31T23:59:10.000Z',
+    });
+    legacy.store.finalizeBatch({ batch_id: 'legacy-upgrade', status: 'retryable_failure', created_at: '2025-12-31T23:59:00.000Z', finalized_at: '2025-12-31T23:59:20.000Z' });
+
+    const upgraded = runtime(dir);
+    const pending = upgraded.store.beginBatch('legacy-upgrade', '2026-01-01T00:00:00.000Z');
+    expect(pending.attempt_id).toBeTruthy();
+    expect(upgraded.remember('legacy-upgrade', personal()).outcome).toBe('accepted');
+    expect(upgraded.finalizeBatch('legacy-upgrade', true)).toBe('completed');
+
+    const oldRetryables = upgraded.store.listOutcomes().filter((item) => item.batch_id === 'legacy-upgrade' && item.outcome === 'retryable_failed');
+    expect(oldRetryables).toHaveLength(2);
+    expect(oldRetryables.every((item) => item.attempt_id === undefined)).toBe(true);
+    expect(upgraded.store.listBatches().at(-1)).toEqual(expect.objectContaining({ attempt_id: pending.attempt_id, status: 'completed' }));
+  });
 });
 
 describe('observer contract correction', () => {
