@@ -16,6 +16,7 @@ import {
   RELATIONSHIP_DISALLOWED_CLIENT_TOOLS,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
+  LegacyMemorySourceStore,
   rebuildProjection,
   stableId,
   renderProjection,
@@ -504,6 +505,74 @@ describe('reinforcement and linking foundation', () => {
     expect(retry.reinforce('reinforce-retry', { memory_id: original.memory_id!, evidence_message_ids: ['msg-user-2'] }).outcome).toBe('accepted');
     expect(retry.store.listReinforcements()).toHaveLength(1);
     expect(retry.store.listEvidence().filter((e) => e.message_id === 'msg-user-2')).toHaveLength(1);
+  });
+
+  it('accepts first transcript reinforcement for a durable legacy-provenance memory with no canonical transcript evidence', () => {
+    const dir = tempDir();
+    const rt = runtime(dir);
+    const memoryId = 'mem-legacy-zero-evidence';
+    rt.store.appendMemory({
+      schema_version: 1, memory_id: memoryId, subject_id: 'subject-fixture', kind: 'inside_joke', summary: 'Legacy callback',
+      participants: ['user', 'assistant'], payload: { name: 'Legacy callback', meaning: 'Imported durable relationship context.' },
+      status: 'active', observed_at: '2025-12-31T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      source_key: 'legacy_memory_src_fixture', dedupe_key: stableId('dedupe', { legacy: memoryId }),
+    }, []);
+    new LegacyMemorySourceStore(dir).appendProvenance({
+      legacy_source_id: 'legacy_source_fixture', canonical_memory_id: memoryId, disposition: 'created', recorded_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    rt.store.beginBatch('legacy-reinforce', '2026-01-02T00:00:00.000Z');
+    expect(rt.reinforce('legacy-reinforce', { memory_id: memoryId, evidence_message_ids: ['msg-user-2'] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(rt.store.listEvidence().filter((item) => item.memory_id === memoryId)).toHaveLength(1);
+    expect(rt.store.listReinforcements().filter((item) => item.memory_id === memoryId)).toHaveLength(1);
+    expect(rt.finalizeBatch('legacy-reinforce', true)).toBe('completed');
+  });
+
+  it('keeps zero-evidence memories without durable legacy provenance retryable', () => {
+    const rt = runtime();
+    const memoryId = 'mem-corrupt-zero-evidence';
+    rt.store.appendMemory({
+      schema_version: 1, memory_id: memoryId, subject_id: 'subject-fixture', kind: 'inside_joke', summary: 'Unprovenanced callback',
+      participants: ['user', 'assistant'], payload: { name: 'Unprovenanced callback', meaning: 'No durable origin is available.' },
+      status: 'active', observed_at: '2025-12-31T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      source_key: 'unknown_src_fixture', dedupe_key: stableId('dedupe', { corrupt: memoryId }),
+    }, []);
+
+    rt.store.beginBatch('zero-evidence-no-provenance', '2026-01-02T00:00:00.000Z');
+    expect(rt.reinforce('zero-evidence-no-provenance', { memory_id: memoryId, evidence_message_ids: ['msg-user-2'] }))
+      .toEqual(expect.objectContaining({ outcome: 'retryable_failed', reason: expect.stringContaining('Unable to reconstruct canonical evidence provenance') }));
+    expect(rt.store.listEvidence().filter((item) => item.memory_id === memoryId)).toHaveLength(0);
+    expect(rt.store.listReinforcements().filter((item) => item.memory_id === memoryId)).toHaveLength(0);
+    expect(rt.finalizeBatch('zero-evidence-no-provenance', true)).toBe('retryable_failure');
+  });
+
+  it('allows a same-batch retry to heal a prior provenance failure once durable legacy provenance exists', () => {
+    const dir = tempDir();
+    const memoryId = 'mem-legacy-retry';
+    const first = runtime(dir);
+    first.store.appendMemory({
+      schema_version: 1, memory_id: memoryId, subject_id: 'subject-fixture', kind: 'inside_joke', summary: 'Legacy retry callback',
+      participants: ['user', 'assistant'], payload: { name: 'Legacy retry callback', meaning: 'Retry should heal after provenance becomes available.' },
+      status: 'active', observed_at: '2025-12-31T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      source_key: 'legacy_memory_src_retry_fixture', dedupe_key: stableId('dedupe', { retry: memoryId }),
+    }, []);
+    first.store.beginBatch('legacy-retry-batch', '2026-01-02T00:00:00.000Z');
+    expect(first.reinforce('legacy-retry-batch', { memory_id: memoryId, evidence_message_ids: ['msg-user-2'] }).outcome).toBe('retryable_failed');
+    expect(first.finalizeBatch('legacy-retry-batch', true)).toBe('retryable_failure');
+
+    new LegacyMemorySourceStore(dir).appendProvenance({
+      legacy_source_id: 'legacy_source_retry_fixture', canonical_memory_id: memoryId, disposition: 'created', recorded_at: '2026-01-02T00:01:00.000Z',
+    });
+    const retry = runtime(dir);
+    retry.store.beginBatch('legacy-retry-batch', '2026-01-02T00:02:00.000Z');
+    expect(retry.reinforce('legacy-retry-batch', { memory_id: memoryId, evidence_message_ids: ['msg-user-2'] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(retry.finalizeBatch('legacy-retry-batch', true)).toBe('completed');
+    expect(retry.store.listEvidence().filter((item) => item.memory_id === memoryId)).toHaveLength(1);
+    expect(retry.store.listReinforcements().filter((item) => item.memory_id === memoryId)).toHaveLength(1);
+    const outcomes = retry.store.listOutcomes().filter((item) => item.batch_id === 'legacy-retry-batch');
+    expect(outcomes.map((item) => item.outcome)).toEqual(['retryable_failed', 'accepted']);
   });
 
   it('keeps related-but-distinct and highly similar dated episodes as explicit new linked memories', () => {

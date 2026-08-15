@@ -124,6 +124,10 @@ export function saveBackfillState(file: string, state: BackfillState): void {
   atomicWriteJson(file, state);
 }
 
+export function backfillStateNeedsFreshConversation(state: BackfillState): boolean {
+  return Object.values(state.sources).some((source) => source.blocked?.kind === 'retryable_batch');
+}
+
 export function discoverTranscriptSources(entry: string): string[] {
   const absolute = path.resolve(entry);
   if (!fs.existsSync(absolute)) throw new Error(`Transcript path does not exist: ${absolute}`);

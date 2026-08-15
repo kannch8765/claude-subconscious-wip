@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
+  backfillStateNeedsFreshConversation,
   discoverTranscriptSources,
   loadBackfillState,
   runHistoricalBackfill,
@@ -94,6 +95,20 @@ describe('relationship-memory historical backfill', () => {
     expect(second.status).toBe('completed');
     expect(success.seen[0].batchId).toBe(batchId);
     expect(loadBackfillState(state).sources[path.resolve(transcript)].committed_offset).toBe(fs.statSync(transcript).size);
+  });
+
+  it('requests a fresh observer conversation only when a checkpoint is blocked on a retryable batch', () => {
+    const base = {
+      schema_version: 1 as const, backfill_session_id: 'relationship-memory-backfill-fixture', conversation_id: 'conv-old', agent_id: 'agent-fixture',
+      sources: { '/tmp/source.jsonl': { generation: 1, committed_offset: 0, integrity_chunks: [] } },
+    };
+    expect(backfillStateNeedsFreshConversation(base)).toBe(false);
+    expect(backfillStateNeedsFreshConversation({
+      ...base, sources: { '/tmp/source.jsonl': { ...base.sources['/tmp/source.jsonl'], blocked: { kind: 'runtime_failure' as const, offset: 0 } } },
+    })).toBe(false);
+    expect(backfillStateNeedsFreshConversation({
+      ...base, sources: { '/tmp/source.jsonl': { ...base.sources['/tmp/source.jsonl'], blocked: { kind: 'retryable_batch' as const, offset: 0 } } },
+    })).toBe(true);
   });
 
   it('append-only growth processes only newly appended complete records', async () => {

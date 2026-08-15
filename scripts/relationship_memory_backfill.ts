@@ -4,6 +4,7 @@ import { getBackfillAgentId } from './backfill_agent_config.js';
 import { createConversation } from './conversation_utils.js';
 import { runRelationshipObserverBatch } from './relationship_observer_runner.js';
 import {
+  backfillStateNeedsFreshConversation,
   loadBackfillState,
   runHistoricalBackfill,
   saveBackfillState,
@@ -72,10 +73,12 @@ async function main(): Promise<void> {
     state.agent_id = agentId;
     saveBackfillState(statePath, state);
   }
-  if (!state.conversation_id) {
+  const retryingBlockedBatch = backfillStateNeedsFreshConversation(state);
+  if (!state.conversation_id || retryingBlockedBatch) {
     state.conversation_id = await createConversation(apiKey, agentId, () => {});
     state.agent_id = agentId;
     saveBackfillState(statePath, state);
+    if (retryingBlockedBatch) console.error(`[backfill] Rotated observer conversation before retrying a checkpointed retryable batch: ${state.conversation_id}`);
   }
   const conversationId = state.conversation_id;
   const processor = async (batch: HistoricalBatch) => ({
