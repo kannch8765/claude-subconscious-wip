@@ -25,6 +25,7 @@ import {
   type NativeClientTool,
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
+import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -180,12 +181,17 @@ async function main(): Promise<void> {
     }
 
     if (cursorShouldAdvance(completion)) {
-      const state = JSON.parse(fs.readFileSync(payload.stateFile, 'utf-8'));
-      state.lastProcessedIndex = payload.newLastProcessedIndex;
-      fs.writeFileSync(payload.stateFile, JSON.stringify(state, null, 2));
-      log(`Updated state: lastProcessedIndex=${payload.newLastProcessedIndex}`);
+      const state = advanceSyncStateCursor(payload.cwd, payload.sessionId, payload.newLastProcessedIndex, log);
+      log(`Updated state: lastProcessedIndex=${state.lastProcessedIndex}`);
     } else {
-      log(`Held state cursor at current index because batch ${payload.batchId} is retryable.`);
+      markConversationForRetryRotation(
+        payload.cwd,
+        payload.sessionId,
+        payload.conversationId,
+        payload.newLastProcessedIndex,
+        log,
+      );
+      log(`Held state cursor at current index because batch ${payload.batchId} is retryable; armed live-conversation recovery marker for a later pass after overlap grace.`);
     }
 
     fs.unlinkSync(payloadFile);
