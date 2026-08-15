@@ -605,6 +605,34 @@ describe('reinforcement and linking foundation', () => {
     expect(rt.finalizeBatch('legacy-reinforce', true)).toBe('completed');
   });
 
+  it('keeps legacy-created memories reinforceable after their first transcript reinforcement adds canonical evidence', () => {
+    const dir = tempDir();
+    const memoryId = 'mem-legacy-second-reinforce';
+    const rt = runtime(dir);
+    rt.store.appendMemory({
+      schema_version: 1, memory_id: memoryId, subject_id: 'subject-fixture', kind: 'inside_joke', summary: 'Legacy callback',
+      participants: ['user', 'assistant'], payload: { name: 'Legacy callback', meaning: 'Imported durable relationship context.' },
+      status: 'active', observed_at: '2025-12-31T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      source_key: 'legacy_memory_src_second_fixture', dedupe_key: stableId('dedupe', { legacy: memoryId }),
+    }, []);
+    new LegacyMemorySourceStore(dir).appendProvenance({
+      legacy_source_id: 'legacy_source_second_fixture', canonical_memory_id: memoryId, disposition: 'created', recorded_at: '2026-01-01T00:00:00.000Z',
+    });
+
+    rt.store.beginBatch('legacy-second-a', '2026-01-02T00:00:00.000Z');
+    expect(rt.reinforce('legacy-second-a', { memory_id: memoryId, evidence_message_ids: ['msg-user-2'] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(rt.finalizeBatch('legacy-second-a', true)).toBe('completed');
+    expect(rt.store.listEvidence().filter((item) => item.memory_id === memoryId)).toHaveLength(1);
+
+    rt.store.beginBatch('legacy-second-b', '2026-01-02T00:01:00.000Z');
+    expect(rt.reinforce('legacy-second-b', { memory_id: memoryId, evidence_message_ids: ['msg-user-1'] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(rt.finalizeBatch('legacy-second-b', true)).toBe('completed');
+    expect(rt.store.listEvidence().filter((item) => item.memory_id === memoryId)).toHaveLength(2);
+    expect(rt.store.listReinforcements().filter((item) => item.memory_id === memoryId)).toHaveLength(2);
+  });
+
   it('keeps duplicate-link-only zero-evidence memories retryable', () => {
     const dir = tempDir();
     const rt = runtime(dir);
