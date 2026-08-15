@@ -25,6 +25,7 @@ import {
   type NativeClientTool,
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
+import { markConversationForRetryRotation } from './conversation_utils.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -185,7 +186,14 @@ async function main(): Promise<void> {
       fs.writeFileSync(payload.stateFile, JSON.stringify(state, null, 2));
       log(`Updated state: lastProcessedIndex=${payload.newLastProcessedIndex}`);
     } else {
-      log(`Held state cursor at current index because batch ${payload.batchId} is retryable.`);
+      markConversationForRetryRotation(
+        payload.cwd,
+        payload.sessionId,
+        payload.conversationId,
+        payload.newLastProcessedIndex,
+        log,
+      );
+      log(`Held state cursor at current index because batch ${payload.batchId} is retryable; next live pass will rotate the poisoned conversation before replay.`);
     }
 
     fs.unlinkSync(payloadFile);
