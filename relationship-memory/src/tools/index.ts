@@ -375,7 +375,10 @@ export class RelationshipMemoryRuntime {
     const evidence = this.store.listEvidence().filter((item) => item.memory_id === memory.memory_id);
     if (evidence.length === 0) {
       const legacyStore = new LegacyMemorySourceStore(this.store.rootDir);
-      if (legacyStore.sourcesForMemory(memory.memory_id).length > 0) return new Set();
+      const legacyCreated = legacyStore.listProvenance().some((item) =>
+        item.canonical_memory_id === memory.memory_id && item.disposition === 'created'
+      );
+      if (legacyCreated) return new Set();
     }
     for (let length = 1; length <= evidence.length; length += 1) {
       const prefix = evidence.slice(0, length);

@@ -529,6 +529,28 @@ describe('reinforcement and linking foundation', () => {
     expect(rt.finalizeBatch('legacy-reinforce', true)).toBe('completed');
   });
 
+  it('keeps duplicate-link-only zero-evidence memories retryable', () => {
+    const dir = tempDir();
+    const rt = runtime(dir);
+    const memoryId = 'mem-duplicate-link-only-zero-evidence';
+    rt.store.appendMemory({
+      schema_version: 1, memory_id: memoryId, subject_id: 'subject-fixture', kind: 'inside_joke', summary: 'Linked-only callback',
+      participants: ['user', 'assistant'], payload: { name: 'Linked-only callback', meaning: 'Legacy provenance only linked to an existing canonical memory.' },
+      status: 'active', observed_at: '2025-12-31T00:00:00.000Z', created_at: '2026-01-01T00:00:00.000Z',
+      source_key: 'existing_nonlegacy_src_fixture', dedupe_key: stableId('dedupe', { duplicateLinkOnly: memoryId }),
+    }, []);
+    new LegacyMemorySourceStore(dir).appendProvenance({
+      legacy_source_id: 'legacy_source_duplicate_link_fixture', canonical_memory_id: memoryId, disposition: 'duplicate_link', recorded_at: '2026-01-01T00:01:00.000Z',
+    });
+
+    rt.store.beginBatch('duplicate-link-only-reinforce', '2026-01-02T00:00:00.000Z');
+    expect(rt.reinforce('duplicate-link-only-reinforce', { memory_id: memoryId, evidence_message_ids: ['msg-user-2'] }))
+      .toEqual(expect.objectContaining({ outcome: 'retryable_failed', reason: expect.stringContaining('Unable to reconstruct canonical evidence provenance') }));
+    expect(rt.store.listEvidence().filter((item) => item.memory_id === memoryId)).toHaveLength(0);
+    expect(rt.store.listReinforcements().filter((item) => item.memory_id === memoryId)).toHaveLength(0);
+    expect(rt.finalizeBatch('duplicate-link-only-reinforce', true)).toBe('retryable_failure');
+  });
+
   it('keeps zero-evidence memories without durable legacy provenance retryable', () => {
     const rt = runtime();
     const memoryId = 'mem-corrupt-zero-evidence';
