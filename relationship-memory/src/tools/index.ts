@@ -79,7 +79,7 @@ function evidenceProvenance(message: CanonicalMessage) {
 }
 
 export class RelationshipMemoryRuntime {
-  private readonly retryableBatches = new Set<string>();
+  private readonly retryableAttempts = new Set<string>();
 
   constructor(
     readonly store: RelationshipMemoryStore,
@@ -105,6 +105,25 @@ export class RelationshipMemoryRuntime {
   private legacyEvidenceField(raw: unknown): boolean {
     return !!raw && typeof raw === 'object' && !Array.isArray(raw)
       && !('evidence_ids' in raw) && 'evidence_message_ids' in raw;
+  }
+
+  private currentAttempt(batchId: string) {
+    const latest = [...this.store.listBatches()].reverse().find((item) => item.batch_id === batchId);
+    return latest?.status === 'pending' ? latest : undefined;
+  }
+
+  private attemptFields(batchId: string): { attempt_id?: string } {
+    const attemptId = this.currentAttempt(batchId)?.attempt_id;
+    return attemptId ? { attempt_id: attemptId } : {};
+  }
+
+  private attemptKey(batchId: string): string {
+    return this.currentAttempt(batchId)?.attempt_id ?? `legacy:${batchId}`;
+  }
+
+  private ensureRetryAttempt(batchId: string, now: string): void {
+    const latest = [...this.store.listBatches()].reverse().find((item) => item.batch_id === batchId);
+    if (latest?.status === 'retryable_failure') this.store.beginBatch(batchId, now);
   }
 
   private linkedAssistantIntents(memoryId: string): AssistantRememberIntentRecord[] {
@@ -209,14 +228,14 @@ export class RelationshipMemoryRuntime {
   }
 
   private entityRetryable(batchId: string, sourceKey: string, reason: string, now: string): RememberResult {
-    this.retryableBatches.add(batchId);
-    try { this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now }); } catch { }
+    this.retryableAttempts.add(this.attemptKey(batchId));
+    try { this.store.appendEntityOutcome({ batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now }); } catch { }
     return { outcome: 'retryable_failed', reason };
   }
 
   private entityPermanent(batchId: string, sourceKey: string, code: string, reason: string, now: string): RememberResult {
     try {
-      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });
+      this.store.appendEntityOutcome({ batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });
       return { outcome: 'permanently_rejected', rejection_code: code, reason };
     } catch {
       return this.entityRetryable(batchId, sourceKey, 'Failed to durably record entity rejection.', now);
@@ -225,7 +244,7 @@ export class RelationshipMemoryRuntime {
 
   private entityOutcome(batchId: string, sourceKey: string, outcome: 'accepted' | 'duplicate', entityId: string, now: string): RememberResult {
     try {
-      this.store.appendEntityOutcome({ batch_id: batchId, source_key: sourceKey, outcome, entity_id: entityId, recorded_at: now });
+      this.store.appendEntityOutcome({ batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome, entity_id: entityId, recorded_at: now });
       return { outcome, entity_id: entityId };
     } catch (error) {
       return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now);
@@ -234,6 +253,7 @@ export class RelationshipMemoryRuntime {
 
   rememberEntity(batchId: string, rawProposal: unknown): RememberResult {
     const now = this.now();
+    this.ensureRetryAttempt(batchId, now);
     const sourceKey = stableId('entity_src', { batch_id: batchId, proposal: rawProposal });
     const previous = this.store.getTerminalEntityOutcome(sourceKey);
     if (previous) {
@@ -307,13 +327,13 @@ export class RelationshipMemoryRuntime {
   }
 
   private markRetryable(batchId: string, sourceKey: string, reason: string, now: string, intent?: AssistantRememberIntentRecord): RememberResult {
-    this.retryableBatches.add(batchId);
+    this.retryableAttempts.add(this.attemptKey(batchId));
     try {
-      this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now });
+      this.store.appendOutcome({ batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome: 'retryable_failed', reason, recorded_at: now });
     } catch { /* the in-memory batch marker still prevents cursor advance */ }
     if (intent) {
       try {
-        this.store.appendAssistantIntentOutcome({ intent_id: intent.intent_id, batch_id: batchId, outcome: 'retryable_failed', reason, recorded_at: now });
+        this.store.appendAssistantIntentOutcome({ intent_id: intent.intent_id, batch_id: batchId, ...this.attemptFields(batchId), outcome: 'retryable_failed', reason, recorded_at: now });
       } catch { /* the trusted intent remains unresolved and finalizeBatch will hold */ }
     }
     return { outcome: 'retryable_failed', reason };
@@ -328,11 +348,12 @@ export class RelationshipMemoryRuntime {
     intent?: AssistantRememberIntentRecord,
   ): RememberResult {
     try {
-      this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome, memory_id: memoryId, recorded_at: now });
+      this.store.appendOutcome({ batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome, memory_id: memoryId, recorded_at: now });
       if (intent) {
         this.store.appendAssistantIntentOutcome({
           intent_id: intent.intent_id,
           batch_id: batchId,
+          ...this.attemptFields(batchId),
           outcome,
           memory_id: memoryId,
           recorded_at: now,
@@ -354,11 +375,12 @@ export class RelationshipMemoryRuntime {
     intent?: AssistantRememberIntentRecord,
   ): RememberResult {
     try {
-      this.store.appendOutcome({ batch_id: batchId, source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });
+      this.store.appendOutcome({ batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome: 'permanently_rejected', rejection_code: code, reason, recorded_at: now });
       if (intent) {
         this.store.appendAssistantIntentOutcome({
           intent_id: intent.intent_id,
           batch_id: batchId,
+          ...this.attemptFields(batchId),
           outcome: 'permanently_rejected',
           rejection_code: code,
           reason,
@@ -398,6 +420,7 @@ export class RelationshipMemoryRuntime {
 
   reinforce(batchId: string, input: ReinforceInput): RememberResult {
     const now = this.now();
+    this.ensureRetryAttempt(batchId, now);
     const memoryId = typeof input?.memory_id === 'string' ? input.memory_id.trim() : '';
     const rawIds = input?.evidence_ids ?? input?.evidence_message_ids;
     const ids = Array.isArray(rawIds) ? rawIds.map((id) => typeof id === 'string' ? id.trim() : '') : [];
@@ -453,6 +476,7 @@ export class RelationshipMemoryRuntime {
 
   remember(batchId: string, rawProposal: unknown): RememberResult {
     const now = this.now();
+    this.ensureRetryAttempt(batchId, now);
     const sourceKey = stableId('src', { batch_id: batchId, proposal: rawProposal });
     const rawIntentId = rawAssistantIntentId(rawProposal);
     const rawTrustedIntent = this.trustedIntent(rawIntentId);
@@ -612,14 +636,17 @@ export class RelationshipMemoryRuntime {
 
   finalizeBatch(batchId: string, sessionSucceeded: boolean): BatchCompletion {
     const now = this.now();
-    const outcomes = this.store.listOutcomes().filter((item) => item.batch_id === batchId);
-    const entityOutcomes = this.store.listEntityOutcomes().filter((item) => item.batch_id === batchId);
+    const currentAttempt = this.currentAttempt(batchId);
+    const attemptId = currentAttempt?.attempt_id;
+    const inCurrentAttempt = <T extends { attempt_id?: string }>(item: T): boolean => !attemptId || item.attempt_id === attemptId;
+    const outcomes = this.store.listOutcomes().filter((item) => item.batch_id === batchId && inCurrentAttempt(item));
+    const entityOutcomes = this.store.listEntityOutcomes().filter((item) => item.batch_id === batchId && inCurrentAttempt(item));
     const latestBySource = new Map<string, RememberOutcome>();
     for (const outcome of outcomes) latestBySource.set(outcome.source_key, outcome);
     const latestEntityBySource = new Map<string, (typeof entityOutcomes)[number]>();
     for (const outcome of entityOutcomes) latestEntityBySource.set(outcome.source_key, outcome);
 
-    const intentOutcomes = this.store.listAssistantIntentOutcomes().filter((item) => item.batch_id === batchId);
+    const intentOutcomes = this.store.listAssistantIntentOutcomes().filter((item) => item.batch_id === batchId && inCurrentAttempt(item));
     const latestByIntent = new Map<string, AssistantIntentOutcome>();
     for (const outcome of intentOutcomes) latestByIntent.set(outcome.intent_id, outcome);
     const unresolvedAssistantIntent = [...this.trustedAssistantIntents.keys()].some((intentId) => {
@@ -628,15 +655,16 @@ export class RelationshipMemoryRuntime {
     });
 
     const retryable = !sessionSucceeded
-      || this.retryableBatches.has(batchId)
+      || this.retryableAttempts.has(attemptId ?? `legacy:${batchId}`)
       || [...latestBySource.values()].some((item) => item.outcome === 'retryable_failed')
       || [...latestEntityBySource.values()].some((item) => item.outcome === 'retryable_failed')
       || unresolvedAssistantIntent;
     const status: BatchCompletion = retryable ? 'retryable_failure' : 'completed';
     this.store.finalizeBatch({
       batch_id: batchId,
+      ...(attemptId ? { attempt_id: attemptId } : {}),
       status,
-      created_at: this.store.listBatches().find((item) => item.batch_id === batchId)?.created_at ?? now,
+      created_at: currentAttempt?.created_at ?? now,
       finalized_at: now,
       ...(!retryable && outcomes.length === 0 && entityOutcomes.length === 0 && this.trustedAssistantIntents.size === 0 ? { detail: 'no_memory_required' as const } : {}),
     });

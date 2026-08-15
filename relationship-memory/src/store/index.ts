@@ -285,9 +285,16 @@ export class RelationshipMemoryStore {
 
   beginBatch(batchId: string, now: string): BatchRecord {
     return this.withMutationBoundary(() => {
-      const latest = [...this.listBatches()].reverse().find((item) => item.batch_id === batchId);
+      const batches = this.listBatches().filter((item) => item.batch_id === batchId);
+      const latest = batches.at(-1);
       if (latest?.status === 'pending') return latest;
-      const pending: BatchRecord = { batch_id: batchId, status: 'pending', created_at: now };
+      const attemptIndex = batches.filter((item) => item.status === 'pending').length + 1;
+      const pending: BatchRecord = {
+        batch_id: batchId,
+        attempt_id: stableId('batch_attempt', { batch_id: batchId, attempt_index: attemptIndex }),
+        status: 'pending',
+        created_at: now,
+      };
       appendJsonl(this.file('batches.jsonl'), pending);
       return pending;
     });
