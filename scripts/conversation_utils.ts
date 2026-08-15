@@ -25,6 +25,7 @@ const LETTA_APP_BASE = 'https://app.letta.com';
 const LIVE_CONVERSATION_RETRY_ROTATION_GRACE_MS = 10 * 60 * 1000;
 const SYNC_STATE_LOCK_TIMEOUT_MS = 5_000;
 const SYNC_STATE_LOCK_STALE_MS = 30_000;
+const SYNC_STATE_REAPER_STALE_MS = 30_000;
 const SYNC_STATE_LOCK_RETRY_MS = 10;
 const SYNC_STATE_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
 
@@ -144,6 +145,10 @@ export function getSyncStateLockFile(cwd: string, sessionId: string): string {
   return path.join(getDurableStateDir(cwd), `session-${encodeURIComponent(sessionId)}.state.lock`);
 }
 
+export function getSyncStateLockOwnerFile(cwd: string, sessionId: string): string {
+  return path.join(getSyncStateLockFile(cwd, sessionId), 'owner.json');
+}
+
 /**
  * Get the durable retry marker used to rotate a poisoned live Letta conversation
  * without touching the transcript cursor from a detached worker.
@@ -203,42 +208,178 @@ function waitForSyncStateLock(): void {
   Atomics.wait(SYNC_STATE_LOCK_WAIT, 0, 0, SYNC_STATE_LOCK_RETRY_MS);
 }
 
-function withSyncStateLock<T>(cwd: string, sessionId: string, fn: () => T): T {
-  ensureDurableStateDir(cwd);
-  const lockPath = getSyncStateLockFile(cwd, sessionId);
-  const deadline = Date.now() + SYNC_STATE_LOCK_TIMEOUT_MS;
-  let lockFd: number | null = null;
+type DurableLockOwner = {
+  pid: number;
+  token: string;
+  createdAt: string;
+};
 
-  while (lockFd === null) {
+function makeDurableLockToken(): string {
+  return `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function readDurableLockOwner(ownerPath: string): DurableLockOwner | null {
+  try {
+    const owner = JSON.parse(fs.readFileSync(ownerPath, 'utf-8')) as DurableLockOwner;
+    if (
+      !Number.isInteger(owner?.pid)
+      || owner.pid <= 0
+      || typeof owner?.token !== 'string'
+      || owner.token.length === 0
+      || typeof owner?.createdAt !== 'string'
+      || !Number.isFinite(Date.parse(owner.createdAt))
+    ) return null;
+    return owner;
+  } catch {
+    return null;
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error: any) {
+    return error?.code !== 'ESRCH';
+  }
+}
+
+function removeOwnedDirectory(pathToRemove: string, ownerPath: string, token: string): boolean {
+  const owner = readDurableLockOwner(ownerPath);
+  if (!owner || owner.token !== token) return false;
+  try {
+    fs.unlinkSync(ownerPath);
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') throw error;
+  }
+  try {
+    fs.rmdirSync(pathToRemove);
+    return true;
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function acquireReaper(reaperPath: string, deadline: number): { token: string; ownerPath: string } | null {
+  const ownerPath = path.join(reaperPath, 'owner.json');
+  while (Date.now() < deadline) {
+    const token = makeDurableLockToken();
     try {
-      lockFd = fs.openSync(lockPath, 'wx', 0o600);
+      fs.mkdirSync(reaperPath, { mode: 0o700 });
       try {
-        fs.writeFileSync(lockFd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), 'utf-8');
-      } catch (writeError) {
-        fs.closeSync(lockFd);
-        lockFd = null;
-        try { fs.unlinkSync(lockPath); } catch {}
-        throw writeError;
+        fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }), { encoding: 'utf-8', mode: 0o600 });
+        return { token, ownerPath };
+      } catch (error) {
+        try { fs.rmdirSync(reaperPath); } catch {}
+        throw error;
       }
     } catch (error: any) {
       if (error?.code !== 'EEXIST') throw error;
       try {
-        const stat = fs.statSync(lockPath);
-        let ownerAlive = false;
-        try {
-          const owner = JSON.parse(fs.readFileSync(lockPath, 'utf-8'));
-          if (Number.isInteger(owner?.pid) && owner.pid > 0) {
-            try { process.kill(owner.pid, 0); ownerAlive = true; }
-            catch (probeError: any) { if (probeError?.code !== 'ESRCH') ownerAlive = true; }
+        const stat = fs.statSync(reaperPath);
+        const owner = readDurableLockOwner(ownerPath);
+        const ownerAlive = owner ? processIsAlive(owner.pid) : false;
+        const unpublishedTooOld = !owner && Date.now() - stat.mtimeMs >= SYNC_STATE_REAPER_STALE_MS;
+        if ((owner && !ownerAlive) || unpublishedTooOld) {
+          if (owner) removeOwnedDirectory(reaperPath, ownerPath, owner.token);
+          else {
+            // An unpublished reaper is safe to remove only after a long stale
+            // interval: it cannot have entered cleanup without publishing owner.
+            try { fs.rmdirSync(reaperPath); } catch (removeError: any) {
+              if (!['ENOENT', 'ENOTEMPTY'].includes(removeError?.code)) throw removeError;
+            }
           }
-        } catch {}
-        if (!ownerAlive || Date.now() - stat.mtimeMs >= SYNC_STATE_LOCK_STALE_MS) {
-          fs.unlinkSync(lockPath);
           continue;
         }
       } catch (statError: any) {
         if (statError?.code === 'ENOENT') continue;
         throw statError;
+      }
+      waitForSyncStateLock();
+    }
+  }
+  return null;
+}
+
+function syncStateLockLooksReapable(lockPath: string): boolean {
+  try {
+    const stat = fs.statSync(lockPath);
+    const owner = readDurableLockOwner(path.join(lockPath, 'owner.json'));
+    if (owner) return !processIsAlive(owner.pid);
+    return Date.now() - stat.mtimeMs >= SYNC_STATE_LOCK_STALE_MS;
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function maybeReapStaleSyncStateLock(lockPath: string, reaperPath: string, deadline: number): void {
+  const reaper = acquireReaper(reaperPath, deadline);
+  if (!reaper) return;
+  try {
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(lockPath);
+    } catch (error: any) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+
+    const ownerPath = path.join(lockPath, 'owner.json');
+    const owner = readDurableLockOwner(ownerPath);
+    if (!owner) {
+      // A freshly mkdir-published lock with owner metadata not written yet is
+      // already owned. Fail closed during that publication window. If the owner
+      // crashes before metadata publication, the unchanged directory can be
+      // recovered only after the stale interval while the reaper blocks ABA.
+      if (Date.now() - stat.mtimeMs < SYNC_STATE_LOCK_STALE_MS) return;
+      try { fs.rmdirSync(lockPath); } catch (error: any) {
+        if (!['ENOENT', 'ENOTEMPTY'].includes(error?.code)) throw error;
+      }
+      return;
+    }
+
+    if (processIsAlive(owner.pid)) return;
+    removeOwnedDirectory(lockPath, ownerPath, owner.token);
+  } finally {
+    removeOwnedDirectory(reaperPath, reaper.ownerPath, reaper.token);
+  }
+}
+
+function withSyncStateLock<T>(cwd: string, sessionId: string, fn: () => T): T {
+  ensureDurableStateDir(cwd);
+  const lockPath = getSyncStateLockFile(cwd, sessionId);
+  const ownerPath = getSyncStateLockOwnerFile(cwd, sessionId);
+  const reaperPath = `${lockPath}.reaper`;
+  const deadline = Date.now() + SYNC_STATE_LOCK_TIMEOUT_MS;
+  let token: string | null = null;
+
+  while (token === null) {
+    if (fs.existsSync(reaperPath)) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out acquiring durable sync-state lock for session ${sessionId}`);
+      }
+      waitForSyncStateLock();
+      continue;
+    }
+
+    const candidateToken = makeDurableLockToken();
+    try {
+      // mkdir is the ownership publication point. The directory itself is the
+      // lock; owner.json is diagnostic/stale-recovery metadata only.
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      try {
+        fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, token: candidateToken, createdAt: new Date().toISOString() }), { encoding: 'utf-8', mode: 0o600 });
+        token = candidateToken;
+      } catch (writeError) {
+        try { fs.rmdirSync(lockPath); } catch {}
+        throw writeError;
+      }
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (syncStateLockLooksReapable(lockPath)) {
+        maybeReapStaleSyncStateLock(lockPath, reaperPath, deadline);
       }
       if (Date.now() >= deadline) {
         throw new Error(`Timed out acquiring durable sync-state lock for session ${sessionId}`);
@@ -250,11 +391,9 @@ function withSyncStateLock<T>(cwd: string, sessionId: string, fn: () => T): T {
   try {
     return fn();
   } finally {
-    fs.closeSync(lockFd);
-    try { fs.unlinkSync(lockPath); }
-    catch (error: any) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
+    // Never remove a replacement lock. The owner token must still identify the
+    // same generation that this process acquired.
+    removeOwnedDirectory(lockPath, ownerPath, token);
   }
 }
 

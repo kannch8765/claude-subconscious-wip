@@ -256,6 +256,81 @@ describe('live retryable conversation recovery', () => {
     expect(fs.existsSync(markerPath)).toBe(false);
   });
 
+  it('fails closed while mkdir ownership is published before owner metadata', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+
+    const {
+      getConversationRetryMarkerFile,
+      getSyncStateLockFile,
+      getSyncStateLockOwnerFile,
+      markConversationForRetryRotation,
+      saveSyncState,
+    } = await import('./conversation_utils.js');
+
+    const cwd = '/workspace';
+    const sessionId = 'session-1';
+    saveSyncState(cwd, { lastProcessedIndex: 10, sessionId, conversationId: 'conv-old' });
+    expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 15)).toBe(true);
+
+    const markerPath = getConversationRetryMarkerFile(cwd, sessionId);
+    const lockPath = getSyncStateLockFile(cwd, sessionId);
+    const ownerPath = getSyncStateLockOwnerFile(cwd, sessionId);
+    fs.mkdirSync(lockPath, { mode: 0o700 }); // A owns the lock; metadata is intentionally unpublished.
+
+    const moduleUrl = compileConversationUtilsForChild(home);
+    let settled = false;
+    let contenderError: unknown = null;
+    const contender = runMarkerChild(moduleUrl, home, cwd, sessionId, 'conv-old', 30).then(
+      () => { settled = true; },
+      (error) => { settled = true; contenderError = error; },
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    expect(settled).toBe(false);
+    expect(JSON.parse(fs.readFileSync(markerPath, 'utf8')).throughIndex).toBe(15);
+
+    fs.writeFileSync(ownerPath, JSON.stringify({
+      pid: process.pid,
+      token: 'publication-owner',
+      createdAt: new Date().toISOString(),
+    }), { mode: 0o600 });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(settled).toBe(false);
+
+    fs.unlinkSync(ownerPath);
+    fs.rmdirSync(lockPath);
+    await contender;
+    if (contenderError) throw contenderError;
+
+    expect(JSON.parse(fs.readFileSync(markerPath, 'utf8')).throughIndex).toBe(30);
+  }, 10_000);
+
+  it('reaps an abandoned unpublished lock only after it is stale', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+
+    const {
+      getConversationRetryMarkerFile,
+      getSyncStateLockFile,
+      markConversationForRetryRotation,
+      saveSyncState,
+    } = await import('./conversation_utils.js');
+
+    const cwd = '/workspace';
+    const sessionId = 'session-1';
+    saveSyncState(cwd, { lastProcessedIndex: 10, sessionId, conversationId: 'conv-old' });
+
+    const lockPath = getSyncStateLockFile(cwd, sessionId);
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.utimesSync(lockPath, new Date(0), new Date(0));
+
+    expect(markConversationForRetryRotation(cwd, sessionId, 'conv-old', 20)).toBe(true);
+    expect(JSON.parse(fs.readFileSync(getConversationRetryMarkerFile(cwd, sessionId), 'utf8')).throughIndex).toBe(20);
+    expect(fs.existsSync(lockPath)).toBe(false);
+    expect(fs.existsSync(`${lockPath}.reaper`)).toBe(false);
+  });
+
   it('merges concurrent retry markers as earliest markedAt plus maximum throughIndex', async () => {
     const home = tempHome();
     vi.stubEnv('LETTA_HOME', home);
@@ -279,12 +354,15 @@ describe('live retryable conversation recovery', () => {
     fs.writeFileSync(markerPath, JSON.stringify(seed));
 
     const lockPath = getSyncStateLockFile(cwd, sessionId);
-    fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }), { mode: 0o600 });
+    const ownerPath = path.join(lockPath, 'owner.json');
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, token: 'parent-gate', createdAt: new Date().toISOString() }), { mode: 0o600 });
     const moduleUrl = compileConversationUtilsForChild(home);
     const low = runMarkerChild(moduleUrl, home, cwd, sessionId, 'conv-old', 20);
     const high = runMarkerChild(moduleUrl, home, cwd, sessionId, 'conv-old', 30);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    fs.unlinkSync(lockPath);
+    fs.unlinkSync(ownerPath);
+    fs.rmdirSync(lockPath);
     await Promise.all([low, high]);
 
     expect(JSON.parse(fs.readFileSync(markerPath, 'utf8'))).toMatchObject({
