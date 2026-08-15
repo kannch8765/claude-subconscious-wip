@@ -29,6 +29,8 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(worker).toContain('turnSucceeded = !result.clientToolFailure');
     expect(worker).toContain('turnSucceeded = false');
     expect(worker).toContain('runtime.finalizeBatch(payload.batchId, turnSucceeded)');
+    expect(worker).toContain('markConversationForRetryRotation(');
+    expect(worker).toContain('next live pass will rotate the poisoned conversation before replay');
     expect(worker).not.toContain('@letta-ai/letta-code-sdk');
     expect(worker).not.toContain('resumeSession');
     expect(worker).not.toContain('runTurn(');
