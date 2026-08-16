@@ -15,6 +15,8 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(worker).toContain("name: 'deliver_whisper'");
     expect(worker).toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");
     expect(worker).toContain('Model relationship memory_search: query=');
+    expect(worker).toContain('exactGroundedIdentityAnchors(query, result)');
+    expect(worker).toContain('composeGroundedWhisper(text, [...groundedIdentityAnchors])');
     expect(worker).not.toContain('runtime.memorySearchHybrid({ query: firstSearchQuery');
     expect(worker).not.toContain('prefetched_relationship_memory_search');
     expect(send).toContain('latestUserMessage,');

@@ -80,14 +80,14 @@ describe('live entity identity grounding contract', () => {
 
     expect(send).toContain('ground identity only when needed');
     expect(send).toContain('Do not call entity_search merely because a name appears');
-    expect(send).toContain('do not make foreground Kohaku infer identity from episodes alone');
+    expect(send).toContain('The live transport preserves an unambiguous exact-name/alias identity anchor');
     expect(send).toContain('do not repeat an identity anchor the foreground already has');
     expect(send).toContain('entity_search miss is not permission to invent an identity');
     expect(send).toContain('a bare name mention, guess, or episodic association must remain unresolved');
     expect(blocks.get('core_directives')).toContain('I first use entity_search to ground who or what it is, then use that identity to guide episodic memory_search');
     expect(blocks.get('core_directives')).toContain('I do not entity_search every name');
-    expect(blocks.get('core_directives')).toContain('I do not make my foreground self infer identity from episodes alone');
-    expect(blocks.get('tool_guidelines')).toContain('include the minimum stable identity anchor plus the useful episode');
+    expect(blocks.get('core_directives')).toContain('The live transport preserves a concise unambiguous exact-name/alias identity anchor');
+    expect(blocks.get('tool_guidelines')).toContain('live transport preserves a concise unambiguous exact-name/alias identity anchor');
     expect(adapter).toContain('A mere name mention, search miss, or episodic association is insufficient evidence');
   });
 

@@ -25,6 +25,7 @@ import {
   type NativeClientTool,
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
+import { composeGroundedWhisper, exactGroundedIdentityAnchors } from './grounded_whisper.js';
 import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
@@ -73,8 +74,20 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     if (!apiKey) throw new Error('LETTA_API_KEY is required for native live Subconscious execution');
     const client = createNativeLettaClient(apiKey);
 
+    const groundedIdentityAnchors = new Set<string>();
     const relationshipTools: NativeClientTool[] = buildRelationshipTools(runtime, payload.batchId).map((tool) => {
       const execute = tool.execute.bind(tool);
+      if (tool.name === 'entity_search') {
+        return {
+          ...tool,
+          async execute(toolCallId: string, args: unknown) {
+            const result = await execute(toolCallId, args);
+            const query = typeof (args as any)?.query === 'string' ? (args as any).query.trim() : '';
+            for (const anchor of exactGroundedIdentityAnchors(query, result)) groundedIdentityAnchors.add(anchor);
+            return result;
+          },
+        };
+      }
       if (tool.name === 'memory_search') {
         return {
           ...tool,
@@ -106,9 +119,10 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
         if (whisperDelivered) throw new Error('deliver_whisper may be called at most once per batch');
         const text = typeof (args as any)?.text === 'string' ? (args as any).text.trim() : '';
         if (!text) throw new Error('deliver_whisper.text must be non-empty');
-        const queued = queueSubconWhisper(payload.cwd, payload.sessionId, payload.batchId, text);
+        const groundedText = composeGroundedWhisper(text, [...groundedIdentityAnchors]);
+        const queued = queueSubconWhisper(payload.cwd, payload.sessionId, payload.batchId, groundedText);
         whisperDelivered = true;
-        log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${text.length} chars)`);
+        log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
         return { status: 'ok', whisper_id: queued?.whisper_id };
       },
     });
