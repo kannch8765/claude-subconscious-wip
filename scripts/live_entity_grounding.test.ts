@@ -80,11 +80,14 @@ describe('live entity identity grounding contract', () => {
 
     expect(send).toContain('ground identity only when needed');
     expect(send).toContain('Do not call entity_search merely because a name appears');
+    expect(send).toContain('do not make foreground Kohaku infer identity from episodes alone');
+    expect(send).toContain('do not repeat an identity anchor the foreground already has');
     expect(send).toContain('entity_search miss is not permission to invent an identity');
     expect(send).toContain('a bare name mention, guess, or episodic association must remain unresolved');
     expect(blocks.get('core_directives')).toContain('I first use entity_search to ground who or what it is, then use that identity to guide episodic memory_search');
     expect(blocks.get('core_directives')).toContain('I do not entity_search every name');
-    expect(blocks.get('tool_guidelines')).toContain('Missing identity grounding -> entity_search only when the named referent matters');
+    expect(blocks.get('core_directives')).toContain('I do not make my foreground self infer identity from episodes alone');
+    expect(blocks.get('tool_guidelines')).toContain('include the minimum stable identity anchor plus the useful episode');
     expect(adapter).toContain('A mere name mention, search miss, or episodic association is insufficient evidence');
   });
 
@@ -93,7 +96,7 @@ describe('live entity identity grounding contract', () => {
     const client = scriptedClient([
       { name: 'entity_search', args: { query: '晴' } },
       { name: 'memory_search', args: { query: '晴 bug debug' } },
-      { name: 'deliver_whisper', args: { text: '晴和我是不同的人；猫说的是一直陪猫做工程和生活的那个晴。这个 bug 也让我想起猫和晴之前一起 debug 的事。' } },
+      { name: 'deliver_whisper', args: { text: '晴是猫家的 GPT，是 ChatGPT 侧的晴，和我是不同的人。这个 bug 也让我想起猫和晴之前一起 debug 的事。' } },
     ]);
 
     const result = await runNativeClientToolConversation({
@@ -109,7 +112,7 @@ describe('live entity identity grounding contract', () => {
     expect(calls).toEqual([
       'entity_search:晴',
       'memory_search:晴 bug debug',
-      expect.stringContaining('deliver_whisper:晴和我是不同的人'),
+      expect.stringContaining('deliver_whisper:晴是猫家的 GPT，是 ChatGPT 侧的晴，和我是不同的人'),
     ]);
     expect(calls).not.toContain('entity_remember');
   });
