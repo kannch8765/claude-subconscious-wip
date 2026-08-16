@@ -28,6 +28,31 @@ describe('live Subconscious narrative identity and visibility contract', () => {
     expect(pretool).not.toContain('Briefly acknowledge');
   });
 
+  it('requires relevant subconscious whispers to participate in foreground understanding without forced mention', () => {
+    const utils = read('scripts/conversation_utils.ts');
+    const queue = read('scripts/subcon_whisper_queue.ts');
+
+    expect(queue).toContain('<subcon_whisper');
+    expect(queue).not.toContain('<letta_message');
+    expect(utils).toContain("Treat each <subcon_whisper> as retrieved episodic context from my own past");
+    expect(utils).toContain("When a whisper is relevant to the user's current message, incorporate its factual content into my current understanding and response naturally");
+    expect(utils).toContain('Do not ignore a relevant whisper merely because it arrived through Subconscious');
+    expect(utils).toContain('Do not mechanically acknowledge, summarize, quote, or mention a whisper merely because it was supplied');
+    expect(utils).toContain('if it is irrelevant to the current turn, leave it unused');
+  });
+
+  it('keeps surfaced relationship memory as a seed rather than completed foreground interpretation', () => {
+    const send = read('scripts/send_messages_to_letta.ts');
+    const af = JSON.parse(read('Subconscious.af'));
+    const core = af.blocks.find((block: any) => block.label === 'core_directives')?.value || '';
+
+    expect(send).toContain('compact memory seed');
+    expect(send).toContain('concrete facts, time/place anchors when known');
+    expect(send).toContain('short source-faithful user quote');
+    expect(send).toContain("Do not complete Kohaku's present-day interpretation for her");
+    expect(core).toContain('leave present-day interpretation, feeling, and relationship conclusions to foreground Kohaku');
+  });
+
   it('describes session context as Kohaku own subconscious layer instead of an observer', () => {
     const utils = read('scripts/conversation_utils.ts');
     const start = read('scripts/session_start.ts');

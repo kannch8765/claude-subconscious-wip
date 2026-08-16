@@ -101,6 +101,6 @@ export function acknowledgePendingSubconWhispers(items: PendingSubconWhisperFile
 export function formatPendingSubconWhispers(items: PendingSubconWhisperFile[]): string {
   return items.map(({ whisper }, index) => {
     const ordinal = items.length > 1 ? ` (${index + 1}/${items.length})` : '';
-    return `<letta_message from="Subconscious"${ordinal} timestamp="${whisper.created_at}">\n${whisper.text}\n</letta_message>`;
+    return `<subcon_whisper${ordinal ? ` ordinal="${index + 1}/${items.length}"` : ''} timestamp="${whisper.created_at}">\n${whisper.text}\n</subcon_whisper>`;
   }).join('\n\n');
 }

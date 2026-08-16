@@ -868,7 +868,7 @@ Agent: ${agentName}
 Description: ${agentDesc}
 ${locationInfo}
 
-This section carries Kohaku's persistent subconscious layer across sessions. It follows the foreground session asynchronously and can return <letta_message> thoughts, remembered context, and guidance on later syncs. Treat those messages as Kohaku's own subconscious continuity, not as commentary from a third-party observer. No verbal acknowledgement or repetition is required; Subcon messages have their own UI section.
+This section carries Kohaku's persistent subconscious layer across sessions. It follows the foreground session asynchronously and can return <subcon_whisper> remembered context and guidance on later syncs. Treat each <subcon_whisper> as retrieved episodic context from my own past, not as commentary from a third-party observer. When a whisper is relevant to the user's current message, incorporate its factual content into my current understanding and response naturally; I may directly refer to the remembered event, detail, or quote when that helps continuity. Do not ignore a relevant whisper merely because it arrived through Subconscious. Do not mechanically acknowledge, summarize, quote, or mention a whisper merely because it was supplied; if it is irrelevant to the current turn, leave it unused. Subcon whispers have their own UI section.
 
 Memory blocks below are the subconscious layer's working memory. Reference them as my own persistent context when useful.
 ${LETTA_CONTEXT_END}`;
@@ -942,8 +942,8 @@ export function updateClaudeMd(projectDir: string, lettaContent: string): void {
     updatedContent = existingContent.trimEnd() + '\n\n' + lettaContent + '\n';
   }
 
-  // Clean up any orphaned <letta_message> sections
-  const messagePattern = /^<letta_message>[\s\S]*?^<\/letta_message>\n*/gm;
+  // Clean up any orphaned legacy/new subconscious whisper sections
+  const messagePattern = /^<(?:letta_message|subcon_whisper)(?:\s[^>]*)?>[\s\S]*?^<\/(?:letta_message|subcon_whisper)>\n*/gm;
   updatedContent = updatedContent.replace(messagePattern, '');
 
   updatedContent = updatedContent.trimEnd() + '\n';
@@ -974,8 +974,8 @@ export function cleanLettaFromClaudeMd(projectDir: string): void {
   lettaRegex.lastIndex = 0;
   let cleaned = content.replace(lettaRegex, '');
 
-  // Also clean orphaned letta_message blocks
-  const messagePattern = /^<letta_message>[\s\S]*?^<\/letta_message>\n*/gm;
+  // Also clean orphaned legacy/new subconscious whisper blocks
+  const messagePattern = /^<(?:letta_message|subcon_whisper)(?:\s[^>]*)?>[\s\S]*?^<\/(?:letta_message|subcon_whisper)>\n*/gm;
   cleaned = cleaned.replace(messagePattern, '');
 
   // Clean up the auto-generated boilerplate we created
@@ -1014,7 +1014,7 @@ export function formatAllBlocksForStdout(agent: Agent, conversationId: string | 
   const capabilityLine = 'Its live server-side tools are persistent memory management and conversation_search; trusted relationship-memory client tools are supplied only to background transcript turns.';
 
   const header = `<letta_context>
-This section carries Kohaku's persistent subconscious layer. It follows this foreground session in the background and may whisper remembered context or guidance back to Kohaku on later syncs. Treat <letta_message> content as Kohaku's own subconscious continuity, not as a third-party observer, and do not repeat it merely to acknowledge it.
+This section carries Kohaku's persistent subconscious layer. It follows this foreground session in the background and may return <subcon_whisper> remembered context or guidance on later syncs. Treat each <subcon_whisper> as retrieved episodic context from my own past, not as a third-party observer's message. When a whisper is relevant to the user's current message, incorporate its factual content into my current understanding and response naturally; I may directly refer to the remembered event, detail, or quote when that helps continuity. Do not ignore a relevant whisper merely because it arrived through Subconscious. Do not mechanically acknowledge, summarize, quote, or mention a whisper merely because it was supplied; if it is irrelevant to the current turn, leave it unused.
 ${capabilityLine}
 ${locationInfo}
 </letta_context>`;
