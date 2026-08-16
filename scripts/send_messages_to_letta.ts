@@ -176,6 +176,8 @@ ${latestUserEscaped}
 This is the normal asynchronous Subconscious pass after a foreground Kohaku turn. Do both jobs in one pass:
 
 1. MEMORY SURFACING FOR THE NEXT FOREGROUND TURN
+- Before episodic recall, ground identity only when needed: if a clearly named referent matters to understanding the current relationship context but <latest_user_message> plus the trusted current batch do not establish who or what it is, call entity_search with that natural referent first. Use the returned identity to disambiguate the later relationship recall.
+- Do not call entity_search merely because a name appears. If the current context already resolves the referent, continue directly to episodic recall.
 - Read <latest_user_message> together with the trusted current-batch transcript context, then choose and call relationship memory_search yourself. Generate a compact semantic query for what is meaningfully being recalled; do not mechanically copy the whole user message, emoji, or surface punctuation when a cleaner concept query is available.
 - Every live pass that contains a real <latest_user_message> must complete at least one relationship memory_search before ending. This is a hard behavior boundary, not optional guidance.
 - You may issue additional memory_search calls after seeing earlier results when a narrower, broader, or differently phrased semantic search would improve recall.
@@ -186,6 +188,8 @@ This is the normal asynchronous Subconscious pass after a foreground Kohaku turn
 
 2. SILENT LONG-TERM MEMORY MAINTENANCE
 - Reuse relevant relationship search results when applicable to decide whether trusted new evidence should reinforce an existing relationship memory, create a genuinely new durable memory, or do nothing.
+- entity_search miss is not permission to invent an identity. Call entity_remember only when trusted current-batch conversation itself clearly defines or supports the stable identity; a bare name mention, guess, or episodic association must remain unresolved rather than becoming a canonical entity.
+- When an identity is genuinely supported, keep its description concise and stable in relationship terms useful for continuity rather than reducing a person to transient provider/tool/runtime inventory.
 - Perform memory_reinforce / memory_remember / entity operations as needed. This work is private maintenance.
 - Never report maintenance decisions in deliver_whisper, ordinary prose, guidance, or any other foreground-visible channel.
 
