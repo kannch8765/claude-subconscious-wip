@@ -80,7 +80,9 @@ describe('live entity identity grounding contract', () => {
 
     expect(send).toContain('ground identity only when needed');
     expect(send).toContain('Do not call entity_search merely because a name appears');
-    expect(send).toContain('The live transport preserves an unambiguous exact-name/alias identity anchor');
+    expect(send).toContain('purpose=foreground_grounding');
+    expect(send).toContain('purpose=maintenance');
+    expect(send).toContain('exactly one distinct concise foreground-grounding entity');
     expect(send).toContain('do not repeat an identity anchor the foreground already has');
     expect(send).toContain('entity_search miss is not permission to invent an identity');
     expect(send).toContain('a bare name mention, guess, or episodic association must remain unresolved');
@@ -94,7 +96,7 @@ describe('live entity identity grounding contract', () => {
   it('supports the 晴 regression as identity grounding followed by episodic recall and whisper', async () => {
     const calls: string[] = [];
     const client = scriptedClient([
-      { name: 'entity_search', args: { query: '晴' } },
+      { name: 'entity_search', args: { query: '晴', purpose: 'foreground_grounding' } },
       { name: 'memory_search', args: { query: '晴 bug debug' } },
       { name: 'deliver_whisper', args: { text: '晴是猫家的 GPT，是 ChatGPT 侧的晴，和我是不同的人。这个 bug 也让我想起猫和晴之前一起 debug 的事。' } },
     ]);
@@ -141,7 +143,7 @@ describe('live entity identity grounding contract', () => {
       async execute(_id: string, args: any) { calls.push(`entity_search:${args.query}`); return { results: [] }; },
     } : tool);
     const client = scriptedClient([
-      { name: 'entity_search', args: { query: '某个新名字' } },
+      { name: 'entity_search', args: { query: '某个新名字', purpose: 'foreground_grounding' } },
       { name: 'memory_search', args: { query: '某个新名字 当前话题' } },
     ]);
     const result = await runNativeClientToolConversation({

@@ -25,7 +25,7 @@ import {
   type NativeClientTool,
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
-import { composeGroundedWhisper, exactGroundedIdentityAnchors } from './grounded_whisper.js';
+import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
 import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
@@ -74,16 +74,32 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     if (!apiKey) throw new Error('LETTA_API_KEY is required for native live Subconscious execution');
     const client = createNativeLettaClient(apiKey);
 
-    const groundedIdentityAnchors = new Set<string>();
+    const entitySearchObservations: EntitySearchObservation[] = [];
     const relationshipTools: NativeClientTool[] = buildRelationshipTools(runtime, payload.batchId).map((tool) => {
       const execute = tool.execute.bind(tool);
       if (tool.name === 'entity_search') {
+        const baseParameters = tool.parameters as any;
         return {
           ...tool,
+          description: `${tool.description} Set purpose=foreground_grounding only when this lookup is needed because foreground Kohaku does not know the referent; use purpose=maintenance for alias/dedupe checks or other entity maintenance.`,
+          parameters: {
+            ...baseParameters,
+            required: [...new Set([...(Array.isArray(baseParameters?.required) ? baseParameters.required : []), 'purpose'])],
+            properties: {
+              ...(baseParameters?.properties ?? {}),
+              purpose: {
+                type: 'string',
+                enum: ['foreground_grounding', 'maintenance'],
+                description: 'Why this lookup is being performed. foreground_grounding is only for an unresolved referent whose stable identity needs to reach foreground Kohaku; maintenance covers alias/dedupe checks such as searching before entity_remember.',
+              },
+            },
+          },
           async execute(toolCallId: string, args: unknown) {
-            const result = await execute(toolCallId, args);
-            const query = typeof (args as any)?.query === 'string' ? (args as any).query.trim() : '';
-            for (const anchor of exactGroundedIdentityAnchors(query, result)) groundedIdentityAnchors.add(anchor);
+            const rawArgs = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
+            const purpose = rawArgs.purpose;
+            const { purpose: _purpose, ...searchArgs } = rawArgs;
+            const result = await execute(toolCallId, searchArgs);
+            entitySearchObservations.push({ purpose, query: searchArgs.query, result });
             return result;
           },
         };
@@ -119,7 +135,7 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
         if (whisperDelivered) throw new Error('deliver_whisper may be called at most once per batch');
         const text = typeof (args as any)?.text === 'string' ? (args as any).text.trim() : '';
         if (!text) throw new Error('deliver_whisper.text must be non-empty');
-        const groundedText = composeGroundedWhisper(text, [...groundedIdentityAnchors]);
+        const groundedText = composeGroundedWhisper(text, foregroundGroundingIdentityAnchors(entitySearchObservations));
         const queued = queueSubconWhisper(payload.cwd, payload.sessionId, payload.batchId, groundedText);
         whisperDelivered = true;
         log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);

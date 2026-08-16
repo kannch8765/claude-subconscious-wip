@@ -27,22 +27,48 @@ function containsReferentTokens(queryTokens: readonly string[], referent: string
   return false;
 }
 
-export function exactGroundedIdentityAnchors(query: unknown, toolResult: unknown): string[] {
+interface GroundedIdentityMatch {
+  entityId: string;
+  description: string;
+}
+
+export interface EntitySearchObservation {
+  purpose: unknown;
+  query: unknown;
+  result: unknown;
+}
+
+function exactGroundedIdentityMatches(query: unknown, toolResult: unknown): GroundedIdentityMatch[] {
   if (typeof query !== 'string') return [];
   const queryTokens = entityReferentTokens(query);
   if (queryTokens.length === 0) return [];
   const results = Array.isArray((toolResult as any)?.results) ? (toolResult as any).results as GroundedEntityResult[] : [];
-  const matches = results.filter((item) => {
+  const matches = results.flatMap((item): GroundedIdentityMatch[] => {
     const names = [item?.canonical_name, ...(Array.isArray(item?.aliases) ? item.aliases : [])]
       .filter((value): value is string => typeof value === 'string');
-    return names.some((name) => containsReferentTokens(queryTokens, name))
-      && typeof item?.description === 'string'
-      && item.description.trim().length > 0
-      && item.description.trim().length <= MAX_TRANSPORT_IDENTITY_ANCHOR_CHARS;
+    const entityId = typeof item?.entity_id === 'string' ? item.entity_id.trim() : '';
+    const description = typeof item?.description === 'string' ? item.description.trim() : '';
+    if (!entityId || !description || description.length > MAX_TRANSPORT_IDENTITY_ANCHOR_CHARS) return [];
+    if (!names.some((name) => containsReferentTokens(queryTokens, name))) return [];
+    return [{ entityId, description }];
   });
-  const entityIds = new Set(matches.map((item) => typeof item.entity_id === 'string' ? item.entity_id : '').filter(Boolean));
-  if (entityIds.size !== 1) return [];
-  return [...new Set(matches.map((item) => String(item.description).trim()).filter(Boolean))];
+  const entityIds = new Set(matches.map((item) => item.entityId));
+  return entityIds.size === 1 ? matches : [];
+}
+
+export function exactGroundedIdentityAnchors(query: unknown, toolResult: unknown): string[] {
+  return [...new Set(exactGroundedIdentityMatches(query, toolResult).map((item) => item.description))];
+}
+
+export function foregroundGroundingIdentityAnchors(observations: readonly EntitySearchObservation[]): string[] {
+  const identities = new Map<string, string>();
+  for (const observation of observations) {
+    if (observation.purpose !== 'foreground_grounding') continue;
+    for (const match of exactGroundedIdentityMatches(observation.query, observation.result)) {
+      identities.set(match.entityId, match.description);
+    }
+  }
+  return identities.size === 1 ? [...identities.values()] : [];
 }
 
 export function composeGroundedWhisper(text: string, identityAnchors: readonly string[]): string {

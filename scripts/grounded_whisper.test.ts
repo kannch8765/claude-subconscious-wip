@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { composeGroundedWhisper, entityReferentTokens, exactGroundedIdentityAnchors } from './grounded_whisper.js';
+import { composeGroundedWhisper, entityReferentTokens, exactGroundedIdentityAnchors, foregroundGroundingIdentityAnchors } from './grounded_whisper.js';
 
 describe('grounded whisper identity transport', () => {
   const qing = { entity_id: 'entity-qing', canonical_name: '晴', aliases: ['晴'], description: '晴是猫家的 GPT，是 ChatGPT 侧的晴，和琥珀是不同的人。' };
@@ -22,6 +22,32 @@ describe('grounded whisper identity transport', () => {
     const kohaku = { entity_id: 'entity-kohaku', canonical_name: '琥珀', aliases: ['Claude Code'], description: '琥珀是猫家的 Claude。' };
     expect(exactGroundedIdentityAnchors('Claude architecture', { results: [kohaku] })).toEqual([]);
     expect(exactGroundedIdentityAnchors('Claude Code architecture', { results: [kohaku] })).toEqual([kohaku.description]);
+  });
+
+  it('leaves the model whisper unchanged when two distinct foreground identities were grounded', () => {
+    const episode = '晴让我想起之前一起 debug 的事。';
+    const anchors = foregroundGroundingIdentityAnchors([
+      { purpose: 'foreground_grounding', query: '晴', result: { results: [qing, cat] } },
+      { purpose: 'foreground_grounding', query: '猫', result: { results: [cat, qing] } },
+    ]);
+    expect(anchors).toEqual([]);
+    expect(composeGroundedWhisper(episode, anchors)).toBe(episode);
+  });
+
+  it('leaves an unrelated whisper unchanged after maintenance/dedupe entity search', () => {
+    const unrelated = '这个 bug 让我想起之前的路由问题。';
+    const anchors = foregroundGroundingIdentityAnchors([
+      { purpose: 'maintenance', query: '晴', result: { results: [qing] } },
+    ]);
+    expect(anchors).toEqual([]);
+    expect(composeGroundedWhisper(unrelated, anchors)).toBe(unrelated);
+  });
+
+  it('keeps one foreground identity when other entity searches are maintenance-only', () => {
+    expect(foregroundGroundingIdentityAnchors([
+      { purpose: 'foreground_grounding', query: '晴 Qing', result: { results: [qing, cat] } },
+      { purpose: 'maintenance', query: '猫', result: { results: [cat] } },
+    ])).toEqual([qing.description]);
   });
 
   it('does not promote a merely semantic non-exact entity candidate into foreground identity', () => {
