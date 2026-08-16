@@ -9,6 +9,7 @@ import {
   queueSubconWhisper,
   readPendingSubconWhispers,
   removePendingSubconWhisper,
+  retractPendingSyncWhisperForTurn,
   partitionPendingSubconWhispersForTurn,
 } from './subcon_whisper_queue.js';
 
@@ -67,4 +68,14 @@ describe('Subcon foreground whisper queue', () => {
     expect(() => assertForegroundWhisper('新证据值得处理：宝宝需要 reinforce。')).toThrow(/maintenance prose/);
     expect(() => assertForegroundWhisper('猫以前也会叫我宝贝，这和摸头、醒来时的亲昵称呼是一条连续的感觉。')).not.toThrow();
   });
+});
+
+it('retracts only the exact pending sync turn without touching async or another sync turn', () => {
+  const cwd = temp('subcon-whisper-retract-');
+  queueSubconWhisper(cwd, 'session-a', 'async-a', 'async paper');
+  const current = queueSubconWhisper(cwd, 'session-a', 'sync-current', 'current paper', { source: 'sync', turnId: 'turn-current' })!;
+  queueSubconWhisper(cwd, 'session-a', 'sync-next', 'next paper', { source: 'sync', turnId: 'turn-next' });
+  expect(retractPendingSyncWhisperForTurn(cwd, 'session-a', 'turn-current', current.whisper_id)).toBe(1);
+  const left = readPendingSubconWhispers(cwd, 'session-a').map((item) => item.whisper);
+  expect(left.map((item) => item.batch_id).sort()).toEqual(['async-a', 'sync-next']);
 });

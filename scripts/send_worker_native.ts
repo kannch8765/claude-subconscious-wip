@@ -10,6 +10,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 import type { AssistantRememberIntentRecord, CanonicalMessage } from '../relationship-memory/src/schema/index.js';
 import {
   appendTrustedRelationshipCatalog,
@@ -28,7 +29,8 @@ import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
 import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
 import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
-import { buildLettaApiUrl } from './letta_api_url.js';
+import { cancelAndDeferSyncResources, cleanupCompletedSyncResources } from './sync_letta_resources.js';
+import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -36,7 +38,7 @@ const LOG_FILE = path.join(TEMP_STATE_DIR, 'send_worker_native.log');
 
 type LiveWorkerMode = 'async' | 'sync';
 
-interface LiveWorkerPayload {
+export interface LiveWorkerPayload {
   mode?: LiveWorkerMode;
   agentId: string;
   conversationId: string;
@@ -51,7 +53,9 @@ interface LiveWorkerPayload {
   latestUserMessage: string;
   syncCheckpointFile?: string;
   syncTurnId?: string;
-  deleteConversationOnFinish?: boolean;
+  syncAgentId?: string;
+  syncBlockIds?: string[];
+  cleanupSyncResourcesOnFinish?: boolean;
 }
 
 type SyncCheckpointStatus = 'whisper' | 'no_whisper' | 'failed';
@@ -71,15 +75,6 @@ function writeSyncCheckpoint(payload: LiveWorkerPayload, status: SyncCheckpointS
   }
 }
 
-async function deleteConversation(apiKey: string, conversationId: string): Promise<void> {
-  const response = await fetch(buildLettaApiUrl(`/conversations/${encodeURIComponent(conversationId)}`), {
-    method: 'DELETE',
-    headers: { 'Authorization': `Bearer ${apiKey}` },
-  });
-  if (!response.ok && response.status !== 404) {
-    throw new Error(`Failed to delete sync conversation: ${response.status} ${await response.text()}`);
-  }
-}
 
 function log(message: string): void {
   const dir = path.dirname(LOG_FILE);
@@ -88,7 +83,17 @@ function log(message: string): void {
   fs.appendFileSync(LOG_FILE, `[${timestamp}] ${message}\n`);
 }
 
-async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'completed' | 'retryable_failure'> {
+export interface LiveWorkerDependencies {
+  createClient?: (apiKey: string) => any;
+  runConversation?: typeof runNativeClientToolConversation;
+  cancelAndDefer?: typeof cancelAndDeferSyncResources;
+  cleanupCompleted?: typeof cleanupCompletedSyncResources;
+}
+
+export async function sendViaNativeClient(
+  payload: LiveWorkerPayload,
+  dependencies: LiveWorkerDependencies = {},
+): Promise<'completed' | 'retryable_failure'> {
   const mode: LiveWorkerMode = payload.mode ?? 'async';
   const isSync = mode === 'sync';
   const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
@@ -107,11 +112,13 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
 
   const hasRealUserMessage = Boolean(payload.latestUserMessage?.trim());
   let turnSucceeded = false;
+  let whisperDelivered = false;
+  let postWhisperFailureCleanupOwned = false;
 
   try {
     const apiKey = process.env.LETTA_API_KEY;
     if (!apiKey) throw new Error('LETTA_API_KEY is required for native live Subconscious execution');
-    const client = createNativeLettaClient(apiKey);
+    const client = (dependencies.createClient ?? createNativeLettaClient)(apiKey);
 
     const entitySearchObservations: EntitySearchObservation[] = [];
     const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId);
@@ -174,7 +181,6 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
       };
     });
 
-    let whisperDelivered = false;
     relationshipTools.push({
       name: 'deliver_whisper',
       description: isSync
@@ -194,9 +200,11 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
           payload.cwd, payload.sessionId, payload.batchId, groundedText,
           isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
         );
-        whisperDelivered = true;
         log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
         if (isSync) writeSyncCheckpoint(payload, 'whisper', queued?.whisper_id);
+        // Cleanup ownership transfers only after the durable foreground release
+        // checkpoint exists. A queue write alone is not enough to let Kohaku go.
+        whisperDelivered = true;
         return { status: 'ok', whisper_id: queued?.whisper_id };
       },
     });
@@ -223,7 +231,7 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
       // lane remains the sole owner of canonical memory mutation and optional
       // external MCP side effects, avoiding duplicate maintenance for one user turn.
       log('  stdio MCP client tools: (disabled in sync mode)');
-      result = await runNativeClientToolConversation({
+      result = await (dependencies.runConversation ?? runNativeClientToolConversation)({
         client,
         agentId: payload.agentId,
         conversationId: payload.conversationId,
@@ -231,6 +239,7 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
         tools: relationshipTools,
         requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
         continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 },
+        clientToolRoundGate: syncClientToolRoundGate,
       });
     } else {
       const stdioMcp = await openStdioMcpToolsFromEnvironment(log);
@@ -243,7 +252,7 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
       const liveTools = [...relationshipTools, ...mcpTools];
       log(`  stdio MCP client tools: ${mcpTools.map((tool) => tool.name).join(', ') || '(none)'}`);
       try {
-        result = await runNativeClientToolConversation({
+        result = await (dependencies.runConversation ?? runNativeClientToolConversation)({
           client,
           agentId: payload.agentId,
           conversationId: payload.conversationId,
@@ -263,21 +272,34 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
   } catch (error) {
     turnSucceeded = false;
     log(`Live Subconscious native-client failure: ${error instanceof Error ? error.message : String(error)}`);
-    if (isSync) writeSyncCheckpoint(payload, 'failed');
+    if (isSync) {
+      const apiKey = process.env.LETTA_API_KEY;
+      const syncAgentId = payload.syncAgentId ?? payload.agentId;
+      if (whisperDelivered && apiKey) {
+        // Foreground already consumed the durable whisper checkpoint and the
+        // wrapper may have exited. From this point the worker owns cleanup:
+        // cancel/defer the server resources and do NOT publish a new failed
+        // checkpoint that nobody is left to consume.
+        await (dependencies.cancelAndDefer ?? cancelAndDeferSyncResources)(apiKey, payload.conversationId, syncAgentId, payload.syncBlockIds ?? []);
+        // Keep the already-durable whisper checkpoint untouched. If the wrapper
+        // has not observed it yet, it must still be able to release foreground;
+        // if it already observed it, the wrapper has removed it itself.
+        postWhisperFailureCleanupOwned = true;
+        log(`Post-whisper sync failure cleanup deferred for conversation ${payload.conversationId}`);
+      } else {
+        writeSyncCheckpoint(payload, 'failed');
+      }
+    }
   }
 
   if (isSync) {
-    if (payload.deleteConversationOnFinish && turnSucceeded) {
-      const apiKey = process.env.LETTA_API_KEY;
-      if (apiKey) {
-        try { await deleteConversation(apiKey, payload.conversationId); }
-        catch (error) { log(`Failed to clean up sync conversation ${payload.conversationId}: ${error instanceof Error ? error.message : String(error)}`); }
-      }
-    } else if (!turnSucceeded) {
-      // The foreground wrapper owns failed-run cancellation. Deleting here can
-      // race Letta 0.16.8's shielded streaming task after the client sees an
-      // execution error, causing server-side NoResultFound on the conversation.
-      log(`Leaving failed sync conversation ${payload.conversationId} for wrapper cancellation cleanup`);
+    const apiKey = process.env.LETTA_API_KEY;
+    const syncAgentId = payload.syncAgentId ?? payload.agentId;
+    if (payload.cleanupSyncResourcesOnFinish && turnSucceeded && apiKey) {
+      await (dependencies.cleanupCompleted ?? cleanupCompletedSyncResources)(apiKey, payload.conversationId, syncAgentId, payload.syncBlockIds ?? []);
+    } else if (!turnSucceeded && !postWhisperFailureCleanupOwned) {
+      // Before foreground release the wrapper still owns failed-run cleanup.
+      log(`Leaving failed sync resources ${payload.conversationId} / ${syncAgentId} for wrapper cancellation cleanup`);
     }
     return turnSucceeded ? 'completed' : 'retryable_failure';
   }
@@ -287,54 +309,52 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
   return completion;
 }
 
-async function main(): Promise<void> {
-  const payloadFile = process.argv[2];
-  if (!payloadFile) {
-    log('ERROR: No payload file specified');
-    process.exit(1);
-  }
-
+export async function runNativeWorkerPayloadFile(
+  payloadFile: string,
+  dependencies: LiveWorkerDependencies = {},
+): Promise<void> {
+  if (!payloadFile) throw new Error('No payload file specified');
   log('='.repeat(60));
   log(`Native live worker started with payload: ${payloadFile}`);
+  if (!fs.existsSync(payloadFile)) throw new Error(`Payload file not found: ${payloadFile}`);
 
+  const payload: LiveWorkerPayload = JSON.parse(fs.readFileSync(payloadFile, 'utf-8'));
+  log(`Loaded payload for session ${payload.sessionId}`);
+  let completion: 'completed' | 'retryable_failure';
   try {
-    if (!fs.existsSync(payloadFile)) {
-      log(`ERROR: Payload file not found: ${payloadFile}`);
-      process.exit(1);
+    completion = await sendViaNativeClient(payload, dependencies);
+  } catch (error) {
+    log(`Native live turn failed before trusted batch completion: ${error instanceof Error ? error.message : String(error)}`);
+    completion = 'retryable_failure';
+  }
+
+  if ((payload.mode ?? 'async') === 'async') {
+    if (!Number.isInteger(payload.newLastProcessedIndex)) throw new Error('async live worker requires newLastProcessedIndex');
+    const newLastProcessedIndex = payload.newLastProcessedIndex as number;
+    if (cursorShouldAdvance(completion)) {
+      const state = advanceSyncStateCursor(payload.cwd, payload.sessionId, newLastProcessedIndex, log);
+      log(`Updated state: lastProcessedIndex=${state.lastProcessedIndex}`);
+    } else {
+      markConversationForRetryRotation(
+        payload.cwd,
+        payload.sessionId,
+        payload.conversationId,
+        newLastProcessedIndex,
+        log,
+      );
+      log(`Held state cursor at current index because batch ${payload.batchId} is retryable; armed live-conversation recovery marker for a later pass after overlap grace.`);
     }
+  }
 
-    const payload: LiveWorkerPayload = JSON.parse(fs.readFileSync(payloadFile, 'utf-8'));
-    log(`Loaded payload for session ${payload.sessionId}`);
+  try { fs.unlinkSync(payloadFile); } catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
+  log('Cleaned up payload file');
+  log('Native live worker completed successfully');
+}
 
-    let completion: 'completed' | 'retryable_failure';
-    try {
-      completion = await sendViaNativeClient(payload);
-    } catch (error) {
-      log(`Native live turn failed before trusted batch completion: ${error instanceof Error ? error.message : String(error)}`);
-      completion = 'retryable_failure';
-    }
-
-    if ((payload.mode ?? 'async') === 'async') {
-      if (!Number.isInteger(payload.newLastProcessedIndex)) throw new Error('async live worker requires newLastProcessedIndex');
-      const newLastProcessedIndex = payload.newLastProcessedIndex as number;
-      if (cursorShouldAdvance(completion)) {
-        const state = advanceSyncStateCursor(payload.cwd, payload.sessionId, newLastProcessedIndex, log);
-        log(`Updated state: lastProcessedIndex=${state.lastProcessedIndex}`);
-      } else {
-        markConversationForRetryRotation(
-          payload.cwd,
-          payload.sessionId,
-          payload.conversationId,
-          newLastProcessedIndex,
-          log,
-        );
-        log(`Held state cursor at current index because batch ${payload.batchId} is retryable; armed live-conversation recovery marker for a later pass after overlap grace.`);
-      }
-    }
-
-    fs.unlinkSync(payloadFile);
-    log('Cleaned up payload file');
-    log('Native live worker completed successfully');
+async function main(): Promise<void> {
+  const payloadFile = process.argv[2];
+  try {
+    await runNativeWorkerPayloadFile(payloadFile);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     log(`ERROR: ${errorMessage}`);
@@ -343,4 +363,5 @@ async function main(): Promise<void> {
   }
 }
 
-main();
+const invokedAsMain = Boolean(process.argv[1]) && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedAsMain) void main();

@@ -136,6 +136,28 @@ export function partitionPendingSubconWhispersForTurn(
   return { deliverable, deferredSync, staleSync };
 }
 
+export function retractPendingSyncWhisperForTurn(
+  cwd: string,
+  sessionId: string,
+  turnId: string,
+  whisperId?: string,
+): number {
+  if (!turnId) return 0;
+  const pending = readPendingSubconWhispers(cwd, sessionId);
+  let retracted = 0;
+  for (const item of pending) {
+    if (item.whisper.source !== 'sync' || item.whisper.turn_id !== turnId) continue;
+    if (whisperId && item.whisper.whisper_id !== whisperId) continue;
+    try {
+      fs.unlinkSync(item.file);
+      retracted += 1;
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+  return retracted;
+}
+
 export function acknowledgePendingSubconWhispers(items: PendingSubconWhisperFile[]): void {
   for (const item of items) {
     const marker = item.file.replace(/\.json$/, '.delivered');

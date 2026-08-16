@@ -309,3 +309,114 @@ describe('native Letta legacy backfill harness', () => {
     }]);
   });
 });
+
+import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
+
+describe('sync client-tool cross-round dependencies', () => {
+  it('defers a same-round deliver_whisper until a prior round memory_search has completed', async () => {
+    const client = fakeClient([
+      {
+        messages: [{
+          message_type: 'approval_request_message',
+          tool_call: { name: 'deliver_whisper', arguments: '{"text":"premature"}', tool_call_id: 'whisper-1' },
+          tool_calls: [
+            { name: 'deliver_whisper', arguments: '{"text":"premature"}', tool_call_id: 'whisper-1' },
+            { name: 'memory_search', arguments: '{"query":"咖啡"}', tool_call_id: 'search-1' },
+          ],
+        }],
+        stop_reason: 'requires_approval',
+      },
+      {
+        messages: [{ message_type: 'approval_request_message', tool_call: { name: 'deliver_whisper', arguments: '{"text":"grounded"}', tool_call_id: 'whisper-2' } }],
+        stop_reason: 'requires_approval',
+      },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+    const searches: unknown[] = [];
+    const whispers: string[] = [];
+    const result = await runNativeClientToolConversation({
+      client,
+      agentId: 'agent-test',
+      conversationId: 'conv-test',
+      message: '咖啡',
+      tools: [
+        {
+          name: 'memory_search', description: 'search', parameters: {},
+          async execute(_id, args) { searches.push(args); return { results: [{ summary: 'remembered' }] }; },
+        },
+        {
+          name: 'deliver_whisper', description: 'whisper', parameters: {},
+          async execute(_id, args) { whispers.push((args as any).text); return { status: 'ok' }; },
+        },
+      ],
+      requiredClientToolNames: ['memory_search'],
+      clientToolRoundGate: syncClientToolRoundGate,
+    });
+
+    expect(searches).toEqual([{ query: '咖啡' }]);
+    expect(whispers).toEqual(['grounded']);
+    expect(result.clientToolFailure).toBe(false);
+    expect(client.bodies[1].messages[0].tool_returns[0]).toEqual(expect.objectContaining({
+      tool_call_id: 'whisper-1', status: 'success',
+    }));
+    expect(JSON.parse(client.bodies[1].messages[0].tool_returns[0].tool_return)).toEqual(expect.objectContaining({ status: 'deferred' }));
+  });
+
+  it('defers same-round memory_search so the query can use the current foreground entity result', async () => {
+    const client = fakeClient([
+      {
+        messages: [{
+          message_type: 'approval_request_message',
+          tool_call: { name: 'memory_search', arguments: '{"query":"晴"}', tool_call_id: 'search-1' },
+          tool_calls: [
+            { name: 'memory_search', arguments: '{"query":"晴"}', tool_call_id: 'search-1' },
+            { name: 'entity_search', arguments: '{"query":"晴","purpose":"foreground_grounding"}', tool_call_id: 'entity-1' },
+          ],
+        }],
+        stop_reason: 'requires_approval',
+      },
+      {
+        messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"GPT ChatGPT 晴"}', tool_call_id: 'search-2' } }],
+        stop_reason: 'requires_approval',
+      },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+    const order: string[] = [];
+    const result = await runNativeClientToolConversation({
+      client,
+      agentId: 'agent-test',
+      conversationId: 'conv-test',
+      message: '晴是谁',
+      tools: [
+        {
+          name: 'memory_search', description: 'search', parameters: {},
+          async execute() { order.push('memory_search'); return { results: [] }; },
+        },
+        {
+          name: 'entity_search', description: 'entity', parameters: {},
+          async execute() { order.push('entity_search'); return { results: [{ canonical_name: '晴' }] }; },
+        },
+      ],
+      requiredClientToolNames: ['memory_search'],
+      clientToolRoundGate: syncClientToolRoundGate,
+    });
+
+    expect(order).toEqual(['entity_search', 'memory_search']);
+    expect(result.clientToolFailure).toBe(false);
+    expect(JSON.parse(client.bodies[1].messages[0].tool_returns[0].tool_return)).toEqual(expect.objectContaining({ status: 'deferred' }));
+  });
+  it('does not let an older unrelated entity_search unlock a new same-round foreground grounding dependency', async () => {
+    const gate = syncClientToolRoundGate;
+    const requests = [
+      { name: 'memory_search', arguments: '{"query":"晴"}', toolCallId: 'search-now' },
+      { name: 'entity_search', arguments: '{"query":"晴","purpose":"foreground_grounding"}', toolCallId: 'entity-now' },
+    ];
+    expect(gate({
+      request: requests[0],
+      round: 3,
+      completedBeforeRound: new Set(['entity_search']),
+      batchRequests: requests,
+    })).toContain('deferred');
+  });
+
+});

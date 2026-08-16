@@ -83,13 +83,22 @@ export async function ensureLegacyCompletionTool(
   return { toolId: tool.id, rulesChanged, attached: !attached };
 }
 
-interface ToolCall {
+export interface NativeClientToolRequest {
   name: string;
   arguments: unknown;
   toolCallId: string;
 }
 
-function normalizeToolCall(value: any): ToolCall | null {
+export interface ClientToolRoundGateContext {
+  request: NativeClientToolRequest;
+  round: number;
+  completedBeforeRound: ReadonlySet<string>;
+  batchRequests: readonly NativeClientToolRequest[];
+}
+
+export type ClientToolRoundGate = (context: ClientToolRoundGateContext) => string | undefined;
+
+function normalizeToolCall(value: any): NativeClientToolRequest | null {
   if (!value) return null;
   const fn = value.function ?? value;
   const name = typeof fn?.name === 'string' ? fn.name : typeof value?.name === 'string' ? value.name : '';
@@ -104,8 +113,8 @@ function normalizeToolCall(value: any): ToolCall | null {
   return { name, arguments: fn?.arguments ?? value?.arguments ?? {}, toolCallId };
 }
 
-export function extractToolCalls(messages: readonly any[] = []): ToolCall[] {
-  const calls: ToolCall[] = [];
+export function extractToolCalls(messages: readonly any[] = []): NativeClientToolRequest[] {
+  const calls: NativeClientToolRequest[] = [];
   for (const message of messages) {
     if (message?.tool_call) {
       const call = normalizeToolCall(message.tool_call);
@@ -134,8 +143,8 @@ export function extractLegacyCompletion(messages: readonly any[] = []): 'complet
   return unique[0];
 }
 
-function approvalRequests(messages: readonly any[] = []): ToolCall[] {
-  const result: ToolCall[] = [];
+function approvalRequests(messages: readonly any[] = []): NativeClientToolRequest[] {
+  const result: NativeClientToolRequest[] = [];
   const seen = new Set<string>();
   for (const message of messages) {
     if (message?.message_type !== 'approval_request_message' && message?.type !== 'approval_request_message') continue;
@@ -237,11 +246,13 @@ export async function runNativeClientToolConversation(input: {
   tools: readonly NativeClientTool[];
   requiredClientToolNames?: readonly string[];
   continuationBusyRetry?: ContinuationBusyRetryPolicy;
+  clientToolRoundGate?: ClientToolRoundGate;
 }): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
   const requiredClientToolNames = new Set(input.requiredClientToolNames ?? []);
   const completedRequiredClientTools = new Set<string>();
+  const completedClientTools = new Set<string>();
   let clientToolFailure = false;
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
   let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
@@ -274,13 +285,25 @@ export async function runNativeClientToolConversation(input: {
     }
 
     const approvals: any[] = [];
+    const completedBeforeRound = new Set(completedClientTools);
     for (const request of requests) {
       const tool = tools.get(request.name);
       if (!tool) throw new Error(`Letta requested unknown client tool: ${request.name}`);
+      const deferReason = input.clientToolRoundGate?.({ request, round, completedBeforeRound, batchRequests: requests });
+      if (deferReason) {
+        approvals.push({
+          type: 'tool',
+          tool_call_id: request.toolCallId,
+          tool_return: toolReturn({ status: 'deferred', reason: deferReason }),
+          status: 'success',
+        });
+        continue;
+      }
       let status: 'success' | 'error' = 'success';
       let result: string;
       try {
         result = toolReturn(await tool.execute(request.toolCallId, parseToolArguments(request.arguments)));
+        completedClientTools.add(request.name);
         if (requiredClientToolNames.has(request.name)) completedRequiredClientTools.add(request.name);
       } catch (error) {
         status = 'error';

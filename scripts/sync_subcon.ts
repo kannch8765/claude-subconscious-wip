@@ -14,9 +14,15 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn, type ChildProcess } from 'child_process';
 import { fileURLToPath } from 'url';
-import { getConfiguredAgentIdReadOnly, getCanonicalManagedAgentSurface } from './agent_config.js';
-import { buildLettaApiUrl } from './letta_api_url.js';
-import { createConversation, escapeXmlContent, getTempStateDir } from './conversation_utils.js';
+import { escapeXmlContent, getTempStateDir } from './conversation_utils.js';
+import {
+  cancelAndDeferSyncResources,
+  cleanupCompletedSyncResources,
+  createSyncConversation,
+  createToolStrippedSyncAgent,
+  cleanupOrDeferSyncAgentResources,
+  reapDeferredSyncResources,
+} from './sync_letta_resources.js';
 import { removePendingSubconWhisper } from './subcon_whisper_queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -114,8 +120,6 @@ function wait(ms: number): Promise<void> {
 }
 
 const ABORT_CANCEL_GRACE_MS = 750;
-const DEFERRED_CLEANUP_MIN_AGE_MS = 5 * 60_000;
-const DEFERRED_CLEANUP_PREFIX = 'sync-conversation-cleanup-';
 
 function childExited(child: ChildProcess): boolean {
   return child.exitCode !== null || child.signalCode !== null;
@@ -135,141 +139,62 @@ async function stopChild(child: ChildProcess): Promise<void> {
   await waitForChildExit(child, 500);
 }
 
-async function cancelConversation(apiKey: string, conversationId: string): Promise<number | null> {
-  try {
-    const response = await fetch(buildLettaApiUrl(`/conversations/${encodeURIComponent(conversationId)}/cancel`), {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(750),
-    });
-    if (!response.ok) await response.text();
-    return response.status;
-  } catch {
-    return null;
-  }
-}
-
-async function deleteConversation(apiKey: string, conversationId: string): Promise<boolean> {
-  try {
-    const response = await fetch(buildLettaApiUrl(`/conversations/${encodeURIComponent(conversationId)}`), {
-      method: 'DELETE',
-      headers: { 'Authorization': `Bearer ${apiKey}` },
-      signal: AbortSignal.timeout(2_000),
-    });
-    if (!response.ok && response.status !== 404) await response.text();
-    return response.ok || response.status === 404;
-  } catch {
-    return false;
-  }
-}
-
-interface DeferredConversationCleanup {
-  conversation_id: string;
-  recorded_at: string;
-}
-
-function deferredCleanupFile(conversationId: string): string {
-  const digest = crypto.createHash('sha256').update(conversationId).digest('hex').slice(0, 24);
-  return path.join(TEMP_STATE_DIR, `${DEFERRED_CLEANUP_PREFIX}${digest}.json`);
-}
-
-function deferConversationCleanup(conversationId: string): void {
-  const file = deferredCleanupFile(conversationId);
-  const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  const record: DeferredConversationCleanup = { conversation_id: conversationId, recorded_at: new Date().toISOString() };
-  fs.writeFileSync(temp, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-  try { fs.renameSync(temp, file); }
-  catch (error) {
-    try { fs.unlinkSync(temp); } catch {}
-    if (!fs.existsSync(file)) throw error;
-  }
-}
-
-async function reapDeferredConversationCleanups(apiKey: string): Promise<void> {
-  if (!fs.existsSync(TEMP_STATE_DIR)) return;
-  const now = Date.now();
-  const files = fs.readdirSync(TEMP_STATE_DIR)
-    .filter((name) => name.startsWith(DEFERRED_CLEANUP_PREFIX) && name.endsWith('.json'))
-    .sort()
-    .slice(0, 1);
-  for (const name of files) {
-    const file = path.join(TEMP_STATE_DIR, name);
-    let record: DeferredConversationCleanup;
-    try { record = JSON.parse(fs.readFileSync(file, 'utf8')) as DeferredConversationCleanup; }
-    catch { continue; }
-    const recordedAt = Date.parse(record.recorded_at);
-    if (!record.conversation_id || !Number.isFinite(recordedAt) || now - recordedAt < DEFERRED_CLEANUP_MIN_AGE_MS) continue;
-    // Letta 0.16.8 can keep a disconnected streaming task shielded server-side.
-    // If a run is still active, cancel it and restart the grace clock; deleting
-    // the conversation in the same pass would recreate the original race.
-    const cancelStatus = await cancelConversation(apiKey, record.conversation_id);
-    if (cancelStatus === 200) {
-      deferConversationCleanup(record.conversation_id);
-      continue;
-    }
-    if (cancelStatus === null) continue;
-    // 409 means no active run; 404 means the conversation is already gone.
-    if (cancelStatus === 404 || await deleteConversation(apiKey, record.conversation_id)) {
-      try { fs.unlinkSync(file); } catch {}
-    }
-  }
-}
-
 async function main(): Promise<void> {
   const input = cleanInput(JSON.parse(await readStdin()));
-  const timeoutMs = input.timeout_ms ?? 8_000;
+  const timeoutMs = input.timeout_ms ?? 20_000;
   const apiKey = process.env.LETTA_API_KEY;
+  const deadline = Date.now() + timeoutMs;
   if (!apiKey) throw new Error('LETTA_API_KEY is required for sync Subcon mode');
   fs.mkdirSync(TEMP_STATE_DIR, { recursive: true });
-  await reapDeferredConversationCleanups(apiKey);
-  const agentId = getConfiguredAgentIdReadOnly();
-  const isolatedBlockLabels = getCanonicalManagedAgentSurface().blocks.map((block) => block.label);
-  const conversationId = await createConversation(apiKey, agentId, undefined, { isolatedBlockLabels });
+
   const batchId = syncBatchId(input);
   const nonce = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const payloadFile = path.join(TEMP_STATE_DIR, `sync-payload-${nonce}.json`);
   const checkpointFile = path.join(TEMP_STATE_DIR, `sync-checkpoint-${nonce}.json`);
   const workerScript = path.join(__dirname, 'send_worker_native.ts');
   const tsxCli = path.join(PLUGIN_ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  let syncAgentId: string | null = null;
+  let syncBlockIds: string[] = [];
+  let conversationId: string | null = null;
   let child: ChildProcess | null = null;
   let aborting = false;
+  let setupSettledResolve!: () => void;
+  const setupSettled = new Promise<void>((resolve) => { setupSettledResolve = resolve; });
+  let setupMarkedSettled = false;
+  const markSetupSettled = (): void => {
+    if (setupMarkedSettled) return;
+    setupMarkedSettled = true;
+    setupSettledResolve();
+  };
 
   const cleanupAbortedSync = async (): Promise<void> => {
-    // Cancel the server-side Letta run before severing the local stream. Letta
-    // 0.16.8 shields disconnected streaming tasks, so a local child exit is not
-    // strong enough proof that the server task has finished using its conversation.
-    const workerWasStarted = child !== null;
-    if (child) {
-      // A local stream/process may already have exited while Letta's shielded
-      // server-side task is still alive, so cancellation is required regardless
-      // of the local child state once a worker was started.
-      await cancelConversation(apiKey, conversationId);
-      if (!childExited(child) && !await waitForChildExit(child, ABORT_CANCEL_GRACE_MS)) {
-        await stopChild(child);
-      }
+    if (child && syncAgentId && conversationId) {
+      // Once streaming started, the server-side Letta run can outlive the local
+      // client stream. Cancel first and defer resource deletion; never delete a
+      // conversation underneath a shielded run.
+      await cancelAndDeferSyncResources(apiKey, conversationId, syncAgentId, syncBlockIds);
+      if (!childExited(child) && !await waitForChildExit(child, ABORT_CANCEL_GRACE_MS)) await stopChild(child);
+    } else if (conversationId && syncAgentId) {
+      // Setup failed before the worker existed: no run can reference these
+      // ephemeral resources, so immediate deletion is safe.
+      await cleanupCompletedSyncResources(apiKey, conversationId, syncAgentId, syncBlockIds);
+    } else if (syncAgentId) {
+      await cleanupOrDeferSyncAgentResources(apiKey, syncAgentId, syncBlockIds);
     }
     removePendingSubconWhisper(input.cwd, input.session_id, batchId);
     try { fs.unlinkSync(checkpointFile); } catch {}
     try { fs.unlinkSync(payloadFile); } catch {}
-    if (!workerWasStarted) {
-      // Setup failed before any streaming worker existed, so there is no
-      // server-side run that can still reference the ephemeral conversation.
-      await deleteConversation(apiKey, conversationId);
-    } else {
-      // Leave only an opaque 0600 cleanup receipt. A later sync pass re-cancels
-      // and reaps the ephemeral conversation after a quiet period; no user text,
-      // tool result, or credential is persisted here.
-      deferConversationCleanup(conversationId);
-    }
   };
 
   const abortOnSignal = (signal: NodeJS.Signals): void => {
     if (aborting) return;
     aborting = true;
     void (async () => {
+      // Handlers are installed before any Letta create request. Creation calls
+      // are bounded; give an in-flight setup request a chance to publish its ids
+      // so cleanup can reclaim them instead of exiting in the ownership gap.
+      await Promise.race([setupSettled, wait(6_500)]);
       await cleanupAbortedSync();
-      // Cancellation is fail-open for the caller. The process was explicitly
-      // asked to stop, so do not leave a sync conversation or scoped whisper.
       process.exit(signal === 'SIGTERM' ? 143 : 130);
     })();
   };
@@ -278,10 +203,28 @@ async function main(): Promise<void> {
 
   try {
     if (!fs.existsSync(tsxCli)) throw new Error(`tsx runtime missing: ${tsxCli}`);
+    await reapDeferredSyncResources(apiKey);
+    const sibling = await createToolStrippedSyncAgent(apiKey, batchId);
+    syncAgentId = sibling.syncAgentId;
+    syncBlockIds = sibling.syncBlockIds;
+    if (aborting) {
+      markSetupSettled();
+      return;
+    }
+    conversationId = await createSyncConversation(apiKey, syncAgentId);
+    markSetupSettled();
+    if (aborting) return;
+    if (Date.now() >= deadline) {
+      await cleanupAbortedSync();
+      emit('timeout');
+      return;
+    }
 
     const payload = {
       mode: 'sync',
-      agentId,
+      agentId: syncAgentId,
+      syncAgentId,
+      syncBlockIds,
       conversationId,
       sessionId: input.session_id,
       message: syncMessage(input),
@@ -292,7 +235,7 @@ async function main(): Promise<void> {
       latestUserMessage: input.prompt,
       syncCheckpointFile: checkpointFile,
       syncTurnId: input.turn_id,
-      deleteConversationOnFinish: true,
+      cleanupSyncResourcesOnFinish: true,
     };
     fs.writeFileSync(payloadFile, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
 
@@ -302,32 +245,28 @@ async function main(): Promise<void> {
       stdio: 'ignore',
     });
 
-    const started = Date.now();
-    while (Date.now() - started < timeoutMs) {
+    while (Date.now() < deadline) {
       const state = checkpoint(checkpointFile);
       if (state) {
         if (state.status === 'failed') {
-          // A failed streaming run may still be unwinding server-side after the
-          // client receives its error. Let the wrapper cancel/reap it instead of
-          // allowing the worker to delete the conversation underneath that task.
           await cleanupAbortedSync();
         } else {
           try { fs.unlinkSync(checkpointFile); } catch {}
         }
         emit(state.status, state.whisper_id ? { whisper_id: state.whisper_id } : {});
-        // On whisper the worker deliberately outlives this preflight and continues
-        // its Letta turn to end_turn. Failed runs are cancelled/reaped above.
+        // A successful whisper transfers cleanup ownership to the background
+        // worker. It continues to end_turn and reclaims/defer-reaps its sibling
+        // agent + conversation without blocking foreground Kohaku.
         process.exit(0);
       }
       if (child.exitCode !== null || child.signalCode !== null) {
         const finalState = checkpoint(checkpointFile);
         if (finalState) {
-          try { fs.unlinkSync(checkpointFile); } catch {}
+          if (finalState.status === 'failed') await cleanupAbortedSync();
+          else try { fs.unlinkSync(checkpointFile); } catch {}
           emit(finalState.status, finalState.whisper_id ? { whisper_id: finalState.whisper_id } : {});
           process.exit(0);
         }
-        // The worker died before publishing any terminal checkpoint. Reclaim
-        // every resource owned by this sync attempt before failing open.
         await cleanupAbortedSync();
         emit('failed');
         process.exit(0);
@@ -335,16 +274,14 @@ async function main(): Promise<void> {
       await wait(20);
     }
 
-    // Timeout is fail-open for foreground chat, but fail-closed for this sync
-    // delivery: cancel the server run, stop the local worker if needed, then
-    // remove its exact queue entry so a late whisper can never leak forward.
     await cleanupAbortedSync();
     emit('timeout');
   } catch (error) {
-    // Setup can fail after the ephemeral conversation exists (for example a
-    // missing runtime or spawn failure). Do not strand that conversation.
+    markSetupSettled();
     await cleanupAbortedSync();
     throw error;
+  } finally {
+    markSetupSettled();
   }
 }
 

@@ -239,7 +239,7 @@ export class RelationshipMemoryRuntime {
     }));
     let semantic = new Map<string, number>();
     if (this.semanticRetriever?.rankExisting) {
-      try { semantic = await this.semanticRetriever.rankExisting(documents.map((document) => document.id), semanticQuery); }
+      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery); }
       catch { semantic = new Map(); }
     }
     const scored = candidates.map(({ memory }, index) => {
@@ -331,7 +331,7 @@ export class RelationshipMemoryRuntime {
     }));
     let semantic = new Map<string, number>();
     if (this.semanticRetriever?.rankExisting) {
-      try { semantic = await this.semanticRetriever.rankExisting(documents.map((document) => document.id), semanticQuery); }
+      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery); }
       catch { semantic = new Map(); }
     }
     const scored = candidates.map((entity, index) => {

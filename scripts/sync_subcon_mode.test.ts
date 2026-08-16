@@ -42,7 +42,7 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(pretool).toContain(').deliverable');
   });
 
-  it('checkpoints only after the current-turn whisper is durably queued, then lets the worker continue', () => {
+  it('checkpoints after durable queueing and transfers post-release cleanup ownership to the worker', () => {
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
     const queued = worker.indexOf('const queued = queueSubconWhisper(');
     const checkpoint = worker.indexOf("writeSyncCheckpoint(payload, 'whisper'");
@@ -50,25 +50,27 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(queued).toBeGreaterThan(-1);
     expect(checkpoint).toBeGreaterThan(queued);
     expect(completion).toBeGreaterThan(checkpoint);
+    expect(worker).toContain('clientToolRoundGate: syncClientToolRoundGate');
+    expect(worker).toContain('Post-whisper sync failure cleanup deferred');
+    expect(worker).toContain('cancelAndDeferSyncResources');
+    expect(worker).toContain('cleanupCompletedSyncResources');
 
     const sync = fs.readFileSync(path.join(process.cwd(), 'scripts/sync_subcon.ts'), 'utf8');
-    expect(sync).toContain('getConfiguredAgentIdReadOnly');
-    expect(sync).not.toContain('getAgentId(apiKey)');
+    const resources = fs.readFileSync(path.join(process.cwd(), 'scripts/sync_letta_resources.ts'), 'utf8');
+    expect(sync).toContain('createToolStrippedSyncAgent');
     expect(sync).toContain("mode: 'sync'");
-    expect(sync).toContain('deleteConversationOnFinish: true');
+    expect(sync).toContain('cleanupSyncResourcesOnFinish: true');
     expect(sync).toContain('process.exit(0)');
-    expect(sync).toContain('await cancelConversation(apiKey, conversationId)');
+    expect(sync).toContain('cancelAndDeferSyncResources');
     expect(sync).toContain('await stopChild(child)');
-    expect(sync.indexOf('await cancelConversation(apiKey, conversationId)')).toBeLessThan(sync.indexOf('await stopChild(child)'));
-    expect(sync).toContain('deferConversationCleanup(conversationId)');
-    expect(sync).toContain('reapDeferredConversationCleanups(apiKey)');
-    expect(sync).toContain('DEFERRED_CLEANUP_MIN_AGE_MS = 5 * 60_000');
+    expect(sync.indexOf('cancelAndDeferSyncResources')).toBeLessThan(sync.indexOf('await stopChild(child)'));
+    expect(sync).toContain('reapDeferredSyncResources(apiKey)');
     expect(sync).toContain('removePendingSubconWhisper(input.cwd, input.session_id, batchId)');
     expect(sync).toContain("process.once('SIGTERM'");
-    expect(sync).toContain("if (state.status === 'failed')");
-    expect(sync).toContain('await cleanupAbortedSync()');
-    expect(sync).toContain('await deleteConversation(apiKey, conversationId)');
-    expect(worker).toContain('payload.deleteConversationOnFinish && turnSucceeded');
-    expect(worker).toContain('Leaving failed sync conversation');
+    expect(sync.indexOf("process.once('SIGTERM'")).toBeLessThan(sync.indexOf('createToolStrippedSyncAgent(apiKey, batchId)'));
+    expect(resources).toContain('getConfiguredAgentIdReadOnly');
+    expect(resources).toContain('tool_ids: []');
+    expect(resources).toContain('include_base_tools: false');
+    expect(resources).toContain("DEFERRED_CLEANUP_MIN_AGE_MS = 5 * 60_000");
   });
 });

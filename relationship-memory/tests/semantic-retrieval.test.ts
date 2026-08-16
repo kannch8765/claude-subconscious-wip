@@ -200,7 +200,7 @@ describe('relationship-memory semantic retrieval foundation', () => {
     const before = fs.readFileSync(indexFile, 'utf8');
     const documentCallsBefore = provider.documentCalls.length;
 
-    const scores = await retriever.rankExisting(['m1', 'missing'], 'foreground query');
+    const scores = await retriever.rankExisting([{ id: 'm1', text: 'Kyoto gift inclusion' }, { id: 'missing', text: 'missing current text' }], 'foreground query');
 
     expect(scores.get('m1')).toBeCloseTo(1);
     expect(scores.has('missing')).toBe(false);
@@ -209,15 +209,31 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(fs.readFileSync(indexFile, 'utf8')).toBe(before);
   });
 
+  it('rejects a cached vector when the same document id now has different authoritative text without re-embedding documents', async () => {
+    const root = temp('rm-semantic-stale-existing-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    await retriever.rank([{ id: 'm1', text: 'Kyoto gift inclusion' }], 'seed cache');
+    const documentCallsBefore = provider.documentCalls.length;
+    const queryCallsBefore = provider.queryCalls.length;
+
+    const scores = await retriever.rankExisting([{ id: 'm1', text: 'completely different corrected owner content' }], 'Kyoto gift');
+
+    expect(scores.has('m1')).toBe(false);
+    expect(provider.documentCalls).toHaveLength(documentCallsBefore);
+    expect(provider.queryCalls).toHaveLength(queryCallsBefore);
+  });
+
   it('uses existing-vector semantic recall when available and never calls the refresh-capable rank path', async () => {
     const root = temp('rm-semantic-sync-recall-');
     let refreshCalls = 0;
     let existingCalls = 0;
     const retriever: SemanticRetriever = {
       async rank() { refreshCalls += 1; throw new Error('foreground recall must not refresh documents'); },
-      async rankExisting(documentIds) {
+      async rankExisting(documents) {
         existingCalls += 1;
-        return new Map(documentIds.map((id) => [id, id.startsWith('memory:') ? 0.95 : 0]));
+        return new Map(documents.map((document) => [document.id, document.id.startsWith('memory:') ? 0.95 : 0]));
       },
     };
     const { runtime, memoryId } = seedRuntime(root, retriever);
@@ -277,9 +293,9 @@ describe('relationship-memory semantic retrieval foundation', () => {
     let existingCalls = 0;
     const retriever: SemanticRetriever = {
       async rank() { refreshCalls += 1; throw new Error('foreground entity recall must not refresh documents'); },
-      async rankExisting(documentIds) {
+      async rankExisting(documents) {
         existingCalls += 1;
-        return new Map(documentIds.map((id) => [id, id.startsWith('entity:') ? 0.97 : 0]));
+        return new Map(documents.map((document) => [document.id, document.id.startsWith('entity:') ? 0.97 : 0]));
       },
     };
     const { runtime, entityId } = seedRuntime(root, retriever);
