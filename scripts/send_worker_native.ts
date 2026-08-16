@@ -28,23 +28,57 @@ import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
 import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
 import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
+import { buildLettaApiUrl } from './letta_api_url.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
 const LOG_FILE = path.join(TEMP_STATE_DIR, 'send_worker_native.log');
 
+type LiveWorkerMode = 'async' | 'sync';
+
 interface LiveWorkerPayload {
+  mode?: LiveWorkerMode;
   agentId: string;
   conversationId: string;
   sessionId: string;
   message: string;
-  stateFile: string;
-  newLastProcessedIndex: number;
+  stateFile?: string;
+  newLastProcessedIndex?: number;
   cwd: string;
   batchId: string;
-  canonicalMessages: CanonicalMessage[];
-  assistantIntents: AssistantRememberIntentRecord[];
+  canonicalMessages?: CanonicalMessage[];
+  assistantIntents?: AssistantRememberIntentRecord[];
   latestUserMessage: string;
+  syncCheckpointFile?: string;
+  syncTurnId?: string;
+  deleteConversationOnFinish?: boolean;
+}
+
+type SyncCheckpointStatus = 'whisper' | 'no_whisper' | 'failed';
+
+function writeSyncCheckpoint(payload: LiveWorkerPayload, status: SyncCheckpointStatus, whisperId?: string): void {
+  if (payload.mode !== 'sync' || !payload.syncCheckpointFile) return;
+  if (fs.existsSync(payload.syncCheckpointFile)) return;
+  const dir = path.dirname(payload.syncCheckpointFile);
+  fs.mkdirSync(dir, { recursive: true });
+  const checkpoint = { status, ...(whisperId ? { whisper_id: whisperId } : {}), recorded_at: new Date().toISOString() };
+  const temp = `${payload.syncCheckpointFile}.${process.pid}.${Date.now()}.tmp`;
+  fs.writeFileSync(temp, `${JSON.stringify(checkpoint)}\n`, { mode: 0o600 });
+  try { fs.renameSync(temp, payload.syncCheckpointFile); }
+  catch (error) {
+    try { fs.unlinkSync(temp); } catch {}
+    if (!fs.existsSync(payload.syncCheckpointFile)) throw error;
+  }
+}
+
+async function deleteConversation(apiKey: string, conversationId: string): Promise<void> {
+  const response = await fetch(buildLettaApiUrl(`/conversations/${encodeURIComponent(conversationId)}`), {
+    method: 'DELETE',
+    headers: { 'Authorization': `Bearer ${apiKey}` },
+  });
+  if (!response.ok && response.status !== 404) {
+    throw new Error(`Failed to delete sync conversation: ${response.status} ${await response.text()}`);
+  }
 }
 
 function log(message: string): void {
@@ -55,19 +89,23 @@ function log(message: string): void {
 }
 
 async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'completed' | 'retryable_failure'> {
+  const mode: LiveWorkerMode = payload.mode ?? 'async';
+  const isSync = mode === 'sync';
   const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
   const assistantIntents = payload.assistantIntents ?? [];
-  const runtime = createRuntime(payload.canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
+  const canonicalMessages = payload.canonicalMessages ?? [];
+  const runtime = createRuntime(canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
 
-  const latest = [...runtime.store.listBatches()].reverse().find((item) => item.batch_id === payload.batchId);
-  if (latest?.status === 'completed') {
-    log(`Relationship-memory batch already durably completed: ${payload.batchId}`);
-    return 'completed';
+  if (!isSync) {
+    const latest = [...runtime.store.listBatches()].reverse().find((item) => item.batch_id === payload.batchId);
+    if (latest?.status === 'completed') {
+      log(`Relationship-memory batch already durably completed: ${payload.batchId}`);
+      return 'completed';
+    }
+    runtime.store.beginBatch(payload.batchId, new Date().toISOString());
   }
 
   const hasRealUserMessage = Boolean(payload.latestUserMessage?.trim());
-
-  runtime.store.beginBatch(payload.batchId, new Date().toISOString());
   let turnSucceeded = false;
 
   try {
@@ -76,7 +114,11 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     const client = createNativeLettaClient(apiKey);
 
     const entitySearchObservations: EntitySearchObservation[] = [];
-    const relationshipTools: NativeClientTool[] = buildRelationshipTools(runtime, payload.batchId).map((tool) => {
+    const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId);
+    const modeRelationshipTools = isSync
+      ? baseRelationshipTools.filter((tool) => ['memory_search', 'entity_search'].includes(tool.name))
+      : baseRelationshipTools;
+    const relationshipTools: NativeClientTool[] = modeRelationshipTools.map((tool) => {
       const execute = tool.execute.bind(tool);
       if (tool.name === 'entity_search') {
         const baseParameters = tool.parameters as any;
@@ -99,7 +141,9 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
             const rawArgs = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
             const purpose = rawArgs.purpose;
             const { purpose: _purpose, ...searchArgs } = rawArgs;
-            const result = await execute(toolCallId, searchArgs);
+            const result = isSync
+              ? { results: await runtime.entitySearchRecallHybrid(searchArgs as any) }
+              : await execute(toolCallId, searchArgs);
             entitySearchObservations.push({ purpose, query: searchArgs.query, result });
             return result;
           },
@@ -111,7 +155,13 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
           async execute(toolCallId: string, args: unknown) {
             const query = typeof (args as any)?.query === 'string' ? (args as any).query.trim() : '';
             log(`Model relationship memory_search: query=${JSON.stringify(query)}`);
-            return execute(toolCallId, args);
+            const startedAt = Date.now();
+            const result = isSync
+              ? { results: await runtime.memorySearchRecallHybrid((args ?? {}) as any) }
+              : await execute(toolCallId, args);
+            const resultCount = Array.isArray((result as any)?.results) ? (result as any).results.length : undefined;
+            log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${resultCount ?? 'unknown'}`);
+            return result;
           },
         };
       }
@@ -127,7 +177,9 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     let whisperDelivered = false;
     relationshipTools.push({
       name: 'deliver_whisper',
-      description: 'Deliver at most one concise subconscious memory whisper for foreground Kohaku on a later sync. Include only useful remembered context or association; never include search/storage/tool bookkeeping. Do not call when nothing is meaningfully useful.',
+      description: isSync
+        ? 'Deliver at most one concise subconscious memory whisper for the current foreground Kohaku turn. Include only useful remembered context or association; never include search/storage/tool bookkeeping. Do not call when nothing is meaningfully useful.'
+        : 'Deliver at most one concise subconscious memory whisper for foreground Kohaku on a later sync. Include only useful remembered context or association; never include search/storage/tool bookkeeping. Do not call when nothing is meaningfully useful.',
       parameters: {
         type: 'object', additionalProperties: false, required: ['text'],
         properties: { text: { type: 'string', minLength: 1, maxLength: 1200 } },
@@ -137,14 +189,19 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
         const text = typeof (args as any)?.text === 'string' ? (args as any).text.trim() : '';
         if (!text) throw new Error('deliver_whisper.text must be non-empty');
         const groundedText = composeGroundedWhisper(text, foregroundGroundingIdentityAnchors(entitySearchObservations));
-        const queued = queueSubconWhisper(payload.cwd, payload.sessionId, payload.batchId, groundedText);
+        if (isSync && !payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
+        const queued = queueSubconWhisper(
+          payload.cwd, payload.sessionId, payload.batchId, groundedText,
+          isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
+        );
         whisperDelivered = true;
         log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
+        if (isSync) writeSyncCheckpoint(payload, 'whisper', queued?.whisper_id);
         return { status: 'ok', whisper_id: queued?.whisper_id };
       },
     });
 
-    const durableAssistantIntents = assistantIntents.map((intent) => {
+    const durableAssistantIntents = isSync ? [] : assistantIntents.map((intent) => {
       const stored = runtime.store.getAssistantIntent(intent.intent_id);
       if (!stored || stableJson(stored) !== stableJson(intent)) {
         throw new Error(`Trusted assistant intent payload/store mismatch: ${intent.intent_id}`);
@@ -152,46 +209,77 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
       return stored;
     });
 
-    const liveMessage = appendTrustedRelationshipCatalog(
-      payload.message,
-      payload.canonicalMessages,
-      durableAssistantIntents,
-    );
+    const liveMessage = isSync
+      ? payload.message
+      : appendTrustedRelationshipCatalog(payload.message, canonicalMessages, durableAssistantIntents);
 
     log(`Starting native live Subconscious turn for conversation ${payload.conversationId}`);
     log(`  agent: ${payload.agentId}`);
     log(`  relationship client tools: ${relationshipTools.map((tool) => tool.name).join(', ')}`);
 
-    const stdioMcp = await openStdioMcpToolsFromEnvironment(log);
-    const nativeToolNames = new Set(relationshipTools.map((tool) => tool.name));
-    const mcpTools = stdioMcp.tools.filter((tool) => {
-      if (!nativeToolNames.has(tool.name)) return true;
-      log(`Ignoring colliding stdio MCP tool name: ${tool.name}`);
-      return false;
-    });
-    const liveTools = [...relationshipTools, ...mcpTools];
-    log(`  stdio MCP client tools: ${mcpTools.map((tool) => tool.name).join(', ') || '(none)'}`);
-
     let result;
-    try {
+    if (isSync) {
+      // Sync mode is intentionally relationship-recall-only. The existing async
+      // lane remains the sole owner of canonical memory mutation and optional
+      // external MCP side effects, avoiding duplicate maintenance for one user turn.
+      log('  stdio MCP client tools: (disabled in sync mode)');
       result = await runNativeClientToolConversation({
         client,
         agentId: payload.agentId,
         conversationId: payload.conversationId,
         message: liveMessage,
-        tools: liveTools,
+        tools: relationshipTools,
         requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
+        continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 },
       });
-    } finally {
-      await stdioMcp.close();
+    } else {
+      const stdioMcp = await openStdioMcpToolsFromEnvironment(log);
+      const nativeToolNames = new Set(relationshipTools.map((tool) => tool.name));
+      const mcpTools = stdioMcp.tools.filter((tool) => {
+        if (!nativeToolNames.has(tool.name)) return true;
+        log(`Ignoring colliding stdio MCP tool name: ${tool.name}`);
+        return false;
+      });
+      const liveTools = [...relationshipTools, ...mcpTools];
+      log(`  stdio MCP client tools: ${mcpTools.map((tool) => tool.name).join(', ') || '(none)'}`);
+      try {
+        result = await runNativeClientToolConversation({
+          client,
+          agentId: payload.agentId,
+          conversationId: payload.conversationId,
+          message: liveMessage,
+          tools: liveTools,
+          requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
+        });
+      } finally {
+        await stdioMcp.close();
+      }
     }
     turnSucceeded = !result.clientToolFailure;
     const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';
-    log(`Native live turn complete: success=${turnSucceeded}, stop_reason=${stopReason}`);
+    log(`Native live turn complete: mode=${mode}, success=${turnSucceeded}, stop_reason=${stopReason}`);
     if (result.clientToolFailure) log('Native live turn contained at least one failed client-tool execution');
+    if (isSync && !whisperDelivered) writeSyncCheckpoint(payload, 'no_whisper');
   } catch (error) {
     turnSucceeded = false;
     log(`Live Subconscious native-client failure: ${error instanceof Error ? error.message : String(error)}`);
+    if (isSync) writeSyncCheckpoint(payload, 'failed');
+  }
+
+  if (isSync) {
+    if (payload.deleteConversationOnFinish && turnSucceeded) {
+      const apiKey = process.env.LETTA_API_KEY;
+      if (apiKey) {
+        try { await deleteConversation(apiKey, payload.conversationId); }
+        catch (error) { log(`Failed to clean up sync conversation ${payload.conversationId}: ${error instanceof Error ? error.message : String(error)}`); }
+      }
+    } else if (!turnSucceeded) {
+      // The foreground wrapper owns failed-run cancellation. Deleting here can
+      // race Letta 0.16.8's shielded streaming task after the client sees an
+      // execution error, causing server-side NoResultFound on the conversation.
+      log(`Leaving failed sync conversation ${payload.conversationId} for wrapper cancellation cleanup`);
+    }
+    return turnSucceeded ? 'completed' : 'retryable_failure';
   }
 
   const completion = runtime.store.withMutationBoundary(() => runtime.finalizeBatch(payload.batchId, turnSucceeded));
@@ -226,18 +314,22 @@ async function main(): Promise<void> {
       completion = 'retryable_failure';
     }
 
-    if (cursorShouldAdvance(completion)) {
-      const state = advanceSyncStateCursor(payload.cwd, payload.sessionId, payload.newLastProcessedIndex, log);
-      log(`Updated state: lastProcessedIndex=${state.lastProcessedIndex}`);
-    } else {
-      markConversationForRetryRotation(
-        payload.cwd,
-        payload.sessionId,
-        payload.conversationId,
-        payload.newLastProcessedIndex,
-        log,
-      );
-      log(`Held state cursor at current index because batch ${payload.batchId} is retryable; armed live-conversation recovery marker for a later pass after overlap grace.`);
+    if ((payload.mode ?? 'async') === 'async') {
+      if (!Number.isInteger(payload.newLastProcessedIndex)) throw new Error('async live worker requires newLastProcessedIndex');
+      const newLastProcessedIndex = payload.newLastProcessedIndex as number;
+      if (cursorShouldAdvance(completion)) {
+        const state = advanceSyncStateCursor(payload.cwd, payload.sessionId, newLastProcessedIndex, log);
+        log(`Updated state: lastProcessedIndex=${state.lastProcessedIndex}`);
+      } else {
+        markConversationForRetryRotation(
+          payload.cwd,
+          payload.sessionId,
+          payload.conversationId,
+          newLastProcessedIndex,
+          log,
+        );
+        log(`Held state cursor at current index because batch ${payload.batchId} is retryable; armed live-conversation recovery marker for a later pass after overlap grace.`);
+      }
     }
 
     fs.unlinkSync(payloadFile);

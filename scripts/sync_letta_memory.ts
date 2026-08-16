@@ -17,10 +17,11 @@
  *   2 - Blocking error (prevents prompt processing)
  */
 
+import * as fs from 'fs';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
-import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import {
   loadSyncState,
   saveSyncState,
@@ -50,6 +51,7 @@ interface HookInput {
   cwd: string;
   prompt?: string;  // User's prompt text (available on UserPromptSubmit)
   transcript_path?: string;  // Path to transcript JSONL
+  hook_event_name?: string;
 }
 
 
@@ -82,6 +84,20 @@ async function readHookInput(): Promise<HookInput | null> {
       rl.close();
     }, 100);
   });
+}
+
+function expectedSyncTurnId(hookInput: HookInput | null): string | undefined {
+  const isUserPrompt = hookInput?.hook_event_name === 'UserPromptSubmit' || typeof hookInput?.prompt === 'string';
+  if (!isUserPrompt) return undefined;
+  const marker = process.env.SUBCON_SYNC_EXPECTED_TURN_FILE;
+  if (!marker) return undefined;
+  try {
+    const turnId = fs.readFileSync(marker, 'utf8').trim();
+    try { fs.unlinkSync(marker); } catch {}
+    return turnId || undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -179,7 +195,11 @@ async function main(): Promise<void> {
     const hookInput = await readHookInput();
     const cwd = hookInput?.cwd || projectDir;
     const sessionId = hookInput?.session_id;
-    const pendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
+    const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
+    const expectedTurnId = expectedSyncTurnId(hookInput);
+    const partitioned = partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId);
+    const pendingWhispers = partitioned.deliverable;
+    const staleSyncWhispers = partitioned.staleSync;
 
     // Whisper mode is a local transport only: background Subcon explicitly wrote
     // deliver_whisper payloads into the durable queue. Do not contact Letta, fetch
@@ -192,6 +212,7 @@ async function main(): Promise<void> {
       }
       if (injectionPayload) console.log(injectionPayload);
       if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
+      if (staleSyncWhispers.length > 0) acknowledgePendingSubconWhispers(staleSyncWhispers);
       return;
     }
 
@@ -239,6 +260,7 @@ async function main(): Promise<void> {
     }
     if (injectionPayload) console.log(injectionPayload);
     if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
+    if (staleSyncWhispers.length > 0) acknowledgePendingSubconWhispers(staleSyncWhispers);
     if (state && sessionId) saveSyncState(cwd, state);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

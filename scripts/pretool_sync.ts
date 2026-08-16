@@ -17,7 +17,7 @@
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
-import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
 import {
   loadSyncState,
@@ -191,7 +191,12 @@ async function main(): Promise<void> {
     // Load state
     const state = loadSyncState(hookInput.cwd, hookInput.session_id);
     
-    const pendingWhispers = readPendingSubconWhispers(hookInput.cwd, hookInput.session_id);
+    // Sync-scoped whispers are exclusively consumed by the matching
+    // UserPromptSubmit hook. PreToolUse continues to surface only legacy/async
+    // queue entries, preserving the existing mid-turn async behavior.
+    const pendingWhispers = partitionPendingSubconWhispersForTurn(
+      readPendingSubconWhispers(hookInput.cwd, hookInput.session_id),
+    ).deliverable;
     let agent: Agent | null = null;
     let changedBlocks: MemoryBlock[] = [];
 

@@ -190,6 +190,58 @@ describe('native Letta legacy backfill harness', () => {
     expect(client.bodies[1].messages).toEqual([{ type: 'tool_return', tool_returns: [{ type: 'tool', tool_call_id: 'call-1', tool_return: '{"results":[]}', status: 'success' }] }]);
   });
 
+  it('optionally retries only the transient same-conversation 409 before sending one tool return', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"京都"}', tool_call_id: 'call-busy' } }], stop_reason: 'requires_approval' },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+    const originalCreate = client.conversations.messages.create.bind(client.conversations.messages);
+    let continuationCalls = 0;
+    client.conversations.messages.create = async (conversationId, body) => {
+      if ((body.messages as any[])?.[0]?.type === 'tool_return') {
+        continuationCalls += 1;
+        if (continuationCalls === 1) {
+          throw new Error('409 {"detail":"CONFLICT: Cannot send a new message: Another request is currently being processed for this conversation."}');
+        }
+      }
+      return originalCreate(conversationId, body);
+    };
+    let toolCalls = 0;
+    const result = await runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{
+        name: 'memory_search', description: 'search', parameters: {},
+        async execute() { toolCalls += 1; return { results: [] }; },
+      }],
+      requiredClientToolNames: ['memory_search'],
+      continuationBusyRetry: { maxWaitMs: 50, intervalMs: 1 },
+    });
+    expect(result.clientToolFailure).toBe(false);
+    expect(toolCalls).toBe(1);
+    expect(continuationCalls).toBe(2);
+  });
+
+  it('does not retry an unrelated 409 even when continuation busy retry is enabled', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"京都"}', tool_call_id: 'call-other-409' } }], stop_reason: 'requires_approval' },
+    ]);
+    const originalCreate = client.conversations.messages.create.bind(client.conversations.messages);
+    let continuationCalls = 0;
+    client.conversations.messages.create = async (conversationId, body) => {
+      if ((body.messages as any[])?.[0]?.type === 'tool_return') {
+        continuationCalls += 1;
+        throw new Error('409 {"detail":"some other conflict"}');
+      }
+      return originalCreate(conversationId, body);
+    };
+    await expect(runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { return { results: [] }; } }],
+      continuationBusyRetry: { maxWaitMs: 50, intervalMs: 1 },
+    })).rejects.toThrow('some other conflict');
+    expect(continuationCalls).toBe(1);
+  });
+
   it('executes every parallel approval_request tool_calls entry exactly once', async () => {
     const parallelCalls = [
       { name: 'memory_search', arguments: '{"query":"A"}', tool_call_id: 'call-a' },

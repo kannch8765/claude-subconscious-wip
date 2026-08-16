@@ -190,6 +190,105 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(fs.existsSync(`${indexFile}.lock`)).toBe(false);
   });
 
+  it('ranks only existing cached vectors for foreground recall without refreshing document embeddings', async () => {
+    const root = temp('rm-semantic-existing-only-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }, { id: 'm2', text: 'ramen preference' }];
+    await retriever.rank(docs, 'seed cache');
+    const before = fs.readFileSync(indexFile, 'utf8');
+    const documentCallsBefore = provider.documentCalls.length;
+
+    const scores = await retriever.rankExisting(['m1', 'missing'], 'foreground query');
+
+    expect(scores.get('m1')).toBeCloseTo(1);
+    expect(scores.has('missing')).toBe(false);
+    expect(provider.documentCalls).toHaveLength(documentCallsBefore);
+    expect(provider.queryCalls.at(-1)).toBe('foreground query');
+    expect(fs.readFileSync(indexFile, 'utf8')).toBe(before);
+  });
+
+  it('uses existing-vector semantic recall when available and never calls the refresh-capable rank path', async () => {
+    const root = temp('rm-semantic-sync-recall-');
+    let refreshCalls = 0;
+    let existingCalls = 0;
+    const retriever: SemanticRetriever = {
+      async rank() { refreshCalls += 1; throw new Error('foreground recall must not refresh documents'); },
+      async rankExisting(documentIds) {
+        existingCalls += 1;
+        return new Map(documentIds.map((id) => [id, id.startsWith('memory:') ? 0.95 : 0]));
+      },
+    };
+    const { runtime, memoryId } = seedRuntime(root, retriever);
+    const result = await runtime.memorySearchRecallHybrid({ query: 'zero lexical overlap phrase' });
+    expect(result[0]).toEqual(expect.objectContaining({ memory_id: memoryId }));
+    expect(existingCalls).toBe(1);
+    expect(refreshCalls).toBe(0);
+  });
+
+  it('preserves reinforcement metadata and linked assistant intent recall on the foreground fast path', async () => {
+    const root = temp('rm-semantic-sync-recall-shape-');
+    const { runtime, memoryId } = seedRuntime(root);
+    runtime.store.appendReinforcement({
+      schema_version: 1,
+      reinforcement_id: 'reinforcement-sync-shape',
+      memory_id: memoryId,
+      batch_id: 'shape-batch',
+      evidence_ids: ['gift-evidence'],
+      latest_evidence_at: '2026-07-22T00:00:00.000Z',
+      recorded_at: '2026-07-22T00:00:00.000Z',
+    }, []);
+    runtime.store.appendAssistantIntent({
+      schema_version: 1,
+      intent_id: 'intent-sync-shape',
+      subject_id: 'subject',
+      session_id: 'session-shape',
+      assistant_message_id: 'assistant-shape',
+      tool_use_id: 'tool-shape',
+      tool_name: 'remember',
+      memory: { text: '隐藏 provenance 锚点：pineapple constellation' },
+      feel: { text: '一条只用于搜索语义保持的测试感受' },
+      captured_at: '2026-07-22T00:01:00.000Z',
+    });
+    runtime.store.appendAssistantIntentOutcome({
+      intent_id: 'intent-sync-shape',
+      batch_id: 'shape-batch',
+      outcome: 'accepted',
+      memory_id: memoryId,
+      recorded_at: '2026-07-22T00:02:00.000Z',
+    });
+
+    const result = await runtime.memorySearchRecallHybrid({ query: 'pineapple constellation' });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual(expect.objectContaining({
+      memory_id: memoryId,
+      reinforcement_count: 1,
+      reinforcement_evidence_count: 1,
+      reinforcement_evidence_ids: ['gift-evidence'],
+      latest_reinforcement_at: '2026-07-22T00:00:00.000Z',
+    }));
+  });
+
+  it('keeps foreground entity grounding read-only and never refreshes missing entity vectors', async () => {
+    const root = temp('rm-semantic-sync-entity-recall-');
+    let refreshCalls = 0;
+    let existingCalls = 0;
+    const retriever: SemanticRetriever = {
+      async rank() { refreshCalls += 1; throw new Error('foreground entity recall must not refresh documents'); },
+      async rankExisting(documentIds) {
+        existingCalls += 1;
+        return new Map(documentIds.map((id) => [id, id.startsWith('entity:') ? 0.97 : 0]));
+      },
+    };
+    const { runtime, entityId } = seedRuntime(root, retriever);
+    const result = await runtime.entitySearchRecallHybrid({ query: 'zero lexical overlap identity phrase' });
+    expect(result[0]).toEqual(expect.objectContaining({ entity_id: entityId }));
+    expect(existingCalls).toBe(1);
+    expect(refreshCalls).toBe(0);
+  });
+
   it('defaults DashScope semantic retrieval to text-embedding-v4 and enforces its 10-text request limit', async () => {
     const requests: any[] = [];
     const fakeFetch = (async (_url: any, init: any) => {

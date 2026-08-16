@@ -8,6 +8,8 @@ import {
   formatPendingSubconWhispers,
   queueSubconWhisper,
   readPendingSubconWhispers,
+  removePendingSubconWhisper,
+  partitionPendingSubconWhispersForTurn,
 } from './subcon_whisper_queue.js';
 
 const roots: string[] = [];
@@ -30,6 +32,34 @@ describe('Subcon foreground whisper queue', () => {
     expect(readPendingSubconWhispers(cwd, 'session-a')).toEqual([]);
     expect(queueSubconWhisper(cwd, 'session-a', 'batch-a', '重试时不应再次排同一张纸条。')).toBeNull();
     expect(readPendingSubconWhispers(cwd, 'session-a')).toEqual([]);
+  });
+
+  it('delivers sync whispers only to their armed foreground turn while async stays unscoped', () => {
+    const cwd = temp();
+    queueSubconWhisper(cwd, 'session-a', 'async-a', '上一轮 async 纸条');
+    queueSubconWhisper(cwd, 'session-a', 'sync-a', '当前 sync 纸条', { source: 'sync', turnId: 'turn-current' });
+    queueSubconWhisper(cwd, 'session-a', 'sync-old', '旧 sync 纸条', { source: 'sync', turnId: 'turn-old' });
+    const all = readPendingSubconWhispers(cwd, 'session-a');
+
+    const sessionStart = partitionPendingSubconWhispersForTurn(all);
+    expect(sessionStart.deliverable.map((item) => item.whisper.batch_id)).toEqual(['async-a']);
+    expect(sessionStart.deferredSync).toHaveLength(2);
+    expect(sessionStart.staleSync).toEqual([]);
+
+    const current = partitionPendingSubconWhispersForTurn(all, 'turn-current');
+    expect(current.deliverable.map((item) => item.whisper.batch_id).sort()).toEqual(['async-a', 'sync-a']);
+    expect(current.staleSync.map((item) => item.whisper.batch_id)).toEqual(['sync-old']);
+    expect(current.deferredSync).toEqual([]);
+  });
+
+  it('can retract one exact pending sync whisper without touching other batches', () => {
+    const cwd = temp();
+    queueSubconWhisper(cwd, 'session-a', 'sync-a', '第一张');
+    queueSubconWhisper(cwd, 'session-a', 'async-b', '第二张');
+    removePendingSubconWhisper(cwd, 'session-a', 'sync-a');
+    const pending = readPendingSubconWhispers(cwd, 'session-a');
+    expect(pending).toHaveLength(1);
+    expect(pending[0].whisper.batch_id).toBe('async-b');
   });
 
   it('rejects maintenance prose before it can enter the foreground queue', () => {

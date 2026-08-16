@@ -9,6 +9,7 @@ import type {
   EntityEvidenceRecord,
   EntityIdentityRecord,
   MemoryKind,
+  OwnerRevisionRecord,
   ParticipantRole,
   RememberOutcome,
   ReinforcementRecord,
@@ -138,6 +139,120 @@ export class RelationshipMemoryRuntime {
     return result;
   }
 
+  private recallEffectiveMemories(): EffectiveMemoryRecord[] {
+    // Foreground recall must not pay OwnerControlPlane.listEffective()'s repeated
+    // JSONL reads. Materialize genesis + owner revisions once while preserving
+    // the same owner-correction semantics as getEffective().
+    const revisionsByMemory = new Map<string, OwnerRevisionRecord[]>();
+    for (const revision of this.store.listOwnerRevisions()) {
+      const bucket = revisionsByMemory.get(revision.memory_id) ?? [];
+      bucket.push(revision);
+      revisionsByMemory.set(revision.memory_id, bucket);
+    }
+    return this.store.listMemories().map((genesis) => {
+      let semantic = {
+        kind: genesis.kind,
+        summary: genesis.summary,
+        participants: genesis.participants,
+        payload: genesis.payload,
+        ...(genesis.linked_memory_ids ? { linked_memory_ids: genesis.linked_memory_ids } : {}),
+      };
+      let status: 'active' | 'inactive' = 'active';
+      let latest: OwnerRevisionRecord | undefined;
+      for (const revision of revisionsByMemory.get(genesis.memory_id) ?? []) {
+        latest = revision;
+        if (revision.action === 'revise' && revision.replacement) semantic = revision.replacement;
+        else if (revision.action === 'deactivate') status = 'inactive';
+        else if (revision.action === 'restore') status = 'active';
+      }
+      return {
+        ...genesis,
+        ...semantic,
+        status,
+        owner_corrected: Boolean(latest),
+        ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}),
+      };
+    });
+  }
+
+  async memorySearchRecallHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
+    const semanticQuery = query.query?.trim();
+    const trigger = query.trigger?.trim().toLowerCase();
+    const limit = boundedSearchLimit(query.limit);
+
+    // Preserve the existing memory_search result/search semantics without the
+    // hot path's old per-memory JSONL rescans. Materialize each supporting file
+    // once, then join by memory id in memory.
+    const reinforcementsByMemory = new Map<string, ReinforcementRecord[]>();
+    for (const reinforcement of this.store.listReinforcements()) {
+      const bucket = reinforcementsByMemory.get(reinforcement.memory_id) ?? [];
+      bucket.push(reinforcement);
+      reinforcementsByMemory.set(reinforcement.memory_id, bucket);
+    }
+    const intentsById = new Map(this.store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
+    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
+    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
+    const linkedIntentsByMemory = new Map<string, AssistantRememberIntentRecord[]>();
+    for (const [intentId, outcome] of latestOutcomeByIntent) {
+      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
+      const intent = intentsById.get(intentId);
+      if (!intent) continue;
+      const bucket = linkedIntentsByMemory.get(outcome.memory_id) ?? [];
+      bucket.push(intent);
+      linkedIntentsByMemory.set(outcome.memory_id, bucket);
+    }
+
+    const candidates = this.recallEffectiveMemories().map((memory) => {
+      const reinforcements = reinforcementsByMemory.get(memory.memory_id) ?? [];
+      const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
+      const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
+      const enriched: EffectiveMemoryRecord = {
+        ...memory,
+        ...(reinforcements.length ? {
+          reinforcement_count: reinforcements.length,
+          reinforcement_evidence_count: evidenceIds.length,
+          reinforcement_evidence_ids: evidenceIds.slice(-20),
+          latest_reinforcement_at: latest,
+        } : {}),
+      };
+      const linkedIntents = (linkedIntentsByMemory.get(memory.memory_id) ?? []).map((intent) => ({
+        memory: intent.memory.text,
+        feel: intent.feel.text,
+      }));
+      return { memory: enriched, linkedIntents };
+    }).filter(({ memory, linkedIntents }) => {
+      if (memory.status !== 'active') return false;
+      if (query.kind && memory.kind !== query.kind) return false;
+      if (query.participant && !memory.participants.includes(query.participant)) return false;
+      if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
+      if (query.time_start && memory.observed_at < query.time_start) return false;
+      if (query.time_end && memory.observed_at > query.time_end) return false;
+      const haystack = stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: linkedIntents }).toLowerCase();
+      if (trigger && !haystack.includes(trigger)) return false;
+      return true;
+    });
+    if (!semanticQuery) return candidates.slice(0, limit).map((item) => item.memory);
+
+    const documents = candidates.map(({ memory, linkedIntents }) => ({
+      id: `memory:${memory.memory_id}`,
+      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
+    }));
+    let semantic = new Map<string, number>();
+    if (this.semanticRetriever?.rankExisting) {
+      try { semantic = await this.semanticRetriever.rankExisting(documents.map((document) => document.id), semanticQuery); }
+      catch { semantic = new Map(); }
+    }
+    const scored = candidates.map(({ memory }, index) => {
+      const lexical = lexicalTextScore(documents[index].text, semanticQuery);
+      const semanticScore = semantic.get(documents[index].id);
+      return { memory, lexical, semantic: semanticScore, score: hybridScore(lexical, semanticScore) };
+    }).filter((item) => item.semantic !== undefined || item.lexical > 0);
+    return scored
+      .sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
+      .slice(0, limit)
+      .map((item) => item.memory);
+  }
+
   memorySearch(query: SearchQuery): EffectiveMemoryRecord[] {
     const needle = query.query?.trim().toLowerCase();
     const trigger = query.trigger?.trim().toLowerCase();
@@ -203,6 +318,32 @@ export class RelationshipMemoryRuntime {
         evidence_message_ids: evidence.map((item) => item.message_id),
       };
     });
+  }
+
+  async entitySearchRecallHybrid(query: EntitySearchQuery = {}): Promise<EntitySearchResult[]> {
+    const semanticQuery = query.query?.trim();
+    const limit = boundedSearchLimit(query.limit);
+    if (!semanticQuery) return this.entitySearch(query).slice(0, limit);
+    const candidates = this.entitySearch({});
+    const documents = candidates.map((entity) => ({
+      id: `entity:${entity.entity_id}`,
+      text: semanticText(entity.canonical_name, entity.aliases, entity.entity_type, entity.description),
+    }));
+    let semantic = new Map<string, number>();
+    if (this.semanticRetriever?.rankExisting) {
+      try { semantic = await this.semanticRetriever.rankExisting(documents.map((document) => document.id), semanticQuery); }
+      catch { semantic = new Map(); }
+    }
+    const scored = candidates.map((entity, index) => {
+      const lexical = lexicalTextScore(documents[index].text, semanticQuery);
+      const semanticScore = semantic.get(documents[index].id);
+      return { entity, lexical, semantic: semanticScore, score: hybridScore(lexical, semanticScore) };
+    }).filter((item) => item.semantic !== undefined || item.lexical > 0);
+    if (scored.length === 0) return this.entitySearch(query).slice(0, limit);
+    return scored
+      .sort((a, b) => b.score - a.score || b.entity.observed_at.localeCompare(a.entity.observed_at))
+      .slice(0, limit)
+      .map((item) => item.entity);
   }
 
   async entitySearchHybrid(query: EntitySearchQuery = {}): Promise<EntitySearchResult[]> {

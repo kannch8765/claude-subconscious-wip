@@ -547,8 +547,18 @@ function conversationEntryDetails(entry: string | ConversationEntry | undefined)
 /**
  * Create a new conversation for an agent
  */
-export async function createConversation(apiKey: string, agentId: string, log: LogFn = noopLog): Promise<string> {
+export interface CreateConversationOptions {
+  isolatedBlockLabels?: string[];
+}
+
+export async function createConversation(
+  apiKey: string,
+  agentId: string,
+  log: LogFn = noopLog,
+  options: CreateConversationOptions = {},
+): Promise<string> {
   const url = buildLettaApiUrl('/conversations/', { agent_id: agentId });
+  const isolatedBlockLabels = [...new Set(options.isolatedBlockLabels ?? [])].filter((label) => label.trim().length > 0);
   
   log(`Creating new conversation for agent ${agentId}`);
   
@@ -558,6 +568,7 @@ export async function createConversation(apiKey: string, agentId: string, log: L
       'Authorization': `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
+    ...(isolatedBlockLabels.length > 0 ? { body: JSON.stringify({ isolated_block_labels: isolatedBlockLabels }) } : {}),
   });
 
   if (!response.ok) {

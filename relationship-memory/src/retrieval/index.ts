@@ -19,6 +19,11 @@ export interface EmbeddingProvider {
 
 export interface SemanticRetriever {
   rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>>;
+  /**
+   * Rank only vectors already present in the derivative index. This path never
+   * refreshes or embeds documents and is intended for foreground read-only recall.
+   */
+  rankExisting?(documentIds: string[], query: string): Promise<Map<string, number>>;
 }
 
 interface SemanticIndexEntry {
@@ -386,6 +391,30 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     } finally {
       releaseSemanticLock(this.indexFile, token);
     }
+  }
+
+  async rankExisting(documentIds: string[], query: string): Promise<Map<string, number>> {
+    if (!query.trim() || documentIds.length === 0) return new Map();
+    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
+    const index = readIndex(this.indexFile, this.provider.fingerprint);
+    const usable = documentIds.flatMap((id) => {
+      const cached = index.documents[id];
+      if (!cached
+        || cached.vector.length !== this.provider.dimensions
+        || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) return [];
+      return [[id, cached.vector] as const];
+    });
+    // A missing/stale index is a lexical fallback signal, not permission for a
+    // synchronous foreground turn to rebuild hundreds of document embeddings.
+    if (usable.length === 0) return new Map();
+    let queryVector: number[];
+    try {
+      queryVector = await this.provider.embedQuery(query);
+    } catch (error) {
+      writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+      throw error;
+    }
+    return new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));
   }
 
   async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {

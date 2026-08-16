@@ -89,6 +89,17 @@ describe('createConversation', () => {
       }),
     );
   });
+
+  it('can isolate every sync conversation block without changing the default async create call', async () => {
+    vi.stubEnv('LETTA_BASE_URL', 'https://letta.example.com');
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ id: 'conversation-sync' }) });
+    const { createConversation } = await import('./conversation_utils.js');
+
+    await createConversation('test-key', 'agent-123', undefined, { isolatedBlockLabels: ['guidance', 'user_preferences', 'guidance'] });
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(JSON.parse(init.body)).toEqual({ isolated_block_labels: ['guidance', 'user_preferences'] });
+  });
 });
 
 describe('live retryable conversation recovery', () => {

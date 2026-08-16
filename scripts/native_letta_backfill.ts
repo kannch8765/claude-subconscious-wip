@@ -173,6 +173,39 @@ function toolReturn(value: unknown): string {
   catch { return String(value); }
 }
 
+export interface ContinuationBusyRetryPolicy {
+  maxWaitMs: number;
+  intervalMs?: number;
+}
+
+function isConversationBusyConflict(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /\b409\b[\s\S]*Another request[\s\S]*currently being processed for this conversation/i.test(message);
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function createContinuationStream(
+  create: () => Promise<AsyncIterable<any>>,
+  policy?: ContinuationBusyRetryPolicy,
+): Promise<AsyncIterable<any>> {
+  if (!policy) return create();
+  const maxWaitMs = Math.max(0, Math.round(policy.maxWaitMs));
+  const intervalMs = Math.max(1, Math.round(policy.intervalMs ?? 100));
+  const startedAt = Date.now();
+  while (true) {
+    try { return await create(); }
+    catch (error) {
+      if (!isConversationBusyConflict(error)) throw error;
+      const elapsed = Date.now() - startedAt;
+      if (elapsed >= maxWaitMs) throw error;
+      await delay(Math.min(intervalMs, Math.max(1, maxWaitMs - elapsed)));
+    }
+  }
+}
+
 async function collectLettaStream(stream: AsyncIterable<any>): Promise<{ messages: any[]; stop_reason?: any; usage?: any }> {
   const messages: any[] = [];
   let stopReason: any;
@@ -203,6 +236,7 @@ export async function runNativeClientToolConversation(input: {
   message: string;
   tools: readonly NativeClientTool[];
   requiredClientToolNames?: readonly string[];
+  continuationBusyRetry?: ContinuationBusyRetryPolicy;
 }): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
@@ -256,12 +290,15 @@ export async function runNativeClientToolConversation(input: {
       approvals.push({ type: 'tool', tool_call_id: request.toolCallId, tool_return: result, status });
     }
 
-    response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
-      agent_id: input.agentId,
-      streaming: true,
-      messages: [{ type: 'tool_return', tool_returns: approvals }],
-      client_tools: schemas,
-    }));
+    response = await collectLettaStream(await createContinuationStream(
+      () => input.client.conversations.messages.create(input.conversationId, {
+        agent_id: input.agentId,
+        streaming: true,
+        messages: [{ type: 'tool_return', tool_returns: approvals }],
+        client_tools: schemas,
+      }),
+      input.continuationBusyRetry,
+    ));
   }
   throw new Error(`native client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
 }
