@@ -196,13 +196,13 @@ export function buildRelationshipTools(
     },
     {
       label: 'entity_search', name: 'entity_search',
-      description: 'Search first-class canonical entity identities by canonical name, exact/normalized alias, or description before proposing an identity.',
+      description: 'Ground an otherwise unclear named person/place/entity by canonical name, exact/normalized alias, or description when identity matters to the current relationship context; also search before proposing a new identity. Do not call merely because a name appears when current context already resolves it.',
       parameters: entitySearchToolSchema(),
       async execute(_toolCallId, args) { return wrapResult({ results: await runtime.entitySearchHybrid((args ?? {}) as never) }); },
     },
     {
       label: 'entity_remember', name: 'entity_remember',
-      description: 'Propose one evidence-backed first-class entity identity. Preserve literal aliases, use a perspective-neutral Chinese description, and search aliases first.',
+      description: 'Propose one evidence-backed first-class entity identity only when trusted current-batch evidence itself clearly defines or supports that identity. Preserve literal aliases, use a concise stable perspective-neutral Chinese relationship description rather than transient implementation inventory, and search aliases first. A mere name mention, search miss, or episodic association is insufficient evidence.',
       parameters: entityRememberToolSchema(),
       async execute(_toolCallId, args) { return wrapResult(runtime.rememberEntity(batchId, args)); },
     },
