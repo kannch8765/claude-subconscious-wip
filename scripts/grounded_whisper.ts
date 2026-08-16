@@ -38,12 +38,12 @@ export interface EntitySearchObservation {
   result: unknown;
 }
 
-function exactGroundedIdentityMatches(query: unknown, toolResult: unknown): GroundedIdentityMatch[] {
+function groundedIdentityCandidates(query: unknown, toolResult: unknown): GroundedIdentityMatch[] {
   if (typeof query !== 'string') return [];
   const queryTokens = entityReferentTokens(query);
   if (queryTokens.length === 0) return [];
   const results = Array.isArray((toolResult as any)?.results) ? (toolResult as any).results as GroundedEntityResult[] : [];
-  const matches = results.flatMap((item): GroundedIdentityMatch[] => {
+  return results.flatMap((item): GroundedIdentityMatch[] => {
     const names = [item?.canonical_name, ...(Array.isArray(item?.aliases) ? item.aliases : [])]
       .filter((value): value is string => typeof value === 'string');
     const entityId = typeof item?.entity_id === 'string' ? item.entity_id.trim() : '';
@@ -52,6 +52,10 @@ function exactGroundedIdentityMatches(query: unknown, toolResult: unknown): Grou
     if (!names.some((name) => containsReferentTokens(queryTokens, name))) return [];
     return [{ entityId, description }];
   });
+}
+
+function exactGroundedIdentityMatches(query: unknown, toolResult: unknown): GroundedIdentityMatch[] {
+  const matches = groundedIdentityCandidates(query, toolResult);
   const entityIds = new Set(matches.map((item) => item.entityId));
   return entityIds.size === 1 ? matches : [];
 }
@@ -64,7 +68,7 @@ export function foregroundGroundingIdentityAnchors(observations: readonly Entity
   const identities = new Map<string, string>();
   for (const observation of observations) {
     if (observation.purpose !== 'foreground_grounding') continue;
-    for (const match of exactGroundedIdentityMatches(observation.query, observation.result)) {
+    for (const match of groundedIdentityCandidates(observation.query, observation.result)) {
       identities.set(match.entityId, match.description);
     }
   }

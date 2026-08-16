@@ -34,6 +34,16 @@ describe('grounded whisper identity transport', () => {
     expect(composeGroundedWhisper(episode, anchors)).toBe(episode);
   });
 
+  it('remembers ambiguous foreground candidates across later searches and stays fail-closed', () => {
+    const episode = '晴让我想起之前一起 debug 的事。';
+    const anchors = foregroundGroundingIdentityAnchors([
+      { purpose: 'foreground_grounding', query: '晴 猫', result: { results: [qing, cat] } },
+      { purpose: 'foreground_grounding', query: '晴', result: { results: [qing] } },
+    ]);
+    expect(anchors).toEqual([]);
+    expect(composeGroundedWhisper(episode, anchors)).toBe(episode);
+  });
+
   it('leaves an unrelated whisper unchanged after maintenance/dedupe entity search', () => {
     const unrelated = '这个 bug 让我想起之前的路由问题。';
     const anchors = foregroundGroundingIdentityAnchors([
