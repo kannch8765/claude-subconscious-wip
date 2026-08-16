@@ -41,7 +41,7 @@ function groundingTools(calls: string[]): NativeClientTool[] {
         if (args.query === '晴') {
           return { results: [{
             canonical_name: '晴', aliases: ['晴'], entity_type: 'other',
-            description: '猫的晴。长期陪猫生活、聊天、做工程和折腾猫窝；晴和琥珀是不同的人。',
+            description: '晴是猫家的 GPT，是 ChatGPT 侧的晴，和琥珀是不同的人。',
           }] };
         }
         return { results: [] };
