@@ -26,6 +26,7 @@ import {
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
+import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -131,14 +132,29 @@ async function sendViaNativeClient(payload: LiveWorkerPayload): Promise<'complet
     log(`  agent: ${payload.agentId}`);
     log(`  relationship client tools: ${relationshipTools.map((tool) => tool.name).join(', ')}`);
 
-    const result = await runNativeClientToolConversation({
-      client,
-      agentId: payload.agentId,
-      conversationId: payload.conversationId,
-      message: liveMessage,
-      tools: relationshipTools,
-      requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
+    const stdioMcp = await openStdioMcpToolsFromEnvironment(log);
+    const nativeToolNames = new Set(relationshipTools.map((tool) => tool.name));
+    const mcpTools = stdioMcp.tools.filter((tool) => {
+      if (!nativeToolNames.has(tool.name)) return true;
+      log(`Ignoring colliding stdio MCP tool name: ${tool.name}`);
+      return false;
     });
+    const liveTools = [...relationshipTools, ...mcpTools];
+    log(`  stdio MCP client tools: ${mcpTools.map((tool) => tool.name).join(', ') || '(none)'}`);
+
+    let result;
+    try {
+      result = await runNativeClientToolConversation({
+        client,
+        agentId: payload.agentId,
+        conversationId: payload.conversationId,
+        message: liveMessage,
+        tools: liveTools,
+        requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
+      });
+    } finally {
+      await stdioMcp.close();
+    }
     turnSucceeded = !result.clientToolFailure;
     const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';
     log(`Native live turn complete: success=${turnSucceeded}, stop_reason=${stopReason}`);
