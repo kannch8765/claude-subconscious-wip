@@ -1,0 +1,89 @@
+name: Task Subcon AgentFile Repair
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: task/subcon-whisper-seed-consumption
+          fetch-depth: 0
+
+      - name: Restore unrelated tool schema text
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+
+          base_sha = "1f1ab9edc0bcd508335a9919fd894a49b1db1e9a"
+          path = Path("Subconscious.af")
+          raw = path.read_text()
+          current = json.loads(raw)
+          base = json.loads(subprocess.check_output(["git", "show", f"{base_sha}:Subconscious.af"], text=True))
+
+          current_tools = {tool["name"]: tool for tool in current["tools"]}
+          base_tools = {tool["name"]: tool for tool in base["tools"]}
+
+          current_tools["memory"]["json_schema"]["parameters"]["properties"]["command"]["description"] = base_tools["memory"]["json_schema"]["parameters"]["properties"]["command"]["description"]
+          current_tools["memory"]["json_schema"]["parameters"]["properties"]["insert_text"]["description"] = base_tools["memory"]["json_schema"]["parameters"]["properties"]["insert_text"]["description"]
+          current_tools["memory_insert"]["json_schema"]["description"] = base_tools["memory_insert"]["json_schema"]["description"]
+          current_tools["memory_replace"]["json_schema"]["description"] = base_tools["memory_replace"]["json_schema"]["description"]
+
+          # Preserve the existing pretty-printed AgentFile structure while changing
+          # only the four known accidental strings.
+          replacements = []
+          for name, selector in [
+              ("memory.command", lambda d: d["memory"]["json_schema"]["parameters"]["properties"]["command"]["description"]),
+              ("memory.insert_text", lambda d: d["memory"]["json_schema"]["parameters"]["properties"]["insert_text"]["description"]),
+              ("memory_insert.description", lambda d: d["memory_insert"]["json_schema"]["description"]),
+              ("memory_replace.description", lambda d: d["memory_replace"]["json_schema"]["description"]),
+          ]:
+              before = selector({tool["name"]: tool for tool in json.loads(raw)["tools"]})
+              after = selector(base_tools)
+              old = json.dumps(before, ensure_ascii=False)[1:-1]
+              new = json.dumps(after, ensure_ascii=False)[1:-1]
+              if name == "memory_replace.description":
+                  prefix = '"json_schema": {\n        "name": "memory_replace",\n        "description": "'
+                  needle = prefix + old + '"'
+                  if raw.count(needle) != 1:
+                      raise SystemExit(f"unexpected targeted count for {name}: {raw.count(needle)}")
+                  raw = raw.replace(needle, prefix + new + '"', 1)
+              else:
+                  if raw.count(old) != 1:
+                      raise SystemExit(f"unexpected count for {name}: {raw.count(old)}")
+                  raw = raw.replace(old, new, 1)
+
+          repaired = json.loads(raw)
+          if repaired["tools"] != base["tools"]:
+              raise SystemExit("tool inventory/schema still differs from exact base")
+
+          # Guard the intended prompt changes while proving runtime config stayed fixed.
+          agent = repaired["agents"][0]
+          base_agent = base["agents"][0]
+          assert "compact memory seed" in agent["system"]
+          assert "leave present-day interpretation, feeling, and relationship conclusions to foreground Kohaku" in repaired["blocks"][0]["value"]
+          assert agent["model"] == base_agent["model"]
+          assert agent["embedding"] == base_agent["embedding"]
+          assert agent["model_settings"] == base_agent["model_settings"]
+          assert agent["context_window_limit"] == base_agent["context_window_limit"]
+
+          path.write_text(raw)
+          print("AGENTFILE_REPAIR_ASSERTIONS_PASS")
+          PY
+
+          git diff --check
+          git diff -- Subconscious.af
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Subconscious.af
+          git commit -m 'Restore unrelated AgentFile tool schema text'
+          git push origin HEAD:task/subcon-whisper-seed-consumption
