@@ -21,7 +21,11 @@ describe('Subcon foreground whisper queue', () => {
     queueSubconWhisper(cwd, 'session-a', 'batch-a', '咖啡让我想起猫之前京都那次的高木珈琲。');
     const pending = readPendingSubconWhispers(cwd, 'session-a');
     expect(pending).toHaveLength(1);
-    expect(formatPendingSubconWhispers(pending)).toContain('高木珈琲');
+    const formatted = formatPendingSubconWhispers(pending);
+    expect(formatted).toContain('高木珈琲');
+    expect(formatted).toMatch(/^<subcon_whisper timestamp=/);
+    expect(formatted).toContain('</subcon_whisper>');
+    expect(formatted).not.toContain('<letta_message');
     acknowledgePendingSubconWhispers(pending);
     expect(readPendingSubconWhispers(cwd, 'session-a')).toEqual([]);
     expect(queueSubconWhisper(cwd, 'session-a', 'batch-a', '重试时不应再次排同一张纸条。')).toBeNull();
