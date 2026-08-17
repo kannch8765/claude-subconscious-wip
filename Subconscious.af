@@ -38,10 +38,10 @@
       "metadata": null,
       "llm_config": null,
       "embedding_config": null,
-      "model": "opencode-deepseek/deepseek-v4-flash",
+      "model": "openai-proxy/mimo-v2.5",
       "embedding": "local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768",
       "model_settings": {
-        "provider_type": "deepseek",
+        "provider_type": "openai",
         "parallel_tool_calls": true
       },
       "compaction_settings": null,

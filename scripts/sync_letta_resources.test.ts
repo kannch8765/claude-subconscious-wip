@@ -28,7 +28,7 @@ describe('tool-stripped sync sibling agent', () => {
         return new Response(JSON.stringify({
           id: process.env.LETTA_AGENT_ID,
           blocks: [{ label: 'guidance', value: 'LIVE GUIDANCE', limit: 20000 }],
-          model_settings: { provider_type: 'deepseek', parallel_tool_calls: true, max_output_tokens: 16384, temperature: 1.0 },
+          model_settings: { provider_type: 'openai', parallel_tool_calls: true, max_output_tokens: 16384, temperature: 1.0 },
         }), { status: 200, headers: { 'Content-Type': 'application/json' } });
       }
       if (method === 'POST' && /\/v1\/agents\/?$/.test(url)) {
@@ -54,9 +54,9 @@ describe('tool-stripped sync sibling agent', () => {
     expect(create.body.include_base_tools).toBe(false);
     expect(create.body.include_multi_agent_tools).toBe(false);
     expect(create.body.include_base_tool_rules).toBe(false);
-    expect(create.body.model).toBe('opencode-deepseek/deepseek-v4-flash');
+    expect(create.body.model).toBe('openai-proxy/mimo-v2.5');
     expect(create.body.context_window_limit).toBe(400000);
-    expect(create.body.model_settings).toEqual(expect.objectContaining({ provider_type: 'deepseek', parallel_tool_calls: true, max_output_tokens: 16384, temperature: 1.0 }));
+    expect(create.body.model_settings).toEqual(expect.objectContaining({ provider_type: 'openai', parallel_tool_calls: true, max_output_tokens: 16384, temperature: 1.0 }));
     const guidance = create.body.memory_blocks.find((block: any) => block.label === 'guidance');
     expect(guidance.value).toBe('LIVE GUIDANCE');
     expect(create.body.block_ids).toBeUndefined();
