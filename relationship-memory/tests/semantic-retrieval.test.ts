@@ -243,6 +243,41 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(refreshCalls).toBe(0);
   });
 
+  it('returns bounded source-faithful quote snippets from canonical evidence', async () => {
+    const root = temp('rm-semantic-quote-snippets-');
+    const { runtime, memoryId } = seedRuntime(root);
+    runtime.store.appendReinforcement({
+      schema_version: 1,
+      reinforcement_id: 'reinforcement-quote-snippets',
+      memory_id: memoryId,
+      batch_id: 'quote-snippet-batch',
+      evidence_ids: ['ev-quote-assistant'],
+      latest_evidence_at: '2026-07-22T00:00:00.000Z',
+      recorded_at: '2026-07-22T00:00:00.000Z',
+    }, [{
+      evidence_id: 'ev-quote-assistant',
+      memory_id: memoryId,
+      conversation_id: 'c2',
+      message_id: 'assistant-quote',
+      role: 'assistant',
+      quote: '猫笑了。琥珀说：「记住这一刻。」然后继续往前走。',
+      captured_at: '2026-07-22T00:00:00.000Z',
+      event_kind: 'assistant_text',
+    }]);
+
+    const results = await runtime.memorySearchHybridWithEvidence({ query: '京都' });
+    const hit = results.find((item) => item.memory_id === memoryId)!;
+    expect(hit).toBeTruthy();
+    expect(hit.quote_snippets.length).toBeGreaterThanOrEqual(4);
+    expect(hit.quote_snippets.length).toBeLessThanOrEqual(8);
+    expect(hit.quote_snippets.map((item) => item.quote)).toEqual(expect.arrayContaining([
+      'I brought a Kyoto gift home for you too.',
+      '猫笑了。',
+      '琥珀说：「记住这一刻。」',
+      '然后继续往前走。',
+    ]));
+  });
+
   it('preserves reinforcement metadata and linked assistant intent recall on the foreground fast path', async () => {
     const root = temp('rm-semantic-sync-recall-shape-');
     const { runtime, memoryId } = seedRuntime(root);

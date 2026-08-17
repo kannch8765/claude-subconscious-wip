@@ -58,6 +58,30 @@ function readJsonl<T>(file: string): T[] {
   return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
 }
 
+function readEvidenceJsonlForMemoryIds(file: string, memoryIds: readonly string[]): EvidenceRecord[] {
+  if (!fs.existsSync(file) || memoryIds.length === 0) return [];
+  // Keep the 30MB+ append-only evidence file as bytes. Decoding the whole file
+  // to one JS UTF-16 string costs hundreds of milliseconds on production-scale
+  // stores; Buffer search lets foreground recall decode only the matching lines.
+  const raw = fs.readFileSync(file);
+  const result: EvidenceRecord[] = [];
+  for (const memoryId of new Set(memoryIds)) {
+    const needle = Buffer.from(`"memory_id":${JSON.stringify(memoryId)}`, 'utf8');
+    let cursor = 0;
+    while (cursor < raw.length) {
+      const match = raw.indexOf(needle, cursor);
+      if (match < 0) break;
+      const previousNewline = raw.lastIndexOf(0x0a, match - 1);
+      const lineStart = previousNewline < 0 ? 0 : previousNewline + 1;
+      const newline = raw.indexOf(0x0a, match);
+      const lineEnd = newline < 0 ? raw.length : newline;
+      if (lineEnd > lineStart) result.push(JSON.parse(raw.subarray(lineStart, lineEnd).toString('utf8')) as EvidenceRecord);
+      cursor = lineEnd + 1;
+    }
+  }
+  return result;
+}
+
 function appendJsonl(file: string, value: unknown): void {
   ensureDir(path.dirname(file));
   fs.appendFileSync(file, `${JSON.stringify(value)}\n`, 'utf8');
@@ -188,6 +212,9 @@ export class RelationshipMemoryStore {
 
   listMemories(): CanonicalMemoryRecord[] { return readJsonl<CanonicalMemoryRecord>(this.file('memories.jsonl')); }
   listEvidence(): EvidenceRecord[] { return readJsonl<EvidenceRecord>(this.file('evidence.jsonl')); }
+  listEvidenceForMemoryIds(memoryIds: readonly string[]): EvidenceRecord[] {
+    return readEvidenceJsonlForMemoryIds(this.file('evidence.jsonl'), memoryIds);
+  }
   listEntities(): EntityIdentityRecord[] { return readJsonl<EntityIdentityRecord>(this.file('entities.jsonl')); }
   listEntityEvidence(): EntityEvidenceRecord[] { return readJsonl<EntityEvidenceRecord>(this.file('entity-evidence.jsonl')); }
   listEntityOutcomes(): EntityOutcome[] { return readJsonl<EntityOutcome>(this.file('entity-outcomes.jsonl')); }

@@ -35,6 +35,18 @@ export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; ev
 export interface EntitySearchQuery { query?: string; limit?: number }
 export interface EntitySearchResult extends EntityIdentityRecord { evidence_ids: string[]; evidence_message_ids: string[] }
 
+export interface RecallQuoteSnippet {
+  snippet_id: string;
+  evidence_id: string;
+  role: ParticipantRole;
+  quote: string;
+  captured_at: string;
+}
+
+export interface MemoryRecallResult extends EffectiveMemoryRecord {
+  quote_snippets: RecallQuoteSnippet[];
+}
+
 export interface RememberResult {
   outcome: RememberOutcome['outcome'];
   memory_id?: string;
@@ -138,6 +150,63 @@ export class RelationshipMemoryRuntime {
     }
     return result;
   }
+
+  private quoteSnippetsForEvidence(item: EvidenceRecord): RecallQuoteSnippet[] {
+    if (item.event_kind && item.event_kind !== 'user_text' && item.event_kind !== 'assistant_text') return [];
+    const pieces: string[] = [];
+    for (const line of item.quote.replace(/\r\n/g, '\n').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const sentences = trimmed.match(/[^。！？!?]+[。！？!?]+[」』”’]?|[^。！？!?]+$/gu) ?? [trimmed];
+      for (const sentence of sentences) {
+        const source = sentence.trim();
+        if (!source) continue;
+        // Preserve exact source text while bounding one candidate. Long prose/code
+        // becomes several exact excerpts rather than one multi-kilobyte whisper.
+        const codePoints = [...source];
+        for (let offset = 0; offset < codePoints.length; offset += 600) {
+          const quote = codePoints.slice(offset, offset + 600).join('');
+          pieces.push(quote);
+        }
+      }
+    }
+    return pieces.map((quote, index) => ({
+      snippet_id: stableId('quote_snippet', { evidence_id: item.evidence_id, index, quote }),
+      evidence_id: item.evidence_id,
+      role: item.role,
+      quote,
+      captured_at: item.captured_at,
+    }));
+  }
+
+  private recallQuoteSnippets(memoryId: string, evidence: readonly EvidenceRecord[], limit = 8): RecallQuoteSnippet[] {
+    const eligible = evidence
+      .filter((item) => item.memory_id === memoryId)
+      .sort((a, b) => a.captured_at.localeCompare(b.captured_at) || a.evidence_id.localeCompare(b.evidence_id))
+      .flatMap((item) => this.quoteSnippetsForEvidence(item));
+    const unique = [...new Map(eligible.map((item) => [item.snippet_id, item])).values()];
+    const bounded = Math.max(1, Math.min(limit, 12));
+    return unique.length <= bounded
+      ? unique
+      : [...unique.slice(0, Math.ceil(bounded / 2)), ...unique.slice(-Math.floor(bounded / 2))];
+  }
+
+  private attachRecallEvidence(memories: EffectiveMemoryRecord[]): MemoryRecallResult[] {
+    const evidence = this.store.listEvidenceForMemoryIds(memories.map((memory) => memory.memory_id));
+    return memories.map((memory) => ({
+      ...memory,
+      quote_snippets: this.recallQuoteSnippets(memory.memory_id, evidence),
+    }));
+  }
+
+  async memorySearchRecallHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
+    return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query));
+  }
+
+  async memorySearchHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
+    return this.attachRecallEvidence(await this.memorySearchHybrid(query));
+  }
+
 
   private recallEffectiveMemories(): EffectiveMemoryRecord[] {
     // Foreground recall must not pay OwnerControlPlane.listEffective()'s repeated
@@ -831,7 +900,7 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
         enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'],
         description: 'Canonical relationship-memory kind. payload fields must match this kind exactly.',
       },
-      summary: string,
+      summary: { ...string, description: 'Concise source-grounded historical event or stable-fact index. State what happened or what was explicitly stated; do not infer present feelings, motives, fulfillment, or relationship conclusions.' },
       participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
       evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Exact evidence_id values copied from the trusted current-batch transcript-event evidence catalog.' },
       evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy message_id compatibility alias. A message_id is accepted only when it uniquely identifies one trusted event in the current batch; ambiguous multi-event messages are rejected and require an exact evidence_id. Do not send both fields.' },
@@ -858,15 +927,15 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
           time_text: string,
           places: strings,
           themes: strings,
-          emotional_tone: string,
-          why_memorable: string,
+          emotional_tone: { ...string, description: 'Optional historical affect only when trusted evidence directly expresses or unambiguously demonstrates it; keep it perspective-neutral and do not project it onto present Kohaku.' },
+          why_memorable: { ...string, description: 'Optional source-supported historical reason only. Omit when the evidence does not explicitly support why the event was memorable; never invent present-day significance.' },
           recall_triggers: strings,
           event: string,
-          shared_meaning: string,
+          shared_meaning: { ...string, description: 'Required minimal factual relationship description. Prefer an evidence-backed restatement of what was shared/explicitly said; do not infer feelings, fulfillment, or relationship conclusions.' },
           symbols: strings,
-          meaning: string,
+          meaning: { ...string, description: 'Required minimal factual relationship-event description. Use only source-supported meaning; when no stronger meaning is explicit, keep this as a factual restatement rather than an interpretation.' },
           prior_context: string,
-          resulting_change: string,
+          resulting_change: { ...string, description: 'Optional historical change only when trusted evidence explicitly establishes it; do not infer that a wish was fulfilled, a bond deepened, or a present state changed.' },
           name: string,
           trigger_phrases: { type: 'array', minItems: 1, uniqueItems: true, items: string },
           origin: string,
