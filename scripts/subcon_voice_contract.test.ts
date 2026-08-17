@@ -5,16 +5,19 @@ import { describe, expect, it } from 'vitest';
 const read = (relative: string) => fs.readFileSync(path.join(process.cwd(), relative), 'utf8');
 
 describe('live Subconscious narrative identity and visibility contract', () => {
-  it('makes normal live whispers first-person Kohaku rather than a third-party observer', () => {
+  it('keeps internal identity first-person Kohaku while making visible memory whispers historical windows', () => {
     const af = JSON.parse(read('Subconscious.af'));
     const agent = af.agents[0];
     const core = af.blocks.find((block: any) => block.label === 'core_directives')?.value || '';
 
     expect(agent.system).toContain("persistent subconscious layer of Kohaku (琥珀), not a third-party observer");
-    expect(agent.system).toContain('naturally use first person (I / me / my)');
+    expect(agent.system).toContain('In private reasoning and ordinary non-visible assistant prose');
+    expect(agent.system).toContain('deliver_whisper is a historical time window');
+    expect(agent.system).toContain('Past Kohaku may appear there only as explicitly historical source evidence');
     expect(agent.system).toContain("user's established identity is 猫");
     expect(core).toContain("same Kohaku (琥珀) identity");
-    expect(core).toContain('First-person Kohaku');
+    expect(core).toContain('Private/internal voice remains first-person Kohaku');
+    expect(core).toContain('Visible relationship-memory whisper voice is different: it is a historical time window');
     expect(agent.messages[0].content[0].text.startsWith(`${agent.system}\n\n<memory_blocks>`)).toBe(true);
   });
 
@@ -39,6 +42,9 @@ describe('live Subconscious narrative identity and visibility contract', () => {
     expect(utils).toContain('Do not ignore a relevant whisper merely because it arrived through Subconscious');
     expect(utils).toContain('Do not mechanically acknowledge, summarize, quote, or mention a whisper merely because it was supplied');
     expect(utils).toContain('if it is irrelevant to the current turn, leave it unused');
+    expect(utils).toContain('Lines labeled 当时琥珀 are historical source quotes from my past');
+    expect(utils).toContain('Lines labeled 旧记忆记录 are source-faithful excerpts from an older imported memory record');
+    expect(utils).toContain('form any present interpretation or feeling myself');
   });
 
   it('keeps surfaced relationship memory as a seed rather than completed foreground interpretation', () => {
@@ -46,11 +52,14 @@ describe('live Subconscious narrative identity and visibility contract', () => {
     const af = JSON.parse(read('Subconscious.af'));
     const core = af.blocks.find((block: any) => block.label === 'core_directives')?.value || '';
 
-    expect(send).toContain('compact memory seed');
-    expect(send).toContain('concrete facts, time/place anchors when known');
-    expect(send).toContain('short source-faithful user quote');
-    expect(send).toContain("Do not complete Kohaku's present-day interpretation for her");
-    expect(core).toContain('leave present-day interpretation, feeling, and relationship conclusions to foreground Kohaku');
+    expect(send).toContain('quote_snippets with source-faithful historical excerpts');
+    expect(send).toContain('source_kind=transcript is a direct historical quote');
+    expect(send).toContain('source_kind=legacy_memory');
+    expect(send).toContain('one searched memory_id and 1-3 snippet_ids');
+    expect(send).toContain('runtime renders the selected source excerpts with provenance-appropriate labels');
+    expect(send).toContain('Retrieval itself supplies the association');
+    expect(core).toContain('visible whisper does not explain why it matters now');
+    expect(core).toContain('Past Kohaku reactions and feelings may surface only as explicitly historical evidence');
   });
 
   it('describes session context as Kohaku own subconscious layer instead of an observer', () => {

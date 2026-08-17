@@ -190,9 +190,9 @@ export function buildRelationshipTools(
   return [
     {
       label: 'memory_search', name: 'memory_search',
-      description: 'Search canonical relationship-memory records, including bounded reinforcement metadata and linked assistant remember provenance, before choosing whether to reinforce or create. For new trusted evidence that explicitly repeats an existing durable user preference, a search hit is not terminal: follow with memory_reinforce.',
+      description: 'Search canonical relationship-memory records before choosing whether to reinforce/create or surface a past moment. Each hit includes a bounded quote_snippets pool. source_kind=transcript contains source-faithful historical user/assistant quotes; only when no transcript evidence exists, source_kind=legacy_memory contains excerpts from the older imported memory record. Use those snippet IDs when selecting a whisper and never treat legacy_memory as a direct quote. For new trusted evidence that explicitly repeats an existing durable user preference, a search hit is not terminal: follow with memory_reinforce.',
       parameters: memorySearchToolSchema(),
-      async execute(_toolCallId, args) { return wrapResult({ results: await runtime.memorySearchHybrid((args ?? {}) as never) }); },
+      async execute(_toolCallId, args) { return wrapResult({ results: await runtime.memorySearchHybridWithEvidence((args ?? {}) as never) }); },
     },
     {
       label: 'entity_search', name: 'entity_search',
@@ -214,7 +214,7 @@ export function buildRelationshipTools(
     },
     {
       label: 'memory_remember', name: 'memory_remember',
-      description: 'Propose one schema-version-1 relationship memory bound to trusted transcript evidence, including a new explicit durable user_preference when search finds no same preference. When processing a trusted assistant remember intent, copy its assistant_intent_id; never invent or rewrite feel text.',
+      description: 'Propose one schema-version-1 relationship memory bound to trusted transcript evidence. Write a source-grounded historical event/stable-fact index, not a relationship essay: summarize what happened or what was explicitly stated, and do not infer feelings, motives, fulfillment, present-day meaning, or relationship conclusions. Historical affect may be represented only when directly evidenced. Never invent quotes. When processing a trusted assistant remember intent, copy its assistant_intent_id; never invent or rewrite feel text.',
       parameters: memoryRememberToolSchema(),
       async execute(_toolCallId, args) { return wrapResult(runtime.remember(batchId, args)); },
     },

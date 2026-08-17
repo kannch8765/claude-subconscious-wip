@@ -5,9 +5,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DashScopeQwenEmbeddingProvider,
   FileBackedSemanticRetriever,
+  LegacyMemorySourceStore,
   RelationshipMemoryRecallSession,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
+  legacySourceId,
   buildRelationshipTools,
   type EmbeddingProvider,
   type SemanticDocument,
@@ -241,6 +243,101 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(result[0]).toEqual(expect.objectContaining({ memory_id: memoryId }));
     expect(existingCalls).toBe(1);
     expect(refreshCalls).toBe(0);
+  });
+
+  it('returns bounded source-faithful quote snippets from canonical evidence', async () => {
+    const root = temp('rm-semantic-quote-snippets-');
+    const { runtime, memoryId } = seedRuntime(root);
+    runtime.store.appendReinforcement({
+      schema_version: 1,
+      reinforcement_id: 'reinforcement-quote-snippets',
+      memory_id: memoryId,
+      batch_id: 'quote-snippet-batch',
+      evidence_ids: ['ev-quote-assistant'],
+      latest_evidence_at: '2026-07-22T00:00:00.000Z',
+      recorded_at: '2026-07-22T00:00:00.000Z',
+    }, [{
+      evidence_id: 'ev-quote-assistant',
+      memory_id: memoryId,
+      conversation_id: 'c2',
+      message_id: 'assistant-quote',
+      role: 'assistant',
+      quote: '猫笑了。琥珀说：「记住这一刻。」然后继续往前走。',
+      captured_at: '2026-07-22T00:00:00.000Z',
+      event_kind: 'assistant_text',
+    }]);
+
+    const results = await runtime.memorySearchHybridWithEvidence({ query: '京都' });
+    const hit = results.find((item) => item.memory_id === memoryId)!;
+    expect(hit).toBeTruthy();
+    expect(hit.quote_snippets.length).toBeGreaterThanOrEqual(4);
+    expect(hit.quote_snippets.length).toBeLessThanOrEqual(8);
+    expect(hit.quote_snippets.every((item) => item.source_kind === 'transcript')).toBe(true);
+    expect(hit.quote_snippets.map((item) => item.quote)).toEqual(expect.arrayContaining([
+      'I brought a Kyoto gift home for you too.',
+      '猫笑了。',
+      '琥珀说：「记住这一刻。」',
+      '然后继续往前走。',
+    ]));
+  });
+
+  it('falls back to explicitly marked legacy-memory excerpts only when transcript evidence is absent', async () => {
+    const root = temp('rm-semantic-legacy-snippets-');
+    const store = new RelationshipMemoryStore(root, 'subject');
+    const runtime = new RelationshipMemoryRuntime(store, new Map(), () => '2026-06-04T02:12:11.000Z');
+    const memoryId = 'mem-legacy-window';
+    store.appendMemory({
+      schema_version: 1,
+      memory_id: memoryId,
+      subject_id: 'subject',
+      kind: 'personal_experience',
+      summary: '旧记忆灯笼：搬家与家具的血泪教训',
+      participants: ['user', 'assistant'],
+      payload: { title: '旧记忆灯笼', experience: '旧记忆灯笼：搬家与家具的血泪教训。' },
+      status: 'active',
+      observed_at: '2026-06-04T02:12:11.000Z',
+      created_at: '2026-08-11T09:00:00.000Z',
+      source_key: 'legacy-source-key',
+      dedupe_key: 'legacy-dedupe-key',
+    }, []);
+
+    const legacyStore = new LegacyMemorySourceStore(root);
+    const sourceId = legacySourceId('legacy-subject', 'archive', 'legacy-window');
+    legacyStore.appendSource({
+      schema_version: 1,
+      legacy_source_id: sourceId,
+      subject_id: 'legacy-subject',
+      provenance_kind: 'legacy_assistant_memory',
+      source_system: 'ombre_brain',
+      bucket_type: 'archive',
+      bucket_id: 'legacy-window',
+      relative_path: 'archive/legacy-window.md',
+      source_sha256: 'a'.repeat(64),
+      original_markdown: 'legacy original markdown',
+      body_text: '2026-06-04，跟老婆聊到搬家。老婆说先搬家再买家具是血泪教训。',
+      frontmatter: {
+        name: '旧记忆灯笼', type: 'archive', domain: ['relationship'], tags: ['moving'],
+        importance: 0.8, valence: 0.2, arousal: 0.3, activation_count: 1,
+      },
+      raw_created: '2026-06-04T02:12:11',
+      raw_last_active: '2026-06-04T02:12:11',
+      created_at_utc: '2026-06-04T02:12:11.000Z',
+      last_active_at_utc: '2026-06-04T02:12:11.000Z',
+      manifest_digest: 'b'.repeat(64),
+    });
+    legacyStore.appendProvenance({
+      legacy_source_id: sourceId,
+      canonical_memory_id: memoryId,
+      disposition: 'created',
+      recorded_at: '2026-08-11T09:00:00.000Z',
+    });
+
+    const result = await runtime.memorySearchHybridWithEvidence({ query: '旧记忆灯笼' });
+    expect(result).toHaveLength(1);
+    expect(result[0].quote_snippets.length).toBeGreaterThan(0);
+    expect(result[0].quote_snippets.every((item) => item.source_kind === 'legacy_memory')).toBe(true);
+    expect(result[0].quote_snippets.every((item) => item.role === undefined)).toBe(true);
+    expect(result[0].quote_snippets.map((item) => item.quote).join('')).toContain('老婆说先搬家再买家具是血泪教训。');
   });
 
   it('preserves reinforcement metadata and linked assistant intent recall on the foreground fast path', async () => {
