@@ -38,20 +38,8 @@ export function stableWhisperId(sessionId: string, batchId: string): string {
   return `whisper_${crypto.createHash('sha256').update(`${sessionId}\0${batchId}`).digest('hex').slice(0, 24)}`;
 }
 
-const maintenanceLeakPatterns = [
-  /\bmem_[a-z0-9]+\b/i,
-  /\btranscript_ev_[a-z0-9]+\b/i,
-  /\bevidence[_ -]?ids?\b/i,
-  /\bmemory_(?:search|reinforce|remember)\b/i,
-  /\bdedupe\b/i,
-  /(?:已|需要|无需|不需要).{0,10}(?:reinforce|remember|写入|建档|存档|记忆操作)/i,
-  /新证据.{0,12}(?:值得处理|需要处理|reinforce|remember)/i,
-];
-
-export function assertForegroundWhisper(text: string): void {
-  for (const pattern of maintenanceLeakPatterns) {
-    if (pattern.test(text)) throw new Error('deliver_whisper rejected relationship-memory maintenance prose');
-  }
+function escapeXmlText(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 export function queueSubconWhisper(
@@ -63,7 +51,6 @@ export function queueSubconWhisper(
 ): PendingSubconWhisper | null {
   const cleaned = text.replace(/\r\n/g, '\n').trim();
   if (!cleaned) return null;
-  assertForegroundWhisper(cleaned);
   const dir = queueDir(cwd, sessionId);
   fs.mkdirSync(dir, { recursive: true });
   const whisper: PendingSubconWhisper = {
@@ -174,6 +161,6 @@ export function acknowledgePendingSubconWhispers(items: PendingSubconWhisperFile
 export function formatPendingSubconWhispers(items: PendingSubconWhisperFile[]): string {
   return items.map(({ whisper }, index) => {
     const ordinal = items.length > 1 ? ` (${index + 1}/${items.length})` : '';
-    return `<subcon_whisper${ordinal ? ` ordinal="${index + 1}/${items.length}"` : ''} timestamp="${whisper.created_at}">\n${whisper.text}\n</subcon_whisper>`;
+    return `<subcon_whisper${ordinal ? ` ordinal="${index + 1}/${items.length}"` : ''} timestamp="${whisper.created_at}">\n${escapeXmlText(whisper.text)}\n</subcon_whisper>`;
   }).join('\n\n');
 }

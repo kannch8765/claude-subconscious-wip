@@ -4,6 +4,30 @@ import { describe, expect, it } from 'vitest';
 
 const read = (relative: string) => fs.readFileSync(path.join(process.cwd(), relative), 'utf8');
 
+function expectAttachedBlockSnapshotsMatch(af: any): void {
+  const agent = af.agents[0];
+  const compiled = agent.messages[0].content[0].text as string;
+  expect(compiled.startsWith(`${agent.system}\n\n<memory_blocks>`)).toBe(true);
+  const byId = new Map(af.blocks.map((block: any) => [block.id, block]));
+  for (const blockId of agent.block_ids as string[]) {
+    const block: any = byId.get(blockId);
+    expect(block, `missing attached block ${blockId}`).toBeTruthy();
+    const open = `<${block.label}>`;
+    const close = `</${block.label}>`;
+    const start = compiled.indexOf(open);
+    const end = compiled.indexOf(close, start);
+    expect(start, `compiled snapshot missing ${block.label}`).toBeGreaterThanOrEqual(0);
+    expect(end, `compiled snapshot missing close tag for ${block.label}`).toBeGreaterThan(start);
+    const segment = compiled.slice(start, end + close.length);
+    const description = segment.match(/<description>\n([\s\S]*?)\n<\/description>/)?.[1];
+    const charsCurrent = Number(segment.match(/- chars_current=(\d+)/)?.[1]);
+    const value = segment.match(/<value>\n([\s\S]*?)\n<\/value>/)?.[1];
+    expect(description, `${block.label} compiled description drift`).toBe(block.description || '');
+    expect(charsCurrent, `${block.label} compiled chars_current drift`).toBe(block.value.length);
+    expect(value, `${block.label} compiled value drift`).toBe(block.value);
+  }
+}
+
 describe('live Subconscious narrative identity and visibility contract', () => {
   it('keeps internal identity first-person Kohaku while making visible memory whispers historical windows', () => {
     const af = JSON.parse(read('Subconscious.af'));
@@ -18,7 +42,7 @@ describe('live Subconscious narrative identity and visibility contract', () => {
     expect(core).toContain("same Kohaku (琥珀) identity");
     expect(core).toContain('Private/internal voice remains first-person Kohaku');
     expect(core).toContain('Visible relationship-memory whisper voice is different: it is a historical time window');
-    expect(agent.messages[0].content[0].text.startsWith(`${agent.system}\n\n<memory_blocks>`)).toBe(true);
+    expectAttachedBlockSnapshotsMatch(af);
   });
 
   it('does not force foreground Claude to repeat Subcon messages', () => {
