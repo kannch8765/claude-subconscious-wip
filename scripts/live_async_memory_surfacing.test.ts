@@ -75,7 +75,7 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(blocks.get('tool_guidelines')).toContain('I choose and execute at least one semantic query');
     expect(blocks.get('tool_guidelines')).not.toContain('the exact latest user message is prefetched once');
 
-    expect(agent.model).toBe('opencode-deepseek/deepseek-v4-flash');
+    expect(agent.model).toBe('openai-proxy/mimo-v2.5');
     expect(agent.model_settings?.parallel_tool_calls).toBe(true);
     expect(typeof agent.embedding).toBe('string');
     expect(agent.embedding.length).toBeGreaterThan(0);

@@ -62,11 +62,11 @@ function installManagedFetch(initialSystem: string, patchStatus = 200) {
         name: 'Subconscious_093B_110855',
         tags: REQUIRED_TAGS,
         system: liveSystem,
-        model: 'opencode-deepseek/deepseek-v4-flash',
+        model: 'openai-proxy/mimo-v2.5',
         embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
         context_window_limit: 400000,
-        model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
-        llm_config: { handle: 'opencode-deepseek/deepseek-v4-flash', model: 'deepseek-v4-flash', provider_name: 'opencode-deepseek', context_window: 400000, parallel_tool_calls: true },
+        model_settings: { provider_type: 'openai', parallel_tool_calls: true },
+        llm_config: { handle: 'openai-proxy/mimo-v2.5', model: 'mimo-v2.5', provider_name: 'opencode-go-openai', context_window: 400000, parallel_tool_calls: true },
       });
     }
 

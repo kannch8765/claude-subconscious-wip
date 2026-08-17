@@ -12,10 +12,10 @@ afterEach(() => {
 describe('Task 093AC managed runtime configuration authority', () => {
   it('reads the intended runtime policy from canonical Subconscious.af', () => {
     expect(getCanonicalManagedAgentConfig()).toEqual(expect.objectContaining({
-      model: 'opencode-deepseek/deepseek-v4-flash',
+      model: 'openai-proxy/mimo-v2.5',
       embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
       contextWindowLimit: 400000,
-      modelSettingsProviderType: 'deepseek',
+      modelSettingsProviderType: 'openai',
       parallelToolCalls: true,
     }));
   });
@@ -58,7 +58,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true },
     }]);
     expect(live.model_settings.parallel_tool_calls).toBe(true);
     expect(live.llm_config.parallel_tool_calls).toBe(true);
@@ -75,10 +75,10 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true } as Record<string, unknown>,
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
       llm_config: {
         handle: canonical.model,
-        model_endpoint_type: 'deepseek',
+        model_endpoint_type: 'openai',
         context_window: canonical.contextWindowLimit,
         parallel_tool_calls: true,
       },
@@ -113,7 +113,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
 
     expect(patches).toEqual([{
       context_window_limit: overrideContext,
-      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true },
     }]);
     expect(live.context_window_limit).toBe(overrideContext);
     expect(live.model_settings.parallel_tool_calls).toBe(true);
@@ -129,10 +129,10 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true } as Record<string, unknown>,
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
       llm_config: {
         handle: canonical.model,
-        model_endpoint_type: 'deepseek',
+        model_endpoint_type: 'openai',
         context_window: canonical.contextWindowLimit,
         parallel_tool_calls: false,
       },
@@ -156,7 +156,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
     await reconcileManagedAgentConfiguration('test-key', ID, () => {});
 
     expect(patches).toEqual([{
-      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true },
     }]);
     expect(live.model_settings.parallel_tool_calls).toBe(true);
     expect(live.llm_config.parallel_tool_calls).toBe(true);
@@ -171,10 +171,10 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true } as Record<string, unknown>,
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
       llm_config: {
         handle: canonical.model,
-        model_endpoint_type: 'deepseek',
+        model_endpoint_type: 'openai',
         context_window: canonical.contextWindowLimit,
         parallel_tool_calls: false,
       },
@@ -191,7 +191,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
   });
 
   it('pairs a cross-provider operator model override with Letta metadata and is idempotent', async () => {
-    const overrideModel = 'openai-proxy/glm-5.2';
+    const overrideModel = 'opencode-deepseek/deepseek-v4-flash';
     process.env.LETTA_MODEL = overrideModel;
     const canonical = getCanonicalManagedAgentConfig();
     const live = {
@@ -201,8 +201,8 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true } as Record<string, unknown>,
-      llm_config: { handle: canonical.model, model_endpoint_type: 'deepseek', context_window: canonical.contextWindowLimit, parallel_tool_calls: true },
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
+      llm_config: { handle: canonical.model, model_endpoint_type: 'openai', context_window: canonical.contextWindowLimit, parallel_tool_calls: true },
     };
     const patches: Array<Record<string, unknown>> = [];
     let modelMetadataReads = 0;
@@ -212,7 +212,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       if (url.pathname === '/v1/models/' && method === 'GET') {
         modelMetadataReads += 1;
         return new Response(JSON.stringify([
-          { model: 'glm-5.2', name: 'glm-5.2', provider_type: 'openai', handle: overrideModel },
+          { model: 'deepseek-v4-flash', name: 'deepseek-v4-flash', provider_type: 'deepseek', handle: overrideModel },
         ]), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       if (method === 'PATCH') {
@@ -241,10 +241,10 @@ describe('Task 093AC managed runtime configuration authority', () => {
     expect(patches).toEqual([{
       model: overrideModel,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true },
+      model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
     }]);
     expect(live.model).toBe(overrideModel);
-    expect(live.model_settings).toEqual({ provider_type: 'openai', parallel_tool_calls: true });
+    expect(live.model_settings).toEqual({ provider_type: 'deepseek', parallel_tool_calls: true });
     expect(modelMetadataReads).toBe(2);
   });
 });
