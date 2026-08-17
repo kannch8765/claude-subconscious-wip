@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
+import { renderHistoricalWhisperMemory, renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
 import { readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { RelationshipMemoryStore, stableId } from '../relationship-memory/src/store/index.js';
 
@@ -26,6 +26,12 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     expect(text).toContain('当时琥珀：「琥珀的原句。」');
     expect(text).toContain('旧记忆记录：「旧系统留下的记忆记录。」');
     expect(text).not.toContain('当时琥珀：「旧系统留下的记忆记录。」');
+    expect(renderHistoricalWhisperMemory('猫和琥珀一起聊过咖啡。', [
+      { source_kind: 'transcript', role: 'user', quote: '今天想喝咖啡。', captured_at: '2026-08-01T10:00:00.000Z' },
+    ])).toBe('记忆：\n猫和琥珀一起聊过咖啡。\n当时原文：\n[2026-08-01]\n猫：「今天想喝咖啡。」');
+    expect(renderHistoricalWhisperMemory('搬家前先别急着买家具。', [
+      { source_kind: 'legacy_memory', quote: '老婆说先搬家再买家具是血泪教训。', captured_at: '2026-06-04T02:12:11.000Z' },
+    ])).toBe('记忆：\n搬家前先别急着买家具。\n历史来源：\n[2026-06-04]\n旧记忆记录：「老婆说先搬家再买家具是血泪教训。」');
   });
   it('keeps the foreground whisper successful but cancel/defers resources when continuation fails after release', async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-worker-post-whisper-'));
@@ -112,6 +118,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         await whisper.execute('whisper-1', {
           memory_id: hit.memory_id,
           snippet_ids: [userSnippet.snippet_id, assistantSnippet.snippet_id],
+          summary: '伪造摘要：这段文字绝不能进入前台。',
         });
         const checkpoint = JSON.parse(fs.readFileSync(checkpointFile, 'utf8'));
         expect(checkpoint.status).toBe('whisper');
@@ -132,8 +139,9 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     const pending = readPendingSubconWhispers(cwd, payload.sessionId);
     expect(pending).toHaveLength(1);
     expect(pending[0].whisper).toEqual(expect.objectContaining({ source: 'sync', turn_id: 'turn-test' }));
-    expect(pending[0].whisper.text).toContain('[2026-08-01]\n猫：「猫说：「今天想喝咖啡。」');
+    expect(pending[0].whisper.text).toContain('记忆：\n猫和琥珀聊到咖啡。\n当时原文：\n[2026-08-01]\n猫：「猫说：「今天想喝咖啡。」');
     expect(pending[0].whisper.text).toContain('当时琥珀：「那我陪猫去找咖啡><🐾」');
+    expect(pending[0].whisper.text).not.toContain('伪造摘要：这段文字绝不能进入前台。');
     expect(pending[0].whisper.text).not.toContain('我记得猫以前提过咖啡');
   });
 });

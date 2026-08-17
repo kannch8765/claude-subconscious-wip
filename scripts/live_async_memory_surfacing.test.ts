@@ -19,9 +19,12 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(worker).toContain("enum: ['foreground_grounding', 'maintenance']");
     expect(worker).toContain('const { purpose: _purpose, ...searchArgs } = rawArgs');
     expect(worker).toContain('quote_snippets');
+    expect(send).toContain('canonical summary plus quote_snippets');
     expect(worker).toContain("required: ['memory_id', 'snippet_ids']");
-    expect(worker).toContain('renderHistoricalWhisperQuotes(snippets)');
+    expect(worker).toContain('const surfacedMemories = new Map<string, SurfacedMemoryContext>()');
+    expect(worker).toContain('renderHistoricalWhisperMemory(surfaced.summary, snippets)');
     expect(worker).toContain('composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations))');
+    expect(worker).not.toContain('raw.summary');
     expect(worker).not.toContain('runtime.memorySearchHybrid({ query: firstSearchQuery');
     expect(worker).not.toContain('prefetched_relationship_memory_search');
     expect(send).toContain('latestUserMessage,');
