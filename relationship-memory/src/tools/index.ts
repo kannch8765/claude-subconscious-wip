@@ -9,6 +9,7 @@ import type {
   EntityEvidenceRecord,
   EntityIdentityRecord,
   MemoryKind,
+  OwnerRevisionRecord,
   ParticipantRole,
   RememberOutcome,
   ReinforcementRecord,
@@ -16,7 +17,7 @@ import type {
 import { normalizeEntityAlias, validateEntityIdentityProposal, validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
-import { LegacyMemorySourceStore } from '../legacy/index.js';
+import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
 export interface SearchQuery {
@@ -33,6 +34,20 @@ export interface SearchQuery {
 export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[] }
 export interface EntitySearchQuery { query?: string; limit?: number }
 export interface EntitySearchResult extends EntityIdentityRecord { evidence_ids: string[]; evidence_message_ids: string[] }
+
+export interface RecallQuoteSnippet {
+  snippet_id: string;
+  source_kind: 'transcript' | 'legacy_memory';
+  evidence_id?: string;
+  legacy_source_id?: string;
+  role?: ParticipantRole;
+  quote: string;
+  captured_at: string;
+}
+
+export interface MemoryRecallResult extends EffectiveMemoryRecord {
+  quote_snippets: RecallQuoteSnippet[];
+}
 
 export interface RememberResult {
   outcome: RememberOutcome['outcome'];
@@ -138,6 +153,224 @@ export class RelationshipMemoryRuntime {
     return result;
   }
 
+  private splitSourceText(text: string): string[] {
+    const pieces: string[] = [];
+    for (const line of text.replace(/\r\n/g, '\n').split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const sentences = trimmed.match(/[^。！？!?]+[。！？!?]+[」』”’]?|[^。！？!?]+$/gu) ?? [trimmed];
+      for (const sentence of sentences) {
+        const source = sentence.trim();
+        if (!source) continue;
+        // Preserve exact source text while bounding one candidate. Long prose/code
+        // becomes several exact excerpts rather than one multi-kilobyte whisper.
+        const codePoints = [...source];
+        for (let offset = 0; offset < codePoints.length; offset += 600) {
+          pieces.push(codePoints.slice(offset, offset + 600).join(''));
+        }
+      }
+    }
+    return pieces;
+  }
+
+  private quoteSnippetsForEvidence(item: EvidenceRecord): RecallQuoteSnippet[] {
+    if (item.event_kind && item.event_kind !== 'user_text' && item.event_kind !== 'assistant_text') return [];
+    return this.splitSourceText(item.quote).map((quote, index) => ({
+      snippet_id: stableId('quote_snippet', { evidence_id: item.evidence_id, index, quote }),
+      source_kind: 'transcript' as const,
+      evidence_id: item.evidence_id,
+      role: item.role,
+      quote,
+      captured_at: item.captured_at,
+    }));
+  }
+
+  private quoteSnippetsForLegacySource(source: LegacyAssistantMemorySourceRecord): RecallQuoteSnippet[] {
+    const text = source.body_text.trim() || source.frontmatter.name;
+    return this.splitSourceText(text).map((quote, index) => ({
+      snippet_id: stableId('legacy_quote_snippet', { legacy_source_id: source.legacy_source_id, index, quote }),
+      source_kind: 'legacy_memory' as const,
+      legacy_source_id: source.legacy_source_id,
+      quote,
+      captured_at: source.created_at_utc,
+    }));
+  }
+
+  private boundRecallSnippets(items: readonly RecallQuoteSnippet[], limit = 8): RecallQuoteSnippet[] {
+    const unique = [...new Map(items.map((item) => [item.snippet_id, item])).values()];
+    const bounded = Math.max(1, Math.min(limit, 12));
+    return unique.length <= bounded
+      ? unique
+      : [...unique.slice(0, Math.ceil(bounded / 2)), ...unique.slice(-Math.floor(bounded / 2))];
+  }
+
+  private recallQuoteSnippets(memoryId: string, evidence: readonly EvidenceRecord[], limit = 8): RecallQuoteSnippet[] {
+    const eligible = evidence
+      .filter((item) => item.memory_id === memoryId)
+      .sort((a, b) => a.captured_at.localeCompare(b.captured_at) || a.evidence_id.localeCompare(b.evidence_id))
+      .flatMap((item) => this.quoteSnippetsForEvidence(item));
+    return this.boundRecallSnippets(eligible, limit);
+  }
+
+  private legacyQuoteSnippetsForMemories(memoryIds: readonly string[], limit = 8): Map<string, RecallQuoteSnippet[]> {
+    if (memoryIds.length === 0) return new Map();
+    const wanted = new Set(memoryIds);
+    const legacyStore = new LegacyMemorySourceStore(this.store.rootDir);
+    const provenance = legacyStore.listProvenance().filter((item) => wanted.has(item.canonical_memory_id));
+    if (provenance.length === 0) return new Map();
+    const sourceIds = new Set(provenance.map((item) => item.legacy_source_id));
+    const sources = new Map(legacyStore.listSources()
+      .filter((source) => sourceIds.has(source.legacy_source_id))
+      .map((source) => [source.legacy_source_id, source]));
+    const byMemory = new Map<string, RecallQuoteSnippet[]>();
+    for (const memoryId of memoryIds) {
+      const snippets = provenance
+        .filter((item) => item.canonical_memory_id === memoryId)
+        .map((item) => sources.get(item.legacy_source_id))
+        .filter((source): source is LegacyAssistantMemorySourceRecord => Boolean(source))
+        .sort((a, b) => a.created_at_utc.localeCompare(b.created_at_utc) || a.legacy_source_id.localeCompare(b.legacy_source_id))
+        .flatMap((source) => this.quoteSnippetsForLegacySource(source));
+      if (snippets.length > 0) byMemory.set(memoryId, this.boundRecallSnippets(snippets, limit));
+    }
+    return byMemory;
+  }
+
+  private attachRecallEvidence(memories: EffectiveMemoryRecord[]): MemoryRecallResult[] {
+    const evidence = this.store.listEvidenceForMemoryIds(memories.map((memory) => memory.memory_id));
+    const transcript = new Map(memories.map((memory) => [memory.memory_id, this.recallQuoteSnippets(memory.memory_id, evidence)]));
+    const missing = memories.filter((memory) => (transcript.get(memory.memory_id)?.length ?? 0) === 0).map((memory) => memory.memory_id);
+    const legacy = this.legacyQuoteSnippetsForMemories(missing);
+    return memories.map((memory) => ({
+      ...memory,
+      quote_snippets: transcript.get(memory.memory_id)?.length
+        ? transcript.get(memory.memory_id)!
+        : legacy.get(memory.memory_id) ?? [],
+    }));
+  }
+
+  async memorySearchRecallHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
+    return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query));
+  }
+
+  async memorySearchHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
+    return this.attachRecallEvidence(await this.memorySearchHybrid(query));
+  }
+
+
+  private recallEffectiveMemories(): EffectiveMemoryRecord[] {
+    // Foreground recall must not pay OwnerControlPlane.listEffective()'s repeated
+    // JSONL reads. Materialize genesis + owner revisions once while preserving
+    // the same owner-correction semantics as getEffective().
+    const revisionsByMemory = new Map<string, OwnerRevisionRecord[]>();
+    for (const revision of this.store.listOwnerRevisions()) {
+      const bucket = revisionsByMemory.get(revision.memory_id) ?? [];
+      bucket.push(revision);
+      revisionsByMemory.set(revision.memory_id, bucket);
+    }
+    return this.store.listMemories().map((genesis) => {
+      let semantic = {
+        kind: genesis.kind,
+        summary: genesis.summary,
+        participants: genesis.participants,
+        payload: genesis.payload,
+        ...(genesis.linked_memory_ids ? { linked_memory_ids: genesis.linked_memory_ids } : {}),
+      };
+      let status: 'active' | 'inactive' = 'active';
+      let latest: OwnerRevisionRecord | undefined;
+      for (const revision of revisionsByMemory.get(genesis.memory_id) ?? []) {
+        latest = revision;
+        if (revision.action === 'revise' && revision.replacement) semantic = revision.replacement;
+        else if (revision.action === 'deactivate') status = 'inactive';
+        else if (revision.action === 'restore') status = 'active';
+      }
+      return {
+        ...genesis,
+        ...semantic,
+        status,
+        owner_corrected: Boolean(latest),
+        ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}),
+      };
+    });
+  }
+
+  async memorySearchRecallHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
+    const semanticQuery = query.query?.trim();
+    const trigger = query.trigger?.trim().toLowerCase();
+    const limit = boundedSearchLimit(query.limit);
+
+    // Preserve the existing memory_search result/search semantics without the
+    // hot path's old per-memory JSONL rescans. Materialize each supporting file
+    // once, then join by memory id in memory.
+    const reinforcementsByMemory = new Map<string, ReinforcementRecord[]>();
+    for (const reinforcement of this.store.listReinforcements()) {
+      const bucket = reinforcementsByMemory.get(reinforcement.memory_id) ?? [];
+      bucket.push(reinforcement);
+      reinforcementsByMemory.set(reinforcement.memory_id, bucket);
+    }
+    const intentsById = new Map(this.store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
+    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
+    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
+    const linkedIntentsByMemory = new Map<string, AssistantRememberIntentRecord[]>();
+    for (const [intentId, outcome] of latestOutcomeByIntent) {
+      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
+      const intent = intentsById.get(intentId);
+      if (!intent) continue;
+      const bucket = linkedIntentsByMemory.get(outcome.memory_id) ?? [];
+      bucket.push(intent);
+      linkedIntentsByMemory.set(outcome.memory_id, bucket);
+    }
+
+    const candidates = this.recallEffectiveMemories().map((memory) => {
+      const reinforcements = reinforcementsByMemory.get(memory.memory_id) ?? [];
+      const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
+      const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
+      const enriched: EffectiveMemoryRecord = {
+        ...memory,
+        ...(reinforcements.length ? {
+          reinforcement_count: reinforcements.length,
+          reinforcement_evidence_count: evidenceIds.length,
+          reinforcement_evidence_ids: evidenceIds.slice(-20),
+          latest_reinforcement_at: latest,
+        } : {}),
+      };
+      const linkedIntents = (linkedIntentsByMemory.get(memory.memory_id) ?? []).map((intent) => ({
+        memory: intent.memory.text,
+        feel: intent.feel.text,
+      }));
+      return { memory: enriched, linkedIntents };
+    }).filter(({ memory, linkedIntents }) => {
+      if (memory.status !== 'active') return false;
+      if (query.kind && memory.kind !== query.kind) return false;
+      if (query.participant && !memory.participants.includes(query.participant)) return false;
+      if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
+      if (query.time_start && memory.observed_at < query.time_start) return false;
+      if (query.time_end && memory.observed_at > query.time_end) return false;
+      const haystack = stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: linkedIntents }).toLowerCase();
+      if (trigger && !haystack.includes(trigger)) return false;
+      return true;
+    });
+    if (!semanticQuery) return candidates.slice(0, limit).map((item) => item.memory);
+
+    const documents = candidates.map(({ memory, linkedIntents }) => ({
+      id: `memory:${memory.memory_id}`,
+      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
+    }));
+    let semantic = new Map<string, number>();
+    if (this.semanticRetriever?.rankExisting) {
+      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery); }
+      catch { semantic = new Map(); }
+    }
+    const scored = candidates.map(({ memory }, index) => {
+      const lexical = lexicalTextScore(documents[index].text, semanticQuery);
+      const semanticScore = semantic.get(documents[index].id);
+      return { memory, lexical, semantic: semanticScore, score: hybridScore(lexical, semanticScore) };
+    }).filter((item) => item.semantic !== undefined || item.lexical > 0);
+    return scored
+      .sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
+      .slice(0, limit)
+      .map((item) => item.memory);
+  }
+
   memorySearch(query: SearchQuery): EffectiveMemoryRecord[] {
     const needle = query.query?.trim().toLowerCase();
     const trigger = query.trigger?.trim().toLowerCase();
@@ -203,6 +436,32 @@ export class RelationshipMemoryRuntime {
         evidence_message_ids: evidence.map((item) => item.message_id),
       };
     });
+  }
+
+  async entitySearchRecallHybrid(query: EntitySearchQuery = {}): Promise<EntitySearchResult[]> {
+    const semanticQuery = query.query?.trim();
+    const limit = boundedSearchLimit(query.limit);
+    if (!semanticQuery) return this.entitySearch(query).slice(0, limit);
+    const candidates = this.entitySearch({});
+    const documents = candidates.map((entity) => ({
+      id: `entity:${entity.entity_id}`,
+      text: semanticText(entity.canonical_name, entity.aliases, entity.entity_type, entity.description),
+    }));
+    let semantic = new Map<string, number>();
+    if (this.semanticRetriever?.rankExisting) {
+      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery); }
+      catch { semantic = new Map(); }
+    }
+    const scored = candidates.map((entity, index) => {
+      const lexical = lexicalTextScore(documents[index].text, semanticQuery);
+      const semanticScore = semantic.get(documents[index].id);
+      return { entity, lexical, semantic: semanticScore, score: hybridScore(lexical, semanticScore) };
+    }).filter((item) => item.semantic !== undefined || item.lexical > 0);
+    if (scored.length === 0) return this.entitySearch(query).slice(0, limit);
+    return scored
+      .sort((a, b) => b.score - a.score || b.entity.observed_at.localeCompare(a.entity.observed_at))
+      .slice(0, limit)
+      .map((item) => item.entity);
   }
 
   async entitySearchHybrid(query: EntitySearchQuery = {}): Promise<EntitySearchResult[]> {
@@ -690,7 +949,7 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
         enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'],
         description: 'Canonical relationship-memory kind. payload fields must match this kind exactly.',
       },
-      summary: string,
+      summary: { ...string, description: 'Concise source-grounded historical event or stable-fact index. State what happened or what was explicitly stated; do not infer present feelings, motives, fulfillment, or relationship conclusions.' },
       participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
       evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Exact evidence_id values copied from the trusted current-batch transcript-event evidence catalog.' },
       evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy message_id compatibility alias. A message_id is accepted only when it uniquely identifies one trusted event in the current batch; ambiguous multi-event messages are rejected and require an exact evidence_id. Do not send both fields.' },
@@ -717,15 +976,15 @@ export function memoryRememberToolSchema(): Record<string, unknown> {
           time_text: string,
           places: strings,
           themes: strings,
-          emotional_tone: string,
-          why_memorable: string,
+          emotional_tone: { ...string, description: 'Optional historical affect only when trusted evidence directly expresses or unambiguously demonstrates it; keep it perspective-neutral and do not project it onto present Kohaku.' },
+          why_memorable: { ...string, description: 'Optional source-supported historical reason only. Omit when the evidence does not explicitly support why the event was memorable; never invent present-day significance.' },
           recall_triggers: strings,
           event: string,
-          shared_meaning: string,
+          shared_meaning: { ...string, description: 'Required minimal factual relationship description. Prefer an evidence-backed restatement of what was shared/explicitly said; do not infer feelings, fulfillment, or relationship conclusions.' },
           symbols: strings,
-          meaning: string,
+          meaning: { ...string, description: 'Required minimal factual relationship-event description. Use only source-supported meaning; when no stronger meaning is explicit, keep this as a factual restatement rather than an interpretation.' },
           prior_context: string,
-          resulting_change: string,
+          resulting_change: { ...string, description: 'Optional historical change only when trusted evidence explicitly establishes it; do not infer that a wish was fulfilled, a bond deepened, or a present state changed.' },
           name: string,
           trigger_phrases: { type: 'array', minItems: 1, uniqueItems: true, items: string },
           origin: string,

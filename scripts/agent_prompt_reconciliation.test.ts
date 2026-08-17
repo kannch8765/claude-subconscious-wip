@@ -102,6 +102,30 @@ afterEach(() => {
   delete process.env.LETTA_BASE_URL;
 });
 
+function expectAttachedBlockSnapshotsMatch(af: any): void {
+  const agent = af.agents[0];
+  const compiled = agent.messages[0].content[0].text as string;
+  expect(compiled.startsWith(`${agent.system}\n\n<memory_blocks>`)).toBe(true);
+  const byId = new Map(af.blocks.map((block: any) => [block.id, block]));
+  for (const blockId of agent.block_ids as string[]) {
+    const block: any = byId.get(blockId);
+    expect(block, `missing attached block ${blockId}`).toBeTruthy();
+    const open = `<${block.label}>`;
+    const close = `</${block.label}>`;
+    const start = compiled.indexOf(open);
+    const end = compiled.indexOf(close, start);
+    expect(start, `compiled snapshot missing ${block.label}`).toBeGreaterThanOrEqual(0);
+    expect(end, `compiled snapshot missing close tag for ${block.label}`).toBeGreaterThan(start);
+    const segment = compiled.slice(start, end + close.length);
+    const description = segment.match(/<description>\n([\s\S]*?)\n<\/description>/)?.[1];
+    const charsCurrent = Number(segment.match(/- chars_current=(\d+)/)?.[1]);
+    const value = segment.match(/<value>\n([\s\S]*?)\n<\/value>/)?.[1];
+    expect(description, `${block.label} compiled description drift`).toBe(block.description || '');
+    expect(charsCurrent, `${block.label} compiled chars_current drift`).toBe(block.value.length);
+    expect(value, `${block.label} compiled value drift`).toBe(block.value);
+  }
+}
+
 describe('managed adopted-agent system prompt reconciliation', () => {
   it('patches a stale saved managed agent exactly once with the canonical .af system', async () => {
     const home = makeHome();
@@ -275,7 +299,7 @@ describe('canonical Subconscious prompt contract', () => {
     const af = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf-8'));
 
     expect(mod.getCanonicalManagedSystemPrompt()).toBe(af.agents[0].system);
-    expect(af.agents[0].messages[0].content[0].text.startsWith(`${af.agents[0].system}\n\n<memory_blocks>`)).toBe(true);
+    expectAttachedBlockSnapshotsMatch(af);
   });
 
   it('restores the live guidance/context role instead of the historical observer contract', async () => {

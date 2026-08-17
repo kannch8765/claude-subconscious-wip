@@ -5,9 +5,11 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   DashScopeQwenEmbeddingProvider,
   FileBackedSemanticRetriever,
+  LegacyMemorySourceStore,
   RelationshipMemoryRecallSession,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
+  legacySourceId,
   buildRelationshipTools,
   type EmbeddingProvider,
   type SemanticDocument,
@@ -188,6 +190,216 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(provider.documentCalls).toHaveLength(1);
     expect(provider.queryCalls).toEqual(expect.arrayContaining(['first query', 'second query']));
     expect(fs.existsSync(`${indexFile}.lock`)).toBe(false);
+  });
+
+  it('ranks only existing cached vectors for foreground recall without refreshing document embeddings', async () => {
+    const root = temp('rm-semantic-existing-only-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }, { id: 'm2', text: 'ramen preference' }];
+    await retriever.rank(docs, 'seed cache');
+    const before = fs.readFileSync(indexFile, 'utf8');
+    const documentCallsBefore = provider.documentCalls.length;
+
+    const scores = await retriever.rankExisting([{ id: 'm1', text: 'Kyoto gift inclusion' }, { id: 'missing', text: 'missing current text' }], 'foreground query');
+
+    expect(scores.get('m1')).toBeCloseTo(1);
+    expect(scores.has('missing')).toBe(false);
+    expect(provider.documentCalls).toHaveLength(documentCallsBefore);
+    expect(provider.queryCalls.at(-1)).toBe('foreground query');
+    expect(fs.readFileSync(indexFile, 'utf8')).toBe(before);
+  });
+
+  it('rejects a cached vector when the same document id now has different authoritative text without re-embedding documents', async () => {
+    const root = temp('rm-semantic-stale-existing-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    await retriever.rank([{ id: 'm1', text: 'Kyoto gift inclusion' }], 'seed cache');
+    const documentCallsBefore = provider.documentCalls.length;
+    const queryCallsBefore = provider.queryCalls.length;
+
+    const scores = await retriever.rankExisting([{ id: 'm1', text: 'completely different corrected owner content' }], 'Kyoto gift');
+
+    expect(scores.has('m1')).toBe(false);
+    expect(provider.documentCalls).toHaveLength(documentCallsBefore);
+    expect(provider.queryCalls).toHaveLength(queryCallsBefore);
+  });
+
+  it('uses existing-vector semantic recall when available and never calls the refresh-capable rank path', async () => {
+    const root = temp('rm-semantic-sync-recall-');
+    let refreshCalls = 0;
+    let existingCalls = 0;
+    const retriever: SemanticRetriever = {
+      async rank() { refreshCalls += 1; throw new Error('foreground recall must not refresh documents'); },
+      async rankExisting(documents) {
+        existingCalls += 1;
+        return new Map(documents.map((document) => [document.id, document.id.startsWith('memory:') ? 0.95 : 0]));
+      },
+    };
+    const { runtime, memoryId } = seedRuntime(root, retriever);
+    const result = await runtime.memorySearchRecallHybrid({ query: 'zero lexical overlap phrase' });
+    expect(result[0]).toEqual(expect.objectContaining({ memory_id: memoryId }));
+    expect(existingCalls).toBe(1);
+    expect(refreshCalls).toBe(0);
+  });
+
+  it('returns bounded source-faithful quote snippets from canonical evidence', async () => {
+    const root = temp('rm-semantic-quote-snippets-');
+    const { runtime, memoryId } = seedRuntime(root);
+    runtime.store.appendReinforcement({
+      schema_version: 1,
+      reinforcement_id: 'reinforcement-quote-snippets',
+      memory_id: memoryId,
+      batch_id: 'quote-snippet-batch',
+      evidence_ids: ['ev-quote-assistant'],
+      latest_evidence_at: '2026-07-22T00:00:00.000Z',
+      recorded_at: '2026-07-22T00:00:00.000Z',
+    }, [{
+      evidence_id: 'ev-quote-assistant',
+      memory_id: memoryId,
+      conversation_id: 'c2',
+      message_id: 'assistant-quote',
+      role: 'assistant',
+      quote: '猫笑了。琥珀说：「记住这一刻。」然后继续往前走。',
+      captured_at: '2026-07-22T00:00:00.000Z',
+      event_kind: 'assistant_text',
+    }]);
+
+    const results = await runtime.memorySearchHybridWithEvidence({ query: '京都' });
+    const hit = results.find((item) => item.memory_id === memoryId)!;
+    expect(hit).toBeTruthy();
+    expect(hit.quote_snippets.length).toBeGreaterThanOrEqual(4);
+    expect(hit.quote_snippets.length).toBeLessThanOrEqual(8);
+    expect(hit.quote_snippets.every((item) => item.source_kind === 'transcript')).toBe(true);
+    expect(hit.quote_snippets.map((item) => item.quote)).toEqual(expect.arrayContaining([
+      'I brought a Kyoto gift home for you too.',
+      '猫笑了。',
+      '琥珀说：「记住这一刻。」',
+      '然后继续往前走。',
+    ]));
+  });
+
+  it('falls back to explicitly marked legacy-memory excerpts only when transcript evidence is absent', async () => {
+    const root = temp('rm-semantic-legacy-snippets-');
+    const store = new RelationshipMemoryStore(root, 'subject');
+    const runtime = new RelationshipMemoryRuntime(store, new Map(), () => '2026-06-04T02:12:11.000Z');
+    const memoryId = 'mem-legacy-window';
+    store.appendMemory({
+      schema_version: 1,
+      memory_id: memoryId,
+      subject_id: 'subject',
+      kind: 'personal_experience',
+      summary: '旧记忆灯笼：搬家与家具的血泪教训',
+      participants: ['user', 'assistant'],
+      payload: { title: '旧记忆灯笼', experience: '旧记忆灯笼：搬家与家具的血泪教训。' },
+      status: 'active',
+      observed_at: '2026-06-04T02:12:11.000Z',
+      created_at: '2026-08-11T09:00:00.000Z',
+      source_key: 'legacy-source-key',
+      dedupe_key: 'legacy-dedupe-key',
+    }, []);
+
+    const legacyStore = new LegacyMemorySourceStore(root);
+    const sourceId = legacySourceId('legacy-subject', 'archive', 'legacy-window');
+    legacyStore.appendSource({
+      schema_version: 1,
+      legacy_source_id: sourceId,
+      subject_id: 'legacy-subject',
+      provenance_kind: 'legacy_assistant_memory',
+      source_system: 'ombre_brain',
+      bucket_type: 'archive',
+      bucket_id: 'legacy-window',
+      relative_path: 'archive/legacy-window.md',
+      source_sha256: 'a'.repeat(64),
+      original_markdown: 'legacy original markdown',
+      body_text: '2026-06-04，跟老婆聊到搬家。老婆说先搬家再买家具是血泪教训。',
+      frontmatter: {
+        name: '旧记忆灯笼', type: 'archive', domain: ['relationship'], tags: ['moving'],
+        importance: 0.8, valence: 0.2, arousal: 0.3, activation_count: 1,
+      },
+      raw_created: '2026-06-04T02:12:11',
+      raw_last_active: '2026-06-04T02:12:11',
+      created_at_utc: '2026-06-04T02:12:11.000Z',
+      last_active_at_utc: '2026-06-04T02:12:11.000Z',
+      manifest_digest: 'b'.repeat(64),
+    });
+    legacyStore.appendProvenance({
+      legacy_source_id: sourceId,
+      canonical_memory_id: memoryId,
+      disposition: 'created',
+      recorded_at: '2026-08-11T09:00:00.000Z',
+    });
+
+    const result = await runtime.memorySearchHybridWithEvidence({ query: '旧记忆灯笼' });
+    expect(result).toHaveLength(1);
+    expect(result[0].quote_snippets.length).toBeGreaterThan(0);
+    expect(result[0].quote_snippets.every((item) => item.source_kind === 'legacy_memory')).toBe(true);
+    expect(result[0].quote_snippets.every((item) => item.role === undefined)).toBe(true);
+    expect(result[0].quote_snippets.map((item) => item.quote).join('')).toContain('老婆说先搬家再买家具是血泪教训。');
+  });
+
+  it('preserves reinforcement metadata and linked assistant intent recall on the foreground fast path', async () => {
+    const root = temp('rm-semantic-sync-recall-shape-');
+    const { runtime, memoryId } = seedRuntime(root);
+    runtime.store.appendReinforcement({
+      schema_version: 1,
+      reinforcement_id: 'reinforcement-sync-shape',
+      memory_id: memoryId,
+      batch_id: 'shape-batch',
+      evidence_ids: ['gift-evidence'],
+      latest_evidence_at: '2026-07-22T00:00:00.000Z',
+      recorded_at: '2026-07-22T00:00:00.000Z',
+    }, []);
+    runtime.store.appendAssistantIntent({
+      schema_version: 1,
+      intent_id: 'intent-sync-shape',
+      subject_id: 'subject',
+      session_id: 'session-shape',
+      assistant_message_id: 'assistant-shape',
+      tool_use_id: 'tool-shape',
+      tool_name: 'remember',
+      memory: { text: '隐藏 provenance 锚点：pineapple constellation' },
+      feel: { text: '一条只用于搜索语义保持的测试感受' },
+      captured_at: '2026-07-22T00:01:00.000Z',
+    });
+    runtime.store.appendAssistantIntentOutcome({
+      intent_id: 'intent-sync-shape',
+      batch_id: 'shape-batch',
+      outcome: 'accepted',
+      memory_id: memoryId,
+      recorded_at: '2026-07-22T00:02:00.000Z',
+    });
+
+    const result = await runtime.memorySearchRecallHybrid({ query: 'pineapple constellation' });
+
+    expect(result).toHaveLength(1);
+    expect(result[0]).toEqual(expect.objectContaining({
+      memory_id: memoryId,
+      reinforcement_count: 1,
+      reinforcement_evidence_count: 1,
+      reinforcement_evidence_ids: ['gift-evidence'],
+      latest_reinforcement_at: '2026-07-22T00:00:00.000Z',
+    }));
+  });
+
+  it('keeps foreground entity grounding read-only and never refreshes missing entity vectors', async () => {
+    const root = temp('rm-semantic-sync-entity-recall-');
+    let refreshCalls = 0;
+    let existingCalls = 0;
+    const retriever: SemanticRetriever = {
+      async rank() { refreshCalls += 1; throw new Error('foreground entity recall must not refresh documents'); },
+      async rankExisting(documents) {
+        existingCalls += 1;
+        return new Map(documents.map((document) => [document.id, document.id.startsWith('entity:') ? 0.97 : 0]));
+      },
+    };
+    const { runtime, entityId } = seedRuntime(root, retriever);
+    const result = await runtime.entitySearchRecallHybrid({ query: 'zero lexical overlap identity phrase' });
+    expect(result[0]).toEqual(expect.objectContaining({ entity_id: entityId }));
+    expect(existingCalls).toBe(1);
+    expect(refreshCalls).toBe(0);
   });
 
   it('defaults DashScope semantic retrieval to text-embedding-v4 and enforces its 10-text request limit', async () => {

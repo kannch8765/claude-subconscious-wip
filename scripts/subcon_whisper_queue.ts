@@ -9,6 +9,19 @@ export interface PendingSubconWhisper {
   batch_id: string;
   text: string;
   created_at: string;
+  source?: 'async' | 'sync';
+  turn_id?: string;
+}
+
+export interface SubconWhisperScope {
+  source: 'sync';
+  turnId: string;
+}
+
+export interface PartitionedSubconWhispers {
+  deliverable: PendingSubconWhisperFile[];
+  deferredSync: PendingSubconWhisperFile[];
+  staleSync: PendingSubconWhisperFile[];
 }
 
 export interface PendingSubconWhisperFile {
@@ -21,30 +34,23 @@ function queueDir(cwd: string, sessionId: string): string {
   return path.join(getDurableStateDir(cwd), 'subcon-whispers', sessionKey);
 }
 
-function stableWhisperId(sessionId: string, batchId: string): string {
+export function stableWhisperId(sessionId: string, batchId: string): string {
   return `whisper_${crypto.createHash('sha256').update(`${sessionId}\0${batchId}`).digest('hex').slice(0, 24)}`;
 }
 
-const maintenanceLeakPatterns = [
-  /\bmem_[a-z0-9]+\b/i,
-  /\btranscript_ev_[a-z0-9]+\b/i,
-  /\bevidence[_ -]?ids?\b/i,
-  /\bmemory_(?:search|reinforce|remember)\b/i,
-  /\bdedupe\b/i,
-  /(?:已|需要|无需|不需要).{0,10}(?:reinforce|remember|写入|建档|存档|记忆操作)/i,
-  /新证据.{0,12}(?:值得处理|需要处理|reinforce|remember)/i,
-];
-
-export function assertForegroundWhisper(text: string): void {
-  for (const pattern of maintenanceLeakPatterns) {
-    if (pattern.test(text)) throw new Error('deliver_whisper rejected relationship-memory maintenance prose');
-  }
+function escapeXmlText(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-export function queueSubconWhisper(cwd: string, sessionId: string, batchId: string, text: string): PendingSubconWhisper | null {
+export function queueSubconWhisper(
+  cwd: string,
+  sessionId: string,
+  batchId: string,
+  text: string,
+  scope?: SubconWhisperScope,
+): PendingSubconWhisper | null {
   const cleaned = text.replace(/\r\n/g, '\n').trim();
   if (!cleaned) return null;
-  assertForegroundWhisper(cleaned);
   const dir = queueDir(cwd, sessionId);
   fs.mkdirSync(dir, { recursive: true });
   const whisper: PendingSubconWhisper = {
@@ -53,6 +59,7 @@ export function queueSubconWhisper(cwd: string, sessionId: string, batchId: stri
     batch_id: batchId,
     text: cleaned,
     created_at: new Date().toISOString(),
+    ...(scope ? { source: scope.source, turn_id: scope.turnId } : {}),
   };
   const file = path.join(dir, `${whisper.whisper_id}.json`);
   const deliveredMarker = path.join(dir, `${whisper.whisper_id}.delivered`);
@@ -67,6 +74,15 @@ export function queueSubconWhisper(cwd: string, sessionId: string, batchId: stri
     if (!fs.existsSync(file)) throw error;
   }
   return whisper;
+}
+
+export function removePendingSubconWhisper(cwd: string, sessionId: string, batchId: string): void {
+  const dir = queueDir(cwd, sessionId);
+  const whisperId = stableWhisperId(sessionId, batchId);
+  for (const suffix of ['.json', '.delivered']) {
+    try { fs.unlinkSync(path.join(dir, `${whisperId}${suffix}`)); }
+    catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
+  }
 }
 
 export function readPendingSubconWhispers(cwd: string, sessionId: string): PendingSubconWhisperFile[] {
@@ -85,6 +101,50 @@ export function readPendingSubconWhispers(cwd: string, sessionId: string): Pendi
   return items.sort((a, b) => a.whisper.created_at.localeCompare(b.whisper.created_at));
 }
 
+export function partitionPendingSubconWhispersForTurn(
+  items: PendingSubconWhisperFile[],
+  expectedSyncTurnId?: string,
+): PartitionedSubconWhispers {
+  const deliverable: PendingSubconWhisperFile[] = [];
+  const deferredSync: PendingSubconWhisperFile[] = [];
+  const staleSync: PendingSubconWhisperFile[] = [];
+  for (const item of items) {
+    if (item.whisper.source !== 'sync') {
+      deliverable.push(item);
+      continue;
+    }
+    if (!expectedSyncTurnId) {
+      deferredSync.push(item);
+      continue;
+    }
+    if (item.whisper.turn_id === expectedSyncTurnId) deliverable.push(item);
+    else staleSync.push(item);
+  }
+  return { deliverable, deferredSync, staleSync };
+}
+
+export function retractPendingSyncWhisperForTurn(
+  cwd: string,
+  sessionId: string,
+  turnId: string,
+  whisperId?: string,
+): number {
+  if (!turnId) return 0;
+  const pending = readPendingSubconWhispers(cwd, sessionId);
+  let retracted = 0;
+  for (const item of pending) {
+    if (item.whisper.source !== 'sync' || item.whisper.turn_id !== turnId) continue;
+    if (whisperId && item.whisper.whisper_id !== whisperId) continue;
+    try {
+      fs.unlinkSync(item.file);
+      retracted += 1;
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+  return retracted;
+}
+
 export function acknowledgePendingSubconWhispers(items: PendingSubconWhisperFile[]): void {
   for (const item of items) {
     const marker = item.file.replace(/\.json$/, '.delivered');
@@ -101,6 +161,6 @@ export function acknowledgePendingSubconWhispers(items: PendingSubconWhisperFile
 export function formatPendingSubconWhispers(items: PendingSubconWhisperFile[]): string {
   return items.map(({ whisper }, index) => {
     const ordinal = items.length > 1 ? ` (${index + 1}/${items.length})` : '';
-    return `<subcon_whisper${ordinal ? ` ordinal="${index + 1}/${items.length}"` : ''} timestamp="${whisper.created_at}">\n${whisper.text}\n</subcon_whisper>`;
+    return `<subcon_whisper${ordinal ? ` ordinal="${index + 1}/${items.length}"` : ''} timestamp="${whisper.created_at}">\n${escapeXmlText(whisper.text)}\n</subcon_whisper>`;
   }).join('\n\n');
 }
