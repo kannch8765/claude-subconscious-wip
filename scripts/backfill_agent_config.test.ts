@@ -3,11 +3,12 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getCanonicalManagedAgentConfig, getCanonicalManagedSystemPrompt } from './agent_config.js';
-import { BACKFILL_PURPOSE_TAG, configureVerifiedLegacyFillRuntime, getBackfillAgentId, LEGACY_FILL_VERIFIED_RUNTIME } from './backfill_agent_config.js';
+import { BACKFILL_PURPOSE_TAG, configureVerifiedBackfillRuntime, getBackfillAgentId, VERIFIED_BACKFILL_RUNTIME } from './backfill_agent_config.js';
 
 const LIVE = 'agent-11111111-1111-4111-8111-111111111111';
 const BACKFILL = 'agent-22222222-2222-4222-8222-222222222222';
 const REQUIRED = ['git-memory-enabled', 'origin:claude-subconcious', BACKFILL_PURPOSE_TAG];
+const LIVE_AF = path.join(process.cwd(), 'Subconscious.af');
 const BACKFILL_AF = path.join(process.cwd(), 'SubconsciousBackfill.af');
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
@@ -25,7 +26,7 @@ describe('dedicated historical backfill agent resolver', () => {
     const canonical = getCanonicalManagedSystemPrompt(BACKFILL_AF); const calls: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request) => {
       const url = String(input); calls.push(url); expect(url).toContain(`/agents/${BACKFILL}`);
-      const runtime = getCanonicalManagedAgentConfig(BACKFILL_AF); return jsonResponse({ id: BACKFILL, name: 'backfill', tags: REQUIRED, system: canonical, model: runtime.model, embedding: runtime.embedding, context_window_limit: runtime.contextWindowLimit, model_settings: { provider_type: 'deepseek', parallel_tool_calls: true }, llm_config: { handle: runtime.model, context_window: runtime.contextWindowLimit, parallel_tool_calls: true } });
+      const runtime = getCanonicalManagedAgentConfig(BACKFILL_AF); return jsonResponse({ id: BACKFILL, name: 'backfill', tags: REQUIRED, system: canonical, model: runtime.model, embedding: runtime.embedding, context_window_limit: runtime.contextWindowLimit, model_settings: { provider_type: runtime.modelSettingsProviderType, parallel_tool_calls: true }, llm_config: { handle: runtime.model, context_window: runtime.contextWindowLimit, parallel_tool_calls: true } });
     }));
     await expect(getBackfillAgentId('test-key', () => {})).resolves.toBe(BACKFILL);
     expect(calls.length).toBe(3);
@@ -48,8 +49,19 @@ describe('dedicated historical backfill agent resolver', () => {
     expect(patches.some((body) => 'system' in body)).toBe(false);
   });
 
-  it('applies and verifies the bounded verified DeepSeek fill runtime profile', async () => {
-    const profile = LEGACY_FILL_VERIFIED_RUNTIME;
+  it('keeps live MiMo separate from the verified Ox Alpha backfill runtime', () => {
+    const live = getCanonicalManagedAgentConfig(LIVE_AF);
+    const backfill = getCanonicalManagedAgentConfig(BACKFILL_AF);
+    expect(live.model).toBe('openai-proxy/mimo-v2.5');
+    expect(live.modelSettingsProviderType).toBe('openai');
+    expect(backfill.model).toBe(VERIFIED_BACKFILL_RUNTIME.model);
+    expect(backfill.modelSettingsProviderType).toBe(VERIFIED_BACKFILL_RUNTIME.providerType);
+    expect(backfill.contextWindowLimit).toBe(400_000);
+    expect(backfill.model).not.toBe(live.model);
+  });
+
+  it('applies and verifies the bounded Ox Alpha backfill runtime profile', async () => {
+    const profile = VERIFIED_BACKFILL_RUNTIME;
     let patched = false;
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input); expect(url).toContain(`/agents/${BACKFILL}`);
@@ -59,7 +71,7 @@ describe('dedicated historical backfill agent resolver', () => {
           model: profile.model,
           embedding: profile.embedding,
           context_window_limit: profile.contextWindow,
-          model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+          model_settings: { provider_type: profile.providerType, parallel_tool_calls: true },
         });
         patched = true;
         return jsonResponse({ ok: true });
@@ -70,17 +82,17 @@ describe('dedicated historical backfill agent resolver', () => {
         model: profile.model,
         embedding: profile.embedding,
         llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: true },
-        model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+        model_settings: { provider_type: profile.providerType, parallel_tool_calls: true },
       });
     }));
     const logs: string[] = [];
-    await expect(configureVerifiedLegacyFillRuntime('test-key', BACKFILL, (message) => logs.push(message))).resolves.toBeUndefined();
+    await expect(configureVerifiedBackfillRuntime('test-key', BACKFILL, (message) => logs.push(message))).resolves.toBeUndefined();
     expect(logs.join(' ')).toContain('context=400000');
     expect(logs.join(' ')).toContain('parallel_tool_calls=true');
   });
 
   it('tolerates a briefly stale GET after applying the verified runtime profile', async () => {
-    const profile = LEGACY_FILL_VERIFIED_RUNTIME;
+    const profile = VERIFIED_BACKFILL_RUNTIME;
     let reads = 0;
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if ((init?.method ?? 'GET') === 'PATCH') return jsonResponse({ ok: true });
@@ -91,7 +103,7 @@ describe('dedicated historical backfill agent resolver', () => {
           model: profile.model,
           embedding: profile.embedding,
           llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: false },
-          model_settings: { provider_type: 'deepseek', parallel_tool_calls: false },
+          model_settings: { provider_type: profile.providerType, parallel_tool_calls: false },
         });
       }
       return jsonResponse({
@@ -99,10 +111,10 @@ describe('dedicated historical backfill agent resolver', () => {
         model: profile.model,
         embedding: profile.embedding,
         llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: true },
-        model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+        model_settings: { provider_type: profile.providerType, parallel_tool_calls: true },
       });
     }));
-    await expect(configureVerifiedLegacyFillRuntime('test-key', BACKFILL, () => {})).resolves.toBeUndefined();
+    await expect(configureVerifiedBackfillRuntime('test-key', BACKFILL, () => {})).resolves.toBeUndefined();
     expect(reads).toBe(2);
   });
 
@@ -130,13 +142,13 @@ describe('dedicated historical backfill agent resolver', () => {
         if (body.model_settings && typeof body.model_settings === 'object') parallel = (body.model_settings as { parallel_tool_calls?: boolean }).parallel_tool_calls ?? parallel;
         return jsonResponse({ ok: true });
       }
-      return jsonResponse({ id: BACKFILL, name: 'backfill', tags, system, model, embedding, context_window_limit: contextWindow, model_settings: { provider_type: model.includes('deepseek') ? 'deepseek' : 'zai', parallel_tool_calls: parallel }, llm_config: { handle: model, context_window: contextWindow, parallel_tool_calls: parallel } });
+      return jsonResponse({ id: BACKFILL, name: 'backfill', tags, system, model, embedding, context_window_limit: contextWindow, model_settings: { provider_type: model === getCanonicalManagedAgentConfig(BACKFILL_AF).model ? getCanonicalManagedAgentConfig(BACKFILL_AF).modelSettingsProviderType : 'zai', parallel_tool_calls: parallel }, llm_config: { handle: model, context_window: contextWindow, parallel_tool_calls: parallel } });
     }));
     await expect(getBackfillAgentId('test-key', () => {})).resolves.toBe(BACKFILL);
     expect(tags).toContain(BACKFILL_PURPOSE_TAG); expect(system).toBe(canonical);
     expect(patches.some((body) => body.system === canonical)).toBe(true);
     const runtimePatch = patches.find((body) => body.model === getCanonicalManagedAgentConfig(BACKFILL_AF).model);
-    expect(runtimePatch).toEqual(expect.objectContaining({ embedding: getCanonicalManagedAgentConfig(BACKFILL_AF).embedding, context_window_limit: getCanonicalManagedAgentConfig(BACKFILL_AF).contextWindowLimit, model_settings: { provider_type: 'deepseek', parallel_tool_calls: true } }));
+    expect(runtimePatch).toEqual(expect.objectContaining({ embedding: getCanonicalManagedAgentConfig(BACKFILL_AF).embedding, context_window_limit: getCanonicalManagedAgentConfig(BACKFILL_AF).contextWindowLimit, model_settings: { provider_type: getCanonicalManagedAgentConfig(BACKFILL_AF).modelSettingsProviderType, parallel_tool_calls: true } }));
   });
 
   it('provisions once, saves separate config, and reuses without global agent scan', async () => {
@@ -159,7 +171,7 @@ describe('dedicated historical backfill agent resolver', () => {
         if (body.model_settings && typeof body.model_settings === 'object') parallel = (body.model_settings as { parallel_tool_calls?: boolean }).parallel_tool_calls ?? parallel;
         return jsonResponse({ ok: true });
       }
-      return jsonResponse({ id: BACKFILL, name: 'backfill', tags, system: agentSystem, model, embedding, context_window_limit: contextWindow, model_settings: { provider_type: model.includes('deepseek') ? 'deepseek' : 'zai', parallel_tool_calls: parallel }, llm_config: { handle: model, context_window: contextWindow, parallel_tool_calls: parallel } });
+      return jsonResponse({ id: BACKFILL, name: 'backfill', tags, system: agentSystem, model, embedding, context_window_limit: contextWindow, model_settings: { provider_type: model === getCanonicalManagedAgentConfig(BACKFILL_AF).model ? getCanonicalManagedAgentConfig(BACKFILL_AF).modelSettingsProviderType : 'zai', parallel_tool_calls: parallel }, llm_config: { handle: model, context_window: contextWindow, parallel_tool_calls: parallel } });
     }));
     await expect(getBackfillAgentId('test-key', () => {})).resolves.toBe(BACKFILL);
     await expect(getBackfillAgentId('test-key', () => {})).resolves.toBe(BACKFILL);
