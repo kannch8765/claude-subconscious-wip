@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DashScopeQwenEmbeddingProvider,
   FileBackedSemanticRetriever,
@@ -504,6 +504,49 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(requests[0].parameters).toEqual(expect.objectContaining({ text_type: 'document', dimension: 2, output_type: 'dense' }));
     expect(requests[0].parameters).not.toHaveProperty('instruct');
     expect(requests[1].parameters).toEqual(expect.objectContaining({ text_type: 'query', instruct: expect.stringContaining('semantic equivalence') }));
+  });
+
+  it('materializes canonical support files once per semantic memory search', async () => {
+    const root = temp('rm-semantic-materialized-once-');
+    const retriever = semantic((document) => document.id.startsWith('memory:') ? 0.9 : 0);
+    const { runtime } = seedRuntime(root, retriever);
+    addFallbackMatches(runtime);
+
+    const listMemories = vi.spyOn(runtime.store, 'listMemories');
+    const listOwnerRevisions = vi.spyOn(runtime.store, 'listOwnerRevisions');
+    const listReinforcements = vi.spyOn(runtime.store, 'listReinforcements');
+    const listAssistantIntents = vi.spyOn(runtime.store, 'listAssistantIntents');
+    const listAssistantIntentOutcomes = vi.spyOn(runtime.store, 'listAssistantIntentOutcomes');
+    const getAssistantIntent = vi.spyOn(runtime.store, 'getAssistantIntent');
+
+    const result = await runtime.memorySearchHybrid({ query: 'zero lexical overlap', limit: 2 });
+    expect(result).toHaveLength(2);
+    expect(listMemories).toHaveBeenCalledTimes(1);
+    expect(listOwnerRevisions).toHaveBeenCalledTimes(1);
+    expect(listReinforcements).toHaveBeenCalledTimes(1);
+    expect(listAssistantIntents).toHaveBeenCalledTimes(1);
+    expect(listAssistantIntentOutcomes).toHaveBeenCalledTimes(1);
+    expect(getAssistantIntent).not.toHaveBeenCalled();
+  });
+
+  it('reuses the same materialized rows for provider-failure lexical fallback', async () => {
+    const root = temp('rm-semantic-materialized-fallback-');
+    const failing: SemanticRetriever = { async rank() { throw new Error('provider down'); } };
+    const { runtime } = seedRuntime(root, failing);
+    addFallbackMatches(runtime);
+
+    const listMemories = vi.spyOn(runtime.store, 'listMemories');
+    const listOwnerRevisions = vi.spyOn(runtime.store, 'listOwnerRevisions');
+    const listReinforcements = vi.spyOn(runtime.store, 'listReinforcements');
+    const listAssistantIntents = vi.spyOn(runtime.store, 'listAssistantIntents');
+    const listAssistantIntentOutcomes = vi.spyOn(runtime.store, 'listAssistantIntentOutcomes');
+
+    expect(await runtime.memorySearchHybrid({ query: '礼物', limit: 1 })).toHaveLength(1);
+    expect(listMemories).toHaveBeenCalledTimes(1);
+    expect(listOwnerRevisions).toHaveBeenCalledTimes(1);
+    expect(listReinforcements).toHaveBeenCalledTimes(1);
+    expect(listAssistantIntents).toHaveBeenCalledTimes(1);
+    expect(listAssistantIntentOutcomes).toHaveBeenCalledTimes(1);
   });
 
   it('lets DS memory_search and entity_search retrieve paraphrases with zero lexical overlap', async () => {

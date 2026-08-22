@@ -16,7 +16,6 @@ import type {
 } from '../schema/index.js';
 import { normalizeEntityAlias, validateEntityIdentityProposal, validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
-import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
@@ -371,24 +370,73 @@ export class RelationshipMemoryRuntime {
       .map((item) => item.memory);
   }
 
-  memorySearch(query: SearchQuery): EffectiveMemoryRecord[] {
-    const needle = query.query?.trim().toLowerCase();
-    const trigger = query.trigger?.trim().toLowerCase();
-    return new RelationshipMemoryOwnerControlPlane(this.store).search({ active: true }).map((memory) => {
-      const reinforcements = this.store.listReinforcements().filter((item) => item.memory_id === memory.memory_id);
+  private materializedMemorySearchRows(): Array<{
+    memory: EffectiveMemoryRecord;
+    linkedIntents: Array<{ memory: string; feel: string }>;
+  }> {
+    const reinforcementsByMemory = new Map<string, ReinforcementRecord[]>();
+    for (const reinforcement of this.store.listReinforcements()) {
+      const bucket = reinforcementsByMemory.get(reinforcement.memory_id) ?? [];
+      bucket.push(reinforcement);
+      reinforcementsByMemory.set(reinforcement.memory_id, bucket);
+    }
+
+    // getAssistantIntent() historically returns the first durable record for an
+    // intent id. Preserve that exact behavior while avoiding one JSONL scan per
+    // memory during search.
+    const intentsById = new Map<string, AssistantRememberIntentRecord>();
+    for (const intent of this.store.listAssistantIntents()) {
+      if (!intentsById.has(intent.intent_id)) intentsById.set(intent.intent_id, intent);
+    }
+    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
+    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
+    const linkedIntentsByMemory = new Map<string, AssistantRememberIntentRecord[]>();
+    for (const [intentId, outcome] of latestOutcomeByIntent) {
+      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
+      const intent = intentsById.get(intentId);
+      if (!intent) continue;
+      const bucket = linkedIntentsByMemory.get(outcome.memory_id) ?? [];
+      bucket.push(intent);
+      linkedIntentsByMemory.set(outcome.memory_id, bucket);
+    }
+
+    return this.recallEffectiveMemories().map((memory) => {
+      const reinforcements = reinforcementsByMemory.get(memory.memory_id) ?? [];
       const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
       const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
-      return { ...memory, ...(reinforcements.length ? { reinforcement_count: reinforcements.length, reinforcement_evidence_count: evidenceIds.length, reinforcement_evidence_ids: evidenceIds.slice(-20), latest_reinforcement_at: latest } : {}) };
-    }).filter((memory) => {
+      const enriched: EffectiveMemoryRecord = {
+        ...memory,
+        ...(reinforcements.length ? {
+          reinforcement_count: reinforcements.length,
+          reinforcement_evidence_count: evidenceIds.length,
+          reinforcement_evidence_ids: evidenceIds.slice(-20),
+          latest_reinforcement_at: latest,
+        } : {}),
+      };
+      return {
+        memory: enriched,
+        linkedIntents: (linkedIntentsByMemory.get(memory.memory_id) ?? []).map((intent) => ({
+          memory: intent.memory.text,
+          feel: intent.feel.text,
+        })),
+      };
+    });
+  }
+
+  private filterMemorySearchRows(
+    rows: Array<{ memory: EffectiveMemoryRecord; linkedIntents: Array<{ memory: string; feel: string }> }>,
+    query: SearchQuery,
+    includeQuery = true,
+  ) {
+    const needle = includeQuery ? query.query?.trim().toLowerCase() : undefined;
+    const trigger = query.trigger?.trim().toLowerCase();
+    return rows.filter(({ memory, linkedIntents }) => {
+      if (memory.status !== 'active') return false;
       if (query.kind && memory.kind !== query.kind) return false;
       if (query.participant && !memory.participants.includes(query.participant)) return false;
       if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
       if (query.time_start && memory.observed_at < query.time_start) return false;
       if (query.time_end && memory.observed_at > query.time_end) return false;
-      const linkedIntents = this.linkedAssistantIntents(memory.memory_id).map((intent) => ({
-        memory: intent.memory.text,
-        feel: intent.feel.text,
-      }));
       const haystack = stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: linkedIntents }).toLowerCase();
       if (needle && !haystack.includes(needle)) return false;
       if (trigger && !haystack.includes(trigger)) return false;
@@ -396,28 +444,32 @@ export class RelationshipMemoryRuntime {
     });
   }
 
+  memorySearch(query: SearchQuery): EffectiveMemoryRecord[] {
+    return this.filterMemorySearchRows(this.materializedMemorySearchRows(), query).map(({ memory }) => memory);
+  }
+
   async memorySearchHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
     const semanticQuery = query.query?.trim();
     const limit = boundedSearchLimit(query.limit);
-    if (!this.semanticRetriever || !semanticQuery) return this.memorySearch(query).slice(0, limit);
-    const candidates = this.memorySearch({ ...query, query: undefined });
-    const documents = candidates.map((memory) => {
-      const linkedIntents = this.linkedAssistantIntents(memory.memory_id).map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text }));
-      return {
-        id: `memory:${memory.memory_id}`,
-        text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
-      };
-    });
+    const rows = this.materializedMemorySearchRows();
+    if (!this.semanticRetriever || !semanticQuery) {
+      return this.filterMemorySearchRows(rows, query).slice(0, limit).map(({ memory }) => memory);
+    }
+    const candidates = this.filterMemorySearchRows(rows, query, false);
+    const documents = candidates.map(({ memory, linkedIntents }) => ({
+      id: `memory:${memory.memory_id}`,
+      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
+    }));
     try {
       const semantic = await this.semanticRetriever.rank(documents, semanticQuery);
-      return candidates.map((memory, index) => ({
+      return candidates.map(({ memory }, index) => ({
         memory,
         score: hybridScore(lexicalTextScore(documents[index].text, semanticQuery), semantic.get(documents[index].id)),
       })).sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
         .slice(0, limit)
         .map((item) => item.memory);
     } catch {
-      return this.memorySearch(query).slice(0, limit);
+      return this.filterMemorySearchRows(rows, query).slice(0, limit).map(({ memory }) => memory);
     }
   }
 
