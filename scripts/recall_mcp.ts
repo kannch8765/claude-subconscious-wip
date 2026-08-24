@@ -1,4 +1,6 @@
 #!/usr/bin/env npx tsx
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import * as readline from 'readline';
 import type { RecallResult } from '../relationship-memory/src/recall/index.js';
 import { recallFromEnvironment } from './recall_runtime.js';
@@ -113,4 +115,13 @@ export function runRecallStdio(server = new RecallMcpServer()): void {
   });
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) runRecallStdio();
+function isRecallMcpEntrypoint(): boolean {
+  if (!process.argv[1]) return false;
+  try {
+    return realpathSync(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isRecallMcpEntrypoint()) runRecallStdio();
