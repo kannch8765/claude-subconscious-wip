@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createRerankerFromEnvironment, DashScopeQwenReranker } from '../src/rerank/index.js';
+import { createRerankerFromEnvironment, DashScopeQwenReranker, DEFAULT_QWEN_RERANK_ENDPOINT } from '../src/rerank/index.js';
 
 const dirs: string[] = [];
 function temp(prefix: string): string {
@@ -76,13 +76,14 @@ describe('relationship-memory reranker', () => {
     expect(reranker?.model).toBe('qwen3-rerank');
   });
 
-  it('requires an explicit workspace/region endpoint instead of guessing one', () => {
+  it('defaults to the shared China DashScope endpoint while allowing an operator override', () => {
     const dir = temp('rm-rerank-endpoint-');
     const keyFile = path.join(dir, 'dashscope.key');
     fs.writeFileSync(keyFile, 'shared-secret\n');
     process.env.RELATIONSHIP_MEMORY_RERANK_PROVIDER = 'dashscope-qwen';
     process.env.RELATIONSHIP_MEMORY_EMBEDDING_API_KEY_FILE = keyFile;
 
-    expect(() => createRerankerFromEnvironment()).toThrow('RELATIONSHIP_MEMORY_RERANK_ENDPOINT is required');
+    expect(DEFAULT_QWEN_RERANK_ENDPOINT).toBe('https://dashscope.aliyuncs.com/compatible-api/v1/reranks');
+    expect(createRerankerFromEnvironment()).toBeInstanceOf(DashScopeQwenReranker);
   });
 });

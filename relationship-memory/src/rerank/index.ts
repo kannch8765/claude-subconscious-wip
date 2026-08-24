@@ -21,6 +21,7 @@ export interface Reranker {
 }
 
 export const DEFAULT_QWEN_RERANK_MODEL = 'qwen3-rerank';
+export const DEFAULT_QWEN_RERANK_ENDPOINT = 'https://dashscope.aliyuncs.com/compatible-api/v1/reranks';
 export const DEFAULT_QWEN_RERANK_INSTRUCTION = 'Retrieve semantically similar text.';
 const DEFAULT_RERANK_TIMEOUT_MS = 8_000;
 
@@ -136,10 +137,7 @@ export function createRerankerFromEnvironment(): Reranker | undefined {
   if (!keyFile) {
     throw new Error('RELATIONSHIP_MEMORY_RERANK_API_KEY_FILE or RELATIONSHIP_MEMORY_EMBEDDING_API_KEY_FILE is required when reranking is enabled.');
   }
-  const endpoint = process.env.RELATIONSHIP_MEMORY_RERANK_ENDPOINT?.trim();
-  if (!endpoint) {
-    throw new Error('RELATIONSHIP_MEMORY_RERANK_ENDPOINT is required for qwen3-rerank because the endpoint is workspace/region specific.');
-  }
+  const endpoint = process.env.RELATIONSHIP_MEMORY_RERANK_ENDPOINT?.trim() || DEFAULT_QWEN_RERANK_ENDPOINT;
   return new DashScopeQwenReranker({
     apiKey: readSecretFile(keyFile),
     endpoint,
