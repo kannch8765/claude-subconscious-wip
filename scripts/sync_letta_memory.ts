@@ -24,7 +24,7 @@ import * as readline from 'readline';
 import { fileURLToPath } from 'url';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
-import { runDeterministicSyncRecall } from './sync_recall.js';
+import { composeWhisperModeInjection, resolveSyncRecallInjection } from './sync_recall_injection.js';
 import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import {
   loadSyncState,
@@ -127,24 +127,17 @@ function maybeLaunchDeterministicRecallShadow(hookInput: HookInput | null, cwd: 
 
 async function maybeRunDeterministicRecallInjection(hookInput: HookInput | null): Promise<string> {
   if (syncRecallMode() !== 'inject') return '';
-  const isUserPrompt = hookInput?.hook_event_name === 'UserPromptSubmit' || typeof hookInput?.prompt === 'string';
-  const prompt = hookInput?.prompt?.trim();
-  if (!isUserPrompt || !prompt) return '';
-  try {
-    const result = await runDeterministicSyncRecall(prompt);
+  const resolved = await resolveSyncRecallInjection(hookInput);
+  if (resolved.result) {
     debug('deterministic sync-recall injection completed', {
-      status: result.status,
-      elapsed_ms: result.elapsed_ms,
-      reranker_model: result.reranker_model,
-      selected_memory_id: result.selected?.memory.memory_id,
+      status: resolved.result.status,
+      elapsed_ms: resolved.result.elapsed_ms,
+      reranker_model: resolved.result.reranker_model,
+      selected_memory_id: resolved.result.selected?.memory.memory_id,
+      admission: resolved.admission?.reason,
     });
-    return result.status === 'ok' ? result.selected?.envelope ?? '' : '';
-  } catch (error) {
-    // Foreground recall is enrichment only. Provider/runtime failure must never
-    // block or erase the user's prompt.
-    debug('deterministic sync-recall injection failed open', error);
-    return '';
   }
+  return resolved.output;
 }
 
 function expectedSyncTurnId(hookInput: HookInput | null): string | undefined {
@@ -269,11 +262,8 @@ async function main(): Promise<void> {
     // agent state, or inspect conversation history on the foreground hot path.
     if (mode === 'whisper') {
       cleanLettaFromClaudeMd(cwd);
-      const outputs: string[] = [];
-      if (syncRecallInjection) outputs.push(syncRecallInjection);
       const pendingOutput = formatPendingSubconWhispers(pendingWhispers);
-      if (pendingOutput) outputs.push(pendingOutput);
-      const injectionPayload = outputs.join('\n\n');
+      const injectionPayload = composeWhisperModeInjection(syncRecallInjection, pendingOutput);
       if (sessionId && injectionPayload) {
         mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: injectionPayload });
       }
