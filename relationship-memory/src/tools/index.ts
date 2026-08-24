@@ -48,6 +48,17 @@ export interface MemoryRecallResult extends EffectiveMemoryRecord {
   quote_snippets: RecallQuoteSnippet[];
 }
 
+export interface MemoryRecallRetrievalScores {
+  lexical_score: number;
+  semantic_score?: number;
+  hybrid_score: number;
+  first_stage_rank: number;
+}
+
+export interface MemoryRecallCandidate extends MemoryRecallResult {
+  retrieval: MemoryRecallRetrievalScores;
+}
+
 export interface RememberResult {
   outcome: RememberOutcome['outcome'];
   memory_id?: string;
@@ -251,6 +262,23 @@ export class RelationshipMemoryRuntime {
     return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query));
   }
 
+  async memorySearchRecallCandidatesWithEvidence(query: SearchQuery): Promise<MemoryRecallCandidate[]> {
+    const scored = await this.memorySearchRecallHybridScored(query);
+    const withEvidence = this.attachRecallEvidence(scored.map((item) => item.memory));
+    return withEvidence.map((memory, index) => {
+      const item = scored[index];
+      return {
+        ...memory,
+        retrieval: {
+          lexical_score: item.lexical,
+          ...(item.semantic === undefined ? {} : { semantic_score: item.semantic }),
+          hybrid_score: item.score,
+          first_stage_rank: index + 1,
+        },
+      };
+    });
+  }
+
   async memorySearchHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
     return this.attachRecallEvidence(await this.memorySearchHybrid(query));
   }
@@ -292,7 +320,12 @@ export class RelationshipMemoryRuntime {
     });
   }
 
-  async memorySearchRecallHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
+  private async memorySearchRecallHybridScored(query: SearchQuery): Promise<Array<{
+    memory: EffectiveMemoryRecord;
+    lexical: number;
+    semantic?: number;
+    score: number;
+  }>> {
     const semanticQuery = query.query?.trim();
     const trigger = query.trigger?.trim().toLowerCase();
     const limit = boundedSearchLimit(query.limit);
@@ -348,7 +381,10 @@ export class RelationshipMemoryRuntime {
       if (trigger && !haystack.includes(trigger)) return false;
       return true;
     });
-    if (!semanticQuery) return candidates.slice(0, limit).map((item) => item.memory);
+
+    if (!semanticQuery) {
+      return candidates.slice(0, limit).map(({ memory }) => ({ memory, lexical: 1, semantic: undefined, score: 1 }));
+    }
 
     const documents = candidates.map(({ memory, linkedIntents }) => ({
       id: `memory:${memory.memory_id}`,
@@ -359,15 +395,17 @@ export class RelationshipMemoryRuntime {
       try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery); }
       catch { semantic = new Map(); }
     }
-    const scored = candidates.map(({ memory }, index) => {
+    return candidates.map(({ memory }, index) => {
       const lexical = lexicalTextScore(documents[index].text, semanticQuery);
       const semanticScore = semantic.get(documents[index].id);
       return { memory, lexical, semantic: semanticScore, score: hybridScore(lexical, semanticScore) };
-    }).filter((item) => item.semantic !== undefined || item.lexical > 0);
-    return scored
+    }).filter((item) => item.semantic !== undefined || item.lexical > 0)
       .sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
-      .slice(0, limit)
-      .map((item) => item.memory);
+      .slice(0, limit);
+  }
+
+  async memorySearchRecallHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
+    return (await this.memorySearchRecallHybridScored(query)).map((item) => item.memory);
   }
 
   private materializedMemorySearchRows(): Array<{
