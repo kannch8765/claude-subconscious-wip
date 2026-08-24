@@ -46,6 +46,7 @@ const DEFAULT_SEMANTIC_LOCK_STALE_MS = 300_000;
 const DEFAULT_EMBEDDING_QUOTA_COOLDOWN_MS = 86_400_000;
 const DEFAULT_EMBEDDING_THROTTLE_COOLDOWN_MS = 60_000;
 const DEFAULT_EMBEDDING_PROVIDER_COOLDOWN_MS = 30_000;
+const DEFAULT_EMBEDDING_TIMEOUT_MS = 30_000;
 const SEMANTIC_LOCK_POLL_MS = 25;
 
 interface EmbeddingProviderCooldownFileV1 {
@@ -71,6 +72,10 @@ function sha256(value: string): string {
 function boundedDimensions(value: string | undefined): number {
   const parsed = Number.parseInt(value ?? '', 10);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN_EMBEDDING_DIMENSIONS;
+}
+
+function boundedTimeoutMs(value: number | undefined, fallback: number): number {
+  return Number.isInteger(value) && (value as number) > 0 ? Math.min(value as number, 120_000) : fallback;
 }
 
 function readSecretFile(file: string): string {
@@ -109,6 +114,7 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
   private readonly endpoint: string;
   private readonly queryInstruction: string;
   private readonly fetchFn: typeof fetch;
+  private readonly timeoutMs: number;
 
   constructor(options: {
     apiKey: string;
@@ -117,6 +123,7 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
     dimensions?: number;
     queryInstruction?: string;
     fetchFn?: typeof fetch;
+    timeoutMs?: number;
   }) {
     this.apiKey = options.apiKey;
     this.endpoint = options.endpoint ?? DEFAULT_QWEN_EMBEDDING_ENDPOINT;
@@ -125,6 +132,7 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
     this.maxBatchSize = dashScopeBatchSize(this.model);
     this.queryInstruction = options.queryInstruction ?? DEFAULT_QWEN_QUERY_INSTRUCTION;
     this.fetchFn = options.fetchFn ?? fetch;
+    this.timeoutMs = boundedTimeoutMs(options.timeoutMs, DEFAULT_EMBEDDING_TIMEOUT_MS);
     this.fingerprint = sha256(JSON.stringify({
       provider: 'dashscope-qwen',
       endpoint: this.endpoint,
@@ -139,7 +147,7 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
     if (texts.length === 0) return [];
     if (texts.length > this.maxBatchSize) throw new Error(`DashScope ${this.model} accepts at most ${this.maxBatchSize} texts per request.`);
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(new Error('embedding request timeout')), 30_000);
+    const timeout = setTimeout(() => controller.abort(new Error('embedding request timeout')), this.timeoutMs);
     try {
       const response = await this.fetchFn(this.endpoint, {
         method: 'POST',
@@ -448,6 +456,7 @@ export function createSemanticRetrieverFromEnvironment(rootDir: string): Semanti
     model: process.env.RELATIONSHIP_MEMORY_EMBEDDING_MODEL?.trim() || DEFAULT_QWEN_EMBEDDING_MODEL,
     dimensions: boundedDimensions(process.env.RELATIONSHIP_MEMORY_EMBEDDING_DIMENSIONS),
     queryInstruction: process.env.RELATIONSHIP_MEMORY_EMBEDDING_QUERY_INSTRUCTION?.trim() || DEFAULT_QWEN_QUERY_INSTRUCTION,
+    timeoutMs: Number.parseInt(process.env.RELATIONSHIP_MEMORY_EMBEDDING_TIMEOUT_MS ?? '', 10) || DEFAULT_EMBEDDING_TIMEOUT_MS,
   });
   const indexDir = process.env.RELATIONSHIP_MEMORY_SEMANTIC_INDEX_DIR?.trim() || `${rootDir}-semantic-index`;
   return new FileBackedSemanticRetriever(provider, path.join(indexDir, 'index.json'));

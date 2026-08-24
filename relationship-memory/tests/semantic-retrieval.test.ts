@@ -422,6 +422,22 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(requests[0].model).toBe('text-embedding-v4');
   });
 
+  it('allows the foreground caller to bound DashScope query latency with an embedding timeout', async () => {
+    const hangingFetch = (async (_url: any, init: any) => new Promise<Response>((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
+    })) as typeof fetch;
+    const provider = new DashScopeQwenEmbeddingProvider({
+      apiKey: 'secret',
+      dimensions: 2,
+      fetchFn: hangingFetch,
+      timeoutMs: 20,
+    });
+
+    const started = Date.now();
+    await expect(provider.embedQuery('bounded foreground query')).rejects.toThrow(/timeout/i);
+    expect(Date.now() - started).toBeLessThan(500);
+  });
+
   it('persists free-tier exhaustion cooldown across retrievers while a new provider fingerprint can proceed immediately', async () => {
     const root = temp('rm-semantic-quota-cooldown-');
     const indexFile = path.join(root, 'derived', 'index.json');
