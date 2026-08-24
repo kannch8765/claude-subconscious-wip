@@ -1,6 +1,12 @@
 #!/usr/bin/env tsx
 import * as fs from 'fs';
-import { appendShadowReceipt, makeShadowReceipt, runDeterministicSyncRecall } from './sync_recall.js';
+import { createRuntime, relationshipMemoryRoot } from '../relationship-memory/src/index.js';
+import {
+  appendShadowReceipt,
+  makeShadowReceipt,
+  runDeterministicAnchorShadow,
+  runDeterministicSyncRecall,
+} from './sync_recall.js';
 
 interface ShadowPayload {
   schema_version: 1;
@@ -22,8 +28,12 @@ async function main(): Promise<void> {
   }
   try { fs.rmSync(payloadFile, { force: true }); } catch { }
   if (payload?.schema_version !== 1 || typeof payload.session_id !== 'string' || typeof payload.prompt !== 'string') return;
-  const result = await runDeterministicSyncRecall(payload.prompt);
-  appendShadowReceipt(makeShadowReceipt(payload.session_id, payload.cwd, payload.prompt, result, payload.recorded_at));
+
+  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
+  const runtime = createRuntime([], subjectId, relationshipMemoryRoot(), []);
+  const result = await runDeterministicSyncRecall(payload.prompt, { runtime });
+  const anchorShadow = runDeterministicAnchorShadow(payload.prompt, result, runtime);
+  appendShadowReceipt(makeShadowReceipt(payload.session_id, payload.cwd, payload.prompt, result, payload.recorded_at, anchorShadow));
 }
 
 main().catch(() => process.exit(0));

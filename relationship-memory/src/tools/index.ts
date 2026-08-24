@@ -59,6 +59,17 @@ export interface MemoryRecallCandidate extends MemoryRecallResult {
   retrieval: MemoryRecallRetrievalScores;
 }
 
+export interface MemoryRecallAnchorRetrievalScores {
+  anchor_score: number;
+  matched_anchor_count: number;
+  anchor_count: number;
+  first_stage_rank: number;
+}
+
+export interface MemoryRecallAnchorCandidate extends EffectiveMemoryRecord {
+  anchor_retrieval: MemoryRecallAnchorRetrievalScores;
+}
+
 export interface RememberResult {
   outcome: RememberOutcome['outcome'];
   memory_id?: string;
@@ -277,6 +288,49 @@ export class RelationshipMemoryRuntime {
         },
       };
     });
+  }
+
+  memorySearchRecallAnchorCandidates(anchors: readonly string[], limit = 20): MemoryRecallAnchorCandidate[] {
+    const normalizedAnchors = [...new Set(anchors.map((value) => value.normalize('NFKC').trim().toLowerCase()).filter(Boolean))];
+    if (normalizedAnchors.length === 0) return [];
+
+    const memories = this.recallEffectiveMemories().filter((memory) => memory.status === 'active');
+    if (memories.length === 0) return [];
+    const documents = memories.map((memory) => ({
+      memory,
+      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload).toLowerCase(),
+    }));
+
+    const documentFrequency = new Map<string, number>();
+    for (const anchor of normalizedAnchors) {
+      documentFrequency.set(anchor, documents.reduce((count, document) => count + (document.text.includes(anchor) ? 1 : 0), 0));
+    }
+    const weight = (anchor: string): number => Math.log((documents.length + 1) / ((documentFrequency.get(anchor) ?? 0) + 1)) + 1;
+    const totalWeight = normalizedAnchors.reduce((sum, anchor) => sum + weight(anchor), 0) || 1;
+
+    const ranked = documents.map(({ memory, text }) => {
+      const matched = normalizedAnchors.filter((anchor) => text.includes(anchor));
+      const matchedWeight = matched.reduce((sum, anchor) => sum + weight(anchor), 0);
+      return {
+        memory,
+        anchor_score: matchedWeight / totalWeight,
+        matched_anchor_count: matched.length,
+      };
+    }).filter((item) => item.matched_anchor_count > 0)
+      .sort((a, b) => b.anchor_score - a.anchor_score
+        || b.matched_anchor_count - a.matched_anchor_count
+        || b.memory.observed_at.localeCompare(a.memory.observed_at))
+      .slice(0, boundedSearchLimit(limit));
+
+    return ranked.map((item, index) => ({
+      ...item.memory,
+      anchor_retrieval: {
+        anchor_score: item.anchor_score,
+        matched_anchor_count: item.matched_anchor_count,
+        anchor_count: normalizedAnchors.length,
+        first_stage_rank: index + 1,
+      },
+    }));
   }
 
   async memorySearchHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
