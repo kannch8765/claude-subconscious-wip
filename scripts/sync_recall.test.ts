@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import type { MemoryRecallCandidate, RelationshipMemoryRuntime } from '../relationship-memory/src/index.js';
 import type { Reranker, RerankDocument, RerankResult } from '../relationship-memory/src/rerank/index.js';
-import { makeShadowReceipt, renderSyncRecallBody, runDeterministicSyncRecall, selectSyncRecall } from './sync_recall.js';
+import { makeShadowReceipt, renderSyncRecallBody, runDeterministicSyncRecall, selectSyncRecall, snippetRerankQuery } from './sync_recall.js';
 
 class FakeReranker implements Reranker {
   model = 'fake-reranker';
@@ -85,6 +85,59 @@ describe('deterministic sync recall selection', () => {
       semantic_score: 0.58,
     }));
     expect(reranker.calls).toHaveLength(2);
+    expect(reranker.calls[1].query).toBe(snippetRerankQuery(candidates[1], '猫又来萨莉亚惹'));
+    expect(reranker.calls[1].query).toContain('猫和琥珀之前一起在萨莉亚点过餐');
+  });
+
+  it('grounds snippet selection in the selected canonical memory instead of current-prompt similarity alone', async () => {
+    class GroundingAwareReranker implements Reranker {
+      model = 'grounding-aware-fake';
+
+      async rank(documents: readonly RerankDocument[], query: string, options?: { topN?: number; instruction?: string }): Promise<RerankResult[]> {
+        if (documents[0]?.id.startsWith('memory:')) {
+          return [{ id: documents[0].id, index: 0, score: 0.95 }];
+        }
+        const hasCanonicalMemory = query.includes('猫和琥珀曾经一起修好过唤醒桥');
+        return (hasCanonicalMemory
+          ? [
+              { id: 'grounding', index: 1, score: 0.91 },
+              { id: 'prompt-similar', index: 0, score: 0.82 },
+            ]
+          : [
+              { id: 'prompt-similar', index: 0, score: 0.91 },
+              { id: 'grounding', index: 1, score: 0.82 },
+            ]
+        ).slice(0, options?.topN ?? documents.length);
+      }
+    }
+
+    const memory = candidate({
+      memory_id: 'm-wake',
+      summary: '猫和琥珀曾经一起修好过唤醒桥',
+      quote_snippets: [
+        {
+          snippet_id: 'prompt-similar',
+          source_kind: 'transcript',
+          role: 'user',
+          quote: '今天又要去花园玩狼人杀吗，记得轮询哦',
+          captured_at: '2026-08-20T00:00:00.000Z',
+        },
+        {
+          snippet_id: 'grounding',
+          source_kind: 'transcript',
+          role: 'assistant',
+          quote: '唤醒桥已经 handshake valid，之后轮到我时可以把会话叫醒。',
+          captured_at: '2026-08-20T00:01:00.000Z',
+        },
+      ],
+    });
+
+    const result = await selectSyncRecall('今天又去花园玩狼人杀', [memory], new GroundingAwareReranker(), { snippetLimit: 1 });
+
+    expect(result.selection?.snippets).toHaveLength(1);
+    expect(result.selection?.snippets[0].snippet_id).toBe('grounding');
+    expect(result.selection?.body).toContain('唤醒桥已经 handshake valid');
+    expect(result.selection?.body).not.toContain('今天又要去花园玩狼人杀吗');
   });
 
   it('does not surface a memory that has no source-faithful evidence snippets', async () => {

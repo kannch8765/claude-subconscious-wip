@@ -15,7 +15,7 @@ import { escapeXmlContent } from './conversation_utils.js';
 export const DEFAULT_SYNC_RECALL_TOP_K = 20;
 export const DEFAULT_SYNC_RECALL_SNIPPET_LIMIT = 3;
 export const MEMORY_RERANK_INSTRUCTION = 'Rank historical relationship memories by semantic relevance to the current user message. Prefer the same underlying shared experience, personal experience, relationship event, inside joke, preference, or identity over surface word overlap.';
-export const SNIPPET_RERANK_INSTRUCTION = 'Rank historical source excerpts by how directly they ground the recalled memory that is relevant to the current user message. Prefer specific conversational evidence over generic context.';
+export const SNIPPET_RERANK_INSTRUCTION = 'Rank historical source excerpts by how directly they support the recalled canonical memory named in the query. Use the current user message only as context or a tie-breaker; prefer evidence for the memory over surface similarity to the current message.';
 
 export interface SyncRecallSelectedSnippet extends RecallQuoteSnippet {
   rerank_score: number;
@@ -86,6 +86,13 @@ function snippetDocument(snippet: RecallQuoteSnippet): string {
   return `${speaker}: ${snippet.quote}`;
 }
 
+export function snippetRerankQuery(memory: Pick<MemoryRecallCandidate, 'summary'>, currentQuery: string): string {
+  return [
+    `Recalled canonical memory: ${memory.summary}`,
+    `Current user message: ${currentQuery}`,
+  ].join('\n');
+}
+
 export function renderHistoricalRecallQuotes(snippets: readonly RecallQuoteSnippet[]): string {
   const lines: string[] = [];
   let activeDate = '';
@@ -150,7 +157,7 @@ export async function selectSyncRecall(
     const memory = candidates[rankedMemory.index];
     if (!memory || memory.quote_snippets.length === 0) continue;
     const snippetDocs = memory.quote_snippets.map((snippet) => ({ id: snippet.snippet_id, text: snippetDocument(snippet) }));
-    const snippetRanking = await reranker.rank(snippetDocs, query, {
+    const snippetRanking = await reranker.rank(snippetDocs, snippetRerankQuery(memory, query), {
       topN: Math.min(snippetLimit, snippetDocs.length),
       instruction: SNIPPET_RERANK_INSTRUCTION,
     });
