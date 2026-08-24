@@ -24,6 +24,7 @@ import * as readline from 'readline';
 import { fileURLToPath } from 'url';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
+import { runDeterministicSyncRecall } from './sync_recall.js';
 import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import {
   loadSyncState,
@@ -90,8 +91,12 @@ async function readHookInput(): Promise<HookInput | null> {
   });
 }
 
+function syncRecallMode(): string {
+  return process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_MODE?.trim().toLowerCase() || 'off';
+}
+
 function maybeLaunchDeterministicRecallShadow(hookInput: HookInput | null, cwd: string): void {
-  if (process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_MODE?.trim().toLowerCase() !== 'shadow') return;
+  if (syncRecallMode() !== 'shadow') return;
   const isUserPrompt = hookInput?.hook_event_name === 'UserPromptSubmit' || typeof hookInput?.prompt === 'string';
   const prompt = hookInput?.prompt?.trim();
   const sessionId = hookInput?.session_id?.trim();
@@ -117,6 +122,28 @@ function maybeLaunchDeterministicRecallShadow(hookInput: HookInput | null, cwd: 
   } catch (error) {
     if (payloadFile) { try { fs.rmSync(payloadFile, { force: true }); } catch {} }
     debug('failed to launch deterministic sync-recall shadow worker', error);
+  }
+}
+
+async function maybeRunDeterministicRecallInjection(hookInput: HookInput | null): Promise<string> {
+  if (syncRecallMode() !== 'inject') return '';
+  const isUserPrompt = hookInput?.hook_event_name === 'UserPromptSubmit' || typeof hookInput?.prompt === 'string';
+  const prompt = hookInput?.prompt?.trim();
+  if (!isUserPrompt || !prompt) return '';
+  try {
+    const result = await runDeterministicSyncRecall(prompt);
+    debug('deterministic sync-recall injection completed', {
+      status: result.status,
+      elapsed_ms: result.elapsed_ms,
+      reranker_model: result.reranker_model,
+      selected_memory_id: result.selected?.memory.memory_id,
+    });
+    return result.status === 'ok' ? result.selected?.envelope ?? '' : '';
+  } catch (error) {
+    // Foreground recall is enrichment only. Provider/runtime failure must never
+    // block or erase the user's prompt.
+    debug('deterministic sync-recall injection failed open', error);
+    return '';
   }
 }
 
@@ -230,6 +257,7 @@ async function main(): Promise<void> {
     const cwd = hookInput?.cwd || projectDir;
     const sessionId = hookInput?.session_id;
     maybeLaunchDeterministicRecallShadow(hookInput, cwd);
+    const syncRecallInjection = mode === 'whisper' ? await maybeRunDeterministicRecallInjection(hookInput) : '';
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const expectedTurnId = expectedSyncTurnId(hookInput);
     const partitioned = partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId);
@@ -241,7 +269,11 @@ async function main(): Promise<void> {
     // agent state, or inspect conversation history on the foreground hot path.
     if (mode === 'whisper') {
       cleanLettaFromClaudeMd(cwd);
-      const injectionPayload = formatPendingSubconWhispers(pendingWhispers);
+      const outputs: string[] = [];
+      if (syncRecallInjection) outputs.push(syncRecallInjection);
+      const pendingOutput = formatPendingSubconWhispers(pendingWhispers);
+      if (pendingOutput) outputs.push(pendingOutput);
+      const injectionPayload = outputs.join('\n\n');
       if (sessionId && injectionPayload) {
         mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: injectionPayload });
       }
