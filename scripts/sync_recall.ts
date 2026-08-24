@@ -6,10 +6,11 @@ import {
   relationshipMemoryRoot,
   semanticText,
   type MemoryRecallCandidate,
-  type RecallQuoteSnippet,
   type RelationshipMemoryRuntime,
+  type RecallQuoteSnippet,
 } from '../relationship-memory/src/index.js';
 import { createRerankerFromEnvironment, type Reranker, type RerankResult } from '../relationship-memory/src/rerank/index.js';
+import { extractLexicalAnchorAnalysis, readLexicalAnchorAliases } from '../relationship-memory/src/anchor/index.js';
 import { escapeXmlContent } from './conversation_utils.js';
 
 export const DEFAULT_SYNC_RECALL_TOP_K = 20;
@@ -226,6 +227,125 @@ export async function runDeterministicSyncRecall(
   }
 }
 
+
+export interface SyncRecallAnchorShadowCandidate {
+  memory_id: string;
+  summary: string;
+  anchor_rank: number;
+  anchor_score: number;
+  matched_anchor_count: number;
+  anchor_count: number;
+}
+
+export interface SyncRecallAnchorShadowFusedCandidate {
+  memory_id: string;
+  summary: string;
+  rrf_score: number;
+  raw_first_stage_rank?: number;
+  anchor_rank?: number;
+}
+
+export interface SyncRecallAnchorShadow {
+  status: 'ok' | 'no_anchors' | 'no_candidates' | 'failed';
+  anchor_set_sha256: string;
+  anchor_count: number;
+  context_signal_count: number;
+  anchors?: string[];
+  context_signals?: string[];
+  candidates: SyncRecallAnchorShadowCandidate[];
+  raw_selected_anchor_rank?: number;
+  top_agrees_with_raw_selected?: boolean;
+  fused_candidates: SyncRecallAnchorShadowFusedCandidate[];
+  error?: string;
+}
+
+function reciprocalRank(rank: number | undefined): number {
+  return rank === undefined ? 0 : 1 / (60 + rank);
+}
+
+export function runDeterministicAnchorShadow(
+  query: string,
+  rawResult: SyncRecallRunResult,
+  runtime: RelationshipMemoryRuntime,
+): SyncRecallAnchorShadow {
+  const aliases = readLexicalAnchorAliases(process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_ANCHOR_ALIASES_FILE);
+  const analysis = extractLexicalAnchorAnalysis(query, aliases);
+  const includeAnchors = process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_SHADOW_INCLUDE_ANCHORS === '1';
+  const base = {
+    anchor_set_sha256: analysis.anchor_set_sha256,
+    anchor_count: analysis.anchors.length,
+    context_signal_count: analysis.context_signals.length,
+    ...(includeAnchors ? { anchors: analysis.anchors, context_signals: analysis.context_signals } : {}),
+  };
+  if (analysis.anchors.length === 0) {
+    return { status: 'no_anchors', ...base, candidates: [], fused_candidates: [] };
+  }
+
+  try {
+    const topK = boundedInteger(process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_ANCHOR_TOP_K, DEFAULT_SYNC_RECALL_TOP_K, 20);
+    const anchorCandidates = runtime.memorySearchRecallAnchorCandidates(analysis.anchors, topK);
+    if (anchorCandidates.length === 0) {
+      return { status: 'no_candidates', ...base, candidates: [], fused_candidates: [] };
+    }
+    const candidates: SyncRecallAnchorShadowCandidate[] = anchorCandidates.map((memory) => ({
+      memory_id: memory.memory_id,
+      summary: memory.summary,
+      anchor_rank: memory.anchor_retrieval.first_stage_rank,
+      anchor_score: memory.anchor_retrieval.anchor_score,
+      matched_anchor_count: memory.anchor_retrieval.matched_anchor_count,
+      anchor_count: memory.anchor_retrieval.anchor_count,
+    }));
+
+    const rawSelectedId = rawResult.selected?.memory.memory_id;
+    const rawSelectedAnchorRank = rawSelectedId
+      ? candidates.find((candidate) => candidate.memory_id === rawSelectedId)?.anchor_rank
+      : undefined;
+
+    const byId = new Map<string, SyncRecallAnchorShadowFusedCandidate>();
+    for (const raw of rawResult.candidates) {
+      byId.set(raw.memory_id, {
+        memory_id: raw.memory_id,
+        summary: raw.summary,
+        raw_first_stage_rank: raw.first_stage_rank,
+        rrf_score: reciprocalRank(raw.first_stage_rank),
+      });
+    }
+    for (const anchor of candidates) {
+      const existing = byId.get(anchor.memory_id);
+      byId.set(anchor.memory_id, {
+        memory_id: anchor.memory_id,
+        summary: anchor.summary,
+        ...(existing?.raw_first_stage_rank === undefined ? {} : { raw_first_stage_rank: existing.raw_first_stage_rank }),
+        anchor_rank: anchor.anchor_rank,
+        rrf_score: (existing?.rrf_score ?? 0) + reciprocalRank(anchor.anchor_rank),
+      });
+    }
+    const fusedCandidates = [...byId.values()]
+      .sort((a, b) => b.rrf_score - a.rrf_score || a.memory_id.localeCompare(b.memory_id))
+      .slice(0, 5);
+
+    return {
+      status: 'ok',
+      ...base,
+      candidates,
+      ...(rawSelectedId ? {
+        ...(rawSelectedAnchorRank === undefined ? {} : { raw_selected_anchor_rank: rawSelectedAnchorRank }),
+        top_agrees_with_raw_selected: candidates[0]?.memory_id === rawSelectedId,
+      } : {}),
+      fused_candidates: fusedCandidates,
+    };
+  } catch (error) {
+    return {
+      status: 'failed',
+      ...base,
+      candidates: [],
+      fused_candidates: [],
+      error: boundedError(error),
+    };
+  }
+}
+
+
 export interface SyncRecallShadowReceipt {
   schema_version: 1;
   recorded_at: string;
@@ -233,6 +353,7 @@ export interface SyncRecallShadowReceipt {
   cwd?: string;
   query_sha256: string;
   query_preview?: string;
+  anchor_shadow?: SyncRecallAnchorShadow;
   result: Omit<SyncRecallRunResult, 'selected'> & {
     selected?: {
       memory_id: string;
@@ -256,6 +377,7 @@ export function makeShadowReceipt(
   query: string,
   result: SyncRecallRunResult,
   recordedAt = new Date().toISOString(),
+  anchorShadow?: SyncRecallAnchorShadow,
 ): SyncRecallShadowReceipt {
   const includeQuery = process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_SHADOW_INCLUDE_QUERY === '1';
   return {
@@ -265,6 +387,7 @@ export function makeShadowReceipt(
     ...(cwd ? { cwd } : {}),
     query_sha256: result.query_sha256,
     ...(includeQuery ? { query_preview: [...query].slice(0, 800).join('') } : {}),
+    ...(anchorShadow ? { anchor_shadow: anchorShadow } : {}),
     result: {
       status: result.status,
       query_sha256: result.query_sha256,
