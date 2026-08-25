@@ -29,6 +29,8 @@ export interface PendingSubconWhisperFile {
   whisper: PendingSubconWhisper;
 }
 
+export type SubconWhisperDeliveryState = 'pending' | 'emitted' | 'missing';
+
 function queueDir(cwd: string, sessionId: string): string {
   const sessionKey = crypto.createHash('sha256').update(sessionId).digest('hex').slice(0, 24);
   return path.join(getDurableStateDir(cwd), 'subcon-whispers', sessionKey);
@@ -36,6 +38,13 @@ function queueDir(cwd: string, sessionId: string): string {
 
 export function stableWhisperId(sessionId: string, batchId: string): string {
   return `whisper_${crypto.createHash('sha256').update(`${sessionId}\0${batchId}`).digest('hex').slice(0, 24)}`;
+}
+
+export function getSubconWhisperDeliveryState(cwd: string, sessionId: string, whisperId: string): SubconWhisperDeliveryState {
+  const dir = queueDir(cwd, sessionId);
+  if (fs.existsSync(path.join(dir, `${whisperId}.delivered`))) return 'emitted';
+  if (fs.existsSync(path.join(dir, `${whisperId}.json`))) return 'pending';
+  return 'missing';
 }
 
 function escapeXmlText(value: string): string {

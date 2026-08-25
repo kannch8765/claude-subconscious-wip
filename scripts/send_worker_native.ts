@@ -25,12 +25,14 @@ import {
   runNativeClientToolConversation,
   type NativeClientTool,
 } from './native_letta_backfill.js';
-import { queueSubconWhisper } from './subcon_whisper_queue.js';
+import { queueSubconWhisper, stableWhisperId } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
 import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
 import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
 import { cancelAndDeferSyncResources, cleanupCompletedSyncResources } from './sync_letta_resources.js';
 import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
+import { buildForegroundRecallBundle, renderForegroundRecallBundle, type ForegroundRecallCandidate } from './foreground_recall.js';
+import { persistForegroundRecallBundle, writeForegroundRecallReceipt, type ForegroundRecallSearchReceipt } from './foreground_recall_state.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -101,6 +103,18 @@ export function renderHistoricalWhisperQuotes(snippets: readonly { source_kind: 
   return lines.join('\n');
 }
 
+
+function registerSurfacedRecallCandidates(
+  candidates: readonly ForegroundRecallCandidate[],
+  surfaced: Map<string, Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>>,
+): void {
+  for (const memory of candidates) {
+    const bucket = surfaced.get(memory.memory_id) ?? new Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>();
+    for (const snippet of memory.quote_snippets) bucket.set(snippet.snippet_id, snippet);
+    surfaced.set(memory.memory_id, bucket);
+  }
+}
+
 export interface LiveWorkerDependencies {
   createClient?: (apiKey: string) => any;
   runConversation?: typeof runNativeClientToolConversation;
@@ -131,7 +145,11 @@ export async function sendViaNativeClient(
   const hasRealUserMessage = Boolean(payload.latestUserMessage?.trim());
   let turnSucceeded = false;
   let whisperDelivered = false;
+  let recallResolved = false;
+  let foregroundReleased = false;
   let postWhisperFailureCleanupOwned = false;
+  const recallSearches: ForegroundRecallSearchReceipt[] = [];
+  let foregroundBundle = undefined as Awaited<ReturnType<typeof buildForegroundRecallBundle>> | undefined;
 
   try {
     const apiKey = process.env.LETTA_API_KEY;
@@ -140,9 +158,20 @@ export async function sendViaNativeClient(
 
     const entitySearchObservations: EntitySearchObservation[] = [];
     const surfacedQuoteSnippets = new Map<string, Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>>();
+    let expandRecallUsed = false;
+    if (isSync) {
+      if (!payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
+      foregroundBundle = await buildForegroundRecallBundle(runtime, payload.latestUserMessage, {
+        sessionId: payload.sessionId, turnId: payload.syncTurnId,
+      });
+      persistForegroundRecallBundle(payload.cwd, foregroundBundle);
+      registerSurfacedRecallCandidates(foregroundBundle.candidates, surfacedQuoteSnippets);
+      recallSearches.push({ kind: 'prefetch', query_sha256: foregroundBundle.query_sha256, memory_ids: foregroundBundle.candidates.map((item) => item.memory_id) });
+      log(`Foreground recall bundle prepared: candidates=${foregroundBundle.candidates.length}, bundle_id=${foregroundBundle.bundle_id}`);
+    }
     const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId);
     const modeRelationshipTools = isSync
-      ? baseRelationshipTools.filter((tool) => ['memory_search', 'entity_search'].includes(tool.name))
+      ? baseRelationshipTools.filter((tool) => tool.name === 'entity_search')
       : baseRelationshipTools;
     const relationshipTools: NativeClientTool[] = modeRelationshipTools.map((tool) => {
       const execute = tool.execute.bind(tool);
@@ -224,11 +253,115 @@ export async function sendViaNativeClient(
       };
     });
 
-    relationshipTools.push({
+    if (isSync) relationshipTools.push({
+      name: 'expand_recall',
+      description: 'Use at most once only when the prefetched foreground_recall_bundle is insufficient. Provide one short semantic query for the missing historical concept. The runtime returns additional source-faithful memory candidates; do not call near-duplicate refinements.',
+      parameters: {
+        type: 'object', additionalProperties: false, required: ['query'],
+        properties: { query: { type: 'string', minLength: 1, maxLength: 200 } },
+      },
+      async execute(_toolCallId: string, args: unknown) {
+        if (expandRecallUsed) throw new Error('expand_recall may be called at most once per sync turn');
+        const raw = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
+        const query = typeof raw.query === 'string' ? raw.query.trim() : '';
+        if (!query) throw new Error('expand_recall requires a non-empty query');
+        expandRecallUsed = true;
+        const expanded = await buildForegroundRecallBundle(runtime, query, {
+          sessionId: payload.sessionId,
+          turnId: `${payload.syncTurnId}:expand`,
+        });
+        registerSurfacedRecallCandidates(expanded.candidates, surfacedQuoteSnippets);
+        recallSearches.push({ kind: 'expand', query_sha256: expanded.query_sha256, memory_ids: expanded.candidates.map((item) => item.memory_id) });
+        log(`Foreground recall expanded: candidates=${expanded.candidates.length}`);
+        return { results: expanded.candidates };
+      },
+    });
+
+    const selectForegroundRecall = async (memoryId: string, snippetIds: string[]): Promise<{ status: 'ok'; whisper_id?: string }> => {
+      if (whisperDelivered) throw new Error('foreground whisper may be delivered at most once per batch');
+      if (!memoryId || snippetIds.length < 1 || snippetIds.length > 3 || new Set(snippetIds).size !== snippetIds.length) {
+        throw new Error('foreground recall selection requires one surfaced memory_id and 1-3 unique snippet_ids');
+      }
+      const allowed = surfacedQuoteSnippets.get(memoryId);
+      if (!allowed || snippetIds.some((snippetId) => !allowed.has(snippetId))) {
+        throw new Error('foreground recall may select only quote snippets surfaced by the foreground recall bundle or expand_recall in this turn');
+      }
+      const snippets = snippetIds.map((snippetId) => allowed.get(snippetId)!);
+      const historicalWindow = renderHistoricalWhisperQuotes(snippets);
+      const groundedText = composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations));
+      const queued = queueSubconWhisper(
+        payload.cwd, payload.sessionId, payload.batchId, groundedText,
+        isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
+      );
+      log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
+      whisperDelivered = true;
+      if (isSync && foregroundBundle) {
+        const whisperId = queued?.whisper_id ?? stableWhisperId(payload.sessionId, payload.batchId);
+        writeForegroundRecallReceipt(payload.cwd, {
+          schema_version: 1,
+          session_id: payload.sessionId,
+          turn_id: payload.syncTurnId!,
+          bundle_id: foregroundBundle.bundle_id,
+          recorded_at: new Date().toISOString(),
+          decision: 'selected',
+          searches: recallSearches,
+          selected: { memory_id: memoryId, snippet_ids: snippetIds },
+          whisper_id: whisperId,
+        });
+        recallResolved = true;
+        writeSyncCheckpoint(payload, 'whisper', whisperId);
+        foregroundReleased = true;
+        return { status: 'ok', whisper_id: whisperId };
+      }
+      return { status: 'ok', whisper_id: queued?.whisper_id };
+    };
+
+    if (isSync) relationshipTools.push({
+      name: 'resolve_recall',
+      description: 'Resolve foreground recall exactly once. Choose decision=selected only when one surfaced historical memory materially helps this CURRENT user turn; otherwise choose decision=none. Candidate presence, lexical overlap, or an exact identifier match is not enough by itself.',
+      parameters: {
+        type: 'object', additionalProperties: false, required: ['decision'],
+        properties: {
+          decision: { type: 'string', enum: ['selected', 'none'] },
+          memory_id: { type: 'string', minLength: 1 },
+          snippet_ids: { type: 'array', minItems: 1, maxItems: 3, uniqueItems: true, items: { type: 'string', minLength: 1 } },
+        },
+      },
+      async execute(_toolCallId: string, args: unknown) {
+        if (recallResolved) throw new Error('resolve_recall may be called exactly once per sync turn');
+        const raw = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
+        const decision = raw.decision;
+        if (decision === 'none') {
+          if (!foregroundBundle) throw new Error('resolve_recall requires a foreground recall bundle');
+          if (raw.memory_id !== undefined || raw.snippet_ids !== undefined) throw new Error('resolve_recall decision=none must not include memory_id or snippet_ids');
+          writeForegroundRecallReceipt(payload.cwd, {
+            schema_version: 1,
+            session_id: payload.sessionId,
+            turn_id: payload.syncTurnId!,
+            bundle_id: foregroundBundle.bundle_id,
+            recorded_at: new Date().toISOString(),
+            decision: 'none',
+            searches: recallSearches,
+          });
+          recallResolved = true;
+          writeSyncCheckpoint(payload, 'no_whisper');
+          foregroundReleased = true;
+          log('Foreground recall resolved: none');
+          return { status: 'ok', decision: 'none' };
+        }
+        if (decision !== 'selected') throw new Error('resolve_recall decision must be selected or none');
+        const memoryId = typeof raw.memory_id === 'string' ? raw.memory_id.trim() : '';
+        const snippetIds = Array.isArray(raw.snippet_ids)
+          ? raw.snippet_ids.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
+          : [];
+        const result = await selectForegroundRecall(memoryId, snippetIds);
+        recallResolved = true;
+        return { ...result, decision: 'selected' };
+      },
+    });
+    else relationshipTools.push({
       name: 'deliver_whisper',
-      description: isSync
-        ? 'Surface one source-faithful historical memory window for the CURRENT foreground Kohaku turn. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.'
-        : 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
+      description: 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
       parameters: {
         type: 'object', additionalProperties: false, required: ['memory_id', 'snippet_ids'],
         properties: {
@@ -236,38 +369,17 @@ export async function sendViaNativeClient(
           snippet_ids: {
             type: 'array', minItems: 1, maxItems: 3, uniqueItems: true,
             items: { type: 'string', minLength: 1 },
-            description: 'Choose 1-3 source-faithful snippet IDs returned under quote_snippets for this memory in a prior memory_search result. transcript snippets are direct quotes; legacy_memory snippets are explicitly labeled old-memory-record excerpts, not direct quotes. Prefer the fewest quotes that let the remembered moment stand on its own.',
+            description: 'Choose 1-3 source-faithful snippet IDs returned under quote_snippets for this memory in a prior memory_search result.',
           },
         },
       },
       async execute(_toolCallId: string, args: unknown) {
-        if (whisperDelivered) throw new Error('deliver_whisper may be called at most once per batch');
         const raw = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
         const memoryId = typeof raw.memory_id === 'string' ? raw.memory_id.trim() : '';
         const snippetIds = Array.isArray(raw.snippet_ids)
           ? raw.snippet_ids.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
           : [];
-        if (!memoryId || snippetIds.length < 1 || snippetIds.length > 3 || new Set(snippetIds).size !== snippetIds.length) {
-          throw new Error('deliver_whisper requires one searched memory_id and 1-3 unique snippet_ids');
-        }
-        const allowed = surfacedQuoteSnippets.get(memoryId);
-        if (!allowed || snippetIds.some((snippetId) => !allowed.has(snippetId))) {
-          throw new Error('deliver_whisper may select only quote snippets surfaced by a prior memory_search in this turn');
-        }
-        const snippets = snippetIds.map((snippetId) => allowed.get(snippetId)!);
-        const historicalWindow = renderHistoricalWhisperQuotes(snippets);
-        const groundedText = composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations));
-        if (isSync && !payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
-        const queued = queueSubconWhisper(
-          payload.cwd, payload.sessionId, payload.batchId, groundedText,
-          isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
-        );
-        log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
-        if (isSync) writeSyncCheckpoint(payload, 'whisper', queued?.whisper_id);
-        // Cleanup ownership transfers only after the durable foreground release
-        // checkpoint exists. A queue write alone is not enough to let Kohaku go.
-        whisperDelivered = true;
-        return { status: 'ok', whisper_id: queued?.whisper_id };
+        return selectForegroundRecall(memoryId, snippetIds);
       },
     });
 
@@ -280,7 +392,9 @@ export async function sendViaNativeClient(
     });
 
     const liveMessage = isSync
-      ? payload.message
+      ? `${payload.message}
+
+${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
       : appendTrustedRelationshipCatalog(payload.message, canonicalMessages, durableAssistantIntents);
 
     log(`Starting native live Subconscious turn for conversation ${payload.conversationId}`);
@@ -299,7 +413,7 @@ export async function sendViaNativeClient(
         conversationId: payload.conversationId,
         message: liveMessage,
         tools: relationshipTools,
-        requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
+        requiredClientToolNames: ['resolve_recall'],
         continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 },
         clientToolRoundGate: syncClientToolRoundGate,
       });
@@ -330,14 +444,24 @@ export async function sendViaNativeClient(
     const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';
     log(`Native live turn complete: mode=${mode}, success=${turnSucceeded}, stop_reason=${stopReason}`);
     if (result.clientToolFailure) log('Native live turn contained at least one failed client-tool execution');
-    if (isSync && !whisperDelivered) writeSyncCheckpoint(payload, 'no_whisper');
+    if (isSync && !recallResolved) throw new Error('sync foreground recall ended without resolve_recall');
   } catch (error) {
     turnSucceeded = false;
     log(`Live Subconscious native-client failure: ${error instanceof Error ? error.message : String(error)}`);
     if (isSync) {
+      if (!recallResolved && foregroundBundle && payload.syncTurnId) writeForegroundRecallReceipt(payload.cwd, {
+        schema_version: 1,
+        session_id: payload.sessionId,
+        turn_id: payload.syncTurnId,
+        bundle_id: foregroundBundle.bundle_id,
+        recorded_at: new Date().toISOString(),
+        decision: 'failed',
+        searches: recallSearches,
+        error: error instanceof Error ? error.message.slice(0, 300) : String(error).slice(0, 300),
+      });
       const apiKey = process.env.LETTA_API_KEY;
       const syncAgentId = payload.syncAgentId ?? payload.agentId;
-      if (whisperDelivered && apiKey) {
+      if (foregroundReleased && apiKey) {
         // Foreground already consumed the durable whisper checkpoint and the
         // wrapper may have exited. From this point the worker owns cleanup:
         // cancel/defer the server resources and do NOT publish a new failed
@@ -347,7 +471,7 @@ export async function sendViaNativeClient(
         // has not observed it yet, it must still be able to release foreground;
         // if it already observed it, the wrapper has removed it itself.
         postWhisperFailureCleanupOwned = true;
-        log(`Post-whisper sync failure cleanup deferred for conversation ${payload.conversationId}`);
+        log(`Post-release sync failure cleanup deferred for conversation ${payload.conversationId}`);
       } else {
         writeSyncCheckpoint(payload, 'failed');
       }

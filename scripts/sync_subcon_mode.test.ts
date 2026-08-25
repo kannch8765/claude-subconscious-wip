@@ -19,10 +19,15 @@ describe('additive synchronous Subcon mode contract', () => {
 
   it('makes sync recall read-only while preserving the full async mutation surface', () => {
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
-    expect(worker).toContain("baseRelationshipTools.filter((tool) => ['memory_search', 'entity_search'].includes(tool.name))");
+    expect(worker).toContain("baseRelationshipTools.filter((tool) => tool.name === 'entity_search')");
+    expect(worker).toContain("name: 'expand_recall'");
+    expect(worker).toContain('buildForegroundRecallBundle');
+    expect(worker).toContain('persistForegroundRecallBundle');
+    expect(worker).toContain('renderForegroundRecallBundle');
+    expect(worker).toContain("name: 'resolve_recall'");
     expect(worker).toContain("name: 'deliver_whisper'");
     expect(worker).toContain("['memory_remember', 'memory_reinforce', 'entity_remember']");
-    expect(worker).toContain('runtime.memorySearchRecallHybrid');
+    expect(worker).toContain('runtime.memorySearchRecallHybridWithEvidence');
     expect(worker).toContain('runtime.entitySearchRecallHybrid');
     expect(worker).toContain('stdio MCP client tools: (disabled in sync mode)');
     expect(worker).toContain('continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 }');
@@ -40,6 +45,9 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(syncHook).toContain('acknowledgePendingSubconWhispers(staleSyncWhispers)');
     expect(pretool).toContain('partitionPendingSubconWhispersForTurn(');
     expect(pretool).toContain(').deliverable');
+    expect(worker).toContain('writeForegroundRecallReceipt');
+    expect(worker).toContain("decision: 'selected'");
+    expect(worker).toContain("decision: 'none'");
   });
 
   it('checkpoints after durable queueing and transfers post-release cleanup ownership to the worker', () => {
@@ -51,7 +59,8 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(checkpoint).toBeGreaterThan(queued);
     expect(completion).toBeGreaterThan(checkpoint);
     expect(worker).toContain('clientToolRoundGate: syncClientToolRoundGate');
-    expect(worker).toContain('Post-whisper sync failure cleanup deferred');
+    expect(worker).toContain("requiredClientToolNames: ['resolve_recall']");
+    expect(worker).toContain('Post-release sync failure cleanup deferred');
     expect(worker).toContain('cancelAndDeferSyncResources');
     expect(worker).toContain('cleanupCompletedSyncResources');
 
@@ -59,6 +68,11 @@ describe('additive synchronous Subcon mode contract', () => {
     const resources = fs.readFileSync(path.join(process.cwd(), 'scripts/sync_letta_resources.ts'), 'utf8');
     expect(sync).toContain('createToolStrippedSyncAgent');
     expect(sync).toContain("mode: 'sync'");
+    expect(sync).toContain('<foreground_recall_bundle>');
+    expect(sync).toContain('expand_recall once');
+    expect(sync).toContain('resolve_recall exactly once');
+    expect(sync).toContain('decision=none');
+    expect(sync).not.toContain('must complete at least one relationship memory_search');
     expect(sync).toContain('cleanupSyncResourcesOnFinish: true');
     expect(sync).toContain('process.exit(0)');
     expect(sync).toContain('cancelAndDeferSyncResources');

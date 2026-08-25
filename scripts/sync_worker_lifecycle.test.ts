@@ -3,7 +3,8 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
-import { readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { acknowledgePendingSubconWhispers, readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { readForegroundRecallTurnState } from './foreground_recall_state.js';
 import { RelationshipMemoryStore, stableId } from '../relationship-memory/src/store/index.js';
 
 const dirs: string[] = [];
@@ -92,26 +93,32 @@ describe('sync worker post-whisper lifecycle ownership', () => {
       createClient: () => ({}),
       runConversation: (async (input: any) => {
         const search = input.tools.find((tool: any) => tool.name === 'memory_search');
+        const expand = input.tools.find((tool: any) => tool.name === 'expand_recall');
+        const resolve = input.tools.find((tool: any) => tool.name === 'resolve_recall');
         const whisper = input.tools.find((tool: any) => tool.name === 'deliver_whisper');
-        expect(search).toBeTruthy();
-        expect(whisper).toBeTruthy();
-        const searchResult = await search.execute('search-1', { query: '咖啡' });
-        const hit = searchResult.results[0];
-        expect(hit.memory_id).toBe('mem-coffee-scene');
-        expect(hit.quote_snippets.length).toBeGreaterThanOrEqual(2);
-        const userSnippet = hit.quote_snippets.find((item: any) => item.role === 'user');
-        const assistantSnippet = hit.quote_snippets.find((item: any) => item.role === 'assistant');
+        expect(search).toBeFalsy();
+        expect(expand).toBeTruthy();
+        expect(resolve).toBeTruthy();
+        expect(whisper).toBeFalsy();
+        expect(input.requiredClientToolNames).toEqual(['resolve_recall']);
+        expect(input.message).toContain('<foreground_recall_bundle');
+        const state = readForegroundRecallTurnState(cwd, payload.sessionId, payload.syncTurnId!);
+        const hit = state.bundle?.candidate_refs.find((item) => item.memory_id === 'mem-coffee-scene');
+        expect(hit).toBeTruthy();
+        expect(hit!.snippet_ids.length).toBeGreaterThanOrEqual(2);
         const hiddenCanonicalSnippet = stableId('quote_snippet', {
           evidence_id: 'ev-coffee-long', index: 4, quote: '片段4。',
         });
-        expect(hit.quote_snippets.some((item: any) => item.snippet_id === hiddenCanonicalSnippet)).toBe(false);
-        await expect(whisper.execute('whisper-hidden', {
-          memory_id: hit.memory_id,
-          snippet_ids: [hiddenCanonicalSnippet],
-        })).rejects.toThrow('only quote snippets surfaced by a prior memory_search');
-        await whisper.execute('whisper-1', {
-          memory_id: hit.memory_id,
-          snippet_ids: [userSnippet.snippet_id, assistantSnippet.snippet_id],
+        expect(hit!.snippet_ids).not.toContain(hiddenCanonicalSnippet);
+        await expect(resolve.execute('resolve-hidden', {
+          decision: 'selected', memory_id: hit!.memory_id, snippet_ids: [hiddenCanonicalSnippet],
+        })).rejects.toThrow('only quote snippets surfaced by the foreground recall bundle or expand_recall');
+        const userSnippet = /<snippet snippet_id="([^"]+)"[^>]*>猫：/.exec(input.message)?.[1];
+        const assistantSnippet = /<snippet snippet_id="([^"]+)"[^>]*>当时琥珀：/.exec(input.message)?.[1];
+        expect(userSnippet).toBeTruthy();
+        expect(assistantSnippet).toBeTruthy();
+        await resolve.execute('resolve-1', {
+          decision: 'selected', memory_id: hit!.memory_id, snippet_ids: [userSnippet!, assistantSnippet!],
         });
         const checkpoint = JSON.parse(fs.readFileSync(checkpointFile, 'utf8'));
         expect(checkpoint.status).toBe('whisper');
@@ -135,5 +142,11 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     expect(pending[0].whisper.text).toContain('[2026-08-01]\n猫：「猫说：「今天想喝咖啡。」');
     expect(pending[0].whisper.text).toContain('当时琥珀：「那我陪猫去找咖啡><🐾」');
     expect(pending[0].whisper.text).not.toContain('我记得猫以前提过咖啡');
+    const receiptBefore = readForegroundRecallTurnState(cwd, payload.sessionId, payload.syncTurnId!);
+    expect(receiptBefore.receipt).toEqual(expect.objectContaining({ decision: 'selected' }));
+    expect(receiptBefore.delivery_state).toBe('pending');
+    acknowledgePendingSubconWhispers(pending);
+    const receiptAfter = readForegroundRecallTurnState(cwd, payload.sessionId, payload.syncTurnId!);
+    expect(receiptAfter.delivery_state).toBe('emitted');
   });
 });
