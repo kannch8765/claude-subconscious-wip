@@ -91,7 +91,8 @@ describe('stdio MCP native client-tool bridge', () => {
     expect(worker).toContain('openStdioMcpToolsFromEnvironment(log)');
     expect(worker).toContain('const liveTools = [...relationshipTools, ...mcpTools]');
     expect(worker).toContain('tools: liveTools');
-    expect(worker).toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");
+    expect(worker).toContain('requiredClientToolNames: []');
+    expect(worker).not.toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");
     expect(worker).toContain("enum: ['foreground_grounding', 'maintenance']");
     expect(worker).toContain('foregroundGroundingIdentityAnchors(entitySearchObservations)');
     expect(worker).toContain('renderHistoricalWhisperQuotes(snippets)');

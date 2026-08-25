@@ -87,6 +87,49 @@ export async function readTranscript(transcriptPath: string, log: LogFn = noopLo
 }
 
 /**
+ * Resolve the real Claude transcript UUID for the current UserPromptSubmit without
+ * scanning the whole transcript. Only an exact visible-text match is accepted; a
+ * miss is intentionally non-fatal so downstream receipt reuse can safely fall back.
+ */
+export function findLatestUserMessageUuidForPrompt(
+  transcriptPath: string,
+  prompt: string,
+  maxTailBytes = 4 * 1024 * 1024,
+): string | undefined {
+  const normalizedPrompt = prompt.trim();
+  if (!normalizedPrompt || !fs.existsSync(transcriptPath)) return undefined;
+  const stat = fs.statSync(transcriptPath);
+  if (stat.size <= 0) return undefined;
+  const length = Math.min(stat.size, Math.max(4096, maxTailBytes));
+  const start = stat.size - length;
+  const fd = fs.openSync(transcriptPath, 'r');
+  try {
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, start);
+    let text = buffer.toString('utf8');
+    if (start > 0) {
+      const firstNewline = text.indexOf('\n');
+      if (firstNewline < 0) return undefined;
+      text = text.slice(firstNewline + 1);
+    }
+    const lines = text.split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let message: TranscriptMessage;
+      try { message = JSON.parse(line) as TranscriptMessage; }
+      catch { continue; }
+      if (message.type !== 'user' || !message.uuid) continue;
+      const visible = extractAllContent(message).text?.trim();
+      if (visible === normalizedPrompt) return message.uuid;
+    }
+    return undefined;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
  * Extract different content types from a message
  */
 export function extractAllContent(msg: TranscriptMessage): ExtractedContent {

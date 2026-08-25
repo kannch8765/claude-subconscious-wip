@@ -3,8 +3,10 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildForegroundRecallBundle, renderForegroundRecallBundle } from './foreground_recall.js';
-import { persistForegroundRecallBundle, readForegroundRecallTurnState, writeForegroundRecallReceipt } from './foreground_recall_state.js';
+import { bindForegroundRecallTurnToMessage, persistForegroundRecallBundle, readForegroundRecallTurnState, readForegroundRecallTurnStateForMessage, writeForegroundRecallReceipt } from './foreground_recall_state.js';
 import { acknowledgePendingSubconWhispers, queueSubconWhisper, readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { findLatestUserMessageUuidForPrompt } from './transcript_utils.js';
+import { renderForegroundRecallReceiptCatalog } from './send_worker_native.js';
 
 const dirs: string[] = [];
 
@@ -70,4 +72,50 @@ describe('foreground recall bundle and receipt', () => {
     acknowledgePendingSubconWhispers(readPendingSubconWhispers(cwd, 'session-a'));
     expect(readForegroundRecallTurnState(cwd, 'session-a', 'turn-a').delivery_state).toBe('emitted');
   });
+
+  it('binds foreground turns to the exact transcript user UUID so repeated prompts cannot cross wires', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-binding-'));
+    dirs.push(cwd);
+    const transcript = path.join(cwd, 'transcript.jsonl');
+    fs.writeFileSync(transcript, [
+      { type: 'user', uuid: 'user-1', message: { content: [{ type: 'text', text: '一样的问题' }] } },
+      { type: 'assistant', uuid: 'assistant-1', message: { content: [{ type: 'text', text: '第一次回答' }] } },
+      { type: 'user', uuid: 'user-2', message: { content: [{ type: 'text', text: '一样的问题' }] } },
+    ].map((item) => JSON.stringify(item)).join('\n') + '\n');
+    expect(findLatestUserMessageUuidForPrompt(transcript, '一样的问题')).toBe('user-2');
+    expect(findLatestUserMessageUuidForPrompt(transcript, '不存在')).toBeUndefined();
+
+    const bundle = await buildForegroundRecallBundle({
+      async memorySearchRecallHybridWithEvidence() { return []; },
+    }, '一样的问题', { sessionId: 'session-a', turnId: 'turn-2', now: () => '2026-08-25T00:00:00.000Z' });
+    persistForegroundRecallBundle(cwd, bundle);
+    writeForegroundRecallReceipt(cwd, {
+      schema_version: 1, session_id: 'session-a', turn_id: 'turn-2', bundle_id: bundle.bundle_id,
+      recorded_at: '2026-08-25T00:00:01.000Z', decision: 'none', searches: [],
+    });
+    bindForegroundRecallTurnToMessage(cwd, 'session-a', 'turn-2', 'user-2', () => '2026-08-25T00:00:02.000Z');
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-1')).toBeUndefined();
+    const bound = readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-2');
+    expect(bound?.binding.turn_id).toBe('turn-2');
+    expect(bound?.receipt?.decision).toBe('none');
+    expect(() => bindForegroundRecallTurnToMessage(cwd, 'session-a', 'other-turn', 'user-2')).toThrow('binding conflict');
+  });
+
+  it('renders receipt history as bookkeeping only, including delivery state but no raw query or quotes', () => {
+    const rendered = renderForegroundRecallReceiptCatalog([{
+      message_id: 'user-2', turn_id: 'turn-2', delivery_state: 'emitted',
+      receipt: {
+        schema_version: 1, session_id: 'session-a', turn_id: 'turn-2', bundle_id: 'bundle-2',
+        recorded_at: '2026-08-25T00:00:01.000Z', decision: 'selected',
+        searches: [{ kind: 'prefetch', query_sha256: 'hash-only', memory_ids: ['mem-1'] }],
+        selected: { memory_id: 'mem-1', snippet_ids: ['snippet-1'] }, whisper_id: 'whisper-1',
+      },
+    }]);
+    expect(rendered).toContain('message_id="user-2"');
+    expect(rendered).toContain('decision="selected"');
+    expect(rendered).toContain('delivery_state="emitted"');
+    expect(rendered).toContain('memory_id="mem-1"');
+    expect(rendered).not.toContain('raw query');
+  });
+
 });

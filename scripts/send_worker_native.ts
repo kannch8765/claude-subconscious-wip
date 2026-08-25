@@ -32,13 +32,27 @@ import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
 import { cancelAndDeferSyncResources, cleanupCompletedSyncResources } from './sync_letta_resources.js';
 import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
 import { buildForegroundRecallBundle, renderForegroundRecallBundle, type ForegroundRecallCandidate } from './foreground_recall.js';
-import { persistForegroundRecallBundle, writeForegroundRecallReceipt, type ForegroundRecallSearchReceipt } from './foreground_recall_state.js';
+import {
+  persistForegroundRecallBundle,
+  writeForegroundRecallReceipt,
+  type ForegroundRecallReceipt,
+  type ForegroundRecallSearchReceipt,
+  type PersistedForegroundRecallBundle,
+} from './foreground_recall_state.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
 const LOG_FILE = path.join(TEMP_STATE_DIR, 'send_worker_native.log');
 
 type LiveWorkerMode = 'async' | 'sync';
+
+export interface AsyncForegroundRecallTurnSnapshot {
+  message_id: string;
+  turn_id: string;
+  bundle?: PersistedForegroundRecallBundle;
+  receipt?: ForegroundRecallReceipt;
+  delivery_state: 'pending' | 'emitted' | 'missing' | 'not_applicable';
+}
 
 export interface LiveWorkerPayload {
   mode?: LiveWorkerMode;
@@ -53,6 +67,8 @@ export interface LiveWorkerPayload {
   canonicalMessages?: CanonicalMessage[];
   assistantIntents?: AssistantRememberIntentRecord[];
   latestUserMessage: string;
+  latestUserMessageId?: string;
+  foregroundRecallTurns?: AsyncForegroundRecallTurnSnapshot[];
   syncCheckpointFile?: string;
   syncTurnId?: string;
   syncAgentId?: string;
@@ -75,6 +91,26 @@ function writeSyncCheckpoint(payload: LiveWorkerPayload, status: SyncCheckpointS
     try { fs.unlinkSync(temp); } catch {}
     if (!fs.existsSync(payload.syncCheckpointFile)) throw error;
   }
+}
+
+
+function escapeXml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+export function renderForegroundRecallReceiptCatalog(turns: readonly AsyncForegroundRecallTurnSnapshot[]): string {
+  if (turns.length === 0) return '';
+  const body = turns.map((turn) => {
+    const decision = turn.receipt?.decision ?? 'missing';
+    const searches = (turn.receipt?.searches ?? []).map((search) =>
+      `<search kind="${search.kind}" query_sha256="${escapeXml(search.query_sha256)}" memory_ids="${escapeXml(search.memory_ids.join(','))}"/>`
+    ).join('\n');
+    const selected = turn.receipt?.selected
+      ? `<selected memory_id="${escapeXml(turn.receipt.selected.memory_id)}" snippet_ids="${escapeXml(turn.receipt.selected.snippet_ids.join(','))}"/>`
+      : '';
+    return `<turn message_id="${escapeXml(turn.message_id)}" turn_id="${escapeXml(turn.turn_id)}" decision="${decision}" delivery_state="${turn.delivery_state}">\n${searches}${searches && selected ? '\n' : ''}${selected}\n</turn>`;
+  }).join('\n');
+  return `<foreground_recall_receipt_catalog schema_version="1">\n${body}\n</foreground_recall_receipt_catalog>`;
 }
 
 
@@ -142,7 +178,6 @@ export async function sendViaNativeClient(
     runtime.store.beginBatch(payload.batchId, new Date().toISOString());
   }
 
-  const hasRealUserMessage = Boolean(payload.latestUserMessage?.trim());
   let turnSucceeded = false;
   let whisperDelivered = false;
   let recallResolved = false;
@@ -150,6 +185,11 @@ export async function sendViaNativeClient(
   let postWhisperFailureCleanupOwned = false;
   const recallSearches: ForegroundRecallSearchReceipt[] = [];
   let foregroundBundle = undefined as Awaited<ReturnType<typeof buildForegroundRecallBundle>> | undefined;
+  const latestForegroundRecall = !isSync && payload.latestUserMessageId
+    ? payload.foregroundRecallTurns?.find((item) => item.message_id === payload.latestUserMessageId)
+    : undefined;
+  const latestForegroundRecallResolved = latestForegroundRecall?.receipt?.decision === 'selected'
+    || latestForegroundRecall?.receipt?.decision === 'none';
 
   try {
     const apiKey = process.env.LETTA_API_KEY;
@@ -359,7 +399,7 @@ export async function sendViaNativeClient(
         return { ...result, decision: 'selected' };
       },
     });
-    else relationshipTools.push({
+    else if (!latestForegroundRecallResolved) relationshipTools.push({
       name: 'deliver_whisper',
       description: 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
       parameters: {
@@ -382,6 +422,9 @@ export async function sendViaNativeClient(
         return selectForegroundRecall(memoryId, snippetIds);
       },
     });
+    if (!isSync && latestForegroundRecallResolved) {
+      log(`Skipping async deliver_whisper because foreground recall already resolved for message ${payload.latestUserMessageId}`);
+    }
 
     const durableAssistantIntents = isSync ? [] : assistantIntents.map((intent) => {
       const stored = runtime.store.getAssistantIntent(intent.intent_id);
@@ -395,7 +438,10 @@ export async function sendViaNativeClient(
       ? `${payload.message}
 
 ${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
-      : appendTrustedRelationshipCatalog(payload.message, canonicalMessages, durableAssistantIntents);
+      : [
+          appendTrustedRelationshipCatalog(payload.message, canonicalMessages, durableAssistantIntents),
+          renderForegroundRecallReceiptCatalog(payload.foregroundRecallTurns ?? []),
+        ].filter(Boolean).join('\n\n');
 
     log(`Starting native live Subconscious turn for conversation ${payload.conversationId}`);
     log(`  agent: ${payload.agentId}`);
@@ -434,7 +480,7 @@ ${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
           conversationId: payload.conversationId,
           message: liveMessage,
           tools: liveTools,
-          requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
+          requiredClientToolNames: [],
         });
       } finally {
         await stdioMcp.close();

@@ -22,6 +22,8 @@ import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
 import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { bindForegroundRecallTurnToMessage } from './foreground_recall_state.js';
+import { findLatestUserMessageUuidForPrompt } from './transcript_utils.js';
 import {
   loadSyncState,
   saveSyncState,
@@ -197,6 +199,21 @@ async function main(): Promise<void> {
     const sessionId = hookInput?.session_id;
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const expectedTurnId = expectedSyncTurnId(hookInput);
+    if (sessionId && expectedTurnId && hookInput?.transcript_path && typeof hookInput.prompt === 'string') {
+      try {
+        const messageId = findLatestUserMessageUuidForPrompt(hookInput.transcript_path, hookInput.prompt);
+        if (messageId) {
+          bindForegroundRecallTurnToMessage(cwd, sessionId, expectedTurnId, messageId);
+          debug('Bound foreground recall turn to transcript message', { turn_id: expectedTurnId, message_id: messageId });
+        } else {
+          debug('Could not bind foreground recall turn: no exact latest user transcript match');
+        }
+      } catch (error) {
+        // Receipt reuse is an optimization. A binding failure must never block the
+        // foreground prompt; the async lane will safely fall back to normal lookup.
+        debug('Foreground recall turn binding failed; continuing without receipt reuse', error);
+      }
+    }
     const partitioned = partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId);
     const pendingWhispers = partitioned.deliverable;
     const staleSyncWhispers = partitioned.staleSync;

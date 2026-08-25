@@ -40,6 +40,18 @@ export interface ForegroundRecallTurnState {
   delivery_state: SubconWhisperDeliveryState | 'not_applicable';
 }
 
+export interface ForegroundRecallMessageBinding {
+  schema_version: 1;
+  session_id: string;
+  message_id: string;
+  turn_id: string;
+  bound_at: string;
+}
+
+export interface BoundForegroundRecallTurnState extends ForegroundRecallTurnState {
+  binding: ForegroundRecallMessageBinding;
+}
+
 function sessionDir(cwd: string, sessionId: string): string {
   const key = crypto.createHash('sha256').update(sessionId).digest('hex').slice(0, 24);
   return path.join(getDurableStateDir(cwd), 'foreground-recall', key);
@@ -47,6 +59,14 @@ function sessionDir(cwd: string, sessionId: string): string {
 
 function turnKey(turnId: string): string {
   return crypto.createHash('sha256').update(turnId).digest('hex').slice(0, 24);
+}
+
+function messageKey(messageId: string): string {
+  return crypto.createHash('sha256').update(messageId).digest('hex').slice(0, 24);
+}
+
+function messageBindingPath(cwd: string, sessionId: string, messageId: string): string {
+  return path.join(sessionDir(cwd, sessionId), 'message-bindings', `${messageKey(messageId)}.json`);
 }
 
 function pathsFor(cwd: string, sessionId: string, turnId: string): { bundle: string; receipt: string } {
@@ -100,4 +120,45 @@ export function readForegroundRecallTurnState(cwd: string, sessionId: string, tu
     ...(receipt ? { receipt } : {}),
     delivery_state: deliveryState,
   };
+}
+
+
+export function bindForegroundRecallTurnToMessage(
+  cwd: string,
+  sessionId: string,
+  turnId: string,
+  messageId: string,
+  now: () => string = () => new Date().toISOString(),
+): ForegroundRecallMessageBinding {
+  const cleanSession = sessionId.trim();
+  const cleanTurn = turnId.trim();
+  const cleanMessage = messageId.trim();
+  if (!cleanSession || !cleanTurn || !cleanMessage) throw new Error('sessionId, turnId, and messageId are required');
+  const file = messageBindingPath(cwd, cleanSession, cleanMessage);
+  const existing = readJson<ForegroundRecallMessageBinding>(file);
+  if (existing) {
+    if (existing.session_id !== cleanSession || existing.message_id !== cleanMessage || existing.turn_id !== cleanTurn) {
+      throw new Error(`foreground recall message binding conflict for ${cleanMessage}`);
+    }
+    return existing;
+  }
+  const binding: ForegroundRecallMessageBinding = {
+    schema_version: 1,
+    session_id: cleanSession,
+    message_id: cleanMessage,
+    turn_id: cleanTurn,
+    bound_at: now(),
+  };
+  atomicWriteJson(file, binding);
+  return binding;
+}
+
+export function readForegroundRecallTurnStateForMessage(
+  cwd: string,
+  sessionId: string,
+  messageId: string,
+): BoundForegroundRecallTurnState | undefined {
+  const binding = readJson<ForegroundRecallMessageBinding>(messageBindingPath(cwd, sessionId, messageId));
+  if (!binding || binding.session_id !== sessionId || binding.message_id !== messageId || !binding.turn_id) return undefined;
+  return { binding, ...readForegroundRecallTurnState(cwd, sessionId, binding.turn_id) };
 }

@@ -41,6 +41,7 @@ import {
 import { buildCanonicalMessages, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
+import { readForegroundRecallTurnStateForMessage } from './foreground_recall_state.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -173,26 +174,26 @@ ${latestUserEscaped}
 </latest_user_message>
 
 <instructions>
-This is the normal asynchronous Subconscious pass after a foreground Kohaku turn. Do both jobs in one pass:
+This is the normal asynchronous Subconscious pass after a foreground Kohaku turn. Maintain long-term relationship memory, and perform foreground recall only as a fallback when the synchronous foreground lane did not already resolve that exact user turn.
 
-1. MEMORY SURFACING FOR THE NEXT FOREGROUND TURN
-- Before episodic recall, ground identity only when needed: if a clearly named referent matters to understanding the current relationship context but <latest_user_message> plus the trusted current batch do not establish who or what it is, call entity_search with that natural referent and purpose=foreground_grounding first. Use the returned identity to disambiguate the later relationship recall. For alias/dedupe checks or other entity maintenance, including search before entity_remember, use purpose=maintenance instead.
-- Do not call entity_search merely because a name appears. If the current context already resolves the referent, continue directly to episodic recall and do not repeat an identity anchor the foreground already has.
-- If a purpose=foreground_grounding entity_search returns a useful stable identity, use it to guide recall and do not embellish identity claims beyond the grounded entity result. The live transport preserves an identity anchor only when the entire live pass resolves exactly one distinct concise foreground-grounding entity; maintenance searches and passes with multiple distinct foreground-grounding identities do not auto-inject identity. Use the grounded identity only to guide recall and quote selection; when exactly one eligible foreground identity is resolved, the runtime preserves that factual identity anchor separately.
-- Read <latest_user_message> together with the trusted current-batch transcript context, then choose and call relationship memory_search yourself. Generate a compact semantic query for what is meaningfully being recalled; do not mechanically copy the whole user message, emoji, or surface punctuation when a cleaner concept query is available.
-- Every live pass that contains a real <latest_user_message> must complete at least one relationship memory_search before ending. This is a hard behavior boundary, not optional guidance.
-- You may issue additional memory_search calls after seeing earlier results when a narrower, broader, or differently phrased semantic search would improve recall.
-- Treat returned relationship memories as candidate past moments. Each hit contains quote_snippets with source-faithful historical excerpts. source_kind=transcript is a direct historical quote; source_kind=legacy_memory is only a fallback for a memory with no transcript evidence and is an older memory-record excerpt, not a direct quote. Select only a moment genuinely useful for continuity on the next foreground turn.
-- If something useful surfaced, call deliver_whisper once with one searched memory_id and 1-3 snippet_ids from that memory's quote_snippets. Prefer the fewest quotes that let the moment stand on its own. The runtime renders the selected source excerpts with provenance-appropriate labels; do not write or paraphrase whisper prose yourself.
-- Retrieval itself supplies the association. Do not explain why the memory matters now, declare that something was fulfilled/came full circle, infer relationship meaning, or tell foreground Kohaku what to feel. Past Kohaku feelings may surface only as explicitly historical source quotes.
-- If nothing useful surfaced, do not call deliver_whisper. Silence is correct.
-- A whisper must never expose memory_search, IDs, snippet IDs, reinforce/remember/create/dedupe, archival status, or whether anything deserves storage.
+1. FOREGROUND RECALL FALLBACK
+- The runtime may append a trusted <foreground_recall_receipt_catalog> after this envelope. Each entry is bound to a real transcript user message_id; it records what the synchronous foreground recall lane searched and whether it explicitly selected a memory, selected none, or failed.
+- A receipt with decision=selected or decision=none means recall for that exact foreground user turn was already resolved. Do not repeat episodic search or queue another whisper merely because the same memory/topic appears in maintenance. The runtime may remove deliver_whisper from this pass when the latest foreground turn is already resolved.
+- decision=selected is only a foreground continuity decision. It is NOT evidence that the memory should be reinforced, revised, or otherwise weighted more strongly. decision=none is also a successful recall outcome, not evidence that no long-term maintenance is needed.
+- If the latest user turn has no receipt or decision=failed, you may use relationship memory_search as a fallback when a past moment would genuinely help continuity on a later foreground turn. Generate a compact semantic query; do not mechanically copy the whole user message. Additional searches are allowed only when they answer a materially different recall/canonicalization question.
+- Before fallback episodic recall, ground identity only when needed: if a clearly named referent matters to understanding the current relationship context but <latest_user_message> plus the trusted current batch do not establish who or what it is, call entity_search with that natural referent and purpose=foreground_grounding first. Use purpose=maintenance instead for alias/dedupe checks or other entity maintenance.
+- Do not call entity_search merely because a name appears. If current context already resolves the referent, do not repeat an identity anchor the foreground already has. When exactly one distinct concise foreground-grounding entity is resolved, the runtime may preserve that factual identity anchor separately; maintenance searches and multiple distinct foreground identities do not auto-inject identity.
+- For fallback surfacing, treat returned relationship memories as candidates. Each hit contains quote_snippets with source-faithful historical excerpts. source_kind=transcript is a direct historical quote; source_kind=legacy_memory is only a fallback for a memory with no transcript evidence and is an older memory-record excerpt, not a direct quote.
+- If something genuinely useful surfaced and deliver_whisper is available, call deliver_whisper once with one searched memory_id and 1-3 snippet_ids from that memory. Prefer the fewest quotes that let the moment stand on its own; the runtime renders the selected source excerpts with provenance-appropriate labels. If nothing useful surfaced, silence is correct.
+- Retrieval itself supplies the association. Never explain why a memory matters now, infer relationship meaning, or tell foreground Kohaku what to feel. A whisper must never expose search/write bookkeeping.
 
 2. SILENT LONG-TERM MEMORY MAINTENANCE
-- Reuse relevant relationship search results when applicable to decide whether trusted new evidence should reinforce an existing relationship memory, create a genuinely new durable memory, or do nothing.
+- Read the full trusted current-batch transcript and the receipt catalog together, but keep their roles separate: transcript evidence can justify memory writes; foreground receipts are only retrieval/selection history.
+- Do NOT reinforce a memory merely because foreground selected or emitted it. surface != reinforce. Reinforce only when trusted current-batch evidence is genuinely another instance of the same underlying episode/event or the same explicit stable preference.
+- Use memory_search when you actually need canonical lookup: same-event/same-preference verification, dedupe, related-memory linking, or another ambiguous maintenance decision. There is no search quota and no requirement to repeat a search already performed by foreground just to satisfy this pass.
+- If the receipt points at a memory_id but the full turn introduces materially new semantics, or you need to verify sameness/current canonical state before writing, perform a maintenance search. A receipt is a hint, never a substitute for evidence.
 - entity_search miss is not permission to invent an identity. Call entity_remember only when trusted current-batch conversation itself clearly defines or supports the stable identity; a bare name mention, guess, or episodic association must remain unresolved rather than becoming a canonical entity.
-- When an identity is genuinely supported, keep its description concise and stable in relationship terms useful for continuity rather than reducing a person to transient provider/tool/runtime inventory.
-- Perform memory_reinforce / memory_remember / entity operations as needed. This work is private maintenance.
+- Perform memory_reinforce / memory_remember / entity operations only as warranted by trusted current-batch evidence. This work is private maintenance.
 - Never report maintenance decisions in deliver_whisper, ordinary prose, guidance, or any other foreground-visible channel.
 
 The foreground sees only explicit deliver_whisper output. Ordinary assistant prose from this background pass is not a whisper and will not be injected.
@@ -205,6 +206,23 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
     const batchId = makeBatchId(hookInput.session_id, state.lastProcessedIndex, messages.length - 1);
     const canonicalMessages = buildCanonicalMessages(messages, state.lastProcessedIndex, conversationId);
     log(`Relationship-memory batch: ${batchId} (${canonicalMessages.length} canonical evidence messages)`);
+    const userMessageIds = [...new Set(canonicalMessages
+      .filter((item) => item.role === 'user' && item.event_kind === 'user_text')
+      .map((item) => item.message_id))];
+    const foregroundRecallTurns = userMessageIds.flatMap((messageId) => {
+      const turnState = readForegroundRecallTurnStateForMessage(hookInput.cwd, hookInput.session_id, messageId);
+      if (!turnState) return [];
+      return [{
+        message_id: messageId,
+        turn_id: turnState.binding.turn_id,
+        ...(turnState.bundle ? { bundle: turnState.bundle } : {}),
+        ...(turnState.receipt ? { receipt: turnState.receipt } : {}),
+        delivery_state: turnState.delivery_state,
+      }];
+    });
+    const latestUserMessageId = [...canonicalMessages].reverse()
+      .find((item) => item.role === 'user' && item.event_kind === 'user_text')?.message_id;
+    log(`Foreground recall receipt coverage: ${foregroundRecallTurns.length}/${userMessageIds.length} user message(s)`);
 
     const nativePayload = {
       agentId,
@@ -218,6 +236,8 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
       canonicalMessages,
       assistantIntents,
       latestUserMessage,
+      ...(latestUserMessageId ? { latestUserMessageId } : {}),
+      ...(foregroundRecallTurns.length ? { foregroundRecallTurns } : {}),
     };
     fs.writeFileSync(payloadFile, JSON.stringify(nativePayload), 'utf-8');
     log(`Wrote native live payload to ${payloadFile}`);
