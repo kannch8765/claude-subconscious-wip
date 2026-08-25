@@ -8,6 +8,7 @@ import {
   RelationshipMemoryRecallSession,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
+  buildBundleFirstRecallTools,
   buildRecallTools,
   executeRecall,
   type AssistantRememberIntentRecord,
@@ -144,6 +145,32 @@ describe('assistant relationship-memory recall core', () => {
     expect(buildRecallTools(recall).map((tool) => tool.name)).toEqual([
       'relationship_memory_search', 'transcript_search', 'transcript_read', 'deliver_recall',
     ]);
+  });
+
+
+  it('prefetches a bounded evidence bundle and exposes only one optional expansion plus terminal delivery to the model', async () => {
+    const root = temp('rm-recall-bundle-first-');
+    seedRelationshipMemory(root);
+    const transcriptDir = temp('rm-recall-bundle-transcript-');
+    const transcript = path.join(transcriptDir, 'session.jsonl');
+    fs.writeFileSync(transcript, [
+      JSON.stringify({ type: 'user', uuid: 'u1', timestamp: '2026-08-20T10:00:00.000Z', message: { content: [{ type: 'text', text: 'I brought the Kyoto orange cake back for you too.' }] } }),
+      JSON.stringify({ type: 'assistant', uuid: 'a1', timestamp: '2026-08-20T10:01:00.000Z', message: { content: [{ type: 'text', text: 'You remembered me when choosing the orange cake.' }] } }),
+    ].join('\n') + '\n');
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [transcriptDir] });
+
+    const bundle = await recall.evidenceBundle({ query: 'Kyoto orange cake', transcript_window_limit: 1 });
+    expect(bundle.policy).toBe('explicit_recall');
+    expect(bundle.relationship_results.length).toBeGreaterThan(0);
+    expect(bundle.transcript_hits.length).toBeGreaterThan(0);
+    expect(bundle.transcript_windows).toHaveLength(1);
+    expect(bundle.source_refs.length).toBeGreaterThan(0);
+    expect(buildBundleFirstRecallTools(recall).map((tool) => tool.name)).toEqual(['expand_recall', 'deliver_recall']);
+
+    const expand = buildBundleFirstRecallTools(recall)[0];
+    const expanded = await expand.execute('call-1', { query: 'orange cake Kyoto' }) as any;
+    expect(expanded.policy).toBe('explicit_recall');
+    await expect(expand.execute('call-2', { query: 'again' })).rejects.toThrow(/at most once/);
   });
 
   it('keeps an accepted terminal delivery even when the model runner outlives the deadline', async () => {

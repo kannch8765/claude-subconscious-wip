@@ -11,6 +11,37 @@ import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, 
 
 export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
+export type RecallEvidencePolicy = 'explicit_recall';
+
+export interface RecallEvidenceBundle {
+  schema_version: 1;
+  policy: RecallEvidencePolicy;
+  query: string;
+  generated_at: string;
+  relationship_results: unknown[];
+  transcript_hits: unknown[];
+  transcript_windows: Array<{ source_ref: string; context: unknown[] }>;
+  source_refs: string[];
+}
+
+export interface RecallEvidenceBundleInput {
+  query: string;
+  kind?: MemoryKind;
+  time_start?: string;
+  time_end?: string;
+  memory_limit?: number;
+  transcript_limit?: number;
+  transcript_window_limit?: number;
+  transcript_before?: number;
+  transcript_after?: number;
+}
+
+export interface ExpandRecallInput {
+  query: string;
+  kind?: MemoryKind;
+  time_start?: string;
+  time_end?: string;
+}
 
 export interface RecallSourceSummary {
   source_ref: string;
@@ -79,7 +110,7 @@ interface TranscriptCandidate extends TranscriptLocator {
 
 export interface RecallTool {
   label: string;
-  name: 'relationship_memory_search' | 'transcript_search' | 'transcript_read' | 'deliver_recall';
+  name: 'relationship_memory_search' | 'transcript_search' | 'transcript_read' | 'expand_recall' | 'deliver_recall';
   description: string;
   parameters: Record<string, unknown>;
   execute(toolCallId: string, args: unknown): Promise<unknown>;
@@ -222,6 +253,7 @@ export class RelationshipMemoryRecallSession {
   private resolveDelivery!: (result: RecallResult) => void;
   private closedReason?: 'timeout' | 'cancelled' | 'failed';
   private readonly semanticRetriever?: SemanticRetriever;
+  private expansionCount = 0;
 
   constructor(options: {
     recallId?: string;
@@ -456,6 +488,72 @@ export class RelationshipMemoryRecallSession {
     return { source_ref: readRef, context };
   }
 
+
+  async evidenceBundle(input: RecallEvidenceBundleInput): Promise<RecallEvidenceBundle> {
+    this.assertOpen();
+    const query = cleanText(input?.query, 'query');
+    const memoryLimit = boundedLimit(input.memory_limit, 8, 12);
+    const transcriptLimit = boundedLimit(input.transcript_limit, 6, 12);
+    const transcriptWindowLimit = boundedLimit(input.transcript_window_limit, 3, 4);
+    const before = boundedContext(input.transcript_before, 2);
+    const after = boundedContext(input.transcript_after, 2);
+
+    const relationship = await this.relationshipMemorySearchHybrid({
+      query,
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.time_start ? { time_start: input.time_start } : {}),
+      ...(input.time_end ? { time_end: input.time_end } : {}),
+      limit: memoryLimit,
+    }) as { results: unknown[] };
+
+    const transcript = await this.transcriptSearch({
+      query,
+      ...(input.time_start ? { time_start: input.time_start } : {}),
+      ...(input.time_end ? { time_end: input.time_end } : {}),
+      limit: transcriptLimit,
+    }) as { results: Array<{ source_ref?: string }> };
+
+    const transcriptWindows: Array<{ source_ref: string; context: unknown[] }> = [];
+    for (const hit of transcript.results.slice(0, transcriptWindowLimit)) {
+      if (typeof hit?.source_ref !== 'string' || !hit.source_ref) continue;
+      const read = await this.transcriptRead({ source_ref: hit.source_ref, before, after });
+      transcriptWindows.push(read);
+    }
+
+    const sourceRefs = new Set<string>();
+    for (const item of relationship.results) {
+      const sourceRef = item && typeof item === 'object' && !Array.isArray(item) ? (item as Record<string, unknown>).source_ref : undefined;
+      if (typeof sourceRef === 'string') sourceRefs.add(sourceRef);
+    }
+    for (const item of transcript.results) {
+      if (typeof item?.source_ref === 'string') sourceRefs.add(item.source_ref);
+    }
+    for (const item of transcriptWindows) sourceRefs.add(item.source_ref);
+
+    return {
+      schema_version: 1,
+      policy: 'explicit_recall',
+      query,
+      generated_at: new Date().toISOString(),
+      relationship_results: relationship.results,
+      transcript_hits: transcript.results,
+      transcript_windows: transcriptWindows,
+      source_refs: [...sourceRefs],
+    };
+  }
+
+  async expandEvidenceBundle(input: ExpandRecallInput): Promise<RecallEvidenceBundle> {
+    this.assertOpen();
+    if (this.expansionCount >= 1) throw new Error('expand_recall may be called at most once per recall.');
+    this.expansionCount += 1;
+    return this.evidenceBundle({
+      query: cleanText(input?.query, 'query'),
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.time_start ? { time_start: input.time_start } : {}),
+      ...(input.time_end ? { time_end: input.time_end } : {}),
+    });
+  }
+
   deliver(input: DeliverRecallInput): RecallResult {
     this.assertOpen();
     if (cleanText(input?.recall_id, 'recall_id') !== this.recallId) throw new Error('deliver_recall recall_id does not match the pending recall.');
@@ -527,6 +625,36 @@ export function deliverRecallToolSchema(): Record<string, unknown> {
   };
 }
 
+
+export function expandRecallToolSchema(): Record<string, unknown> {
+  return {
+    type: 'object', additionalProperties: false, required: ['query'],
+    properties: {
+      query: { type: 'string', minLength: 1, description: 'One revised natural-language search concept for the single allowed expansion.' },
+      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'] },
+      time_start: { type: 'string', description: 'Optional ISO-compatible lower time bound.' },
+      time_end: { type: 'string', description: 'Optional ISO-compatible upper time bound.' },
+    },
+  };
+}
+
+export function buildBundleFirstRecallTools(session: RelationshipMemoryRecallSession, wrapResult: RecallResultWrapper = (value) => value): RecallTool[] {
+  return [
+    {
+      label: 'expand_recall', name: 'expand_recall',
+      description: 'Optional single fallback search. The script performs trusted memory + transcript retrieval and returns another bounded evidence bundle. Use only when the initial bundle is materially insufficient.',
+      parameters: expandRecallToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(await session.expandEvidenceBundle(args as ExpandRecallInput)); },
+    },
+    {
+      label: 'deliver_recall', name: 'deliver_recall',
+      description: 'Terminally deliver the synthesized recall answer. Cite only source_ref values present in the script-provided evidence bundles for this recall.',
+      parameters: deliverRecallToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(session.deliver(args as DeliverRecallInput)); },
+    },
+  ];
+}
+
 export function buildRecallTools(session: RelationshipMemoryRecallSession, wrapResult: RecallResultWrapper = (value) => value): RecallTool[] {
   return [
     {
@@ -556,7 +684,7 @@ export function buildRecallTools(session: RelationshipMemoryRecallSession, wrapR
   ];
 }
 
-export const RECALL_ALLOWED_CLIENT_TOOLS = ['relationship_memory_search', 'transcript_search', 'transcript_read', 'deliver_recall'] as const;
+export const RECALL_BUNDLE_ALLOWED_CLIENT_TOOLS = ['expand_recall', 'deliver_recall'] as const;
 export const RECALL_FORBIDDEN_CLIENT_TOOLS = [
   'memory_remember', 'memory', 'memory_insert', 'memory_replace', 'memory_rethink',
   'owner_revise', 'owner_deactivate', 'owner_restore', 'Write', 'Edit', 'Bash', 'Read', 'Grep', 'Glob',

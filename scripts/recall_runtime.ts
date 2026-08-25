@@ -2,9 +2,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  buildRecallTools,
+  buildBundleFirstRecallTools,
   executeRecall,
-  RECALL_ALLOWED_CLIENT_TOOLS,
+  RECALL_BUNDLE_ALLOWED_CLIENT_TOOLS,
   RECALL_FORBIDDEN_CLIENT_TOOLS,
   type RecallResult,
   type RelationshipMemoryRecallSession,
@@ -51,15 +51,16 @@ async function deleteConversation(apiKey: string, conversationId: string): Promi
   }
 }
 
-function recallPrompt(session: RelationshipMemoryRecallSession, query: string): string {
+function recallPrompt(session: RelationshipMemoryRecallSession, query: string, bundle: unknown): string {
   return `<relationship_memory_recall recall_id="${escapeXml(session.recallId)}">
 <query>${escapeXml(query)}</query>
+<initial_evidence_bundle_json>${escapeXml(JSON.stringify(bundle))}</initial_evidence_bundle_json>
 <instructions>
 You are in a one-shot, read-only relationship-memory recall mode for the primary Claude Code assistant.
-Investigate only with relationship_memory_search, transcript_search, and transcript_read. Canonical relationship memory and direct Claude transcript JSONL are the trusted sources. Do not rely on your own prior conversational context as evidence.
-For transcript evidence, use transcript_search first and transcript_read when context is needed before synthesis. Do not invent source_ref values. Call only one tool at a time; wait for each tool result before issuing the next tool call.
-You cannot write memory, mutate owner state, advance observer batches, edit files, or inject into Claude by any other channel.
-Finish exactly once by calling deliver_recall with this exact recall_id, a concise natural-language answer to the query, and only source_refs that were actually returned by trusted read tools in this recall. If evidence is absent, say so in the answer and deliver with the evidence you actually found (possibly an empty source_refs list).
+The script has already retrieved a bounded trusted evidence bundle from canonical relationship memory and direct Claude transcript JSONL. Start by reasoning from that bundle; do not repeat the same search yourself.
+If the initial bundle is materially insufficient, you may call expand_recall at most once with a better natural-language search concept and optional time/kind bounds. The script performs the search and returns another trusted bundle. Do not call expand_recall merely to confirm evidence already present.
+You cannot directly search memory/transcripts, write memory, mutate owner state, advance observer batches, edit files, or inject into Claude by any other channel.
+Finish exactly once by calling deliver_recall with this exact recall_id, a concise natural-language answer to the query, and only source_refs present in the script-provided evidence bundle(s). If evidence is absent, say so and deliver with an empty source_refs list.
 Do not treat ordinary assistant prose as delivery; deliver_recall is the only terminal channel.
 </instructions>
 </relationship_memory_recall>`;
@@ -84,7 +85,9 @@ async function runLettaRecallModel(core: RelationshipMemoryRecallSession, query:
   signal.addEventListener('abort', onAbort, { once: true });
 
   try {
-    const tools = buildRecallTools(core, jsonResult).map((tool) => {
+    const initialBundle = await core.evidenceBundle({ query });
+    log(`Recall ${core.recallId} prefetched evidence: relationship=${initialBundle.relationship_results.length}, transcript_hits=${initialBundle.transcript_hits.length}, transcript_windows=${initialBundle.transcript_windows.length}`);
+    const tools = buildBundleFirstRecallTools(core, jsonResult).map((tool) => {
       const execute = tool.execute.bind(tool);
       return {
         ...tool,
@@ -100,7 +103,7 @@ async function runLettaRecallModel(core: RelationshipMemoryRecallSession, query:
       };
     });
     const sessionOptions: Record<string, unknown> = {
-      allowedTools: [...RECALL_ALLOWED_CLIENT_TOOLS],
+      allowedTools: [...RECALL_BUNDLE_ALLOWED_CLIENT_TOOLS],
       disallowedTools: [...RECALL_FORBIDDEN_CLIENT_TOOLS],
       tools,
       permissionMode: 'bypassPermissions',
@@ -112,7 +115,7 @@ async function runLettaRecallModel(core: RelationshipMemoryRecallSession, query:
     };
     log(`Starting recall ${core.recallId} in isolated conversation ${conversationId}`);
     sdkSession = resumeSession(conversationId, sessionOptions);
-    await sdkSession.send(recallPrompt(core, query));
+    await sdkSession.send(recallPrompt(core, query, initialBundle));
 
     const drain = (async () => {
       for await (const msg of sdkSession.stream()) {
