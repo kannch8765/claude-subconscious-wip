@@ -71,6 +71,7 @@ export function getTempStateDir(): string {
 // Types
 export interface SyncState {
   lastProcessedIndex: number;
+  maintenanceEnqueuedThrough?: number;
   sessionId: string;
   conversationId?: string;
   lastBlockValues?: { [label: string]: string };
@@ -347,7 +348,7 @@ function maybeReapStaleSyncStateLock(lockPath: string, reaperPath: string, deadl
   }
 }
 
-function withSyncStateLock<T>(cwd: string, sessionId: string, fn: () => T): T {
+export function withSyncStateLock<T>(cwd: string, sessionId: string, fn: () => T): T {
   ensureDurableStateDir(cwd);
   const lockPath = getSyncStateLockFile(cwd, sessionId);
   const ownerPath = getSyncStateLockOwnerFile(cwd, sessionId);
@@ -405,8 +406,16 @@ export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLo
   withSyncStateLock(cwd, state.sessionId, () => {
     const durable = readSyncStateForMutation(cwd, state.sessionId);
     const merged: SyncState = durable
-      ? { ...durable, ...state, lastProcessedIndex: Math.max(durable.lastProcessedIndex, state.lastProcessedIndex) }
-      : { ...state };
+      ? {
+          ...durable,
+          ...state,
+          lastProcessedIndex: Math.max(durable.lastProcessedIndex, state.lastProcessedIndex),
+          maintenanceEnqueuedThrough: Math.max(
+            durable.maintenanceEnqueuedThrough ?? durable.lastProcessedIndex,
+            state.maintenanceEnqueuedThrough ?? state.lastProcessedIndex,
+          ),
+        }
+      : { ...state, maintenanceEnqueuedThrough: state.maintenanceEnqueuedThrough ?? state.lastProcessedIndex };
 
     if (durable?.conversationId && state.conversationId && durable.conversationId !== state.conversationId) {
       merged.conversationId = durable.conversationId;
@@ -414,6 +423,40 @@ export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLo
 
     writeSyncStateUnlocked(cwd, merged, log);
     Object.assign(state, merged);
+  });
+}
+
+/**
+ * Atomically reserve the not-yet-enqueued transcript suffix for one maintenance job.
+ * The callback must durably publish the immutable job before this watermark advances.
+ */
+export function enqueueMaintenanceRange<T>(
+  cwd: string,
+  sessionId: string,
+  throughIndex: number,
+  publishJob: (startIndex: number, throughIndex: number) => T,
+  log: LogFn = noopLog,
+): { startIndex: number; throughIndex: number; value: T } | null {
+  if (!Number.isInteger(throughIndex)) throw new Error('maintenance enqueue throughIndex must be an integer');
+  return withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
+    const enqueuedThrough = Math.max(
+      durable.lastProcessedIndex,
+      durable.maintenanceEnqueuedThrough ?? durable.lastProcessedIndex,
+    );
+    if (throughIndex <= enqueuedThrough) {
+      log(`Maintenance queue already enqueued through index ${enqueuedThrough}`);
+      return null;
+    }
+
+    const value = publishJob(enqueuedThrough, throughIndex);
+    const next: SyncState = {
+      ...durable,
+      maintenanceEnqueuedThrough: throughIndex,
+    };
+    writeSyncStateUnlocked(cwd, next, log);
+    log(`Maintenance queue reserved transcript indices ${enqueuedThrough + 1}..${throughIndex}`);
+    return { startIndex: enqueuedThrough, throughIndex, value };
   });
 }
 
@@ -426,9 +469,14 @@ export function advanceSyncStateCursor(
 ): SyncState {
   return withSyncStateLock(cwd, sessionId, () => {
     const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
+    const nextLastProcessedIndex = Math.max(durable.lastProcessedIndex, lastProcessedIndex);
     const next: SyncState = {
       ...durable,
-      lastProcessedIndex: Math.max(durable.lastProcessedIndex, lastProcessedIndex),
+      lastProcessedIndex: nextLastProcessedIndex,
+      maintenanceEnqueuedThrough: Math.max(
+        durable.maintenanceEnqueuedThrough ?? durable.lastProcessedIndex,
+        nextLastProcessedIndex,
+      ),
     };
     writeSyncStateUnlocked(cwd, next, log);
     return next;

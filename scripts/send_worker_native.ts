@@ -560,17 +560,10 @@ ${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
   return completion;
 }
 
-export async function runNativeWorkerPayloadFile(
-  payloadFile: string,
+export async function runNativeWorkerPayload(
+  payload: LiveWorkerPayload,
   dependencies: LiveWorkerDependencies = {},
-): Promise<void> {
-  if (!payloadFile) throw new Error('No payload file specified');
-  log('='.repeat(60));
-  log(`Native live worker started with payload: ${payloadFile}`);
-  if (!fs.existsSync(payloadFile)) throw new Error(`Payload file not found: ${payloadFile}`);
-
-  const payload: LiveWorkerPayload = JSON.parse(fs.readFileSync(payloadFile, 'utf-8'));
-  log(`Loaded payload for session ${payload.sessionId}`);
+): Promise<'completed' | 'retryable_failure'> {
   let completion: 'completed' | 'retryable_failure';
   try {
     completion = await sendViaNativeClient(payload, dependencies);
@@ -596,10 +589,26 @@ export async function runNativeWorkerPayloadFile(
       log(`Held state cursor at current index because batch ${payload.batchId} is retryable; armed live-conversation recovery marker for a later pass after overlap grace.`);
     }
   }
+  return completion;
+}
+
+export async function runNativeWorkerPayloadFile(
+  payloadFile: string,
+  dependencies: LiveWorkerDependencies = {},
+): Promise<'completed' | 'retryable_failure'> {
+  if (!payloadFile) throw new Error('No payload file specified');
+  log('='.repeat(60));
+  log(`Native live worker started with payload: ${payloadFile}`);
+  if (!fs.existsSync(payloadFile)) throw new Error(`Payload file not found: ${payloadFile}`);
+
+  const payload: LiveWorkerPayload = JSON.parse(fs.readFileSync(payloadFile, 'utf-8'));
+  log(`Loaded payload for session ${payload.sessionId}`);
+  const completion = await runNativeWorkerPayload(payload, dependencies);
 
   try { fs.unlinkSync(payloadFile); } catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
   log('Cleaned up payload file');
   log('Native live worker completed successfully');
+  return completion;
 }
 
 async function main(): Promise<void> {
