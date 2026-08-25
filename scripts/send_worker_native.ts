@@ -67,6 +67,7 @@ export interface LiveWorkerPayload {
   canonicalMessages?: CanonicalMessage[];
   assistantIntents?: AssistantRememberIntentRecord[];
   latestUserMessage: string;
+  foregroundRecallQuery?: string;
   latestUserMessageId?: string;
   foregroundRecallTurns?: AsyncForegroundRecallTurnSnapshot[];
   syncCheckpointFile?: string;
@@ -218,7 +219,7 @@ export async function sendViaNativeClient(
     let expandRecallUsed = false;
     if (isSync) {
       if (!payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
-      foregroundBundle = await buildForegroundRecallBundle(runtime, payload.latestUserMessage, {
+      foregroundBundle = await buildForegroundRecallBundle(runtime, payload.foregroundRecallQuery ?? payload.latestUserMessage, {
         sessionId: payload.sessionId, turnId: payload.syncTurnId,
       });
       persistForegroundRecallBundle(payload.cwd, foregroundBundle);

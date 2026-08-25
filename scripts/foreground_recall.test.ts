@@ -66,6 +66,7 @@ describe('foreground recall bundle and receipt', () => {
     expect(stateBefore.delivery_state).toBe('pending');
     const persisted = JSON.stringify(stateBefore.bundle);
     expect(persisted).not.toContain('raw private query');
+    expect(persisted).toContain(bundle.query_sha256);
     expect(persisted).not.toContain('private summary');
     expect(persisted).not.toContain('private quote');
 

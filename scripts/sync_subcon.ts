@@ -24,6 +24,7 @@ import {
   reapDeferredSyncResources,
 } from './sync_letta_resources.js';
 import { removePendingSubconWhisper } from './subcon_whisper_queue.js';
+import { contextualForegroundRecallQuery, readForegroundRecentTranscript, renderForegroundRecentTranscript } from './foreground_recent_context.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -36,6 +37,7 @@ interface SyncSubconInput {
   cwd: string;
   prompt: string;
   context?: string;
+  transcript_path?: string;
   timeout_ms?: number;
 }
 
@@ -65,11 +67,12 @@ function cleanInput(raw: unknown): SyncSubconInput {
   const cwd = typeof value.cwd === 'string' ? value.cwd.trim() : '';
   const prompt = typeof value.prompt === 'string' ? value.prompt.trim() : '';
   const context = typeof value.context === 'string' ? value.context.trim() : '';
+  const transcriptPath = typeof value.transcript_path === 'string' ? value.transcript_path.trim() : '';
   const timeout = typeof value.timeout_ms === 'number' && Number.isFinite(value.timeout_ms)
     ? Math.max(250, Math.min(30_000, Math.round(value.timeout_ms)))
     : 20_000;
   if (!sessionId || !turnId || !cwd || !prompt) throw new Error('session_id, turn_id, cwd, and prompt are required');
-  return { session_id: sessionId, turn_id: turnId, cwd, prompt, ...(context ? { context } : {}), timeout_ms: timeout };
+  return { session_id: sessionId, turn_id: turnId, cwd, prompt, ...(context ? { context } : {}), ...(transcriptPath ? { transcript_path: transcriptPath } : {}), timeout_ms: timeout };
 }
 
 function syncBatchId(input: SyncSubconInput): string {
@@ -77,9 +80,10 @@ function syncBatchId(input: SyncSubconInput): string {
   return `sync_${digest}`;
 }
 
-function syncMessage(input: SyncSubconInput): string {
+function syncMessage(input: SyncSubconInput, recentTranscript = ''): string {
   const context = escapeXmlContent((input.context ?? '').slice(-8000));
   const prompt = escapeXmlContent(input.prompt);
+  const recent = recentTranscript ? `\n${recentTranscript}` : '';
   return `<subcon_sync_foreground_turn>
 <session_id>${escapeXmlContent(input.session_id)}</session_id>
 <current_foreground_context>
@@ -87,11 +91,12 @@ ${context}
 </current_foreground_context>
 <latest_user_message>
 ${prompt}
-</latest_user_message>
+</latest_user_message>${recent}
 <instructions>
 This is the synchronous Subconscious mode immediately before foreground Kohaku receives <latest_user_message>.
 
-- The runtime has already searched relationship memory for this turn and appends a trusted <foreground_recall_bundle> after this envelope. Review those candidates together with <latest_user_message> and the bounded current foreground context. Candidate presence is only evidence availability, not relevance. Do not mechanically choose the top candidate.
+- The runtime has already searched relationship memory for this turn and appends a trusted <foreground_recall_bundle> after this envelope. Review those candidates together with <latest_user_message>, the bounded current foreground context, and any <recent_foreground_transcript>. Candidate presence is only evidence availability, not relevance. Do not mechanically choose the top candidate.
+- <recent_foreground_transcript> is source-faithful recent foreground transcript context used only to understand the current turn. It is NOT canonical relationship memory, does not imply that maintenance will remember/reinforce it, and can never itself be selected, quoted, or surfaced by resolve_recall. Only a surfaced canonical memory candidate may become a whisper.
 - If the prefetched bundle is insufficient because a materially different historical concept is missing, you may call expand_recall once with one short atomic semantic query. Do not fan out or issue near-duplicate refinements. Normal sync turns should not need a search tool call.
 - If a named referent is unresolved and its stable identity materially matters, you may call entity_search with purpose=foreground_grounding. Do not search identity merely because a name appears.
 - Bundle candidates and expand_recall results include quote_snippets containing source-faithful historical excerpts. source_kind=transcript is a direct historical quote; source_kind=legacy_memory is only a fallback when no transcript evidence exists and is an older memory-record excerpt, not a direct quote.
@@ -222,6 +227,10 @@ async function main(): Promise<void> {
       return;
     }
 
+    const recentForeground = readForegroundRecentTranscript(input.cwd, input.session_id, input.prompt, input.transcript_path);
+    const recentForegroundXml = renderForegroundRecentTranscript(recentForeground);
+    const foregroundRecallQuery = contextualForegroundRecallQuery(input.prompt, recentForeground, input.context ?? '');
+
     const payload = {
       mode: 'sync',
       agentId: syncAgentId,
@@ -229,12 +238,13 @@ async function main(): Promise<void> {
       syncBlockIds,
       conversationId,
       sessionId: input.session_id,
-      message: syncMessage(input),
+      message: syncMessage(input, recentForegroundXml),
       cwd: input.cwd,
       batchId,
       canonicalMessages: [],
       assistantIntents: [],
       latestUserMessage: input.prompt,
+      foregroundRecallQuery,
       syncCheckpointFile: checkpointFile,
       syncTurnId: input.turn_id,
       cleanupSyncResourcesOnFinish: true,

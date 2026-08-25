@@ -80,6 +80,9 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(sync).toContain('expand_recall once');
     expect(sync).toContain('resolve_recall exactly once');
     expect(sync).toContain('decision=none');
+    expect(sync).toContain('<recent_foreground_transcript> is source-faithful recent foreground transcript context');
+    expect(sync).toContain('foregroundRecallQuery');
+    expect(sync).toContain('readForegroundRecentTranscript');
     expect(sync).not.toContain('must complete at least one relationship memory_search');
     expect(sync).toContain('cleanupSyncResourcesOnFinish: true');
     expect(sync).toContain('process.exit(0)');
