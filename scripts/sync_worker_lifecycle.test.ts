@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
+import { renderHistoricalMemoryWhisper, renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
 import { acknowledgePendingSubconWhispers, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { readForegroundRecallTurnState } from './foreground_recall_state.js';
 import { RelationshipMemoryStore, stableId } from '../relationship-memory/src/store/index.js';
@@ -27,6 +27,18 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     expect(text).toContain('当时琥珀：「琥珀的原句。」');
     expect(text).toContain('旧记忆记录：「旧系统留下的记忆记录。」');
     expect(text).not.toContain('当时琥珀：「旧系统留下的记忆记录。」');
+  });
+
+  it('renders the canonical memory event before source-faithful historical excerpts', () => {
+    const text = renderHistoricalMemoryWhisper('猫和琥珀聊到咖啡。', [
+      { source_kind: 'transcript', role: 'user', quote: '今天想喝咖啡。', captured_at: '2026-08-01T10:00:00.000Z' },
+      { source_kind: 'legacy_memory', quote: '旧记录里的咖啡片段。', captured_at: '2026-06-04T02:12:11.000Z' },
+    ]);
+    expect(text).toBe(
+      '记忆：猫和琥珀聊到咖啡。\n\n'
+      + '[2026-08-01]\n猫：「今天想喝咖啡。」\n'
+      + '[2026-06-04]\n旧记忆记录：「旧记录里的咖啡片段。」',
+    );
   });
   it('keeps the foreground whisper successful but cancel/defers resources when continuation fails after release', async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-worker-post-whisper-'));
@@ -112,7 +124,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         expect(hit!.snippet_ids).not.toContain(hiddenCanonicalSnippet);
         await expect(resolve.execute('resolve-hidden', {
           decision: 'selected', memory_id: hit!.memory_id, snippet_ids: [hiddenCanonicalSnippet],
-        })).rejects.toThrow('only quote snippets surfaced by the foreground recall bundle or expand_recall');
+        })).rejects.toThrow('only one memory and quote snippets surfaced by the foreground recall bundle or expand_recall');
         const userSnippet = /<snippet snippet_id="([^"]+)"[^>]*>猫：/.exec(input.message)?.[1];
         const assistantSnippet = /<snippet snippet_id="([^"]+)"[^>]*>当时琥珀：/.exec(input.message)?.[1];
         expect(userSnippet).toBeTruthy();
@@ -139,7 +151,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     const pending = readPendingSubconWhispers(cwd, payload.sessionId);
     expect(pending).toHaveLength(1);
     expect(pending[0].whisper).toEqual(expect.objectContaining({ source: 'sync', turn_id: 'turn-test' }));
-    expect(pending[0].whisper.text).toContain('[2026-08-01]\n猫：「猫说：「今天想喝咖啡。」');
+    expect(pending[0].whisper.text).toContain('记忆：猫和琥珀聊到咖啡。\n\n[2026-08-01]\n猫：「猫说：「今天想喝咖啡。」');
     expect(pending[0].whisper.text).toContain('当时琥珀：「那我陪猫去找咖啡><🐾」');
     expect(pending[0].whisper.text).not.toContain('我记得猫以前提过咖啡');
     const receiptBefore = readForegroundRecallTurnState(cwd, payload.sessionId, payload.syncTurnId!);

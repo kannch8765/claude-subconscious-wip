@@ -122,7 +122,14 @@ function log(message: string): void {
 }
 
 
-export function renderHistoricalWhisperQuotes(snippets: readonly { source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }[]): string {
+type HistoricalRecallSnippet = { snippet_id?: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string };
+
+interface SurfacedRecallMemory {
+  summary: string;
+  snippets: Map<string, HistoricalRecallSnippet & { snippet_id: string }>;
+}
+
+export function renderHistoricalWhisperQuotes(snippets: readonly HistoricalRecallSnippet[]): string {
   const lines: string[] = [];
   let activeDate = '';
   for (const snippet of snippets) {
@@ -139,15 +146,25 @@ export function renderHistoricalWhisperQuotes(snippets: readonly { source_kind: 
   return lines.join('\n');
 }
 
+export function renderHistoricalMemoryWhisper(summary: string, snippets: readonly HistoricalRecallSnippet[]): string {
+  const memoryEvent = summary.trim();
+  if (!memoryEvent) throw new Error('historical memory whisper requires a surfaced canonical summary');
+  const historical = renderHistoricalWhisperQuotes(snippets);
+  return historical ? `记忆：${memoryEvent}\n\n${historical}` : `记忆：${memoryEvent}`;
+}
+
 
 function registerSurfacedRecallCandidates(
   candidates: readonly ForegroundRecallCandidate[],
-  surfaced: Map<string, Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>>,
+  surfaced: Map<string, SurfacedRecallMemory>,
 ): void {
   for (const memory of candidates) {
-    const bucket = surfaced.get(memory.memory_id) ?? new Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>();
-    for (const snippet of memory.quote_snippets) bucket.set(snippet.snippet_id, snippet);
-    surfaced.set(memory.memory_id, bucket);
+    const summary = memory.summary.trim();
+    if (!summary) continue;
+    const existing = surfaced.get(memory.memory_id);
+    const record: SurfacedRecallMemory = existing ?? { summary, snippets: new Map() };
+    for (const snippet of memory.quote_snippets) record.snippets.set(snippet.snippet_id, snippet);
+    surfaced.set(memory.memory_id, record);
   }
 }
 
@@ -197,7 +214,7 @@ export async function sendViaNativeClient(
     const client = (dependencies.createClient ?? createNativeLettaClient)(apiKey);
 
     const entitySearchObservations: EntitySearchObservation[] = [];
-    const surfacedQuoteSnippets = new Map<string, Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>>();
+    const surfacedRecallMemories = new Map<string, SurfacedRecallMemory>();
     let expandRecallUsed = false;
     if (isSync) {
       if (!payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
@@ -205,7 +222,7 @@ export async function sendViaNativeClient(
         sessionId: payload.sessionId, turnId: payload.syncTurnId,
       });
       persistForegroundRecallBundle(payload.cwd, foregroundBundle);
-      registerSurfacedRecallCandidates(foregroundBundle.candidates, surfacedQuoteSnippets);
+      registerSurfacedRecallCandidates(foregroundBundle.candidates, surfacedRecallMemories);
       recallSearches.push({ kind: 'prefetch', query_sha256: foregroundBundle.query_sha256, memory_ids: foregroundBundle.candidates.map((item) => item.memory_id) });
       log(`Foreground recall bundle prepared: candidates=${foregroundBundle.candidates.length}, bundle_id=${foregroundBundle.bundle_id}`);
     }
@@ -257,9 +274,11 @@ export async function sendViaNativeClient(
             const results = Array.isArray((result as any)?.results) ? (result as any).results as any[] : [];
             for (const memory of results) {
               const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id : '';
+              const summary = typeof memory?.summary === 'string' ? memory.summary.trim() : '';
               const snippets = Array.isArray(memory?.quote_snippets) ? memory.quote_snippets : [];
-              if (!memoryId) continue;
-              const bucket = surfacedQuoteSnippets.get(memoryId) ?? new Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>();
+              if (!memoryId || !summary) continue;
+              const existing = surfacedRecallMemories.get(memoryId);
+              const record: SurfacedRecallMemory = existing ?? { summary, snippets: new Map() };
               for (const snippet of snippets) {
                 const sourceKind = snippet?.source_kind;
                 const validTranscript = sourceKind === 'transcript' && (snippet?.role === 'user' || snippet?.role === 'assistant');
@@ -269,7 +288,7 @@ export async function sendViaNativeClient(
                   && (validTranscript || validLegacy)
                   && typeof snippet?.quote === 'string'
                   && typeof snippet?.captured_at === 'string'
-                ) bucket.set(snippet.snippet_id, {
+                ) record.snippets.set(snippet.snippet_id, {
                   snippet_id: snippet.snippet_id,
                   source_kind: sourceKind,
                   ...(validTranscript ? { role: snippet.role } : {}),
@@ -277,7 +296,7 @@ export async function sendViaNativeClient(
                   captured_at: snippet.captured_at,
                 });
               }
-              surfacedQuoteSnippets.set(memoryId, bucket);
+              surfacedRecallMemories.set(memoryId, record);
             }
             log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${results.length}`);
             return result;
@@ -310,7 +329,7 @@ export async function sendViaNativeClient(
           sessionId: payload.sessionId,
           turnId: `${payload.syncTurnId}:expand`,
         });
-        registerSurfacedRecallCandidates(expanded.candidates, surfacedQuoteSnippets);
+        registerSurfacedRecallCandidates(expanded.candidates, surfacedRecallMemories);
         recallSearches.push({ kind: 'expand', query_sha256: expanded.query_sha256, memory_ids: expanded.candidates.map((item) => item.memory_id) });
         log(`Foreground recall expanded: candidates=${expanded.candidates.length}`);
         return { results: expanded.candidates };
@@ -322,12 +341,12 @@ export async function sendViaNativeClient(
       if (!memoryId || snippetIds.length < 1 || snippetIds.length > 3 || new Set(snippetIds).size !== snippetIds.length) {
         throw new Error('foreground recall selection requires one surfaced memory_id and 1-3 unique snippet_ids');
       }
-      const allowed = surfacedQuoteSnippets.get(memoryId);
-      if (!allowed || snippetIds.some((snippetId) => !allowed.has(snippetId))) {
-        throw new Error('foreground recall may select only quote snippets surfaced by the foreground recall bundle or expand_recall in this turn');
+      const surfacedMemory = surfacedRecallMemories.get(memoryId);
+      if (!surfacedMemory || snippetIds.some((snippetId) => !surfacedMemory.snippets.has(snippetId))) {
+        throw new Error('foreground recall may select only one memory and quote snippets surfaced by the foreground recall bundle or expand_recall in this turn');
       }
-      const snippets = snippetIds.map((snippetId) => allowed.get(snippetId)!);
-      const historicalWindow = renderHistoricalWhisperQuotes(snippets);
+      const snippets = snippetIds.map((snippetId) => surfacedMemory.snippets.get(snippetId)!);
+      const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
       const groundedText = composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations));
       const queued = queueSubconWhisper(
         payload.cwd, payload.sessionId, payload.batchId, groundedText,
@@ -401,7 +420,7 @@ export async function sendViaNativeClient(
     });
     else if (!latestForegroundRecallResolved) relationshipTools.push({
       name: 'deliver_whisper',
-      description: 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
+      description: 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
       parameters: {
         type: 'object', additionalProperties: false, required: ['memory_id', 'snippet_ids'],
         properties: {

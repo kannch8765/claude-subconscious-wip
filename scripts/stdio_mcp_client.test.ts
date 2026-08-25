@@ -95,7 +95,7 @@ describe('stdio MCP native client-tool bridge', () => {
     expect(worker).not.toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");
     expect(worker).toContain("enum: ['foreground_grounding', 'maintenance']");
     expect(worker).toContain('foregroundGroundingIdentityAnchors(entitySearchObservations)');
-    expect(worker).toContain('renderHistoricalWhisperQuotes(snippets)');
+    expect(worker).toContain('renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets)');
     expect(worker).toContain('composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations))');
     expect(worker).toContain('await stdioMcp.close()');
   });
