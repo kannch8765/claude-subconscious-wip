@@ -34,6 +34,7 @@ export interface TranscriptMessage {
   tool_result?: any;
   timestamp?: string;
   uuid?: string;
+  parentUuid?: string;   // raw Claude transcript parent edge
   // Summary message fields
   summary?: string;
   // System message fields
@@ -88,6 +89,7 @@ export async function readTranscript(transcriptPath: string, log: LogFn = noopLo
 
 export interface TranscriptUserTurnAnchor {
   tail_role: 'user' | 'assistant' | 'none';
+  tail_message_id?: string;
   last_user_message_id?: string;
 }
 
@@ -115,6 +117,7 @@ export function readTranscriptUserTurnAnchor(
       text = text.slice(firstNewline + 1);
     }
     let tailRole: 'user' | 'assistant' | 'none' = 'none';
+    let tailMessageId: string | undefined;
     let lastUserMessageId: string | undefined;
     for (const raw of text.split(/\r?\n/)) {
       const line = raw.trim();
@@ -122,12 +125,19 @@ export function readTranscriptUserTurnAnchor(
       let message: TranscriptMessage;
       try { message = JSON.parse(line) as TranscriptMessage; } catch { continue; }
       if (message.type !== 'user' && message.type !== 'assistant') continue;
-      const visible = extractAllContent(message).text?.trim();
-      if (!visible) continue;
+      // This is a structural anchor, not a visible-context filter. Thinking-only
+      // and tool-only assistant records still delimit user turns.
       tailRole = message.type;
-      if (message.type === 'user' && message.uuid) lastUserMessageId = message.uuid;
+      tailMessageId = message.uuid;
+      if (message.type === 'user' && message.uuid && extractAllContent(message).text?.trim()) {
+        lastUserMessageId = message.uuid;
+      }
     }
-    return { tail_role: tailRole, ...(lastUserMessageId ? { last_user_message_id: lastUserMessageId } : {}) };
+    return {
+      tail_role: tailRole,
+      ...(tailMessageId ? { tail_message_id: tailMessageId } : {}),
+      ...(lastUserMessageId ? { last_user_message_id: lastUserMessageId } : {}),
+    };
   } finally {
     fs.closeSync(fd);
   }

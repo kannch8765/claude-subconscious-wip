@@ -286,12 +286,15 @@ async function main(): Promise<void> {
     if (messageOutput) outputs.push(messageOutput);
 
     const injectionPayload = outputs.join('\n\n');
+    // Complete all fallible local state work before stdout + delivery marker. Once
+    // a sync whisper is marked emitted, no later exception should turn this hook
+    // into a nonzero result whose stdout may be discarded by the host.
+    if (state && sessionId) saveSyncState(cwd, state);
     if (sessionId && injectionPayload) {
       mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: injectionPayload });
     }
     if (injectionPayload) console.log(injectionPayload);
     if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
-    if (state && sessionId) saveSyncState(cwd, state);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
     console.error(`Error syncing Letta memory: ${errorMessage}`);

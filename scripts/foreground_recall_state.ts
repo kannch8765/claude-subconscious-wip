@@ -4,7 +4,7 @@ import * as path from 'path';
 import { getDurableStateDir, withSyncStateLock } from './conversation_utils.js';
 import { getSubconWhisperDeliveryState, type SubconWhisperDeliveryState } from './subcon_whisper_queue.js';
 import type { ForegroundRecallBundle } from './foreground_recall.js';
-import type { TranscriptUserTurnAnchor } from './transcript_utils.js';
+import { extractAllContent, type TranscriptMessage, type TranscriptUserTurnAnchor } from './transcript_utils.js';
 
 export interface ForegroundRecallSearchReceipt {
   kind: 'prefetch' | 'expand';
@@ -216,65 +216,176 @@ function listForegroundRecallMessageBindings(cwd: string, sessionId: string): Fo
     });
 }
 
-export function bindPendingForegroundRecallTurnsToMessages(
+export interface ForegroundRecallBindingBatch {
+  bindings: ForegroundRecallMessageBinding[];
+  retired_unbound_turn_ids: string[];
+  blocked_turn_id?: string;
+}
+
+interface RawTranscriptBindingRecord {
+  role: 'user' | 'assistant';
+  message_id?: string;
+  parent_message_id?: string;
+  user_text: boolean;
+}
+
+function rawTranscriptRecords(messages: readonly TranscriptMessage[]): RawTranscriptBindingRecord[] {
+  return messages.flatMap((message) => message.type === 'user' || message.type === 'assistant'
+    ? [{
+        role: message.type,
+        ...(message.uuid ? { message_id: message.uuid } : {}),
+        ...(message.parentUuid ? { parent_message_id: message.parentUuid } : {}),
+        user_text: message.type === 'user' && Boolean(extractAllContent(message).text?.trim()),
+      }]
+    : []);
+}
+
+function firstUserAfter(records: readonly RawTranscriptBindingRecord[], index: number): string | undefined {
+  for (let i = index + 1; i < records.length; i++) {
+    if (records[i].role === 'user' && records[i].user_text && records[i].message_id) return records[i].message_id;
+  }
+  return undefined;
+}
+
+function retirePendingTurn(cwd: string, sessionId: string, turn: PendingForegroundRecallTurn): void {
+  try { fs.unlinkSync(pendingTurnPath(cwd, sessionId, turn.sequence, turn.turn_id)); }
+  catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
+}
+
+/**
+ * Bind pending foreground turns while the caller already owns the session sync-state lock.
+ * Only raw transcript order plus the current unprocessed user suffix are authoritative.
+ * Ambiguous turns are explicitly retired unbound so Stop can fallback; a turn whose
+ * user record has not appeared yet blocks the pending prefix instead of allowing overtaking.
+ */
+export function bindPendingForegroundRecallTurnsToTranscriptUnlocked(
   cwd: string,
   sessionId: string,
-  messageIds: readonly string[],
+  transcriptMessages: readonly TranscriptMessage[],
+  bindableMessageIds: readonly string[],
   now: () => string = () => new Date().toISOString(),
-): ForegroundRecallMessageBinding[] {
+): ForegroundRecallBindingBatch {
   const cleanSession = sessionId.trim();
-  if (!cleanSession) return [];
-  return withSyncStateLock(cwd, cleanSession, () => {
-    const existingBindings = listForegroundRecallMessageBindings(cwd, cleanSession);
-    const alreadyBoundTurns = new Set(existingBindings.map((item) => item.turn_id));
-    const pending = listPendingForegroundRecallTurns(cwd, cleanSession).filter((turn) => {
-      if (!alreadyBoundTurns.has(turn.turn_id)) return true;
-      // Crash recovery: binding publication is authoritative. If the process died
-      // before removing its pending registration, retire that duplicate now.
-      try { fs.unlinkSync(pendingTurnPath(cwd, cleanSession, turn.sequence, turn.turn_id)); }
-      catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
-      return false;
-    });
-    if (pending.length === 0) return [];
-    const alreadyBoundMessages = new Set(existingBindings.map((item) => item.message_id));
-    const unboundMessages = [...new Set(messageIds.map((value) => value.trim()).filter(Boolean))]
-      .filter((messageId) => !alreadyBoundMessages.has(messageId));
-    if (unboundMessages.length === 0) return [];
-
-    // Bind only from transcript structure + durable order; prompt text, hashes,
-    // timestamps and latest-receipt heuristics are deliberately absent.
-    const available = [...unboundMessages];
-    const bindings: ForegroundRecallMessageBinding[] = [];
-    for (const turn of pending) {
-      const anchor = turn.transcript_anchor;
-      let messageId: string | undefined;
-      if (anchor.tail_role === 'user' && anchor.last_user_message_id) {
-        const direct = available.indexOf(anchor.last_user_message_id);
-        if (direct >= 0) {
-          messageId = available[direct];
-        } else if (alreadyBoundMessages.has(anchor.last_user_message_id)) {
-          // The hook observed the previous user as the tail (e.g. an interrupted
-          // turn with no assistant record); the current turn is the next UUID.
-          messageId = available[0];
-        }
-      } else if (anchor.tail_role === 'assistant') {
-        messageId = available.find((candidate) => candidate !== anchor.last_user_message_id);
-      } else if (anchor.tail_role === 'none') {
-        messageId = available[0];
-      }
-      if (!messageId) continue;
-      const binding: ForegroundRecallMessageBinding = {
-        schema_version: 1, session_id: cleanSession, message_id: messageId, turn_id: turn.turn_id, bound_at: now(),
-      };
-      atomicWriteJson(messageBindingPath(cwd, cleanSession, messageId), binding);
-      alreadyBoundMessages.add(messageId);
-      available.splice(available.indexOf(messageId), 1);
-      try { fs.unlinkSync(pendingTurnPath(cwd, cleanSession, turn.sequence, turn.turn_id)); }
-      catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
-      bindings.push(binding);
-    }
-    return bindings;
+  if (!cleanSession) return { bindings: [], retired_unbound_turn_ids: [] };
+  const existingBindings = listForegroundRecallMessageBindings(cwd, cleanSession);
+  const alreadyBoundTurns = new Set(existingBindings.map((item) => item.turn_id));
+  const pending = listPendingForegroundRecallTurns(cwd, cleanSession).filter((turn) => {
+    if (!alreadyBoundTurns.has(turn.turn_id)) return true;
+    // Crash recovery: binding publication is authoritative. If the process died
+    // before removing its pending registration, retire that duplicate now.
+    retirePendingTurn(cwd, cleanSession, turn);
+    return false;
   });
+  if (pending.length === 0) return { bindings: [], retired_unbound_turn_ids: [] };
+
+  const alreadyBoundMessages = new Set(existingBindings.map((item) => item.message_id));
+  const bindable = new Set([...new Set(bindableMessageIds.map((value) => value.trim()).filter(Boolean))]
+    .filter((messageId) => !alreadyBoundMessages.has(messageId)));
+  const records = rawTranscriptRecords(transcriptMessages);
+  const bindings: ForegroundRecallMessageBinding[] = [];
+  const retired: string[] = [];
+
+  for (const turn of pending) {
+    const anchor = turn.transcript_anchor;
+    let candidates: string[] = [];
+    let targetNotYetPresent = false;
+
+    if (anchor.tail_role === 'assistant') {
+      let anchorIndex = -1;
+      if (anchor.tail_message_id) anchorIndex = records.findIndex((item) => item.message_id === anchor.tail_message_id);
+      if (anchorIndex < 0 && anchor.last_user_message_id) anchorIndex = records.findIndex((item) => item.role === 'user' && item.message_id === anchor.last_user_message_id);
+      const nextUser = anchorIndex >= 0 ? firstUserAfter(records, anchorIndex) : undefined;
+      if (!nextUser) targetNotYetPresent = true;
+      else if (bindable.has(nextUser)) candidates = [nextUser];
+    } else if (anchor.tail_role === 'user' && anchor.last_user_message_id) {
+      const rawTailIsNonTextUser = Boolean(anchor.tail_message_id && anchor.tail_message_id !== anchor.last_user_message_id);
+      const anchorIndex = rawTailIsNonTextUser && anchor.tail_message_id
+        ? records.findIndex((item) => item.message_id === anchor.tail_message_id)
+        : records.findIndex((item) => item.role === 'user' && item.user_text && item.message_id === anchor.last_user_message_id);
+      const nextUser = anchorIndex >= 0 ? firstUserAfter(records, anchorIndex) : undefined;
+      if (rawTailIsNonTextUser) {
+        // A tool-result user wrapper cannot be the UserPromptSubmit message. It is
+        // an exact structural predecessor just like an assistant tail.
+        if (!nextUser) targetNotYetPresent = true;
+        else if (bindable.has(nextUser)) candidates = [nextUser];
+      } else {
+        const semanticCandidates = [anchor.last_user_message_id, ...(nextUser ? [nextUser] : [])];
+        const responded = semanticCandidates.filter((candidate) => records.some((item) =>
+          item.role === 'assistant' && item.parent_message_id === candidate,
+        ));
+        const respondedBindable = [...new Set(responded.filter((candidate) => bindable.has(candidate)))];
+        if (respondedBindable.length > 0) {
+          // Raw parentUuid is an exact transcript graph edge: if exactly one of the
+          // two structural interpretations actually owns the assistant response,
+          // it identifies the foreground user without prompt/timestamp heuristics.
+          candidates = respondedBindable;
+        } else {
+          const selfBindable = bindable.has(anchor.last_user_message_id);
+          const nextBindable = Boolean(nextUser && bindable.has(nextUser));
+          if (!selfBindable && nextBindable && nextUser) {
+            // The tail user is outside the current maintenance suffix, so the first
+            // user after it is the only possible current foreground UUID.
+            candidates = [nextUser];
+          } else if (selfBindable && nextBindable && nextUser) {
+            candidates = [anchor.last_user_message_id, nextUser];
+          } else if (!nextUser) {
+            // Current may be the tail user or a not-yet-appended next user. Wait for
+            // either a parent edge or a new user record; never guess the tail UUID.
+            targetNotYetPresent = true;
+          }
+        }
+      }
+    } else if (anchor.tail_role === 'none') {
+      const userIds = records.filter((item) => item.role === 'user' && item.user_text && item.message_id).map((item) => item.message_id!);
+      const possible = userIds.filter((messageId) => bindable.has(messageId));
+      if (possible.length === 0) targetNotYetPresent = true;
+      else if (userIds.length === 1 && possible.length === 1) candidates = possible;
+      else if (possible.length > 1) candidates = possible;
+      // One bindable user among older transcript history is still ambiguous when
+      // the hook had no structural anchor; retire unbound instead of guessing.
+    }
+
+    candidates = [...new Set(candidates)].filter((messageId) => bindable.has(messageId));
+    if (candidates.length === 0 && targetNotYetPresent) {
+      return { bindings, retired_unbound_turn_ids: retired, blocked_turn_id: turn.turn_id };
+    }
+    if (candidates.length !== 1) {
+      // Structural ambiguity is terminal for receipt reuse on this turn. Retire it
+      // in sequence order and let async Stop fallback rather than guessing a UUID.
+      retirePendingTurn(cwd, cleanSession, turn);
+      retired.push(turn.turn_id);
+      continue;
+    }
+
+    const messageId = candidates[0];
+    const binding: ForegroundRecallMessageBinding = {
+      schema_version: 1,
+      session_id: cleanSession,
+      message_id: messageId,
+      turn_id: turn.turn_id,
+      bound_at: now(),
+    };
+    atomicWriteJson(messageBindingPath(cwd, cleanSession, messageId), binding);
+    alreadyBoundMessages.add(messageId);
+    bindable.delete(messageId);
+    retirePendingTurn(cwd, cleanSession, turn);
+    bindings.push(binding);
+  }
+  return { bindings, retired_unbound_turn_ids: retired };
+}
+
+export function bindPendingForegroundRecallTurnsToTranscript(
+  cwd: string,
+  sessionId: string,
+  transcriptMessages: readonly TranscriptMessage[],
+  bindableMessageIds: readonly string[],
+  now: () => string = () => new Date().toISOString(),
+): ForegroundRecallBindingBatch {
+  const cleanSession = sessionId.trim();
+  if (!cleanSession) return { bindings: [], retired_unbound_turn_ids: [] };
+  return withSyncStateLock(cwd, cleanSession, () => bindPendingForegroundRecallTurnsToTranscriptUnlocked(
+    cwd, cleanSession, transcriptMessages, bindableMessageIds, now,
+  ));
 }
 
 export function bindForegroundRecallTurnToMessage(

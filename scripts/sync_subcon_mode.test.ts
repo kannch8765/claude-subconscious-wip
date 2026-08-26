@@ -14,6 +14,8 @@ describe('additive synchronous Subcon mode contract', () => {
     const stopSource = fs.readFileSync(path.join(process.cwd(), 'scripts/send_messages_to_letta.ts'), 'utf8');
     const queueWorker = fs.readFileSync(path.join(process.cwd(), 'scripts/maintenance_queue_worker.ts'), 'utf8');
     expect(stopSource).toContain('enqueueMaintenanceRange');
+    expect(stopSource).toContain('bindPendingForegroundRecallTurnsToTranscriptUnlocked');
+    expect(stopSource).not.toContain('bindPendingForegroundRecallTurnsToTranscript(');
     expect(stopSource).toContain("'maintenance_queue_worker.ts'");
     expect(stopSource).not.toContain("path.join(__dirname, 'send_worker_native.ts')");
     expect(queueWorker).toContain('later jobs remain blocked');

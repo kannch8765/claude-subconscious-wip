@@ -11,10 +11,11 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(send).toContain('<foreground_recall_receipt_catalog>');
     expect(send).toContain('There is no search quota');
     expect(send).toContain('surface != reinforce');
+    expect(send).toContain('selected with delivery_state=pending or missing is NOT resolved delivery');
     expect(send).toContain('readForegroundRecallTurnStateForMessage');
     expect(send).toContain('latestUserMessageId');
     expect(send).toContain('foregroundRecallTurns');
-    expect(send).toContain('bindPendingForegroundRecallTurnsToMessages');
+    expect(send).toContain('bindPendingForegroundRecallTurnsToTranscriptUnlocked');
     expect(sync).toContain('v2 never derives transcript identity from prompt text');
     expect(worker).toContain("name: 'deliver_whisper'");
     expect(worker).toContain('latestForegroundRecallResolved');
@@ -62,6 +63,7 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(prompt).toContain('<foreground_recall_receipt_catalog>');
     expect(prompt).toContain('There is no mandatory search quota');
     expect(prompt).toContain('decision=selected is only a foreground continuity decision');
+    expect(prompt).toContain('decision=selected without delivery_state=emitted');
     expect(prompt).toContain('deliver_whisper');
     expect(prompt).not.toContain('must complete at least one relationship memory_search');
     expect(prompt).not.toContain('use the exact text inside <latest_user_message> as your first memory_search query');
@@ -69,6 +71,7 @@ describe('live async relationship-memory surfacing contract', () => {
 
     const blocks = new Map((af.blocks as any[]).map((block) => [block.label, String(block.value ?? '')]));
     expect(blocks.get('core_directives')).toContain('surface != reinforce');
+    expect(blocks.get('core_directives')).toContain('selected with pending/missing delivery did not reach foreground');
     expect(blocks.get('core_directives')).toContain('There is no mandatory search quota');
     expect(blocks.get('tool_guidelines')).toContain('there is no per-pass search quota');
     expect(blocks.get('tool_guidelines')).not.toContain('I choose and execute at least one semantic query');

@@ -3,7 +3,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
-import { registerPendingForegroundRecallTurn } from './foreground_recall_state.js';
+import { registerPendingForegroundRecallTurn, retractUnreleasedForegroundRecallReceipt } from './foreground_recall_state.js';
+import { retractPendingSyncWhisperForTurn } from './subcon_whisper_queue.js';
 import { readTranscriptUserTurnAnchor } from './transcript_utils.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -161,6 +162,11 @@ export async function runSyncSubconCli(
   });
 }
 
+function cleanupFailedForegroundSync(cwd: string, sessionId: string, turnId: string): void {
+  try { retractPendingSyncWhisperForTurn(cwd, sessionId, turnId); } catch {}
+  try { retractUnreleasedForegroundRecallReceipt(cwd, sessionId, turnId); } catch {}
+}
+
 export async function runForegroundSyncForHook(
   hookInput: ForegroundSyncHookInput | null,
   cwd: string,
@@ -194,8 +200,10 @@ export async function runForegroundSyncForHook(
       timeout_ms: Math.max(250, Math.min(30_000, Math.round(timeoutMs))),
       sync_started_at_ms: startedAt,
     });
+    if (result.status === 'failed' || result.status === 'timeout') cleanupFailedForegroundSync(cwd, sessionId, identity.turn_id);
     return { ...result, turn_id: identity.turn_id, hook_elapsed_ms: Date.now() - startedAt };
   } catch (error) {
+    cleanupFailedForegroundSync(cwd, sessionId, identity.turn_id);
     return {
       status: 'failed',
       turn_id: identity.turn_id,

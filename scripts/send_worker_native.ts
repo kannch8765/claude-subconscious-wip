@@ -214,8 +214,8 @@ export async function sendViaNativeClient(
   const latestForegroundRecall = !isSync && payload.latestUserMessageId
     ? payload.foregroundRecallTurns?.find((item) => item.message_id === payload.latestUserMessageId)
     : undefined;
-  const latestForegroundRecallResolved = latestForegroundRecall?.receipt?.decision === 'selected'
-    || latestForegroundRecall?.receipt?.decision === 'none';
+  const latestForegroundRecallResolved = latestForegroundRecall?.receipt?.decision === 'none'
+    || (latestForegroundRecall?.receipt?.decision === 'selected' && latestForegroundRecall.delivery_state === 'emitted');
 
   try {
     const apiKey = process.env.LETTA_API_KEY;

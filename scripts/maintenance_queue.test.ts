@@ -8,6 +8,7 @@ import {
   loadSyncState,
   saveSyncState,
 } from './conversation_utils.js';
+import { bindPendingForegroundRecallTurnsToTranscriptUnlocked, readForegroundRecallTurnStateForMessage, registerPendingForegroundRecallTurn } from './foreground_recall_state.js';
 import {
   acquireMaintenanceDrainLock,
   listMaintenanceQueueJobs,
@@ -85,6 +86,24 @@ describe('per-session maintenance queue', () => {
     expect(next).toMatchObject({ startIndex: 5, throughIndex: 9 });
     expect(listMaintenanceQueueJobs(cwd, 's').map((item) => [item.start_index, item.through_index])).toEqual([[2, 5], [5, 9]]);
     expect(loadSyncState(cwd, 's').maintenanceEnqueuedThrough).toBe(9);
+  });
+
+  it('composes foreground binding inside enqueue without re-entering the session lock', () => {
+    const cwd = root();
+    saveSyncState(cwd, { sessionId: 's', lastProcessedIndex: -1 });
+    registerPendingForegroundRecallTurn(cwd, 's', 'fg-1', { tail_role: 'none' });
+    const u1: any = { type: 'user', uuid: 'user-1', message: { content: [{ type: 'text', text: 'one' }] } };
+    const started = Date.now();
+    const claim = enqueueMaintenanceRange(cwd, 's', 0, (start, through) => {
+      const batch = bindPendingForegroundRecallTurnsToTranscriptUnlocked(cwd, 's', [u1], ['user-1']);
+      expect(batch.bindings.map((item) => item.message_id)).toEqual(['user-1']);
+      const value = job('s', start, through, 'with-binding');
+      publishMaintenanceQueueJob(cwd, value);
+      return value;
+    }, undefined, () => listMaintenanceQueueJobs(cwd, 's'));
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(claim?.value.job_id).toBe('with-binding');
+    expect(readForegroundRecallTurnStateForMessage(cwd, 's', 'user-1')?.binding.turn_id).toBe('fg-1');
   });
 
   it('keeps enqueuedThrough monotonic across stale saves and cursor advancement', () => {

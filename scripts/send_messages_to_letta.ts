@@ -42,7 +42,7 @@ import {
 import { buildCanonicalMessages, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
-import { bindPendingForegroundRecallTurnsToMessages, readForegroundRecallTurnStateForMessage } from './foreground_recall_state.js';
+import { bindPendingForegroundRecallTurnsToTranscriptUnlocked, readForegroundRecallTurnStateForMessage } from './foreground_recall_state.js';
 import { listMaintenanceQueueJobs, publishMaintenanceQueueJob, type MaintenanceQueueJob } from './maintenance_queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -209,9 +209,9 @@ This is the normal asynchronous Subconscious pass after a foreground Kohaku turn
 
 1. FOREGROUND RECALL FALLBACK
 - The runtime may append a trusted <foreground_recall_receipt_catalog> after this envelope. Each entry is bound to a real transcript user message_id; it records what the synchronous foreground recall lane searched and whether it explicitly selected a memory, selected none, or failed.
-- A receipt with decision=selected or decision=none means recall for that exact foreground user turn was already resolved. Do not repeat episodic search or queue another whisper merely because the same memory/topic appears in maintenance. The runtime may remove deliver_whisper from this pass when the latest foreground turn is already resolved.
+- A receipt with decision=none means foreground recall for that exact user turn resolved with no whisper. A decision=selected receipt suppresses async fallback only when delivery_state=emitted, meaning the selected sync whisper was actually injected. selected with delivery_state=pending or missing is NOT resolved delivery and must leave fallback surfacing available. Do not repeat episodic surfacing only when the runtime has established one of those resolved states.
 - decision=selected is only a foreground continuity decision. It is NOT evidence that the memory should be reinforced, revised, or otherwise weighted more strongly. decision=none is also a successful recall outcome, not evidence that no long-term maintenance is needed.
-- If the latest user turn has no receipt or decision=failed, you may use relationship memory_search as a fallback when a past moment would genuinely help continuity on a later foreground turn. Generate a compact semantic query; do not mechanically copy the whole user message. Additional searches are allowed only when they answer a materially different recall/canonicalization question.
+- If the latest user turn has no receipt, decision=failed, or decision=selected without delivery_state=emitted, you may use relationship memory_search as a fallback when a past moment would genuinely help continuity on a later foreground turn. Generate a compact semantic query; do not mechanically copy the whole user message. Additional searches are allowed only when they answer a materially different recall/canonicalization question.
 - Before fallback episodic recall, ground identity only when needed: if a clearly named referent matters to understanding the current relationship context but <latest_user_message> plus the trusted current batch do not establish who or what it is, call entity_search with that natural referent and purpose=foreground_grounding first. Use purpose=maintenance instead for alias/dedupe checks or other entity maintenance.
 - Do not call entity_search merely because a name appears. If current context already resolves the referent, do not repeat an identity anchor the foreground already has. When exactly one distinct concise foreground-grounding entity is resolved, the runtime may preserve that factual identity anchor separately; maintenance searches and multiple distinct foreground identities do not auto-inject identity.
 - For fallback surfacing, treat returned relationship memories as candidates. Each hit contains quote_snippets with source-faithful historical excerpts. source_kind=transcript is a direct historical quote; source_kind=legacy_memory is only a fallback for a memory with no transcript evidence and is an older memory-record excerpt, not a direct quote.
@@ -244,11 +244,17 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
         const userMessageIds = [...new Set(canonicalMessages
           .filter((item) => item.role === 'user' && item.event_kind === 'user_text')
           .map((item) => item.message_id))];
-        const foregroundBindings = bindPendingForegroundRecallTurnsToMessages(
-          hookInput.cwd, hookInput.session_id, userMessageIds,
+        const foregroundBindingBatch = bindPendingForegroundRecallTurnsToTranscriptUnlocked(
+          hookInput.cwd, hookInput.session_id, messages, userMessageIds,
         );
-        if (foregroundBindings.length > 0) {
-          log(`Bound ${foregroundBindings.length} pending foreground recall turn(s) to authoritative transcript UUIDs`);
+        if (foregroundBindingBatch.bindings.length > 0) {
+          log(`Bound ${foregroundBindingBatch.bindings.length} pending foreground recall turn(s) to authoritative transcript UUIDs`);
+        }
+        if (foregroundBindingBatch.retired_unbound_turn_ids.length > 0) {
+          log(`Retired ${foregroundBindingBatch.retired_unbound_turn_ids.length} ambiguous foreground recall turn(s) unbound; async fallback remains available`);
+        }
+        if (foregroundBindingBatch.blocked_turn_id) {
+          log(`Foreground recall binding prefix blocked until transcript user UUID is durable: ${foregroundBindingBatch.blocked_turn_id}`);
         }
         const foregroundRecallTurns = userMessageIds.flatMap((messageId) => {
           const turnState = readForegroundRecallTurnStateForMessage(hookInput.cwd, hookInput.session_id, messageId);

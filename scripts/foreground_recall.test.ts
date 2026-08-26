@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildForegroundRecallBundle, renderForegroundRecallBundle } from './foreground_recall.js';
-import { bindForegroundRecallTurnToMessage, bindPendingForegroundRecallTurnsToMessages, listPendingForegroundRecallTurns, persistForegroundRecallBundle, readForegroundRecallTurnState, readForegroundRecallTurnStateForMessage, registerPendingForegroundRecallTurn, retractUnreleasedForegroundRecallReceipt, writeForegroundRecallReceipt } from './foreground_recall_state.js';
+import { bindForegroundRecallTurnToMessage, bindPendingForegroundRecallTurnsToTranscript, bindPendingForegroundRecallTurnsToTranscriptUnlocked, listPendingForegroundRecallTurns, persistForegroundRecallBundle, readForegroundRecallTurnState, readForegroundRecallTurnStateForMessage, registerPendingForegroundRecallTurn, retractUnreleasedForegroundRecallReceipt, writeForegroundRecallReceipt } from './foreground_recall_state.js';
 import { acknowledgePendingSubconWhispers, queueSubconWhisper, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { findLatestUserMessageUuidForPrompt } from './transcript_utils.js';
 import { renderForegroundRecallReceiptCatalog } from './send_worker_native.js';
@@ -102,58 +102,138 @@ describe('foreground recall bundle and receipt', () => {
     expect(() => bindForegroundRecallTurnToMessage(cwd, 'session-a', 'other-turn', 'user-2')).toThrow('binding conflict');
   });
 
-  it('binds opaque foreground turns to real transcript UUIDs in durable UserPromptSubmit order', () => {
+  it('binds opaque foreground turns only from full transcript structure plus the unprocessed user suffix', () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-pending-binding-'));
     dirs.push(cwd);
+    const u1: any = { type: 'user', uuid: 'user-1', message: { content: [{ type: 'text', text: 'one' }] } };
+    const a1: any = { type: 'assistant', uuid: 'assistant-1', message: { content: [{ type: 'text', text: 'reply' }] } };
+    const u2: any = { type: 'user', uuid: 'user-2', message: { content: [{ type: 'text', text: 'two' }] } };
+
     registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-1', { tail_role: 'none' }, () => '2026-08-26T00:00:00.000Z');
-    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-2', { tail_role: 'none' }, () => '2026-08-26T00:00:01.000Z');
+    const first = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [u1], ['user-1'], () => '2026-08-26T00:00:02.000Z');
+    expect(first.bindings.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-1', 'user-1']]);
 
-    const first = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-1'], () => '2026-08-26T00:00:02.000Z');
-    expect(first.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-1', 'user-1']]);
-    expect(listPendingForegroundRecallTurns(cwd, 'session-a').map((item) => item.turn_id)).toEqual(['fg-2']);
-
-    const second = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-2'], () => '2026-08-26T00:00:03.000Z');
-    expect(second.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-2', 'user-2']]);
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-2', {
+      tail_role: 'assistant', tail_message_id: 'assistant-1', last_user_message_id: 'user-1',
+    }, () => '2026-08-26T00:00:01.000Z');
+    const second = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [u1, a1, u2], ['user-2'], () => '2026-08-26T00:00:03.000Z');
+    expect(second.bindings.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-2', 'user-2']]);
     expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-1')?.binding.turn_id).toBe('fg-1');
     expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-2')?.binding.turn_id).toBe('fg-2');
     expect(listPendingForegroundRecallTurns(cwd, 'session-a')).toEqual([]);
   });
 
-  it('does not bind an N+1 pending turn to N while N+1 has not reached the transcript yet', () => {
+  it('does not bind N+1 to N while the next real user UUID has not reached the transcript', () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-fast-chat-anchor-'));
     dirs.push(cwd);
+    const uN: any = { type: 'user', uuid: 'user-n', message: { content: [{ type: 'text', text: 'n' }] } };
+    const aN: any = { type: 'assistant', uuid: 'assistant-n', message: { content: [{ type: 'text', text: 'reply n' }] } };
+    const uNext: any = { type: 'user', uuid: 'user-next', message: { content: [{ type: 'text', text: 'next' }] } };
     registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-next', {
-      tail_role: 'assistant', last_user_message_id: 'user-n',
+      tail_role: 'assistant', tail_message_id: 'assistant-n', last_user_message_id: 'user-n',
     });
-    expect(bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-n'])).toEqual([]);
+    const blocked = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [uN, aN], ['user-n']);
+    expect(blocked.bindings).toEqual([]);
+    expect(blocked.blocked_turn_id).toBe('fg-next');
     expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-n')).toBeUndefined();
     expect(listPendingForegroundRecallTurns(cwd, 'session-a').map((item) => item.turn_id)).toEqual(['fg-next']);
 
-    const bound = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-next']);
-    expect(bound.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-next', 'user-next']]);
-    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-next')?.binding.turn_id).toBe('fg-next');
+    const bound = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [uN, aN, uNext], ['user-next']);
+    expect(bound.bindings.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-next', 'user-next']]);
+  });
+
+  it('treats an interrupted pre-v2 user tail as ambiguous instead of binding the old UUID', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-user-tail-ambiguous-'));
+    dirs.push(cwd);
+    const u0: any = { type: 'user', uuid: 'user-old', message: { content: [{ type: 'text', text: 'old' }] } };
+    const u1: any = { type: 'user', uuid: 'user-current', message: { content: [{ type: 'text', text: 'current' }] } };
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-current', {
+      tail_role: 'user', tail_message_id: 'user-old', last_user_message_id: 'user-old',
+    });
+
+    // Without a raw parent edge both old and current remain structurally possible.
+    const ambiguous = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [u0, u1], ['user-old', 'user-current']);
+    expect(ambiguous.bindings).toEqual([]);
+    expect(ambiguous.retired_unbound_turn_ids).toEqual(['fg-current']);
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-old')).toBeUndefined();
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-current')).toBeUndefined();
+    expect(listPendingForegroundRecallTurns(cwd, 'session-a')).toEqual([]);
+  });
+
+  it('uses the raw assistant parent edge to bind an interrupted pre-v2 user tail to the actual current UUID', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-parent-edge-'));
+    dirs.push(cwd);
+    const u0: any = { type: 'user', uuid: 'user-old', message: { content: [{ type: 'text', text: 'old' }] } };
+    const u1: any = { type: 'user', uuid: 'user-current', message: { content: [{ type: 'text', text: 'current' }] } };
+    const a1: any = { type: 'assistant', uuid: 'assistant-current', parentUuid: 'user-current', message: { content: [{ type: 'thinking', thinking: 'tool-only response can still anchor' }] } };
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-current', {
+      tail_role: 'user', tail_message_id: 'user-old', last_user_message_id: 'user-old',
+    });
+    const result = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [u0, u1, a1], ['user-old', 'user-current']);
+    expect(result.bindings.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-current', 'user-current']]);
+    expect(result.retired_unbound_turn_ids).toEqual([]);
+  });
+
+  it('binds the next UUID after an interrupted user tail when the old UUID is outside the maintenance suffix', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-user-tail-next-'));
+    dirs.push(cwd);
+    const u0: any = { type: 'user', uuid: 'user-old', message: { content: [{ type: 'text', text: 'old' }] } };
+    const u1: any = { type: 'user', uuid: 'user-current', message: { content: [{ type: 'text', text: 'current' }] } };
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-current', {
+      tail_role: 'user', tail_message_id: 'user-old', last_user_message_id: 'user-old',
+    });
+    const result = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [u0, u1], ['user-current']);
+    expect(result.bindings.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-current', 'user-current']]);
+  });
+
+  it('skips a raw tool-result user tail and binds the next human user text UUID', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-tool-result-tail-'));
+    dirs.push(cwd);
+    const u0: any = { type: 'user', uuid: 'user-human-old', message: { content: [{ type: 'text', text: 'old' }] } };
+    const toolResult: any = { type: 'user', uuid: 'user-tool-result', message: { content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'ok' }] } };
+    const u1: any = { type: 'user', uuid: 'user-current', message: { content: [{ type: 'text', text: 'current' }] } };
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-current', {
+      tail_role: 'user', tail_message_id: 'user-tool-result', last_user_message_id: 'user-human-old',
+    });
+    const result = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [u0, toolResult, u1], ['user-current']);
+    expect(result.bindings.map((item) => item.message_id)).toEqual(['user-current']);
+  });
+
+  it('never lets a later pending turn overtake an earlier turn whose target is not durable yet', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-prefix-block-'));
+    dirs.push(cwd);
+    const u1: any = { type: 'user', uuid: 'user-1', message: { content: [{ type: 'text', text: 'one' }] } };
+    const a1: any = { type: 'assistant', uuid: 'assistant-1', message: { content: [{ type: 'thinking', thinking: 'internal only' }] } };
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-earlier', {
+      tail_role: 'assistant', tail_message_id: 'assistant-1', last_user_message_id: 'user-1',
+    });
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-later', {
+      tail_role: 'user', tail_message_id: 'user-1', last_user_message_id: 'user-1',
+    });
+    const result = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [u1, a1], ['user-1']);
+    expect(result.bindings).toEqual([]);
+    expect(result.blocked_turn_id).toBe('fg-earlier');
+    expect(listPendingForegroundRecallTurns(cwd, 'session-a').map((item) => item.turn_id)).toEqual(['fg-earlier', 'fg-later']);
   });
 
   it('recovers when a message binding was published before the pending registration could be removed', () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-pending-crash-'));
     dirs.push(cwd);
     registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-crash');
-    // Simulate the crash window after durable binding publication but before
-    // pending-turn unlink by writing the same authoritative binding directly.
     bindForegroundRecallTurnToMessage(cwd, 'session-a', 'fg-crash', 'user-crash');
-    const next = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-next']);
-    expect(next).toEqual([]);
+    const result = bindPendingForegroundRecallTurnsToTranscript(cwd, 'session-a', [], []);
+    expect(result.bindings).toEqual([]);
     expect(listPendingForegroundRecallTurns(cwd, 'session-a')).toEqual([]);
     expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-crash')?.binding.turn_id).toBe('fg-crash');
-    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-next')).toBeUndefined();
   });
 
-  it('binds pending v2 turns to the newest transcript suffix when Stop also covers older pre-v2 user records', () => {
-    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-pending-suffix-'));
+  it('provides an unlocked binder for composition inside the maintenance enqueue session-lock transaction', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-unlocked-binding-'));
     dirs.push(cwd);
-    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-current', { tail_role: 'user', last_user_message_id: 'user-current' });
-    const bindings = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-pre-v2-a', 'user-pre-v2-b', 'user-current']);
-    expect(bindings.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-current', 'user-current']]);
+    const u1: any = { type: 'user', uuid: 'user-1', message: { content: [{ type: 'text', text: 'one' }] } };
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-1', { tail_role: 'none' });
+    const result = bindPendingForegroundRecallTurnsToTranscriptUnlocked(cwd, 'session-a', [u1], ['user-1']);
+    expect(result.bindings.map((item) => item.message_id)).toEqual(['user-1']);
   });
 
   it('retracts selected/none receipts that never reached a release checkpoint but preserves failed receipts', () => {
