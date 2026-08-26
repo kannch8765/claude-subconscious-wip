@@ -39,6 +39,7 @@ interface SyncSubconInput {
   context?: string;
   transcript_path?: string;
   timeout_ms?: number;
+  sync_started_at_ms?: number;
 }
 
 type SyncStatus = 'whisper' | 'no_whisper' | 'failed' | 'timeout';
@@ -47,6 +48,8 @@ interface SyncCheckpoint {
   status: 'whisper' | 'no_whisper' | 'failed';
   whisper_id?: string;
   recorded_at?: string;
+  bundle_ready_ms?: number;
+  resolve_recall_ms?: number;
 }
 
 function readStdin(): Promise<string> {
@@ -68,11 +71,12 @@ function cleanInput(raw: unknown): SyncSubconInput {
   const prompt = typeof value.prompt === 'string' ? value.prompt.trim() : '';
   const context = typeof value.context === 'string' ? value.context.trim() : '';
   const transcriptPath = typeof value.transcript_path === 'string' ? value.transcript_path.trim() : '';
+  const syncStartedAtMs = typeof value.sync_started_at_ms === 'number' && Number.isFinite(value.sync_started_at_ms) ? value.sync_started_at_ms : undefined;
   const timeout = typeof value.timeout_ms === 'number' && Number.isFinite(value.timeout_ms)
     ? Math.max(250, Math.min(30_000, Math.round(value.timeout_ms)))
     : 20_000;
   if (!sessionId || !turnId || !cwd || !prompt) throw new Error('session_id, turn_id, cwd, and prompt are required');
-  return { session_id: sessionId, turn_id: turnId, cwd, prompt, ...(context ? { context } : {}), ...(transcriptPath ? { transcript_path: transcriptPath } : {}), timeout_ms: timeout };
+  return { session_id: sessionId, turn_id: turnId, cwd, prompt, ...(context ? { context } : {}), ...(transcriptPath ? { transcript_path: transcriptPath } : {}), timeout_ms: timeout, ...(syncStartedAtMs !== undefined ? { sync_started_at_ms: syncStartedAtMs } : {}) };
 }
 
 function syncBatchId(input: SyncSubconInput): string {
@@ -149,6 +153,7 @@ async function stopChild(child: ChildProcess): Promise<void> {
 async function main(): Promise<void> {
   const input = cleanInput(JSON.parse(await readStdin()));
   const timeoutMs = input.timeout_ms ?? 20_000;
+  const syncStartedAtMs = input.sync_started_at_ms ?? Date.now();
   const apiKey = process.env.LETTA_API_KEY;
   const deadline = Date.now() + timeoutMs;
   if (!apiKey) throw new Error('LETTA_API_KEY is required for sync Subcon mode');
@@ -248,6 +253,7 @@ async function main(): Promise<void> {
       syncCheckpointFile: checkpointFile,
       syncTurnId: input.turn_id,
       cleanupSyncResourcesOnFinish: true,
+      syncStartedAtMs,
     };
     fs.writeFileSync(payloadFile, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
 
@@ -265,7 +271,12 @@ async function main(): Promise<void> {
         } else {
           try { fs.unlinkSync(checkpointFile); } catch {}
         }
-        emit(state.status, state.whisper_id ? { whisper_id: state.whisper_id } : {});
+        emit(state.status, {
+          ...(state.whisper_id ? { whisper_id: state.whisper_id } : {}),
+          ...(state.bundle_ready_ms !== undefined ? { bundle_ready_ms: state.bundle_ready_ms } : {}),
+          ...(state.resolve_recall_ms !== undefined ? { resolve_recall_ms: state.resolve_recall_ms } : {}),
+          foreground_release_ms: Date.now() - syncStartedAtMs,
+        });
         // A successful whisper transfers cleanup ownership to the background
         // worker. It continues to end_turn and reclaims/defer-reaps its sibling
         // agent + conversation without blocking foreground Kohaku.
@@ -276,7 +287,12 @@ async function main(): Promise<void> {
         if (finalState) {
           if (finalState.status === 'failed') await cleanupAbortedSync();
           else try { fs.unlinkSync(checkpointFile); } catch {}
-          emit(finalState.status, finalState.whisper_id ? { whisper_id: finalState.whisper_id } : {});
+          emit(finalState.status, {
+            ...(finalState.whisper_id ? { whisper_id: finalState.whisper_id } : {}),
+            ...(finalState.bundle_ready_ms !== undefined ? { bundle_ready_ms: finalState.bundle_ready_ms } : {}),
+            ...(finalState.resolve_recall_ms !== undefined ? { resolve_recall_ms: finalState.resolve_recall_ms } : {}),
+            foreground_release_ms: Date.now() - syncStartedAtMs,
+          });
           process.exit(0);
         }
         await cleanupAbortedSync();

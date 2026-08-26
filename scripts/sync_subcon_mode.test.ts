@@ -6,7 +6,9 @@ describe('additive synchronous Subcon mode contract', () => {
   it('keeps the existing Stop lane asynchronous and makes sync explicit opt-in', () => {
     const hooks = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'hooks/hooks.json'), 'utf8'));
     const stop = hooks.hooks.Stop[0].hooks[0];
+    const userPrompt = hooks.hooks.UserPromptSubmit[0].hooks[0];
     expect(stop.async).toBe(true);
+    expect(userPrompt.timeout).toBeGreaterThanOrEqual(45);
     expect(stop.command).toContain('send_messages_to_letta.ts');
 
     const stopSource = fs.readFileSync(path.join(process.cwd(), 'scripts/send_messages_to_letta.ts'), 'utf8');
@@ -49,6 +51,10 @@ describe('additive synchronous Subcon mode contract', () => {
     const pretool = fs.readFileSync(path.join(process.cwd(), 'scripts/pretool_sync.ts'), 'utf8');
     expect(worker).toContain("isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined");
     expect(syncHook).toContain('SUBCON_SYNC_EXPECTED_TURN_FILE');
+    expect(syncHook).toContain('runForegroundSyncForHook(hookInput, cwd)');
+    expect(syncHook).toContain('const legacyExpectedTurnId = expectedSyncTurnId(hookInput)');
+    expect(syncHook).toContain('foregroundSync?.turn_id ?? legacyExpectedTurnId');
+    expect(syncHook).toContain('foregroundSync?.message_id');
     expect(syncHook).toContain('partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId)');
     expect(syncHook).toContain('acknowledgePendingSubconWhispers(staleSyncWhispers)');
     expect(pretool).toContain('partitionPendingSubconWhispersForTurn(');
@@ -82,6 +88,9 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(sync).toContain('decision=none');
     expect(sync).toContain('<recent_foreground_transcript> is source-faithful recent foreground transcript context');
     expect(sync).toContain('foregroundRecallQuery');
+    expect(sync).toContain('syncStartedAtMs');
+    expect(worker).toContain('bundle_ready_ms');
+    expect(worker).toContain('resolve_recall_ms');
     expect(sync).toContain('readForegroundRecentTranscript');
     expect(sync).not.toContain('must complete at least one relationship memory_search');
     expect(sync).toContain('cleanupSyncResourcesOnFinish: true');

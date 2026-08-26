@@ -97,6 +97,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
       syncCheckpointFile: checkpointFile,
       syncTurnId: 'turn-test',
       cleanupSyncResourcesOnFinish: true,
+      syncStartedAtMs: Date.now() - 100,
     };
     fs.writeFileSync(payloadFile, JSON.stringify(payload), { mode: 0o600 });
     const deferred: Array<[string, string, string[]]> = [];
@@ -135,6 +136,8 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         });
         const checkpoint = JSON.parse(fs.readFileSync(checkpointFile, 'utf8'));
         expect(checkpoint.status).toBe('whisper');
+        expect(checkpoint.bundle_ready_ms).toBeGreaterThanOrEqual(0);
+        expect(checkpoint.resolve_recall_ms).toBeGreaterThanOrEqual(checkpoint.bundle_ready_ms);
         // Simulate the foreground wrapper consuming the durable release point.
         fs.unlinkSync(checkpointFile);
         throw new Error('synthetic continuation failure after foreground release');

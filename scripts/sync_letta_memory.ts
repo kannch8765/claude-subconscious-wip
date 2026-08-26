@@ -24,6 +24,7 @@ import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
 import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { bindForegroundRecallTurnToMessage } from './foreground_recall_state.js';
 import { findLatestUserMessageUuidForPrompt } from './transcript_utils.js';
+import { runForegroundSyncForHook } from './foreground_sync_hook.js';
 import {
   loadSyncState,
   saveSyncState,
@@ -53,6 +54,7 @@ interface HookInput {
   cwd: string;
   prompt?: string;  // User's prompt text (available on UserPromptSubmit)
   transcript_path?: string;  // Path to transcript JSONL
+  context?: string;
   hook_event_name?: string;
 }
 
@@ -197,11 +199,23 @@ async function main(): Promise<void> {
     const hookInput = await readHookInput();
     const cwd = hookInput?.cwd || projectDir;
     const sessionId = hookInput?.session_id;
+    const foregroundSync = await runForegroundSyncForHook(hookInput, cwd);
+    if (foregroundSync) debug('foreground sync v2 completed', {
+      status: foregroundSync.status,
+      turn_id: foregroundSync.turn_id,
+      message_id: foregroundSync.message_id,
+      bundle_ready_ms: foregroundSync.bundle_ready_ms,
+      resolve_recall_ms: foregroundSync.resolve_recall_ms,
+      foreground_release_ms: foregroundSync.foreground_release_ms,
+      hook_elapsed_ms: foregroundSync.hook_elapsed_ms,
+    });
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
-    const expectedTurnId = expectedSyncTurnId(hookInput);
-    if (sessionId && expectedTurnId && hookInput?.transcript_path && typeof hookInput.prompt === 'string') {
+    const legacyExpectedTurnId = expectedSyncTurnId(hookInput);
+    const expectedTurnId = foregroundSync?.turn_id ?? legacyExpectedTurnId;
+    if (sessionId && expectedTurnId && typeof hookInput?.prompt === 'string') {
       try {
-        const messageId = findLatestUserMessageUuidForPrompt(hookInput.transcript_path, hookInput.prompt);
+        const messageId = foregroundSync?.message_id
+          ?? (hookInput.transcript_path ? findLatestUserMessageUuidForPrompt(hookInput.transcript_path, hookInput.prompt) : undefined);
         if (messageId) {
           bindForegroundRecallTurnToMessage(cwd, sessionId, expectedTurnId, messageId);
           debug('Bound foreground recall turn to transcript message', { turn_id: expectedTurnId, message_id: messageId });

@@ -75,16 +75,22 @@ export interface LiveWorkerPayload {
   syncAgentId?: string;
   syncBlockIds?: string[];
   cleanupSyncResourcesOnFinish?: boolean;
+  syncStartedAtMs?: number;
 }
 
 type SyncCheckpointStatus = 'whisper' | 'no_whisper' | 'failed';
 
-function writeSyncCheckpoint(payload: LiveWorkerPayload, status: SyncCheckpointStatus, whisperId?: string): void {
+function writeSyncCheckpoint(
+  payload: LiveWorkerPayload,
+  status: SyncCheckpointStatus,
+  whisperId?: string,
+  timings: { bundle_ready_ms?: number; resolve_recall_ms?: number } = {},
+): void {
   if (payload.mode !== 'sync' || !payload.syncCheckpointFile) return;
   if (fs.existsSync(payload.syncCheckpointFile)) return;
   const dir = path.dirname(payload.syncCheckpointFile);
   fs.mkdirSync(dir, { recursive: true });
-  const checkpoint = { status, ...(whisperId ? { whisper_id: whisperId } : {}), recorded_at: new Date().toISOString() };
+  const checkpoint = { status, ...(whisperId ? { whisper_id: whisperId } : {}), ...timings, recorded_at: new Date().toISOString() };
   const temp = `${payload.syncCheckpointFile}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temp, `${JSON.stringify(checkpoint)}\n`, { mode: 0o600 });
   try { fs.renameSync(temp, payload.syncCheckpointFile); }
@@ -185,6 +191,8 @@ export async function sendViaNativeClient(
   const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
   const assistantIntents = payload.assistantIntents ?? [];
   const canonicalMessages = payload.canonicalMessages ?? [];
+  const syncTimingOriginMs = payload.syncStartedAtMs ?? Date.now();
+  let syncBundleReadyMs: number | undefined;
   const runtime = createRuntime(canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
 
   if (!isSync) {
@@ -223,9 +231,10 @@ export async function sendViaNativeClient(
         sessionId: payload.sessionId, turnId: payload.syncTurnId,
       });
       persistForegroundRecallBundle(payload.cwd, foregroundBundle);
+      syncBundleReadyMs = Date.now() - syncTimingOriginMs;
       registerSurfacedRecallCandidates(foregroundBundle.candidates, surfacedRecallMemories);
       recallSearches.push({ kind: 'prefetch', query_sha256: foregroundBundle.query_sha256, memory_ids: foregroundBundle.candidates.map((item) => item.memory_id) });
-      log(`Foreground recall bundle prepared: candidates=${foregroundBundle.candidates.length}, bundle_id=${foregroundBundle.bundle_id}`);
+      log(`Foreground recall bundle prepared: candidates=${foregroundBundle.candidates.length}, bundle_id=${foregroundBundle.bundle_id}, bundle_ready_ms=${syncBundleReadyMs}`);
     }
     const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId);
     const modeRelationshipTools = isSync
@@ -369,7 +378,7 @@ export async function sendViaNativeClient(
           whisper_id: whisperId,
         });
         recallResolved = true;
-        writeSyncCheckpoint(payload, 'whisper', whisperId);
+        writeSyncCheckpoint(payload, 'whisper', whisperId, { bundle_ready_ms: syncBundleReadyMs, resolve_recall_ms: Date.now() - syncTimingOriginMs });
         foregroundReleased = true;
         return { status: 'ok', whisper_id: whisperId };
       }
@@ -404,7 +413,7 @@ export async function sendViaNativeClient(
             searches: recallSearches,
           });
           recallResolved = true;
-          writeSyncCheckpoint(payload, 'no_whisper');
+          writeSyncCheckpoint(payload, 'no_whisper', undefined, { bundle_ready_ms: syncBundleReadyMs, resolve_recall_ms: Date.now() - syncTimingOriginMs });
           foregroundReleased = true;
           log('Foreground recall resolved: none');
           return { status: 'ok', decision: 'none' };
@@ -539,7 +548,7 @@ ${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
         postWhisperFailureCleanupOwned = true;
         log(`Post-release sync failure cleanup deferred for conversation ${payload.conversationId}`);
       } else {
-        writeSyncCheckpoint(payload, 'failed');
+        writeSyncCheckpoint(payload, 'failed', undefined, { bundle_ready_ms: syncBundleReadyMs });
       }
     }
   }
