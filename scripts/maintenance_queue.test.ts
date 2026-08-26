@@ -70,6 +70,23 @@ describe('per-session maintenance queue', () => {
     expect(state.maintenanceEnqueuedThrough).toBe(3);
   });
 
+  it('recovers a durable publish that crashed before the enqueue watermark commit', () => {
+    const cwd = root();
+    saveSyncState(cwd, { sessionId: 's', lastProcessedIndex: 2, maintenanceEnqueuedThrough: 2 });
+    // Simulate publish(2..5) succeeding, then process death before state write.
+    publishMaintenanceQueueJob(cwd, job('s', 2, 5, 'crash-published'));
+    expect(loadSyncState(cwd, 's').maintenanceEnqueuedThrough).toBe(2);
+
+    const next = enqueueMaintenanceRange(cwd, 's', 9, (start, through) => {
+      const value = job('s', start, through, 'after-recovery');
+      publishMaintenanceQueueJob(cwd, value);
+      return value;
+    }, undefined, () => listMaintenanceQueueJobs(cwd, 's'));
+    expect(next).toMatchObject({ startIndex: 5, throughIndex: 9 });
+    expect(listMaintenanceQueueJobs(cwd, 's').map((item) => [item.start_index, item.through_index])).toEqual([[2, 5], [5, 9]]);
+    expect(loadSyncState(cwd, 's').maintenanceEnqueuedThrough).toBe(9);
+  });
+
   it('keeps enqueuedThrough monotonic across stale saves and cursor advancement', () => {
     const cwd = root();
     const stale = { sessionId: 's', lastProcessedIndex: 1, maintenanceEnqueuedThrough: 1 };

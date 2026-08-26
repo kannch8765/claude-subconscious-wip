@@ -47,15 +47,14 @@ function boundRecent(
     unique.push(message);
   }
 
-  // UserPromptSubmit transcripts can already contain the current prompt. The
-  // current prompt has its own trusted field, so keep this lane strictly prior.
+  // UserPromptSubmit transcripts can already end with the current user record.
+  // Only strip an exact match when it is itself the final visible transcript
+  // message. Never scan backward through a prior assistant turn: when the new
+  // user record has not been appended yet, an identical previous prompt is real
+  // recent context and must remain visible.
   const normalizedPrompt = currentPrompt.trim();
-  for (let i = unique.length - 1; i >= 0; i--) {
-    if (unique[i].role === 'user') {
-      if (normalizedPrompt && unique[i].text.trim() === normalizedPrompt) unique.splice(i, 1);
-      break;
-    }
-  }
+  const tail = unique[unique.length - 1];
+  if (tail?.role === 'user' && normalizedPrompt && tail.text.trim() === normalizedPrompt) unique.pop();
   return unique.slice(-Math.max(1, maxMessages));
 }
 

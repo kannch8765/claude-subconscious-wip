@@ -86,6 +86,53 @@ export async function readTranscript(transcriptPath: string, log: LogFn = noopLo
   return messages;
 }
 
+export interface TranscriptUserTurnAnchor {
+  tail_role: 'user' | 'assistant' | 'none';
+  last_user_message_id?: string;
+}
+
+/**
+ * Observe only transcript structure for foreground turn binding. This never
+ * compares prompt text: Stop later uses the durable order plus real UUIDs.
+ */
+export function readTranscriptUserTurnAnchor(
+  transcriptPath: string,
+  maxTailBytes = 4 * 1024 * 1024,
+): TranscriptUserTurnAnchor {
+  if (!transcriptPath || !fs.existsSync(transcriptPath)) return { tail_role: 'none' };
+  const stat = fs.statSync(transcriptPath);
+  if (stat.size <= 0) return { tail_role: 'none' };
+  const length = Math.min(stat.size, Math.max(4096, maxTailBytes));
+  const start = stat.size - length;
+  const fd = fs.openSync(transcriptPath, 'r');
+  try {
+    const buffer = Buffer.alloc(length);
+    fs.readSync(fd, buffer, 0, length, start);
+    let text = buffer.toString('utf8');
+    if (start > 0) {
+      const firstNewline = text.indexOf('\n');
+      if (firstNewline < 0) return { tail_role: 'none' };
+      text = text.slice(firstNewline + 1);
+    }
+    let tailRole: 'user' | 'assistant' | 'none' = 'none';
+    let lastUserMessageId: string | undefined;
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      let message: TranscriptMessage;
+      try { message = JSON.parse(line) as TranscriptMessage; } catch { continue; }
+      if (message.type !== 'user' && message.type !== 'assistant') continue;
+      const visible = extractAllContent(message).text?.trim();
+      if (!visible) continue;
+      tailRole = message.type;
+      if (message.type === 'user' && message.uuid) lastUserMessageId = message.uuid;
+    }
+    return { tail_role: tailRole, ...(lastUserMessageId ? { last_user_message_id: lastUserMessageId } : {}) };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
 /**
  * Resolve the real Claude transcript UUID for the current UserPromptSubmit without
  * scanning the whole transcript. Only an exact visible-text match is accepted; a

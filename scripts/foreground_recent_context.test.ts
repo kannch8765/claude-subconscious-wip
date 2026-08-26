@@ -74,6 +74,31 @@ describe('foreground recent transcript context', () => {
     expect(recent.some((item) => item.text.includes('还没来得及进 maintenance queue'))).toBe(true);
   });
 
+  it('keeps the previous identical prompt when the current user record is not in the transcript yet', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'recent-identical-lag-'));
+    dirs.push(cwd);
+    const transcript = path.join(cwd, 'lagged.jsonl');
+    fs.writeFileSync(transcript, [
+      msg('user', 'u-prev', '一样的问题', '2026-08-26T00:00:00.000Z'),
+      msg('assistant', 'a-prev', '上一轮回答', '2026-08-26T00:00:01.000Z'),
+    ].map((item) => JSON.stringify(item)).join('\n') + '\n');
+    const recent = readForegroundRecentTranscript(cwd, 'session-a', '一样的问题', transcript);
+    expect(recent.map((item) => item.message_id)).toEqual(['u-prev', 'a-prev']);
+  });
+
+  it('removes only the appended current duplicate and keeps the previous identical turn', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'recent-identical-appended-'));
+    dirs.push(cwd);
+    const transcript = path.join(cwd, 'appended.jsonl');
+    fs.writeFileSync(transcript, [
+      msg('user', 'u-prev', '一样的问题', '2026-08-26T00:00:00.000Z'),
+      msg('assistant', 'a-prev', '上一轮回答', '2026-08-26T00:00:01.000Z'),
+      msg('user', 'u-current', '一样的问题', '2026-08-26T00:00:02.000Z'),
+    ].map((item) => JSON.stringify(item)).join('\n') + '\n');
+    const recent = readForegroundRecentTranscript(cwd, 'session-a', '一样的问题', transcript);
+    expect(recent.map((item) => item.message_id)).toEqual(['u-prev', 'a-prev']);
+  });
+
   it('falls back to queued context when the live transcript tail contains only the current prompt', () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'recent-current-only-'));
     dirs.push(cwd);

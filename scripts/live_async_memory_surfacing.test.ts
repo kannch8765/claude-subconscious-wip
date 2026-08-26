@@ -14,8 +14,8 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(send).toContain('readForegroundRecallTurnStateForMessage');
     expect(send).toContain('latestUserMessageId');
     expect(send).toContain('foregroundRecallTurns');
-    expect(sync).toContain('findLatestUserMessageUuidForPrompt');
-    expect(sync).toContain('bindForegroundRecallTurnToMessage');
+    expect(send).toContain('bindPendingForegroundRecallTurnsToMessages');
+    expect(sync).toContain('v2 never derives transcript identity from prompt text');
     expect(worker).toContain("name: 'deliver_whisper'");
     expect(worker).toContain('latestForegroundRecallResolved');
     expect(worker).toContain('Skipping async deliver_whisper because foreground recall already resolved');

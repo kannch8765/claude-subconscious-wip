@@ -21,7 +21,7 @@ import * as fs from 'fs';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
-import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { acknowledgePendingSubconWhispers, discardPendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForCheckpoint, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { bindForegroundRecallTurnToMessage } from './foreground_recall_state.js';
 import { findLatestUserMessageUuidForPrompt } from './transcript_utils.js';
 import { runForegroundSyncForHook } from './foreground_sync_hook.js';
@@ -203,7 +203,6 @@ async function main(): Promise<void> {
     if (foregroundSync) debug('foreground sync v2 completed', {
       status: foregroundSync.status,
       turn_id: foregroundSync.turn_id,
-      message_id: foregroundSync.message_id,
       bundle_ready_ms: foregroundSync.bundle_ready_ms,
       resolve_recall_ms: foregroundSync.resolve_recall_ms,
       foreground_release_ms: foregroundSync.foreground_release_ms,
@@ -211,26 +210,28 @@ async function main(): Promise<void> {
     });
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const legacyExpectedTurnId = expectedSyncTurnId(hookInput);
-    const expectedTurnId = foregroundSync?.turn_id ?? legacyExpectedTurnId;
-    if (sessionId && expectedTurnId && typeof hookInput?.prompt === 'string') {
+    // v2 never derives transcript identity from prompt text. Its opaque turn is
+    // registered before sync work and bound later by Stop once transcript UUIDs
+    // are authoritative. Keep the text lookup only for the legacy marker path.
+    if (!foregroundSync && sessionId && legacyExpectedTurnId && typeof hookInput?.prompt === 'string') {
       try {
-        const messageId = foregroundSync?.message_id
-          ?? (hookInput.transcript_path ? findLatestUserMessageUuidForPrompt(hookInput.transcript_path, hookInput.prompt) : undefined);
-        if (messageId) {
-          bindForegroundRecallTurnToMessage(cwd, sessionId, expectedTurnId, messageId);
-          debug('Bound foreground recall turn to transcript message', { turn_id: expectedTurnId, message_id: messageId });
-        } else {
-          debug('Could not bind foreground recall turn: no exact latest user transcript match');
-        }
+        const messageId = hookInput.transcript_path
+          ? findLatestUserMessageUuidForPrompt(hookInput.transcript_path, hookInput.prompt)
+          : undefined;
+        if (messageId) bindForegroundRecallTurnToMessage(cwd, sessionId, legacyExpectedTurnId, messageId);
       } catch (error) {
-        // Receipt reuse is an optimization. A binding failure must never block the
-        // foreground prompt; the async lane will safely fall back to normal lookup.
-        debug('Foreground recall turn binding failed; continuing without receipt reuse', error);
+        debug('Legacy foreground recall binding failed; continuing without receipt reuse', error);
       }
     }
-    const partitioned = partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId);
+    const authorizedWhisperId = foregroundSync?.status === 'whisper' ? foregroundSync.whisper_id : undefined;
+    const partitioned = foregroundSync
+      ? partitionPendingSubconWhispersForCheckpoint(allPendingWhispers, foregroundSync.turn_id, authorizedWhisperId)
+      : partitionPendingSubconWhispersForTurn(allPendingWhispers, legacyExpectedTurnId);
     const pendingWhispers = partitioned.deliverable;
     const staleSyncWhispers = partitioned.staleSync;
+    // Retraction is part of foreground release authority, not post-injection
+    // acknowledgement. Do it before any later API/block-sync failure can return.
+    if (staleSyncWhispers.length > 0) discardPendingSubconWhispers(staleSyncWhispers);
 
     // Whisper mode is a local transport only: background Subcon explicitly wrote
     // deliver_whisper payloads into the durable queue. Do not contact Letta, fetch
@@ -243,7 +244,6 @@ async function main(): Promise<void> {
       }
       if (injectionPayload) console.log(injectionPayload);
       if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
-      if (staleSyncWhispers.length > 0) acknowledgePendingSubconWhispers(staleSyncWhispers);
       return;
     }
 
@@ -291,7 +291,6 @@ async function main(): Promise<void> {
     }
     if (injectionPayload) console.log(injectionPayload);
     if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
-    if (staleSyncWhispers.length > 0) acknowledgePendingSubconWhispers(staleSyncWhispers);
     if (state && sessionId) saveSyncState(cwd, state);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);

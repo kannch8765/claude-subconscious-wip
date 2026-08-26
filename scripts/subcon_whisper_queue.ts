@@ -132,6 +132,42 @@ export function partitionPendingSubconWhispersForTurn(
   return { deliverable, deferredSync, staleSync };
 }
 
+export function partitionPendingSubconWhispersForCheckpoint(
+  items: PendingSubconWhisperFile[],
+  turnId: string,
+  authorizedWhisperId?: string,
+): PartitionedSubconWhispers {
+  const deliverable: PendingSubconWhisperFile[] = [];
+  const deferredSync: PendingSubconWhisperFile[] = [];
+  const staleSync: PendingSubconWhisperFile[] = [];
+  for (const item of items) {
+    if (item.whisper.source !== 'sync') {
+      deliverable.push(item);
+      continue;
+    }
+    if (item.whisper.turn_id !== turnId) {
+      staleSync.push(item);
+      continue;
+    }
+    if (authorizedWhisperId && item.whisper.whisper_id === authorizedWhisperId) deliverable.push(item);
+    else staleSync.push(item);
+  }
+  return { deliverable, deferredSync, staleSync };
+}
+
+export function discardPendingSubconWhispers(items: readonly PendingSubconWhisperFile[]): number {
+  let discarded = 0;
+  for (const item of items) {
+    try {
+      fs.unlinkSync(item.file);
+      discarded += 1;
+    } catch (error: any) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+  }
+  return discarded;
+}
+
 export function retractPendingSyncWhisperForTurn(
   cwd: string,
   sessionId: string,

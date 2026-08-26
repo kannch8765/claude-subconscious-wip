@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { advanceSyncStateCursor, getSyncStateFile, loadSyncState, saveSyncState } from './conversation_utils.js';
+import { advanceSyncStateCursor, enqueueMaintenanceRange, getSyncStateFile, loadSyncState, saveSyncState } from './conversation_utils.js';
 import { listMaintenanceQueueJobs, publishMaintenanceQueueJob, type MaintenanceQueueJob } from './maintenance_queue.js';
 import { drainMaintenanceQueue } from './maintenance_queue_worker.js';
 import { buildCanonicalMessages } from '../relationship-memory/src/adapter/index.js';
@@ -86,6 +86,32 @@ describe('maintenance queue drainer', () => {
     expect(seen).toEqual(['a']);
     expect(loadSyncState(cwd, sessionId).lastProcessedIndex).toBe(-1);
     expect(listMaintenanceQueueJobs(cwd, sessionId).map((item) => item.job_id)).toEqual(['a', 'b']);
+  });
+
+  it('drains through a publish-before-watermark crash after enqueue reconciles the durable frontier', async () => {
+    const cwd = makeRoot();
+    const sessionId = 's';
+    saveSyncState(cwd, { sessionId, lastProcessedIndex: 2, maintenanceEnqueuedThrough: 2, conversationId: 'conv-a' });
+    publishMaintenanceQueueJob(cwd, makeJob(cwd, sessionId, 2, 5, 'crash-a'));
+    enqueueMaintenanceRange(cwd, sessionId, 9, (start, through) => {
+      const value = makeJob(cwd, sessionId, start, through, 'after-crash-b');
+      publishMaintenanceQueueJob(cwd, value);
+      return value;
+    }, undefined, () => listMaintenanceQueueJobs(cwd, sessionId));
+
+    const seen: string[] = [];
+    const result = await drainMaintenanceQueue({ cwd, sessionId }, {
+      getConversation: getConversation as any,
+      runPayload: async (payload) => {
+        seen.push(payload.batchId);
+        advanceSyncStateCursor(cwd, sessionId, payload.newLastProcessedIndex!);
+        return 'completed';
+      },
+    });
+    expect(result).toBe('drained');
+    expect(seen).toEqual(['crash-a', 'after-crash-b']);
+    expect(loadSyncState(cwd, sessionId)).toMatchObject({ lastProcessedIndex: 9, maintenanceEnqueuedThrough: 9 });
+    expect(listMaintenanceQueueJobs(cwd, sessionId)).toEqual([]);
   });
 
   it('rebinds canonical evidence to a rotated conversation without mutating the durable job', async () => {

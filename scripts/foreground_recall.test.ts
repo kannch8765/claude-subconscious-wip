@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { buildForegroundRecallBundle, renderForegroundRecallBundle } from './foreground_recall.js';
-import { bindForegroundRecallTurnToMessage, persistForegroundRecallBundle, readForegroundRecallTurnState, readForegroundRecallTurnStateForMessage, writeForegroundRecallReceipt } from './foreground_recall_state.js';
+import { bindForegroundRecallTurnToMessage, bindPendingForegroundRecallTurnsToMessages, listPendingForegroundRecallTurns, persistForegroundRecallBundle, readForegroundRecallTurnState, readForegroundRecallTurnStateForMessage, registerPendingForegroundRecallTurn, retractUnreleasedForegroundRecallReceipt, writeForegroundRecallReceipt } from './foreground_recall_state.js';
 import { acknowledgePendingSubconWhispers, queueSubconWhisper, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { findLatestUserMessageUuidForPrompt } from './transcript_utils.js';
 import { renderForegroundRecallReceiptCatalog } from './send_worker_native.js';
@@ -100,6 +100,79 @@ describe('foreground recall bundle and receipt', () => {
     expect(bound?.binding.turn_id).toBe('turn-2');
     expect(bound?.receipt?.decision).toBe('none');
     expect(() => bindForegroundRecallTurnToMessage(cwd, 'session-a', 'other-turn', 'user-2')).toThrow('binding conflict');
+  });
+
+  it('binds opaque foreground turns to real transcript UUIDs in durable UserPromptSubmit order', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-pending-binding-'));
+    dirs.push(cwd);
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-1', { tail_role: 'none' }, () => '2026-08-26T00:00:00.000Z');
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-2', { tail_role: 'none' }, () => '2026-08-26T00:00:01.000Z');
+
+    const first = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-1'], () => '2026-08-26T00:00:02.000Z');
+    expect(first.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-1', 'user-1']]);
+    expect(listPendingForegroundRecallTurns(cwd, 'session-a').map((item) => item.turn_id)).toEqual(['fg-2']);
+
+    const second = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-2'], () => '2026-08-26T00:00:03.000Z');
+    expect(second.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-2', 'user-2']]);
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-1')?.binding.turn_id).toBe('fg-1');
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-2')?.binding.turn_id).toBe('fg-2');
+    expect(listPendingForegroundRecallTurns(cwd, 'session-a')).toEqual([]);
+  });
+
+  it('does not bind an N+1 pending turn to N while N+1 has not reached the transcript yet', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-fast-chat-anchor-'));
+    dirs.push(cwd);
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-next', {
+      tail_role: 'assistant', last_user_message_id: 'user-n',
+    });
+    expect(bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-n'])).toEqual([]);
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-n')).toBeUndefined();
+    expect(listPendingForegroundRecallTurns(cwd, 'session-a').map((item) => item.turn_id)).toEqual(['fg-next']);
+
+    const bound = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-next']);
+    expect(bound.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-next', 'user-next']]);
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-next')?.binding.turn_id).toBe('fg-next');
+  });
+
+  it('recovers when a message binding was published before the pending registration could be removed', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-pending-crash-'));
+    dirs.push(cwd);
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-crash');
+    // Simulate the crash window after durable binding publication but before
+    // pending-turn unlink by writing the same authoritative binding directly.
+    bindForegroundRecallTurnToMessage(cwd, 'session-a', 'fg-crash', 'user-crash');
+    const next = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-next']);
+    expect(next).toEqual([]);
+    expect(listPendingForegroundRecallTurns(cwd, 'session-a')).toEqual([]);
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-crash')?.binding.turn_id).toBe('fg-crash');
+    expect(readForegroundRecallTurnStateForMessage(cwd, 'session-a', 'user-next')).toBeUndefined();
+  });
+
+  it('binds pending v2 turns to the newest transcript suffix when Stop also covers older pre-v2 user records', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-pending-suffix-'));
+    dirs.push(cwd);
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-current', { tail_role: 'user', last_user_message_id: 'user-current' });
+    const bindings = bindPendingForegroundRecallTurnsToMessages(cwd, 'session-a', ['user-pre-v2-a', 'user-pre-v2-b', 'user-current']);
+    expect(bindings.map((item) => [item.turn_id, item.message_id])).toEqual([['fg-current', 'user-current']]);
+  });
+
+  it('retracts selected/none receipts that never reached a release checkpoint but preserves failed receipts', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-unreleased-receipt-'));
+    dirs.push(cwd);
+    writeForegroundRecallReceipt(cwd, {
+      schema_version: 1, session_id: 'session-a', turn_id: 'turn-selected', bundle_id: 'bundle-a',
+      recorded_at: '2026-08-26T00:00:00.000Z', decision: 'selected', searches: [],
+      selected: { memory_id: 'mem-a', snippet_ids: ['snippet-a'] }, whisper_id: 'whisper-a',
+    });
+    expect(retractUnreleasedForegroundRecallReceipt(cwd, 'session-a', 'turn-selected')).toBe(true);
+    expect(readForegroundRecallTurnState(cwd, 'session-a', 'turn-selected').receipt).toBeUndefined();
+
+    writeForegroundRecallReceipt(cwd, {
+      schema_version: 1, session_id: 'session-a', turn_id: 'turn-failed', bundle_id: 'bundle-b',
+      recorded_at: '2026-08-26T00:00:01.000Z', decision: 'failed', searches: [], error: 'provider failed',
+    });
+    expect(retractUnreleasedForegroundRecallReceipt(cwd, 'session-a', 'turn-failed')).toBe(false);
+    expect(readForegroundRecallTurnState(cwd, 'session-a', 'turn-failed').receipt?.decision).toBe('failed');
   });
 
   it('renders receipt history as bookkeeping only, including delivery state but no raw query or quotes', () => {

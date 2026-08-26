@@ -10,6 +10,8 @@ import {
   removePendingSubconWhisper,
   retractPendingSyncWhisperForTurn,
   partitionPendingSubconWhispersForTurn,
+  partitionPendingSubconWhispersForCheckpoint,
+  discardPendingSubconWhispers,
 } from './subcon_whisper_queue.js';
 
 const roots: string[] = [];
@@ -50,6 +52,31 @@ describe('Subcon foreground whisper queue', () => {
     expect(current.deliverable.map((item) => item.whisper.batch_id).sort()).toEqual(['async-a', 'sync-a']);
     expect(current.staleSync.map((item) => item.whisper.batch_id)).toEqual(['sync-old']);
     expect(current.deferredSync).toEqual([]);
+  });
+
+  it('uses checkpoint whisper_id as the only v2 sync delivery authority', () => {
+    const cwd = temp();
+    queueSubconWhisper(cwd, 'session-a', 'async-a', 'async paper');
+    const authorized = queueSubconWhisper(cwd, 'session-a', 'sync-authorized', 'authorized', { source: 'sync', turnId: 'turn-current' })!;
+    queueSubconWhisper(cwd, 'session-a', 'sync-stale', 'stale same-turn paper', { source: 'sync', turnId: 'turn-current' });
+    const all = readPendingSubconWhispers(cwd, 'session-a');
+    const partitioned = partitionPendingSubconWhispersForCheckpoint(all, 'turn-current', authorized.whisper_id);
+    expect(partitioned.deliverable.map((item) => item.whisper.batch_id).sort()).toEqual(['async-a', 'sync-authorized']);
+    expect(partitioned.staleSync.map((item) => item.whisper.batch_id)).toEqual(['sync-stale']);
+    expect(discardPendingSubconWhispers(partitioned.staleSync)).toBe(1);
+    expect(readPendingSubconWhispers(cwd, 'session-a').map((item) => item.whisper.batch_id).sort()).toEqual(['async-a', 'sync-authorized']);
+  });
+
+  it('treats no_whisper/failed/timeout as zero sync delivery authority for the current turn', () => {
+    const cwd = temp();
+    queueSubconWhisper(cwd, 'session-a', 'async-a', 'async paper');
+    queueSubconWhisper(cwd, 'session-a', 'sync-old', 'OLD', { source: 'sync', turnId: 'turn-current' });
+    const all = readPendingSubconWhispers(cwd, 'session-a');
+    const partitioned = partitionPendingSubconWhispersForCheckpoint(all, 'turn-current');
+    expect(partitioned.deliverable.map((item) => item.whisper.batch_id)).toEqual(['async-a']);
+    expect(partitioned.staleSync.map((item) => item.whisper.batch_id)).toEqual(['sync-old']);
+    discardPendingSubconWhispers(partitioned.staleSync);
+    expect(readPendingSubconWhispers(cwd, 'session-a').map((item) => item.whisper.batch_id)).toEqual(['async-a']);
   });
 
   it('can retract one exact pending sync whisper without touching other batches', () => {

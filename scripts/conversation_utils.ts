@@ -426,6 +426,28 @@ export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLo
   });
 }
 
+export interface MaintenanceQueuedRange { start_index: number; through_index: number }
+
+export function reconcileMaintenanceQueuedFrontier(
+  committedIndex: number,
+  ranges: readonly MaintenanceQueuedRange[],
+): number {
+  let frontier = committedIndex;
+  const ordered = [...ranges].sort((a, b) => a.start_index - b.start_index || a.through_index - b.through_index);
+  for (const range of ordered) {
+    if (!Number.isInteger(range.start_index) || !Number.isInteger(range.through_index) || range.through_index <= range.start_index) {
+      throw new Error('invalid durable maintenance queue range');
+    }
+    if (range.through_index <= frontier) continue;
+    if (range.start_index < frontier) {
+      throw new Error(`overlapping durable maintenance queue range ${range.start_index}..${range.through_index} at frontier ${frontier}`);
+    }
+    if (range.start_index > frontier) break;
+    frontier = range.through_index;
+  }
+  return frontier;
+}
+
 /**
  * Atomically reserve the not-yet-enqueued transcript suffix for one maintenance job.
  * The callback must durably publish the immutable job before this watermark advances.
@@ -436,14 +458,26 @@ export function enqueueMaintenanceRange<T>(
   throughIndex: number,
   publishJob: (startIndex: number, throughIndex: number) => T,
   log: LogFn = noopLog,
+  listDurableRanges?: () => readonly MaintenanceQueuedRange[],
 ): { startIndex: number; throughIndex: number; value: T } | null {
   if (!Number.isInteger(throughIndex)) throw new Error('maintenance enqueue throughIndex must be an integer');
   return withSyncStateLock(cwd, sessionId, () => {
     const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
-    const enqueuedThrough = Math.max(
+    const stateWatermark = Math.max(
       durable.lastProcessedIndex,
       durable.maintenanceEnqueuedThrough ?? durable.lastProcessedIndex,
     );
+    let enqueuedThrough = stateWatermark;
+    if (listDurableRanges) {
+      // Durable queue files are the crash-recovery authority. A process may die
+      // after publishing a job but before committing maintenanceEnqueuedThrough;
+      // reconstruct the contiguous frontier before reserving another suffix.
+      const recovered = reconcileMaintenanceQueuedFrontier(durable.lastProcessedIndex, listDurableRanges());
+      if (stateWatermark > recovered) {
+        throw new Error(`maintenance enqueue watermark ${stateWatermark} exceeds durable contiguous frontier ${recovered}`);
+      }
+      enqueuedThrough = recovered;
+    }
     if (throughIndex <= enqueuedThrough) {
       log(`Maintenance queue already enqueued through index ${enqueuedThrough}`);
       return null;

@@ -24,6 +24,7 @@ import {
   reapDeferredSyncResources,
 } from './sync_letta_resources.js';
 import { removePendingSubconWhisper } from './subcon_whisper_queue.js';
+import { retractUnreleasedForegroundRecallReceipt } from './foreground_recall_state.js';
 import { contextualForegroundRecallQuery, readForegroundRecentTranscript, renderForegroundRecentTranscript } from './foreground_recent_context.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -194,6 +195,9 @@ async function main(): Promise<void> {
       await cleanupOrDeferSyncAgentResources(apiKey, syncAgentId, syncBlockIds);
     }
     removePendingSubconWhisper(input.cwd, input.session_id, batchId);
+    // selected/none receipts are successful only after the release checkpoint.
+    // If this wrapper aborts before that point, leave Stop free to fallback.
+    retractUnreleasedForegroundRecallReceipt(input.cwd, input.session_id, input.turn_id);
     try { fs.unlinkSync(checkpointFile); } catch {}
     try { fs.unlinkSync(payloadFile); } catch {}
   };

@@ -42,7 +42,7 @@ import {
 import { buildCanonicalMessages, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
-import { readForegroundRecallTurnStateForMessage } from './foreground_recall_state.js';
+import { bindPendingForegroundRecallTurnsToMessages, readForegroundRecallTurnStateForMessage } from './foreground_recall_state.js';
 import { listMaintenanceQueueJobs, publishMaintenanceQueueJob, type MaintenanceQueueJob } from './maintenance_queue.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -244,6 +244,12 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
         const userMessageIds = [...new Set(canonicalMessages
           .filter((item) => item.role === 'user' && item.event_kind === 'user_text')
           .map((item) => item.message_id))];
+        const foregroundBindings = bindPendingForegroundRecallTurnsToMessages(
+          hookInput.cwd, hookInput.session_id, userMessageIds,
+        );
+        if (foregroundBindings.length > 0) {
+          log(`Bound ${foregroundBindings.length} pending foreground recall turn(s) to authoritative transcript UUIDs`);
+        }
         const foregroundRecallTurns = userMessageIds.flatMap((messageId) => {
           const turnState = readForegroundRecallTurnStateForMessage(hookInput.cwd, hookInput.session_id, messageId);
           if (!turnState) return [];
@@ -289,6 +295,7 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
         return job;
       },
       log,
+      () => listMaintenanceQueueJobs(hookInput.cwd, hookInput.session_id),
     );
 
     if (!claim) log('Another Stop hook already enqueued this transcript suffix');
