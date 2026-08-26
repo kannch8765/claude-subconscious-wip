@@ -24,6 +24,7 @@ import {
   createNativeLettaClient,
   runNativeClientToolConversation,
   type NativeClientTool,
+  type NativeClientToolRoundTelemetry,
 } from './native_letta_backfill.js';
 import { queueSubconWhisper, stableWhisperId } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
@@ -76,15 +77,27 @@ export interface LiveWorkerPayload {
   syncBlockIds?: string[];
   cleanupSyncResourcesOnFinish?: boolean;
   syncStartedAtMs?: number;
+  syncSetupReadyMs?: number;
 }
 
 type SyncCheckpointStatus = 'whisper' | 'no_whisper' | 'failed';
+
+export interface SyncDecisionTelemetry {
+  setup_ready_ms?: number;
+  retrieval_ms?: number;
+  candidate_count?: number;
+  approval_round_count: number;
+  expand_recall_count: number;
+  entity_search_count: number;
+  rounds: NativeClientToolRoundTelemetry[];
+  decision?: 'selected' | 'none';
+}
 
 function writeSyncCheckpoint(
   payload: LiveWorkerPayload,
   status: SyncCheckpointStatus,
   whisperId?: string,
-  timings: { bundle_ready_ms?: number; resolve_recall_ms?: number } = {},
+  timings: { bundle_ready_ms?: number; resolve_recall_ms?: number; telemetry?: SyncDecisionTelemetry } = {},
 ): void {
   if (payload.mode !== 'sync' || !payload.syncCheckpointFile) return;
   if (fs.existsSync(payload.syncCheckpointFile)) return;
@@ -211,6 +224,21 @@ export async function sendViaNativeClient(
   let postWhisperFailureCleanupOwned = false;
   const recallSearches: ForegroundRecallSearchReceipt[] = [];
   let foregroundBundle = undefined as Awaited<ReturnType<typeof buildForegroundRecallBundle>> | undefined;
+  let syncRetrievalMs: number | undefined;
+  let syncCandidateCount: number | undefined;
+  const syncApprovalRounds: NativeClientToolRoundTelemetry[] = [];
+  const entitySearchObservations: EntitySearchObservation[] = [];
+  let expandRecallUsed = false;
+  const syncTelemetrySnapshot = (decision?: 'selected' | 'none'): SyncDecisionTelemetry => ({
+    ...(payload.syncSetupReadyMs !== undefined ? { setup_ready_ms: payload.syncSetupReadyMs } : {}),
+    ...(syncRetrievalMs !== undefined ? { retrieval_ms: syncRetrievalMs } : {}),
+    ...(syncCandidateCount !== undefined ? { candidate_count: syncCandidateCount } : {}),
+    approval_round_count: syncApprovalRounds.length,
+    expand_recall_count: recallSearches.filter((item) => item.kind === 'expand').length,
+    entity_search_count: entitySearchObservations.length,
+    rounds: syncApprovalRounds.map((item) => ({ ...item, requested_tools: [...item.requested_tools] })),
+    ...(decision ? { decision } : {}),
+  });
   const latestForegroundRecall = !isSync && payload.latestUserMessageId
     ? payload.foregroundRecallTurns?.find((item) => item.message_id === payload.latestUserMessageId)
     : undefined;
@@ -222,14 +250,15 @@ export async function sendViaNativeClient(
     if (!apiKey) throw new Error('LETTA_API_KEY is required for native live Subconscious execution');
     const client = (dependencies.createClient ?? createNativeLettaClient)(apiKey);
 
-    const entitySearchObservations: EntitySearchObservation[] = [];
     const surfacedRecallMemories = new Map<string, SurfacedRecallMemory>();
-    let expandRecallUsed = false;
     if (isSync) {
       if (!payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
+      const retrievalStartedAt = Date.now();
       foregroundBundle = await buildForegroundRecallBundle(runtime, payload.foregroundRecallQuery ?? payload.latestUserMessage, {
         sessionId: payload.sessionId, turnId: payload.syncTurnId,
       });
+      syncRetrievalMs = Date.now() - retrievalStartedAt;
+      syncCandidateCount = foregroundBundle.candidates.length;
       persistForegroundRecallBundle(payload.cwd, foregroundBundle);
       syncBundleReadyMs = Date.now() - syncTimingOriginMs;
       registerSurfacedRecallCandidates(foregroundBundle.candidates, surfacedRecallMemories);
@@ -378,7 +407,11 @@ export async function sendViaNativeClient(
           whisper_id: whisperId,
         });
         recallResolved = true;
-        writeSyncCheckpoint(payload, 'whisper', whisperId, { bundle_ready_ms: syncBundleReadyMs, resolve_recall_ms: Date.now() - syncTimingOriginMs });
+        writeSyncCheckpoint(payload, 'whisper', whisperId, {
+          bundle_ready_ms: syncBundleReadyMs,
+          resolve_recall_ms: Date.now() - syncTimingOriginMs,
+          telemetry: syncTelemetrySnapshot('selected'),
+        });
         foregroundReleased = true;
         return { status: 'ok', whisper_id: whisperId };
       }
@@ -413,7 +446,11 @@ export async function sendViaNativeClient(
             searches: recallSearches,
           });
           recallResolved = true;
-          writeSyncCheckpoint(payload, 'no_whisper', undefined, { bundle_ready_ms: syncBundleReadyMs, resolve_recall_ms: Date.now() - syncTimingOriginMs });
+          writeSyncCheckpoint(payload, 'no_whisper', undefined, {
+            bundle_ready_ms: syncBundleReadyMs,
+            resolve_recall_ms: Date.now() - syncTimingOriginMs,
+            telemetry: syncTelemetrySnapshot('none'),
+          });
           foregroundReleased = true;
           log('Foreground recall resolved: none');
           return { status: 'ok', decision: 'none' };
@@ -491,6 +528,10 @@ ${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
         requiredClientToolNames: ['resolve_recall'],
         continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 },
         clientToolRoundGate: syncClientToolRoundGate,
+        onClientToolRound: (round) => {
+          syncApprovalRounds.push(round);
+          log(`Foreground recall model round ${round.round}: stream_ms=${round.stream_ms}, tools=${round.requested_tools.join(',') || '(none)'}`);
+        },
       });
     } else {
       const stdioMcp = await openStdioMcpToolsFromEnvironment(log);
@@ -548,7 +589,10 @@ ${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
         postWhisperFailureCleanupOwned = true;
         log(`Post-release sync failure cleanup deferred for conversation ${payload.conversationId}`);
       } else {
-        writeSyncCheckpoint(payload, 'failed', undefined, { bundle_ready_ms: syncBundleReadyMs });
+        writeSyncCheckpoint(payload, 'failed', undefined, {
+          bundle_ready_ms: syncBundleReadyMs,
+          telemetry: syncTelemetrySnapshot(),
+        });
       }
     }
   }

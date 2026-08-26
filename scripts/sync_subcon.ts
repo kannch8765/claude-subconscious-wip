@@ -51,6 +51,16 @@ interface SyncCheckpoint {
   recorded_at?: string;
   bundle_ready_ms?: number;
   resolve_recall_ms?: number;
+  telemetry?: {
+    setup_ready_ms?: number;
+    retrieval_ms?: number;
+    candidate_count?: number;
+    approval_round_count: number;
+    expand_recall_count: number;
+    entity_search_count: number;
+    rounds: Array<{ round: number; stream_ms: number; requested_tools: string[]; stop_reason?: string }>;
+    decision?: 'selected' | 'none';
+  };
 }
 
 function readStdin(): Promise<string> {
@@ -239,6 +249,7 @@ async function main(): Promise<void> {
     const recentForeground = readForegroundRecentTranscript(input.cwd, input.session_id, input.prompt, input.transcript_path);
     const recentForegroundXml = renderForegroundRecentTranscript(recentForeground);
     const foregroundRecallQuery = contextualForegroundRecallQuery(input.prompt, recentForeground, input.context ?? '');
+    const syncSetupReadyMs = Date.now() - syncStartedAtMs;
 
     const payload = {
       mode: 'sync',
@@ -258,6 +269,7 @@ async function main(): Promise<void> {
       syncTurnId: input.turn_id,
       cleanupSyncResourcesOnFinish: true,
       syncStartedAtMs,
+      syncSetupReadyMs,
     };
     fs.writeFileSync(payloadFile, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
 
@@ -279,6 +291,7 @@ async function main(): Promise<void> {
           ...(state.whisper_id ? { whisper_id: state.whisper_id } : {}),
           ...(state.bundle_ready_ms !== undefined ? { bundle_ready_ms: state.bundle_ready_ms } : {}),
           ...(state.resolve_recall_ms !== undefined ? { resolve_recall_ms: state.resolve_recall_ms } : {}),
+          ...(state.telemetry ? { telemetry: state.telemetry } : {}),
           foreground_release_ms: Date.now() - syncStartedAtMs,
         });
         // A successful whisper transfers cleanup ownership to the background
@@ -295,6 +308,7 @@ async function main(): Promise<void> {
             ...(finalState.whisper_id ? { whisper_id: finalState.whisper_id } : {}),
             ...(finalState.bundle_ready_ms !== undefined ? { bundle_ready_ms: finalState.bundle_ready_ms } : {}),
             ...(finalState.resolve_recall_ms !== undefined ? { resolve_recall_ms: finalState.resolve_recall_ms } : {}),
+            ...(finalState.telemetry ? { telemetry: finalState.telemetry } : {}),
             foreground_release_ms: Date.now() - syncStartedAtMs,
           });
           process.exit(0);

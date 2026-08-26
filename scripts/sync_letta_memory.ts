@@ -207,6 +207,14 @@ async function main(): Promise<void> {
       resolve_recall_ms: foregroundSync.resolve_recall_ms,
       foreground_release_ms: foregroundSync.foreground_release_ms,
       hook_elapsed_ms: foregroundSync.hook_elapsed_ms,
+      setup_ready_ms: foregroundSync.telemetry?.setup_ready_ms,
+      retrieval_ms: foregroundSync.telemetry?.retrieval_ms,
+      candidate_count: foregroundSync.telemetry?.candidate_count,
+      approval_round_count: foregroundSync.telemetry?.approval_round_count,
+      expand_recall_count: foregroundSync.telemetry?.expand_recall_count,
+      entity_search_count: foregroundSync.telemetry?.entity_search_count,
+      decision: foregroundSync.telemetry?.decision,
+      model_rounds_json: JSON.stringify(foregroundSync.telemetry?.rounds ?? []),
     });
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const legacyExpectedTurnId = expectedSyncTurnId(hookInput);

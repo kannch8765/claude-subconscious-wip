@@ -98,6 +98,13 @@ export interface ClientToolRoundGateContext {
 
 export type ClientToolRoundGate = (context: ClientToolRoundGateContext) => string | undefined;
 
+export interface NativeClientToolRoundTelemetry {
+  round: number;
+  stream_ms: number;
+  requested_tools: string[];
+  stop_reason?: string;
+}
+
 function normalizeToolCall(value: any): NativeClientToolRequest | null {
   if (!value) return null;
   const fn = value.function ?? value;
@@ -247,6 +254,7 @@ export async function runNativeClientToolConversation(input: {
   requiredClientToolNames?: readonly string[];
   continuationBusyRetry?: ContinuationBusyRetryPolicy;
   clientToolRoundGate?: ClientToolRoundGate;
+  onClientToolRound?: (telemetry: NativeClientToolRoundTelemetry) => void;
 }): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
@@ -255,12 +263,14 @@ export async function runNativeClientToolConversation(input: {
   const completedClientTools = new Set<string>();
   let clientToolFailure = false;
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
+  let streamStartedAt = Date.now();
   let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
     agent_id: input.agentId,
     streaming: true,
     messages: [{ role: 'user', content: input.message }],
     client_tools: schemas,
   }));
+  let responseStreamMs = Date.now() - streamStartedAt;
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const stopReason = response?.stop_reason?.stop_reason ?? response?.stop_reason?.reason ?? response?.stop_reason;
@@ -276,6 +286,16 @@ export async function runNativeClientToolConversation(input: {
       terminalSeen = terminal;
     }
     const requests = approvalRequests(messages);
+    try {
+      input.onClientToolRound?.({
+        round,
+        stream_ms: responseStreamMs,
+        requested_tools: requests.map((request) => request.name),
+        ...(stopReason ? { stop_reason: String(stopReason) } : {}),
+      });
+    } catch {
+      // Telemetry is observational only and must never alter tool execution.
+    }
     if (requests.length === 0) {
       const missingRequired = [...requiredClientToolNames].filter((name) => !completedRequiredClientTools.has(name));
       if (missingRequired.length > 0) {
@@ -313,6 +333,7 @@ export async function runNativeClientToolConversation(input: {
       approvals.push({ type: 'tool', tool_call_id: request.toolCallId, tool_return: result, status });
     }
 
+    streamStartedAt = Date.now();
     response = await collectLettaStream(await createContinuationStream(
       () => input.client.conversations.messages.create(input.conversationId, {
         agent_id: input.agentId,
@@ -322,6 +343,7 @@ export async function runNativeClientToolConversation(input: {
       }),
       input.continuationBusyRetry,
     ));
+    responseStreamMs = Date.now() - streamStartedAt;
   }
   throw new Error(`native client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
 }

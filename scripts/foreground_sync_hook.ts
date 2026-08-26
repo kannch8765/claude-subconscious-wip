@@ -37,6 +37,16 @@ export interface ForegroundSyncCliResult {
   bundle_ready_ms?: number;
   resolve_recall_ms?: number;
   foreground_release_ms?: number;
+  telemetry?: {
+    setup_ready_ms?: number;
+    retrieval_ms?: number;
+    candidate_count?: number;
+    approval_round_count: number;
+    expand_recall_count: number;
+    entity_search_count: number;
+    rounds: Array<{ round: number; stream_ms: number; requested_tools: string[]; stop_reason?: string }>;
+    decision?: 'selected' | 'none';
+  };
   error?: string;
 }
 

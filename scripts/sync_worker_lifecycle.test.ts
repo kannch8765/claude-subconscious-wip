@@ -138,6 +138,15 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         expect(checkpoint.status).toBe('whisper');
         expect(checkpoint.bundle_ready_ms).toBeGreaterThanOrEqual(0);
         expect(checkpoint.resolve_recall_ms).toBeGreaterThanOrEqual(checkpoint.bundle_ready_ms);
+        expect(checkpoint.telemetry).toEqual(expect.objectContaining({
+          retrieval_ms: expect.any(Number),
+          candidate_count: expect.any(Number),
+          approval_round_count: 0,
+          expand_recall_count: 0,
+          entity_search_count: 0,
+          rounds: [],
+          decision: 'selected',
+        }));
         // Simulate the foreground wrapper consuming the durable release point.
         fs.unlinkSync(checkpointFile);
         throw new Error('synthetic continuation failure after foreground release');

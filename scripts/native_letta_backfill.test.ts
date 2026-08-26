@@ -164,6 +164,43 @@ describe('native Letta legacy backfill harness', () => {
     expect(result.clientToolFailure).toBe(false);
   });
 
+  it('reports each model/approval response round without changing tool execution', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{\"query\":\"京都\"}', tool_call_id: 'round-0' } }], stop_reason: 'requires_approval' },
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'resolve_recall', arguments: '{\"decision\":\"none\"}', tool_call_id: 'round-1' } }], stop_reason: 'requires_approval' },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+    const rounds: any[] = [];
+    const result = await runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [
+        { name: 'memory_search', description: 'search', parameters: {}, async execute() { return { results: [] }; } },
+        { name: 'resolve_recall', description: 'resolve', parameters: {}, async execute() { return { status: 'ok' }; } },
+      ],
+      requiredClientToolNames: ['resolve_recall'],
+      onClientToolRound: (round) => rounds.push(round),
+    });
+    expect(result.clientToolFailure).toBe(false);
+    expect(rounds.map((round) => round.requested_tools)).toEqual([['memory_search'], ['resolve_recall'], []]);
+    expect(rounds.map((round) => round.round)).toEqual([0, 1, 2]);
+    expect(rounds.every((round) => Number.isInteger(round.stream_ms) && round.stream_ms >= 0)).toBe(true);
+  });
+
+  it('keeps native tool execution successful when the telemetry observer throws', async () => {
+    const client = fakeClient([
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{\"query\":\"京都\"}', tool_call_id: 'telemetry-throw' } }], stop_reason: 'requires_approval' },
+      { messages: [], stop_reason: 'end_turn' },
+    ]);
+    let toolCalls = 0;
+    const result = await runNativeClientToolConversation({
+      client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
+      tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { toolCalls += 1; return { results: [] }; } }],
+      onClientToolRound: () => { throw new Error('telemetry sink unavailable'); },
+    });
+    expect(result.clientToolFailure).toBe(false);
+    expect(toolCalls).toBe(1);
+  });
+
   it('executes local client tools through native approval returns then accepts a server terminal call', async () => {
     const client = fakeClient([
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{"query":"京都"}', tool_call_id: 'call-1' } }], stop_reason: 'requires_approval' },
