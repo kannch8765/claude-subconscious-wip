@@ -3,6 +3,7 @@ import { cleanupCompletedSyncResources, createSyncConversation, createToolStripp
 
 const originalFetch = globalThis.fetch;
 const originalAgentId = process.env.LETTA_AGENT_ID;
+const originalForegroundProfile = process.env.SUBCON_FOREGROUND_PROFILE;
 
 function fakeBlocks() {
   const labels = ['core_directives', 'guidance', 'pending_items', 'project_context', 'self_improvement', 'session_patterns', 'tool_guidelines', 'user_preferences'];
@@ -13,6 +14,8 @@ afterEach(() => {
   globalThis.fetch = originalFetch;
   if (originalAgentId === undefined) delete process.env.LETTA_AGENT_ID;
   else process.env.LETTA_AGENT_ID = originalAgentId;
+  if (originalForegroundProfile === undefined) delete process.env.SUBCON_FOREGROUND_PROFILE;
+  else process.env.SUBCON_FOREGROUND_PROFILE = originalForegroundProfile;
 });
 
 describe('tool-stripped sync sibling agent', () => {
@@ -60,6 +63,61 @@ describe('tool-stripped sync sibling agent', () => {
     const guidance = create.body.memory_blocks.find((block: any) => block.label === 'guidance');
     expect(guidance.value).toBe('LIVE GUIDANCE');
     expect(create.body.block_ids).toBeUndefined();
+  });
+
+  it('projects thin-v1 as the canonical system with zero background memory blocks', async () => {
+    process.env.LETTA_AGENT_ID = 'agent-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    process.env.SUBCON_FOREGROUND_PROFILE = 'thin-v1';
+    const requests: Array<{ url: string; method: string; body?: any }> = [];
+    globalThis.fetch = (async (input: any, init: any = {}) => {
+      const url = String(input);
+      const method = init.method ?? 'GET';
+      const body = init.body ? JSON.parse(init.body) : undefined;
+      requests.push({ url, method, body });
+      if (method === 'GET' && url.includes('/agents/agent-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')) {
+        return new Response(JSON.stringify({
+          id: process.env.LETTA_AGENT_ID,
+          blocks: fakeBlocks(),
+          model_settings: { provider_type: 'openai', parallel_tool_calls: true },
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (method === 'POST' && /\/v1\/agents\/?$/.test(url)) {
+        return new Response(JSON.stringify({
+          id: 'agent-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+          tools: [],
+          blocks: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${method} ${url}`);
+    }) as typeof fetch;
+
+    const result = await createToolStrippedSyncAgent('test-key', 'sync_thin_turn');
+    expect(result).toEqual({
+      sourceAgentId: 'agent-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      syncAgentId: 'agent-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      syncBlockIds: [],
+    });
+    const create = requests.find((request) => request.method === 'POST')!;
+    expect(create.body.memory_blocks).toEqual([]);
+    expect(create.body.system).toEqual(expect.any(String));
+    expect(create.body.system.length).toBeGreaterThan(1000);
+    expect(create.body.model).toBe('openai-proxy/mimo-v2.5');
+    expect(create.body.context_window_limit).toBe(400000);
+    expect(create.body.tools).toEqual([]);
+    expect(create.body.tool_ids).toEqual([]);
+  });
+
+  it('fails closed on an unknown foreground profile instead of silently changing semantics', async () => {
+    process.env.LETTA_AGENT_ID = 'agent-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    process.env.SUBCON_FOREGROUND_PROFILE = 'mystery';
+    globalThis.fetch = (async (input: any, init: any = {}) => {
+      const url = String(input);
+      if ((init.method ?? 'GET') === 'GET' && url.includes('/agents/agent-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')) {
+        return new Response(JSON.stringify({ id: process.env.LETTA_AGENT_ID, blocks: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      throw new Error(`unexpected request: ${init.method ?? 'GET'} ${url}`);
+    }) as typeof fetch;
+    await expect(createToolStrippedSyncAgent('test-key', 'sync_bad_profile')).rejects.toThrow('unsupported SUBCON_FOREGROUND_PROFILE: mystery');
   });
 
   it('fails closed and deletes the sibling if Letta unexpectedly attaches a server tool', async () => {

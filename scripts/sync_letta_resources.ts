@@ -10,6 +10,15 @@ const DEFERRED_CLEANUP_MIN_AGE_MS = 5 * 60_000;
 const DEFERRED_CLEANUP_PREFIX = 'sync-resource-cleanup-';
 const NETWORK_TIMEOUT_MS = 2_000;
 
+export type ForegroundSyncProfileMode = 'full' | 'thin-v1';
+
+export function foregroundSyncProfileMode(): ForegroundSyncProfileMode {
+  const raw = process.env.SUBCON_FOREGROUND_PROFILE?.trim().toLowerCase();
+  if (!raw || raw === 'full') return 'full';
+  if (raw === 'thin-v1') return 'thin-v1';
+  throw new Error(`unsupported SUBCON_FOREGROUND_PROFILE: ${raw}`);
+}
+
 export interface SyncLettaResources {
   sourceAgentId: string;
   syncAgentId: string;
@@ -88,22 +97,27 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
   const canonical = getCanonicalManagedAgentConfig();
   const surface = getCanonicalManagedAgentSurface();
   const live = await fetchManagedAgentSnapshot(apiKey, sourceAgentId);
+  const profileMode = foregroundSyncProfileMode();
   const liveBlocks = new Map<string, any>((Array.isArray(live?.blocks) ? live.blocks : []).map((block: any) => [String(block?.label ?? ''), block]));
-  const memoryBlocks = surface.blocks.map((block) => {
-    const current = liveBlocks.get(block.label);
-    return {
-      label: block.label,
-      value: typeof current?.value === 'string' ? current.value : block.value,
-      limit: typeof current?.limit === 'number' && current.limit > 0 ? current.limit : block.limit,
-      ...(block.description ? { description: block.description } : {}),
-      read_only: block.readOnly,
-    };
-  });
+  const memoryBlocks = profileMode === 'thin-v1'
+    ? []
+    : surface.blocks.map((block) => {
+        const current = liveBlocks.get(block.label);
+        return {
+          label: block.label,
+          value: typeof current?.value === 'string' ? current.value : block.value,
+          limit: typeof current?.limit === 'number' && current.limit > 0 ? current.limit : block.limit,
+          ...(block.description ? { description: block.description } : {}),
+          read_only: block.readOnly,
+        };
+      });
   if (!syncKey.trim()) throw new Error('syncKey is required for tool-stripped sync agent creation');
   const syncName = `Subconscious Sync ${syncKey}`;
   const body = {
     name: syncName,
-    description: 'Ephemeral tool-stripped sibling for one synchronous relationship-memory foreground recall.',
+    description: profileMode === 'thin-v1'
+      ? 'Ephemeral thin-v1 foreground recall sibling: canonical system with background memory blocks omitted.'
+      : 'Ephemeral tool-stripped sibling for one synchronous relationship-memory foreground recall.',
     system: canonical.system,
     agent_type: 'letta_v1_agent',
     memory_blocks: memoryBlocks,
