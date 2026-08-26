@@ -26,6 +26,8 @@ import {
 import { removePendingSubconWhisper } from './subcon_whisper_queue.js';
 import { retractUnreleasedForegroundRecallReceipt } from './foreground_recall_state.js';
 import { contextualForegroundRecallQuery, readForegroundRecentTranscript, renderForegroundRecentTranscript } from './foreground_recent_context.js';
+import type { SyncDecisionTelemetry } from './send_worker_native.js';
+import type { SyncAgentCreationTelemetry } from './sync_letta_resources.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,16 +53,13 @@ interface SyncCheckpoint {
   recorded_at?: string;
   bundle_ready_ms?: number;
   resolve_recall_ms?: number;
-  telemetry?: {
-    setup_ready_ms?: number;
-    retrieval_ms?: number;
-    candidate_count?: number;
-    approval_round_count: number;
-    expand_recall_count: number;
-    entity_search_count: number;
-    rounds: Array<{ round: number; stream_ms: number; requested_tools: string[]; stop_reason?: string }>;
-    decision?: 'selected' | 'none';
-  };
+  telemetry?: SyncDecisionTelemetry;
+}
+
+interface SyncProgressSnapshot {
+  phase: string;
+  telemetry: SyncDecisionTelemetry;
+  recorded_at?: string;
 }
 
 function readStdin(): Promise<string> {
@@ -137,6 +136,14 @@ function checkpoint(pathname: string): SyncCheckpoint | null {
   return null;
 }
 
+function progressSnapshot(pathname: string): SyncProgressSnapshot | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(pathname, 'utf8')) as SyncProgressSnapshot;
+    if (typeof parsed?.phase === 'string' && parsed.telemetry && typeof parsed.telemetry === 'object') return parsed;
+  } catch {}
+  return null;
+}
+
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -174,6 +181,7 @@ async function main(): Promise<void> {
   const nonce = `${process.pid}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const payloadFile = path.join(TEMP_STATE_DIR, `sync-payload-${nonce}.json`);
   const checkpointFile = path.join(TEMP_STATE_DIR, `sync-checkpoint-${nonce}.json`);
+  const progressFile = path.join(TEMP_STATE_DIR, `sync-progress-${nonce}.json`);
   const workerScript = path.join(__dirname, 'send_worker_native.ts');
   const tsxCli = path.join(PLUGIN_ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
   let syncAgentId: string | null = null;
@@ -181,6 +189,15 @@ async function main(): Promise<void> {
   let conversationId: string | null = null;
   let child: ChildProcess | null = null;
   let aborting = false;
+  const syncSetupTelemetry: NonNullable<import('./send_worker_native.js').LiveWorkerPayload['syncSetupTelemetry']> = {};
+  const setupTelemetrySnapshot = (progressPhase?: string): SyncDecisionTelemetry => ({
+    ...(progressPhase ? { progress_phase: progressPhase } : {}),
+    ...syncSetupTelemetry,
+    approval_round_count: 0,
+    expand_recall_count: 0,
+    entity_search_count: 0,
+    rounds: [],
+  });
   let setupSettledResolve!: () => void;
   const setupSettled = new Promise<void>((resolve) => { setupSettledResolve = resolve; });
   let setupMarkedSettled = false;
@@ -209,6 +226,7 @@ async function main(): Promise<void> {
     // If this wrapper aborts before that point, leave Stop free to fallback.
     retractUnreleasedForegroundRecallReceipt(input.cwd, input.session_id, input.turn_id);
     try { fs.unlinkSync(checkpointFile); } catch {}
+    try { fs.unlinkSync(progressFile); } catch {}
     try { fs.unlinkSync(payloadFile); } catch {}
   };
 
@@ -229,27 +247,45 @@ async function main(): Promise<void> {
 
   try {
     if (!fs.existsSync(tsxCli)) throw new Error(`tsx runtime missing: ${tsxCli}`);
+    const reapStartedAt = Date.now();
     await reapDeferredSyncResources(apiKey);
-    const sibling = await createToolStrippedSyncAgent(apiKey, batchId);
+    syncSetupTelemetry.resource_reap_ms = Date.now() - reapStartedAt;
+    let agentCreationTelemetry: SyncAgentCreationTelemetry | undefined;
+    const sibling = await createToolStrippedSyncAgent(apiKey, batchId, (telemetry) => { agentCreationTelemetry = telemetry; });
+    if (agentCreationTelemetry) {
+      const { profile: _profile, ...safeTelemetry } = agentCreationTelemetry;
+      Object.assign(syncSetupTelemetry, safeTelemetry);
+    }
     syncAgentId = sibling.syncAgentId;
     syncBlockIds = sibling.syncBlockIds;
     if (aborting) {
       markSetupSettled();
       return;
     }
+    const conversationStartedAt = Date.now();
     conversationId = await createSyncConversation(apiKey, syncAgentId);
+    syncSetupTelemetry.conversation_create_ms = Date.now() - conversationStartedAt;
     markSetupSettled();
     if (aborting) return;
     if (Date.now() >= deadline) {
+      const telemetry = setupTelemetrySnapshot('setup_timeout');
       await cleanupAbortedSync();
-      emit('timeout');
+      emit('timeout', { telemetry });
       return;
     }
 
     const recentForeground = readForegroundRecentTranscript(input.cwd, input.session_id, input.prompt, input.transcript_path);
     const recentForegroundXml = renderForegroundRecentTranscript(recentForeground);
     const foregroundRecallQuery = contextualForegroundRecallQuery(input.prompt, recentForeground, input.context ?? '');
+    const foregroundEnvelope = syncMessage(input, recentForegroundXml);
     const syncSetupReadyMs = Date.now() - syncStartedAtMs;
+    Object.assign(syncSetupTelemetry, {
+      foreground_envelope_chars: foregroundEnvelope.length,
+      recent_context_chars: recentForegroundXml.length,
+      current_context_chars: (input.context ?? '').slice(-8000).length,
+      prompt_chars: input.prompt.length,
+      recall_query_chars: foregroundRecallQuery.length,
+    });
 
     const payload = {
       mode: 'sync',
@@ -258,7 +294,7 @@ async function main(): Promise<void> {
       syncBlockIds,
       conversationId,
       sessionId: input.session_id,
-      message: syncMessage(input, recentForegroundXml),
+      message: foregroundEnvelope,
       cwd: input.cwd,
       batchId,
       canonicalMessages: [],
@@ -270,6 +306,8 @@ async function main(): Promise<void> {
       cleanupSyncResourcesOnFinish: true,
       syncStartedAtMs,
       syncSetupReadyMs,
+      syncProgressFile: progressFile,
+      syncSetupTelemetry,
     };
     fs.writeFileSync(payloadFile, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
 
@@ -287,6 +325,7 @@ async function main(): Promise<void> {
         } else {
           try { fs.unlinkSync(checkpointFile); } catch {}
         }
+        try { fs.unlinkSync(progressFile); } catch {}
         emit(state.status, {
           ...(state.whisper_id ? { whisper_id: state.whisper_id } : {}),
           ...(state.bundle_ready_ms !== undefined ? { bundle_ready_ms: state.bundle_ready_ms } : {}),
@@ -304,6 +343,7 @@ async function main(): Promise<void> {
         if (finalState) {
           if (finalState.status === 'failed') await cleanupAbortedSync();
           else try { fs.unlinkSync(checkpointFile); } catch {}
+          try { fs.unlinkSync(progressFile); } catch {}
           emit(finalState.status, {
             ...(finalState.whisper_id ? { whisper_id: finalState.whisper_id } : {}),
             ...(finalState.bundle_ready_ms !== undefined ? { bundle_ready_ms: finalState.bundle_ready_ms } : {}),
@@ -320,8 +360,12 @@ async function main(): Promise<void> {
       await wait(20);
     }
 
+    const progress = progressSnapshot(progressFile);
+    const telemetry: SyncDecisionTelemetry = progress
+      ? { ...progress.telemetry, progress_phase: progress.phase }
+      : setupTelemetrySnapshot('worker_timeout_no_progress');
     await cleanupAbortedSync();
-    emit('timeout');
+    emit('timeout', { telemetry });
   } catch (error) {
     markSetupSettled();
     await cleanupAbortedSync();

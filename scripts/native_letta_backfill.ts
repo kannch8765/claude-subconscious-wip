@@ -101,8 +101,21 @@ export type ClientToolRoundGate = (context: ClientToolRoundGateContext) => strin
 export interface NativeClientToolRoundTelemetry {
   round: number;
   stream_ms: number;
+  request_ms: number;
+  first_event_ms?: number;
+  stream_after_first_event_ms?: number;
+  event_count: number;
   requested_tools: string[];
   stop_reason?: string;
+  usage_numeric?: Record<string, number>;
+}
+
+export interface NativeClientToolStreamProgress {
+  round: number;
+  stage: 'request_created' | 'first_event';
+  elapsed_ms: number;
+  request_ms?: number;
+  first_event_ms?: number;
 }
 
 function normalizeToolCall(value: any): NativeClientToolRequest | null {
@@ -222,13 +235,34 @@ async function createContinuationStream(
   }
 }
 
-async function collectLettaStream(stream: AsyncIterable<any>): Promise<{ messages: any[]; stop_reason?: any; usage?: any }> {
+function numericUsageStatistics(value: unknown, prefix = '', output: Record<string, number> = {}): Record<string, number> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return output;
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const nextKey = prefix ? `${prefix}.${key}` : key;
+    if (typeof item === 'number' && Number.isFinite(item)) output[nextKey] = item;
+    else if (item && typeof item === 'object' && !Array.isArray(item)) numericUsageStatistics(item, nextKey, output);
+  }
+  return output;
+}
+
+async function collectLettaStream(
+  stream: AsyncIterable<any>,
+  roundStartedAt: number,
+  onFirstEvent?: (firstEventMs: number) => void,
+): Promise<{ messages: any[]; stop_reason?: any; usage?: any; first_event_ms?: number; event_count: number }> {
   const messages: any[] = [];
   let stopReason: any;
   let usage: any;
+  let firstEventMs: number | undefined;
+  let eventCount = 0;
   for await (const event of stream) {
     const type = event?.message_type ?? event?.type;
     if (type === 'ping') continue;
+    eventCount += 1;
+    if (firstEventMs === undefined) {
+      firstEventMs = Date.now() - roundStartedAt;
+      try { onFirstEvent?.(firstEventMs); } catch {}
+    }
     if (type === 'stop_reason') {
       stopReason = event;
       continue;
@@ -242,7 +276,34 @@ async function collectLettaStream(stream: AsyncIterable<any>): Promise<{ message
     }
     messages.push(event);
   }
-  return { messages, stop_reason: stopReason, usage };
+  return { messages, stop_reason: stopReason, usage, ...(firstEventMs !== undefined ? { first_event_ms: firstEventMs } : {}), event_count: eventCount };
+}
+
+async function collectConversationRound(
+  round: number,
+  create: () => Promise<AsyncIterable<any>>,
+  onProgress?: (progress: NativeClientToolStreamProgress) => void,
+): Promise<{ response: any; telemetry: Omit<NativeClientToolRoundTelemetry, 'requested_tools' | 'stop_reason'> }> {
+  const roundStartedAt = Date.now();
+  const stream = await create();
+  const requestMs = Date.now() - roundStartedAt;
+  try { onProgress?.({ round, stage: 'request_created', elapsed_ms: requestMs, request_ms: requestMs }); } catch {}
+  const response = await collectLettaStream(stream, roundStartedAt, (firstEventMs) => {
+    try { onProgress?.({ round, stage: 'first_event', elapsed_ms: firstEventMs, request_ms: requestMs, first_event_ms: firstEventMs }); } catch {}
+  });
+  const streamMs = Date.now() - roundStartedAt;
+  const firstEventMs = response.first_event_ms as number | undefined;
+  return {
+    response,
+    telemetry: {
+      round,
+      stream_ms: streamMs,
+      request_ms: requestMs,
+      ...(firstEventMs !== undefined ? { first_event_ms: firstEventMs, stream_after_first_event_ms: Math.max(0, streamMs - firstEventMs) } : {}),
+      event_count: Number(response.event_count ?? 0),
+      ...(response.usage ? { usage_numeric: numericUsageStatistics(response.usage) } : {}),
+    },
+  };
 }
 
 export async function runNativeClientToolConversation(input: {
@@ -255,6 +316,7 @@ export async function runNativeClientToolConversation(input: {
   continuationBusyRetry?: ContinuationBusyRetryPolicy;
   clientToolRoundGate?: ClientToolRoundGate;
   onClientToolRound?: (telemetry: NativeClientToolRoundTelemetry) => void;
+  onClientToolStreamProgress?: (progress: NativeClientToolStreamProgress) => void;
 }): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
@@ -263,14 +325,14 @@ export async function runNativeClientToolConversation(input: {
   const completedClientTools = new Set<string>();
   let clientToolFailure = false;
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
-  let streamStartedAt = Date.now();
-  let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
+  let roundResult = await collectConversationRound(0, () => input.client.conversations.messages.create(input.conversationId, {
     agent_id: input.agentId,
     streaming: true,
     messages: [{ role: 'user', content: input.message }],
     client_tools: schemas,
-  }));
-  let responseStreamMs = Date.now() - streamStartedAt;
+  }), input.onClientToolStreamProgress);
+  let response = roundResult.response;
+  let responseTelemetry = roundResult.telemetry;
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const stopReason = response?.stop_reason?.stop_reason ?? response?.stop_reason?.reason ?? response?.stop_reason;
@@ -288,8 +350,8 @@ export async function runNativeClientToolConversation(input: {
     const requests = approvalRequests(messages);
     try {
       input.onClientToolRound?.({
+        ...responseTelemetry,
         round,
-        stream_ms: responseStreamMs,
         requested_tools: requests.map((request) => request.name),
         ...(stopReason ? { stop_reason: String(stopReason) } : {}),
       });
@@ -333,8 +395,7 @@ export async function runNativeClientToolConversation(input: {
       approvals.push({ type: 'tool', tool_call_id: request.toolCallId, tool_return: result, status });
     }
 
-    streamStartedAt = Date.now();
-    response = await collectLettaStream(await createContinuationStream(
+    roundResult = await collectConversationRound(round + 1, () => createContinuationStream(
       () => input.client.conversations.messages.create(input.conversationId, {
         agent_id: input.agentId,
         streaming: true,
@@ -342,8 +403,9 @@ export async function runNativeClientToolConversation(input: {
         client_tools: schemas,
       }),
       input.continuationBusyRetry,
-    ));
-    responseStreamMs = Date.now() - streamStartedAt;
+    ), input.onClientToolStreamProgress);
+    response = roundResult.response;
+    responseTelemetry = roundResult.telemetry;
   }
   throw new Error(`native client-tool loop exceeded ${MAX_CLIENT_TOOL_ROUNDS} approval rounds`);
 }

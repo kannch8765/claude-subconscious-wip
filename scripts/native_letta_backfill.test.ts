@@ -166,11 +166,12 @@ describe('native Letta legacy backfill harness', () => {
 
   it('reports each model/approval response round without changing tool execution', async () => {
     const client = fakeClient([
-      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{\"query\":\"京都\"}', tool_call_id: 'round-0' } }], stop_reason: 'requires_approval' },
+      { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'memory_search', arguments: '{\"query\":\"京都\"}', tool_call_id: 'round-0' } }], stop_reason: 'requires_approval', usage: { prompt_tokens: 123, completion_tokens: 7 } },
       { messages: [{ message_type: 'approval_request_message', tool_call: { name: 'resolve_recall', arguments: '{\"decision\":\"none\"}', tool_call_id: 'round-1' } }], stop_reason: 'requires_approval' },
       { messages: [], stop_reason: 'end_turn' },
     ]);
     const rounds: any[] = [];
+    const progress: any[] = [];
     const result = await runNativeClientToolConversation({
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
       tools: [
@@ -179,11 +180,19 @@ describe('native Letta legacy backfill harness', () => {
       ],
       requiredClientToolNames: ['resolve_recall'],
       onClientToolRound: (round) => rounds.push(round),
+      onClientToolStreamProgress: (item) => progress.push(item),
     });
     expect(result.clientToolFailure).toBe(false);
     expect(rounds.map((round) => round.requested_tools)).toEqual([['memory_search'], ['resolve_recall'], []]);
     expect(rounds.map((round) => round.round)).toEqual([0, 1, 2]);
     expect(rounds.every((round) => Number.isInteger(round.stream_ms) && round.stream_ms >= 0)).toBe(true);
+    expect(rounds.every((round) => Number.isInteger(round.request_ms) && round.request_ms >= 0)).toBe(true);
+    expect(rounds.every((round) => Number.isInteger(round.first_event_ms) && round.first_event_ms >= round.request_ms)).toBe(true);
+    expect(rounds.every((round) => Number.isInteger(round.stream_after_first_event_ms) && round.stream_after_first_event_ms >= 0)).toBe(true);
+    expect(rounds.every((round) => Number.isInteger(round.event_count) && round.event_count >= 1)).toBe(true);
+    expect(rounds[0].usage_numeric).toEqual(expect.objectContaining({ prompt_tokens: 123, completion_tokens: 7 }));
+    expect(progress.filter((item) => item.stage === 'request_created')).toHaveLength(3);
+    expect(progress.filter((item) => item.stage === 'first_event')).toHaveLength(3);
   });
 
   it('keeps native tool execution successful when the telemetry observer throws', async () => {
@@ -196,6 +205,7 @@ describe('native Letta legacy backfill harness', () => {
       client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source',
       tools: [{ name: 'memory_search', description: 'search', parameters: {}, async execute() { toolCalls += 1; return { results: [] }; } }],
       onClientToolRound: () => { throw new Error('telemetry sink unavailable'); },
+      onClientToolStreamProgress: () => { throw new Error('progress sink unavailable'); },
     });
     expect(result.clientToolFailure).toBe(false);
     expect(toolCalls).toBe(1);

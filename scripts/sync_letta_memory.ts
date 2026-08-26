@@ -215,6 +215,7 @@ async function main(): Promise<void> {
       entity_search_count: foregroundSync.telemetry?.entity_search_count,
       decision: foregroundSync.telemetry?.decision,
       model_rounds_json: JSON.stringify(foregroundSync.telemetry?.rounds ?? []),
+      critical_path_json: JSON.stringify(foregroundSync.telemetry ?? {}),
     });
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const legacyExpectedTurnId = expectedSyncTurnId(hookInput);

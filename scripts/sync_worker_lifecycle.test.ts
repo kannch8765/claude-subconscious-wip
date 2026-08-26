@@ -80,6 +80,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
 
     const payloadFile = path.join(cwd, 'payload.json');
     const checkpointFile = path.join(cwd, 'checkpoint.json');
+    const progressFile = path.join(cwd, 'progress.json');
     const payload: LiveWorkerPayload = {
       mode: 'sync',
       agentId: 'agent-11111111-1111-4111-8111-111111111111',
@@ -95,6 +96,12 @@ describe('sync worker post-whisper lifecycle ownership', () => {
       latestUserMessage: '然后呢',
       foregroundRecallQuery: '咖啡',
       syncCheckpointFile: checkpointFile,
+      syncProgressFile: progressFile,
+      syncSetupTelemetry: {
+        resource_reap_ms: 3, source_agent_fetch_ms: 4, sibling_create_ms: 5, sibling_verify_ms: 0, conversation_create_ms: 6,
+        system_chars: 1000, memory_block_count: 8, memory_block_chars: 2000, model_settings_safe: { provider_type: 'openai', temperature: 0.5 },
+        foreground_envelope_chars: 300, recent_context_chars: 20, current_context_chars: 10, prompt_chars: 4, recall_query_chars: 12,
+      },
       syncTurnId: 'turn-test',
       cleanupSyncResourcesOnFinish: true,
       syncStartedAtMs: Date.now() - 100,
@@ -116,6 +123,15 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         expect(whisper).toBeFalsy();
         expect(input.requiredClientToolNames).toEqual(['resolve_recall']);
         expect(input.message).toContain('<foreground_recall_bundle');
+        const progress = JSON.parse(fs.readFileSync(progressFile, 'utf8'));
+        expect(progress.phase).toBe('model_request_ready');
+        expect(progress.telemetry).toEqual(expect.objectContaining({
+          resource_reap_ms: 3, source_agent_fetch_ms: 4, sibling_create_ms: 5, conversation_create_ms: 6,
+          worker_entry_ms: expect.any(Number), runtime_init_ms: expect.any(Number), retrieval_ms: expect.any(Number), bundle_persist_ms: expect.any(Number),
+          candidate_count: expect.any(Number), system_chars: 1000, memory_block_count: 8, memory_block_chars: 2000,
+          bundle_chars: expect.any(Number), live_message_chars: expect.any(Number), tool_schema_chars: expect.any(Number),
+          model_settings_safe: { provider_type: 'openai', temperature: 0.5 },
+        }));
         const state = readForegroundRecallTurnState(cwd, payload.sessionId, payload.syncTurnId!);
         const hit = state.bundle?.candidate_refs.find((item) => item.memory_id === 'mem-coffee-scene');
         expect(hit).toBeTruthy();
@@ -161,6 +177,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     expect(completedCleanup).toBe(0);
     expect(fs.existsSync(payloadFile)).toBe(false);
     expect(fs.existsSync(checkpointFile)).toBe(false);
+    expect(fs.existsSync(progressFile)).toBe(false);
     const pending = readPendingSubconWhispers(cwd, payload.sessionId);
     expect(pending).toHaveLength(1);
     expect(pending[0].whisper).toEqual(expect.objectContaining({ source: 'sync', turn_id: 'turn-test' }));

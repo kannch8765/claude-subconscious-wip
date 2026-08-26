@@ -19,6 +19,31 @@ export function foregroundSyncProfileMode(): ForegroundSyncProfileMode {
   throw new Error(`unsupported SUBCON_FOREGROUND_PROFILE: ${raw}`);
 }
 
+export interface SyncAgentCreationTelemetry {
+  source_agent_fetch_ms: number;
+  sibling_create_ms: number;
+  sibling_verify_ms: number;
+  profile: ForegroundSyncProfileMode;
+  system_chars: number;
+  memory_block_count: number;
+  memory_block_chars: number;
+  model_settings_safe: Record<string, string | number | boolean>;
+}
+
+function safeModelSettingsMetadata(value: unknown): Record<string, string | number | boolean> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const allowed = new Set([
+    'provider_type', 'parallel_tool_calls', 'temperature', 'top_p', 'max_output_tokens',
+    'max_tokens', 'reasoning_effort', 'frequency_penalty', 'presence_penalty', 'seed',
+  ]);
+  const result: Record<string, string | number | boolean> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (!allowed.has(key)) continue;
+    if (typeof item === 'string' || typeof item === 'boolean' || (typeof item === 'number' && Number.isFinite(item))) result[key] = item;
+  }
+  return result;
+}
+
 export interface SyncLettaResources {
   sourceAgentId: string;
   syncAgentId: string;
@@ -92,11 +117,17 @@ async function recoverConversationForAgent(apiKey: string, agentId: string): Pro
   return matches[0].id;
 }
 
-export async function createToolStrippedSyncAgent(apiKey: string, syncKey: string): Promise<{ sourceAgentId: string; syncAgentId: string; syncBlockIds: string[] }> {
+export async function createToolStrippedSyncAgent(
+  apiKey: string,
+  syncKey: string,
+  onTelemetry?: (telemetry: SyncAgentCreationTelemetry) => void,
+): Promise<{ sourceAgentId: string; syncAgentId: string; syncBlockIds: string[] }> {
   const sourceAgentId = getConfiguredAgentIdReadOnly();
   const canonical = getCanonicalManagedAgentConfig();
   const surface = getCanonicalManagedAgentSurface();
+  const sourceFetchStartedAt = Date.now();
   const live = await fetchManagedAgentSnapshot(apiKey, sourceAgentId);
+  const sourceAgentFetchMs = Date.now() - sourceFetchStartedAt;
   const profileMode = foregroundSyncProfileMode();
   const liveBlocks = new Map<string, any>((Array.isArray(live?.blocks) ? live.blocks : []).map((block: any) => [String(block?.label ?? ''), block]));
   const memoryBlocks = profileMode === 'thin-v1'
@@ -113,6 +144,11 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
       });
   if (!syncKey.trim()) throw new Error('syncKey is required for tool-stripped sync agent creation');
   const syncName = `Subconscious Sync ${syncKey}`;
+  const syncModelSettings = {
+    ...(live?.model_settings && typeof live.model_settings === 'object' && !Array.isArray(live.model_settings) ? live.model_settings : {}),
+    provider_type: canonical.modelSettingsProviderType,
+    parallel_tool_calls: canonical.parallelToolCalls,
+  };
   const body = {
     name: syncName,
     description: profileMode === 'thin-v1'
@@ -130,16 +166,13 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
     model: canonical.model,
     embedding: canonical.embedding,
     context_window_limit: canonical.contextWindowLimit,
-    model_settings: {
-      ...(live?.model_settings && typeof live.model_settings === 'object' && !Array.isArray(live.model_settings) ? live.model_settings : {}),
-      provider_type: canonical.modelSettingsProviderType,
-      parallel_tool_calls: canonical.parallelToolCalls,
-    },
+    model_settings: syncModelSettings,
     enable_sleeptime: false,
     timezone: 'UTC',
     hidden: true,
   };
   let created: any;
+  const siblingCreateStartedAt = Date.now();
   try {
     const response = await boundedFetch(buildLettaApiUrl('/agents/'), {
       method: 'POST',
@@ -156,11 +189,14 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
     if (!recovered) throw error;
     created = recovered;
   }
+  const siblingCreateMs = Date.now() - siblingCreateStartedAt;
   const syncAgentId = typeof created?.id === 'string' ? created.id : '';
   if (!syncAgentId) throw new Error('Letta did not return an id for the tool-stripped sync agent');
   let verified = created;
+  let siblingVerifyMs = 0;
   if (!Array.isArray(verified?.tools) || !Array.isArray(verified?.blocks)) {
-    try { verified = await fetchSyncAgentSnapshot(apiKey, syncAgentId); }
+    const verifyStartedAt = Date.now();
+    try { verified = await fetchSyncAgentSnapshot(apiKey, syncAgentId); siblingVerifyMs = Date.now() - verifyStartedAt; }
     catch (error) {
       // We know the agent id but not its newly-created block ids. Preserve an
       // agent-only cleanup receipt; the reaper will re-fetch the snapshot before
@@ -180,6 +216,20 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
     await cleanupOrDeferSyncAgentResources(apiKey, syncAgentId, syncBlockIds);
     if (attachedTools.length !== 0) throw new Error(`Tool-stripped sync agent unexpectedly has ${attachedTools.length} server tools`);
     throw new Error(`Tool-stripped sync agent returned an invalid block snapshot: ids=${syncBlockIds.length}, labels=${actualLabels.join(',')}`);
+  }
+  try {
+    onTelemetry?.({
+      source_agent_fetch_ms: sourceAgentFetchMs,
+      sibling_create_ms: siblingCreateMs,
+      sibling_verify_ms: siblingVerifyMs,
+      profile: profileMode,
+      system_chars: canonical.system.length,
+      memory_block_count: memoryBlocks.length,
+      memory_block_chars: memoryBlocks.reduce((sum, block) => sum + block.value.length, 0),
+      model_settings_safe: safeModelSettingsMetadata(syncModelSettings),
+    });
+  } catch {
+    // Resource telemetry is observational only.
   }
   return { sourceAgentId, syncAgentId, syncBlockIds };
 }

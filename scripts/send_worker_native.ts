@@ -25,6 +25,7 @@ import {
   runNativeClientToolConversation,
   type NativeClientTool,
   type NativeClientToolRoundTelemetry,
+  type NativeClientToolStreamProgress,
 } from './native_letta_backfill.js';
 import { queueSubconWhisper, stableWhisperId } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
@@ -78,18 +79,57 @@ export interface LiveWorkerPayload {
   cleanupSyncResourcesOnFinish?: boolean;
   syncStartedAtMs?: number;
   syncSetupReadyMs?: number;
+  syncProgressFile?: string;
+  syncSetupTelemetry?: {
+    resource_reap_ms?: number;
+    source_agent_fetch_ms?: number;
+    sibling_create_ms?: number;
+    sibling_verify_ms?: number;
+    conversation_create_ms?: number;
+    system_chars?: number;
+    memory_block_count?: number;
+    memory_block_chars?: number;
+    model_settings_safe?: Record<string, string | number | boolean>;
+    foreground_envelope_chars?: number;
+    recent_context_chars?: number;
+    current_context_chars?: number;
+    prompt_chars?: number;
+    recall_query_chars?: number;
+  };
 }
 
 type SyncCheckpointStatus = 'whisper' | 'no_whisper' | 'failed';
 
 export interface SyncDecisionTelemetry {
+  progress_phase?: string;
   setup_ready_ms?: number;
+  resource_reap_ms?: number;
+  source_agent_fetch_ms?: number;
+  sibling_create_ms?: number;
+  sibling_verify_ms?: number;
+  conversation_create_ms?: number;
+  worker_entry_ms?: number;
+  runtime_init_ms?: number;
   retrieval_ms?: number;
+  bundle_persist_ms?: number;
   candidate_count?: number;
+  system_chars?: number;
+  memory_block_count?: number;
+  memory_block_chars?: number;
+  foreground_envelope_chars?: number;
+  recent_context_chars?: number;
+  current_context_chars?: number;
+  prompt_chars?: number;
+  recall_query_chars?: number;
+  bundle_chars?: number;
+  live_message_chars?: number;
+  tool_schema_chars?: number;
+  model_settings_safe?: Record<string, string | number | boolean>;
   approval_round_count: number;
   expand_recall_count: number;
   entity_search_count: number;
   rounds: NativeClientToolRoundTelemetry[];
+  active_stream?: NativeClientToolStreamProgress;
   decision?: 'selected' | 'none';
 }
 
@@ -113,6 +153,19 @@ function writeSyncCheckpoint(
   }
 }
 
+
+function writeSyncProgress(payload: LiveWorkerPayload, phase: string, telemetry: SyncDecisionTelemetry): void {
+  if (payload.mode !== 'sync' || !payload.syncProgressFile) return;
+  try {
+    const dir = path.dirname(payload.syncProgressFile);
+    fs.mkdirSync(dir, { recursive: true });
+    const temp = `${payload.syncProgressFile}.${process.pid}.${Date.now()}.tmp`;
+    fs.writeFileSync(temp, `${JSON.stringify({ phase, telemetry, recorded_at: new Date().toISOString() })}\n`, { mode: 0o600 });
+    fs.renameSync(temp, payload.syncProgressFile);
+  } catch {
+    // Progress telemetry is observational only and must never affect recall.
+  }
+}
 
 function escapeXml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -205,8 +258,11 @@ export async function sendViaNativeClient(
   const assistantIntents = payload.assistantIntents ?? [];
   const canonicalMessages = payload.canonicalMessages ?? [];
   const syncTimingOriginMs = payload.syncStartedAtMs ?? Date.now();
+  const syncWorkerEntryMs = Date.now() - syncTimingOriginMs;
   let syncBundleReadyMs: number | undefined;
+  const runtimeInitStartedAt = Date.now();
   const runtime = createRuntime(canonicalMessages, subjectId, relationshipMemoryRoot(), assistantIntents);
+  const syncRuntimeInitMs = Date.now() - runtimeInitStartedAt;
 
   if (!isSync) {
     const latest = [...runtime.store.listBatches()].reverse().find((item) => item.batch_id === payload.batchId);
@@ -225,20 +281,34 @@ export async function sendViaNativeClient(
   const recallSearches: ForegroundRecallSearchReceipt[] = [];
   let foregroundBundle = undefined as Awaited<ReturnType<typeof buildForegroundRecallBundle>> | undefined;
   let syncRetrievalMs: number | undefined;
+  let syncBundlePersistMs: number | undefined;
   let syncCandidateCount: number | undefined;
+  let syncBundleChars: number | undefined;
+  let syncLiveMessageChars: number | undefined;
+  let syncToolSchemaChars: number | undefined;
+  let syncActiveStream: NativeClientToolStreamProgress | undefined;
   const syncApprovalRounds: NativeClientToolRoundTelemetry[] = [];
   const entitySearchObservations: EntitySearchObservation[] = [];
   let expandRecallUsed = false;
   const syncTelemetrySnapshot = (decision?: 'selected' | 'none'): SyncDecisionTelemetry => ({
     ...(payload.syncSetupReadyMs !== undefined ? { setup_ready_ms: payload.syncSetupReadyMs } : {}),
+    ...(payload.syncSetupTelemetry ?? {}),
+    worker_entry_ms: syncWorkerEntryMs,
+    runtime_init_ms: syncRuntimeInitMs,
     ...(syncRetrievalMs !== undefined ? { retrieval_ms: syncRetrievalMs } : {}),
+    ...(syncBundlePersistMs !== undefined ? { bundle_persist_ms: syncBundlePersistMs } : {}),
     ...(syncCandidateCount !== undefined ? { candidate_count: syncCandidateCount } : {}),
+    ...(syncBundleChars !== undefined ? { bundle_chars: syncBundleChars } : {}),
+    ...(syncLiveMessageChars !== undefined ? { live_message_chars: syncLiveMessageChars } : {}),
+    ...(syncToolSchemaChars !== undefined ? { tool_schema_chars: syncToolSchemaChars } : {}),
     approval_round_count: syncApprovalRounds.length,
     expand_recall_count: recallSearches.filter((item) => item.kind === 'expand').length,
     entity_search_count: entitySearchObservations.length,
-    rounds: syncApprovalRounds.map((item) => ({ ...item, requested_tools: [...item.requested_tools] })),
+    rounds: syncApprovalRounds.map((item) => ({ ...item, requested_tools: [...item.requested_tools], ...(item.usage_numeric ? { usage_numeric: { ...item.usage_numeric } } : {}) })),
+    ...(syncActiveStream ? { active_stream: { ...syncActiveStream } } : {}),
     ...(decision ? { decision } : {}),
   });
+  if (isSync) writeSyncProgress(payload, 'runtime_ready', syncTelemetrySnapshot());
   const latestForegroundRecall = !isSync && payload.latestUserMessageId
     ? payload.foregroundRecallTurns?.find((item) => item.message_id === payload.latestUserMessageId)
     : undefined;
@@ -259,11 +329,14 @@ export async function sendViaNativeClient(
       });
       syncRetrievalMs = Date.now() - retrievalStartedAt;
       syncCandidateCount = foregroundBundle.candidates.length;
+      const persistStartedAt = Date.now();
       persistForegroundRecallBundle(payload.cwd, foregroundBundle);
+      syncBundlePersistMs = Date.now() - persistStartedAt;
       syncBundleReadyMs = Date.now() - syncTimingOriginMs;
       registerSurfacedRecallCandidates(foregroundBundle.candidates, surfacedRecallMemories);
       recallSearches.push({ kind: 'prefetch', query_sha256: foregroundBundle.query_sha256, memory_ids: foregroundBundle.candidates.map((item) => item.memory_id) });
       log(`Foreground recall bundle prepared: candidates=${foregroundBundle.candidates.length}, bundle_id=${foregroundBundle.bundle_id}, bundle_ready_ms=${syncBundleReadyMs}`);
+      writeSyncProgress(payload, 'bundle_ready', syncTelemetrySnapshot());
     }
     const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId);
     const modeRelationshipTools = isSync
@@ -500,14 +573,22 @@ export async function sendViaNativeClient(
       return stored;
     });
 
+    const renderedForegroundBundle = isSync && foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : '';
     const liveMessage = isSync
       ? `${payload.message}
 
-${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
+${renderedForegroundBundle}`
       : [
           appendTrustedRelationshipCatalog(payload.message, canonicalMessages, durableAssistantIntents),
           renderForegroundRecallReceiptCatalog(payload.foregroundRecallTurns ?? []),
         ].filter(Boolean).join('\n\n');
+
+    if (isSync) {
+      syncBundleChars = renderedForegroundBundle.length;
+      syncLiveMessageChars = liveMessage.length;
+      syncToolSchemaChars = JSON.stringify(relationshipTools.map(({ name, description, parameters }) => ({ name, description, parameters }))).length;
+      writeSyncProgress(payload, 'model_request_ready', syncTelemetrySnapshot());
+    }
 
     log(`Starting native live Subconscious turn for conversation ${payload.conversationId}`);
     log(`  agent: ${payload.agentId}`);
@@ -528,9 +609,16 @@ ${foregroundBundle ? renderForegroundRecallBundle(foregroundBundle) : ''}`
         requiredClientToolNames: ['resolve_recall'],
         continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 },
         clientToolRoundGate: syncClientToolRoundGate,
+        onClientToolStreamProgress: (progress) => {
+          if (foregroundReleased) return;
+          syncActiveStream = progress;
+          writeSyncProgress(payload, `model_${progress.stage}`, syncTelemetrySnapshot());
+        },
         onClientToolRound: (round) => {
           syncApprovalRounds.push(round);
-          log(`Foreground recall model round ${round.round}: stream_ms=${round.stream_ms}, tools=${round.requested_tools.join(',') || '(none)'}`);
+          syncActiveStream = undefined;
+          if (!foregroundReleased) writeSyncProgress(payload, 'model_round_complete', syncTelemetrySnapshot());
+          log(`Foreground recall model round ${round.round}: stream_ms=${round.stream_ms}, request_ms=${round.request_ms}, first_event_ms=${round.first_event_ms ?? 'none'}, tools=${round.requested_tools.join(',') || '(none)'}`);
         },
       });
     } else {
@@ -660,6 +748,7 @@ export async function runNativeWorkerPayloadFile(
   const completion = await runNativeWorkerPayload(payload, dependencies);
 
   try { fs.unlinkSync(payloadFile); } catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
+  try { if (payload.syncProgressFile) fs.unlinkSync(payload.syncProgressFile); } catch (error: any) { if (error?.code !== 'ENOENT') throw error; }
   log('Cleaned up payload file');
   log('Native live worker completed successfully');
   return completion;

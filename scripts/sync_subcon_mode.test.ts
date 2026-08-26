@@ -100,6 +100,14 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(sync).toContain('syncStartedAtMs');
     expect(worker).toContain('bundle_ready_ms');
     expect(worker).toContain('resolve_recall_ms');
+    expect(worker).toContain("writeSyncProgress(payload, 'runtime_ready'");
+    expect(worker).toContain("writeSyncProgress(payload, 'bundle_ready'");
+    expect(worker).toContain("writeSyncProgress(payload, 'model_request_ready'");
+    expect(worker).toContain('onClientToolStreamProgress');
+    expect(sync).toContain('progressSnapshot(progressFile)');
+    expect(sync).toContain("emit('timeout', { telemetry })");
+    expect(sync).toContain('syncSetupTelemetry.resource_reap_ms');
+    expect(sync).toContain('syncSetupTelemetry.conversation_create_ms');
     expect(sync).toContain('readForegroundRecentTranscript');
     expect(sync).not.toContain('must complete at least one relationship memory_search');
     expect(sync).toContain('cleanupSyncResourcesOnFinish: true');
@@ -111,7 +119,7 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(sync).toContain('removePendingSubconWhisper(input.cwd, input.session_id, batchId)');
     expect(sync).toContain('retractUnreleasedForegroundRecallReceipt(input.cwd, input.session_id, input.turn_id)');
     expect(sync).toContain("process.once('SIGTERM'");
-    expect(sync.indexOf("process.once('SIGTERM'")).toBeLessThan(sync.indexOf('createToolStrippedSyncAgent(apiKey, batchId)'));
+    expect(sync.indexOf("process.once('SIGTERM'")).toBeLessThan(sync.indexOf('createToolStrippedSyncAgent(apiKey, batchId,'));
     expect(resources).toContain('getConfiguredAgentIdReadOnly');
     expect(resources).toContain('tool_ids: []');
     expect(resources).toContain('include_base_tools: false');

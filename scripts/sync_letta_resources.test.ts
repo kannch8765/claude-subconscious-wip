@@ -44,7 +44,8 @@ describe('tool-stripped sync sibling agent', () => {
       throw new Error(`unexpected request: ${method} ${url}`);
     }) as typeof fetch;
 
-    const result = await createToolStrippedSyncAgent('test-key', 'sync_test_turn');
+    let telemetry: any;
+    const result = await createToolStrippedSyncAgent('test-key', 'sync_test_turn', (value) => { telemetry = value; });
     expect(result).toEqual({
       sourceAgentId: 'agent-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
       syncAgentId: 'agent-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
@@ -60,6 +61,16 @@ describe('tool-stripped sync sibling agent', () => {
     expect(create.body.model).toBe('openai-proxy/mimo-v2.5');
     expect(create.body.context_window_limit).toBe(400000);
     expect(create.body.model_settings).toEqual(expect.objectContaining({ provider_type: 'openai', parallel_tool_calls: true, max_output_tokens: 16384, temperature: 1.0 }));
+    expect(telemetry).toEqual(expect.objectContaining({
+      source_agent_fetch_ms: expect.any(Number),
+      sibling_create_ms: expect.any(Number),
+      sibling_verify_ms: 0,
+      profile: 'full',
+      system_chars: expect.any(Number),
+      memory_block_count: 8,
+      memory_block_chars: expect.any(Number),
+      model_settings_safe: expect.objectContaining({ provider_type: 'openai', parallel_tool_calls: true, max_output_tokens: 16384, temperature: 1.0 }),
+    }));
     const guidance = create.body.memory_blocks.find((block: any) => block.label === 'guidance');
     expect(guidance.value).toBe('LIVE GUIDANCE');
     expect(create.body.block_ids).toBeUndefined();
