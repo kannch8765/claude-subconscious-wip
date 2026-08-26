@@ -329,9 +329,18 @@ export function bindPendingForegroundRecallTurnsToTranscriptUnlocked(
           } else if (selfBindable && nextBindable && nextUser) {
             candidates = [anchor.last_user_message_id, nextUser];
           } else if (!nextUser) {
-            // Current may be the tail user or a not-yet-appended next user. Wait for
-            // either a parent edge or a new user record; never guess the tail UUID.
-            targetNotYetPresent = true;
+            if (selfBindable) {
+              // The anchor user itself is already inside the maintenance suffix,
+              // so the cursor may advance past it after this Stop. With no exact
+              // parent edge we cannot distinguish "current already appended" from
+              // "next user not appended yet". Retire this turn unbound now rather
+              // than carrying an ambiguous anchor across Stops and later binding it
+              // to the next real user UUID.
+            } else {
+              // No possible current target is in this maintenance suffix yet. Keep
+              // the pending prefix blocked until a real next user UUID is durable.
+              targetNotYetPresent = true;
+            }
           }
         }
       }
