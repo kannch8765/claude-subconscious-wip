@@ -310,15 +310,20 @@ export function bindPendingForegroundRecallTurnsToTranscriptUnlocked(
         else if (bindable.has(nextUser)) candidates = [nextUser];
       } else {
         const semanticCandidates = [anchor.last_user_message_id, ...(nextUser ? [nextUser] : [])];
-        const responded = semanticCandidates.filter((candidate) => records.some((item) =>
-          item.role === 'assistant' && item.parent_message_id === candidate,
-        ));
-        const respondedBindable = [...new Set(responded.filter((candidate) => bindable.has(candidate)))];
-        if (respondedBindable.length > 0) {
-          // Raw parentUuid is an exact transcript graph edge: if exactly one of the
-          // two structural interpretations actually owns the assistant response,
-          // it identifies the foreground user without prompt/timestamp heuristics.
-          candidates = respondedBindable;
+        const semanticCandidateSet = new Set(semanticCandidates);
+        const firstRespondedBindable = anchorIndex >= 0
+          ? records.slice(anchorIndex + 1).find((item) =>
+              item.role === 'assistant'
+              && Boolean(item.parent_message_id)
+              && semanticCandidateSet.has(item.parent_message_id!)
+              && bindable.has(item.parent_message_id!),
+            )?.parent_message_id
+          : undefined;
+        if (firstRespondedBindable) {
+          // Raw parentUuid plus transcript order is an exact structural edge. A later
+          // user's own response must not make an earlier self-anchored foreground
+          // turn ambiguous after several fast-chat turns accumulate before one Stop.
+          candidates = [firstRespondedBindable];
         } else {
           const selfBindable = bindable.has(anchor.last_user_message_id);
           const nextBindable = Boolean(nextUser && bindable.has(nextUser));

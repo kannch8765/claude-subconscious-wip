@@ -123,6 +123,36 @@ describe('foreground recall bundle and receipt', () => {
     expect(listPendingForegroundRecallTurns(cwd, 'session-a')).toEqual([]);
   });
 
+  it('binds multiple self-anchored fast-chat turns from the earliest exact parent edge in one Stop', () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-fast-chat-one-stop-'));
+    dirs.push(cwd);
+    const u0: any = { type: 'user', uuid: 'user-0', message: { content: [{ type: 'text', text: 'same prompt' }] } };
+    const a0: any = { type: 'assistant', uuid: 'assistant-0', parentUuid: 'user-0', message: { content: [{ type: 'text', text: 'reply 0' }] } };
+    const u1: any = { type: 'user', uuid: 'user-1', message: { content: [{ type: 'text', text: 'middle' }] } };
+    const a1: any = { type: 'assistant', uuid: 'assistant-1', parentUuid: 'user-1', message: { content: [{ type: 'text', text: 'reply 1' }] } };
+    const u2: any = { type: 'user', uuid: 'user-2', message: { content: [{ type: 'text', text: 'same prompt' }] } };
+    const a2: any = { type: 'assistant', uuid: 'assistant-2', parentUuid: 'user-2', message: { content: [{ type: 'text', text: 'reply 2' }] } };
+
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-0', {
+      tail_role: 'user', tail_message_id: 'user-0', last_user_message_id: 'user-0',
+    });
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-1', {
+      tail_role: 'user', tail_message_id: 'user-1', last_user_message_id: 'user-1',
+    });
+    registerPendingForegroundRecallTurn(cwd, 'session-a', 'fg-2', {
+      tail_role: 'user', tail_message_id: 'user-2', last_user_message_id: 'user-2',
+    });
+
+    const result = bindPendingForegroundRecallTurnsToTranscript(
+      cwd, 'session-a', [u0, a0, u1, a1, u2, a2], ['user-0', 'user-1', 'user-2'],
+    );
+    expect(result.bindings.map((item) => [item.turn_id, item.message_id])).toEqual([
+      ['fg-0', 'user-0'], ['fg-1', 'user-1'], ['fg-2', 'user-2'],
+    ]);
+    expect(result.retired_unbound_turn_ids).toEqual([]);
+    expect(listPendingForegroundRecallTurns(cwd, 'session-a')).toEqual([]);
+  });
+
   it('does not bind N+1 to N while the next real user UUID has not reached the transcript', () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'foreground-recall-fast-chat-anchor-'));
     dirs.push(cwd);
