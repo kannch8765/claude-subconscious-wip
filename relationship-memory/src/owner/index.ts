@@ -45,7 +45,39 @@ export class RelationshipMemoryOwnerControlPlane {
     for (const rev of this.history(memoryId)) { latest = rev; if (rev.action === 'revise' && rev.replacement) semantic = rev.replacement; else if (rev.action === 'deactivate') status = 'inactive'; else if (rev.action === 'restore') status = 'active'; }
     return { ...genesis, ...semantic, status, owner_corrected: Boolean(latest), ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}) };
   }
-  listEffective(): EffectiveMemoryRecord[] { return this.store.listMemories().map((m) => this.getEffective(m.memory_id)!).filter(Boolean); }
+  listEffective(): EffectiveMemoryRecord[] {
+    const revisionsByMemory = new Map<string, OwnerRevisionRecord[]>();
+    for (const revision of this.store.listOwnerRevisions()) {
+      const revisions = revisionsByMemory.get(revision.memory_id) ?? [];
+      revisions.push(revision);
+      revisionsByMemory.set(revision.memory_id, revisions);
+    }
+
+    return this.store.listMemories().map((genesis) => {
+      let semantic: OwnerSemanticContent = {
+        kind: genesis.kind,
+        summary: genesis.summary,
+        participants: genesis.participants,
+        payload: genesis.payload,
+        ...(genesis.linked_memory_ids ? { linked_memory_ids: genesis.linked_memory_ids } : {}),
+      };
+      let status: 'active'|'inactive' = 'active';
+      let latest: OwnerRevisionRecord | undefined;
+      for (const revision of revisionsByMemory.get(genesis.memory_id) ?? []) {
+        latest = revision;
+        if (revision.action === 'revise' && revision.replacement) semantic = revision.replacement;
+        else if (revision.action === 'deactivate') status = 'inactive';
+        else if (revision.action === 'restore') status = 'active';
+      }
+      return {
+        ...genesis,
+        ...semantic,
+        status,
+        owner_corrected: Boolean(latest),
+        ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}),
+      };
+    });
+  }
   search(query: EffectiveSearchQuery = {}): EffectiveMemoryRecord[] {
     const needle = query.query?.trim().toLowerCase();
     return this.listEffective().filter((m) => {
