@@ -66,6 +66,7 @@ async function main(): Promise<void> {
 
   const state = loadBackfillState(statePath);
   const agentId = await getBackfillAgentId(apiKey, () => {}, { agentId: args.agentId });
+  await configureVerifiedOmenBackfillRuntime(apiKey, agentId, (message) => console.error(`[backfill] ${message}`));
   if (state.agent_id && state.agent_id !== agentId) {
     throw new Error(`Backfill state is bound to a different agent (${state.agent_id}); use a new checkpoint file.`);
   }
