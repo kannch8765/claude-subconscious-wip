@@ -1,4 +1,4 @@
-import type { EffectiveMemoryRecord, MemoryKind, OwnerRevisionRecord, OwnerSemanticContent } from '../schema/index.js';
+import type { CanonicalMemoryRecord, EffectiveMemoryRecord, MemoryKind, OwnerRevisionRecord, OwnerSemanticContent } from '../schema/index.js';
 import { validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 
@@ -11,6 +11,31 @@ function nonEmpty(value: unknown, field: string): string {
   return value.trim();
 }
 function note(value: unknown): string | undefined { return value === undefined ? undefined : nonEmpty(value, 'note'); }
+
+export function materializeEffectiveMemory(genesis: CanonicalMemoryRecord, revisions: OwnerRevisionRecord[]): EffectiveMemoryRecord {
+  let semantic: OwnerSemanticContent = {
+    kind: genesis.kind, summary: genesis.summary, participants: genesis.participants, payload: genesis.payload,
+    ...(genesis.linked_memory_ids ? { linked_memory_ids: genesis.linked_memory_ids } : {}),
+  };
+  let status: 'active'|'inactive' = 'active';
+  let latest: OwnerRevisionRecord | undefined;
+  for (const revision of revisions) {
+    latest = revision;
+    if (revision.action === 'revise' && revision.replacement) semantic = revision.replacement;
+    else if (revision.action === 'deactivate') status = 'inactive';
+    else if (revision.action === 'restore') status = 'active';
+  }
+  // Owner revisions replace the complete semantic surface. Omitted optional fields
+  // therefore clear genesis values instead of accidentally inheriting them.
+  const { linked_memory_ids: _genesisLinkedMemoryIds, ...authoritativeGenesis } = genesis;
+  return {
+    ...authoritativeGenesis,
+    ...semantic,
+    status,
+    owner_corrected: Boolean(latest),
+    ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}),
+  };
+}
 
 function validateReplacement(input: OwnerReviseCommand, evidenceIds: string[]): OwnerSemanticContent {
   const allowed = new Set(['revision_id','note','kind','summary','participants','payload','linked_memory_ids']);
@@ -39,11 +64,8 @@ export class RelationshipMemoryOwnerControlPlane {
   history(memoryId: string) { return this.store.listOwnerRevisions().filter((r) => r.memory_id === memoryId); }
 
   getEffective(memoryId: string): EffectiveMemoryRecord | undefined {
-    const genesis = this.store.getMemory(memoryId); if (!genesis) return undefined;
-    let semantic: OwnerSemanticContent = { kind: genesis.kind, summary: genesis.summary, participants: genesis.participants, payload: genesis.payload, ...(genesis.linked_memory_ids ? { linked_memory_ids: genesis.linked_memory_ids } : {}) };
-    let status: 'active'|'inactive' = 'active'; let latest: OwnerRevisionRecord | undefined;
-    for (const rev of this.history(memoryId)) { latest = rev; if (rev.action === 'revise' && rev.replacement) semantic = rev.replacement; else if (rev.action === 'deactivate') status = 'inactive'; else if (rev.action === 'restore') status = 'active'; }
-    return { ...genesis, ...semantic, status, owner_corrected: Boolean(latest), ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}) };
+    const genesis = this.store.getMemory(memoryId);
+    return genesis ? materializeEffectiveMemory(genesis, this.history(memoryId)) : undefined;
   }
   listEffective(): EffectiveMemoryRecord[] {
     const revisionsByMemory = new Map<string, OwnerRevisionRecord[]>();
@@ -53,30 +75,9 @@ export class RelationshipMemoryOwnerControlPlane {
       revisionsByMemory.set(revision.memory_id, revisions);
     }
 
-    return this.store.listMemories().map((genesis) => {
-      let semantic: OwnerSemanticContent = {
-        kind: genesis.kind,
-        summary: genesis.summary,
-        participants: genesis.participants,
-        payload: genesis.payload,
-        ...(genesis.linked_memory_ids ? { linked_memory_ids: genesis.linked_memory_ids } : {}),
-      };
-      let status: 'active'|'inactive' = 'active';
-      let latest: OwnerRevisionRecord | undefined;
-      for (const revision of revisionsByMemory.get(genesis.memory_id) ?? []) {
-        latest = revision;
-        if (revision.action === 'revise' && revision.replacement) semantic = revision.replacement;
-        else if (revision.action === 'deactivate') status = 'inactive';
-        else if (revision.action === 'restore') status = 'active';
-      }
-      return {
-        ...genesis,
-        ...semantic,
-        status,
-        owner_corrected: Boolean(latest),
-        ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}),
-      };
-    });
+    return this.store.listMemories().map((genesis) =>
+      materializeEffectiveMemory(genesis, revisionsByMemory.get(genesis.memory_id) ?? []),
+    );
   }
   search(query: EffectiveSearchQuery = {}): EffectiveMemoryRecord[] {
     const needle = query.query?.trim().toLowerCase();
