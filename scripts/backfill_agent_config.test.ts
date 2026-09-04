@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getCanonicalManagedAgentConfig, getCanonicalManagedSystemPrompt } from './agent_config.js';
-import { BACKFILL_PURPOSE_TAG, configureVerifiedLegacyFillRuntime, getBackfillAgentId, LEGACY_FILL_VERIFIED_RUNTIME } from './backfill_agent_config.js';
+import { BACKFILL_PURPOSE_TAG, configureVerifiedLegacyFillRuntime, configureVerifiedOmenBackfillRuntime, getBackfillAgentId, LEGACY_FILL_VERIFIED_RUNTIME, OMEN_BACKFILL_VERIFIED_RUNTIME } from './backfill_agent_config.js';
 
 const LIVE = 'agent-11111111-1111-4111-8111-111111111111';
 const BACKFILL = 'agent-22222222-2222-4222-8222-222222222222';
@@ -59,7 +59,7 @@ describe('dedicated historical backfill agent resolver', () => {
           model: profile.model,
           embedding: profile.embedding,
           context_window_limit: profile.contextWindow,
-          model_settings: { provider_type: 'deepseek', parallel_tool_calls: true },
+          model_settings: { provider_type: profile.providerType, parallel_tool_calls: true },
         });
         patched = true;
         return jsonResponse({ ok: true });
@@ -77,6 +77,39 @@ describe('dedicated historical backfill agent resolver', () => {
     await expect(configureVerifiedLegacyFillRuntime('test-key', BACKFILL, (message) => logs.push(message))).resolves.toBeUndefined();
     expect(logs.join(' ')).toContain('context=400000');
     expect(logs.join(' ')).toContain('parallel_tool_calls=true');
+  });
+
+
+  it('applies and verifies the bounded Omen Alpha backfill runtime profile without changing the canonical default', async () => {
+    const profile = OMEN_BACKFILL_VERIFIED_RUNTIME;
+    expect(getCanonicalManagedAgentConfig(BACKFILL_AF).model).toBe(LEGACY_FILL_VERIFIED_RUNTIME.model);
+    let patched = false;
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input); expect(url).toContain(`/agents/${BACKFILL}`);
+      if ((init?.method ?? 'GET') === 'PATCH') {
+        const body = JSON.parse(String(init?.body)) as Record<string, any>;
+        expect(body).toEqual({
+          model: profile.model,
+          embedding: profile.embedding,
+          context_window_limit: profile.contextWindow,
+          model_settings: { provider_type: profile.providerType, parallel_tool_calls: true },
+        });
+        patched = true;
+        return jsonResponse({ ok: true });
+      }
+      expect(patched).toBe(true);
+      return jsonResponse({
+        id: BACKFILL,
+        model: profile.model,
+        embedding: profile.embedding,
+        llm_config: { handle: profile.model, context_window: profile.contextWindow, parallel_tool_calls: true },
+        model_settings: { provider_type: profile.providerType, parallel_tool_calls: true },
+      });
+    }));
+    const logs: string[] = [];
+    await expect(configureVerifiedOmenBackfillRuntime('test-key', BACKFILL, (message) => logs.push(message))).resolves.toBeUndefined();
+    expect(logs.join(' ')).toContain('Omen Alpha');
+    expect(logs.join(' ')).toContain('context=400000');
   });
 
   it('tolerates a briefly stale GET after applying the verified runtime profile', async () => {
