@@ -22,7 +22,7 @@ jobs:
           node-version: '22'
           cache: npm
       - name: Apply task 06 implementation
-        run: python scripts/task_06_apply.py
+        run: python scripts/task_06_prepatch.py && python scripts/task_06_apply.py
       - name: Install dependencies
         run: npm ci
       - name: Targeted regression suite
@@ -68,7 +68,7 @@ jobs:
       - name: Commit verified implementation
         shell: bash
         run: |
-          rm scripts/task_06_apply.py .github/workflows/task-06-apply.yml
+          rm scripts/task_06_apply.py scripts/task_06_prepatch.py .github/workflows/task-06-apply.yml
           git diff --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
