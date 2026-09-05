@@ -87,7 +87,7 @@ describe('Subcon foreground whisper queue', () => {
 });
 
 it('retracts only the exact pending sync turn without touching async or another sync turn', () => {
-  const cwd = temp('subcon-whisper-retract-');
+  const cwd = temp();
   queueSubconWhisper(cwd, 'session-a', 'async-a', 'async paper');
   const current = queueSubconWhisper(cwd, 'session-a', 'sync-current', 'current paper', { source: 'sync', turnId: 'turn-current' })!;
   queueSubconWhisper(cwd, 'session-a', 'sync-next', 'next paper', { source: 'sync', turnId: 'turn-next' });
