@@ -55,10 +55,21 @@ export interface BackfillAgentResolveOptions {
 
 export const LEGACY_FILL_VERIFIED_RUNTIME = {
   model: 'opencode-deepseek/deepseek-v4-flash',
+  providerType: 'deepseek',
   embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
   contextWindow: 400_000,
   parallelToolCalls: true,
 } as const;
+
+export const OMEN_BACKFILL_VERIFIED_RUNTIME = {
+  model: 'openai-proxy/omen-alpha',
+  providerType: 'openai',
+  embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
+  contextWindow: 400_000,
+  parallelToolCalls: true,
+} as const;
+
+type VerifiedBackfillRuntime = typeof LEGACY_FILL_VERIFIED_RUNTIME | typeof OMEN_BACKFILL_VERIFIED_RUNTIME;
 
 function configFile(): string {
   return process.env.LETTA_BACKFILL_CONFIG_FILE || DEFAULT_CONFIG_FILE;
@@ -121,18 +132,19 @@ async function reconcileDedicatedAgent(apiKey: string, agentId: string, reconcil
   }
 }
 
-export async function configureVerifiedLegacyFillRuntime(
+async function configureVerifiedBackfillRuntime(
   apiKey: string,
   agentId: string,
-  log: (message: string) => void = console.log,
+  profile: VerifiedBackfillRuntime,
+  label: string,
+  log: (message: string) => void,
 ): Promise<void> {
-  const profile = LEGACY_FILL_VERIFIED_RUNTIME;
   await patchAgent(apiKey, agentId, {
     model: profile.model,
     embedding: profile.embedding,
     context_window_limit: profile.contextWindow,
-    model_settings: { provider_type: 'deepseek', parallel_tool_calls: profile.parallelToolCalls },
-  }, 'Failed to apply verified legacy fill runtime');
+    model_settings: { provider_type: profile.providerType, parallel_tool_calls: profile.parallelToolCalls },
+  }, `Failed to apply verified ${label} backfill runtime`);
 
   let verified: AgentDetails | undefined;
   let mismatch = 'runtime state not yet visible';
@@ -148,13 +160,29 @@ export async function configureVerifiedLegacyFillRuntime(
       && contextWindow === profile.contextWindow
       && parallel === profile.parallelToolCalls
     ) {
-      log(`Verified legacy fill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=${profile.parallelToolCalls}`);
+      log(`Verified ${label} backfill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=${profile.parallelToolCalls}`);
       return;
     }
     mismatch = `model=${modelHandle ?? 'missing'}, embedding=${embeddingHandle ?? 'missing'}, context=${contextWindow ?? 'missing'}, parallel_tool_calls=${String(parallel)}`;
     if (attempt < 19) await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`Legacy fill runtime mismatch after PATCH: ${mismatch}`);
+  throw new Error(`Verified ${label} backfill runtime mismatch after PATCH: ${mismatch}`);
+}
+
+export async function configureVerifiedLegacyFillRuntime(
+  apiKey: string,
+  agentId: string,
+  log: (message: string) => void = console.log,
+): Promise<void> {
+  return configureVerifiedBackfillRuntime(apiKey, agentId, LEGACY_FILL_VERIFIED_RUNTIME, 'DeepSeek fill', log);
+}
+
+export async function configureVerifiedOmenBackfillRuntime(
+  apiKey: string,
+  agentId: string,
+  log: (message: string) => void = console.log,
+): Promise<void> {
+  return configureVerifiedBackfillRuntime(apiKey, agentId, OMEN_BACKFILL_VERIFIED_RUNTIME, 'Omen Alpha', log);
 }
 async function importDedicatedAgent(apiKey: string): Promise<string> {
   const file = fs.readFileSync(DEFAULT_AGENT_FILE);

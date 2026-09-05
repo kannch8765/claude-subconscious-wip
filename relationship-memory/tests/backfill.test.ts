@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   backfillStateNeedsFreshConversation,
+  buildHistoricalBatch,
   discoverTranscriptSources,
   loadBackfillState,
   runHistoricalBackfill,
@@ -57,6 +58,19 @@ function rememberingProcessor(storeDir: string, options: { failFirst?: boolean; 
 }
 
 describe('relationship-memory historical backfill', () => {
+  it('keeps session-local assistant ignorance from becoming a historical-first claim', () => {
+    const source = { generation: 1, committed_offset: 0, integrity_chunks: [] };
+    const records = [
+      message('assistant', 'a1', 'What is Komorebi? I have never heard of it.'),
+      message('user', 'u1', 'We already worked on Komorebi slides together yesterday.'),
+    ];
+    const batch = buildHistoricalBatch('/tmp/komorebi.jsonl', source, records, 0, 123, 'backfill-session');
+    expect(batch.observerMessage).toContain('session-local epistemic state');
+    expect(batch.observerMessage).toContain('not proof of a historical first occurrence');
+    expect(batch.observerMessage).toContain('If memory_search finds earlier canonical evidence');
+    expect(batch.observerMessage).toContain('do not claim “first learned”, “first discovered”, “first met”');
+  });
+
   it('discovers transcript jsonl recursively in deterministic order', () => {
     const root = temp();
     fs.mkdirSync(path.join(root, 'b')); fs.mkdirSync(path.join(root, 'a'));
