@@ -294,7 +294,7 @@ describe('task 06 pre-merge old-tool and paused-backfill recovery acceptance', (
 
     const retryToolNames = retryClient.bodies[0].body.client_tools.map((tool: any) => tool.name);
     expect(retryClient.bodies.every((item) => item.conversationId === 'conversation-new')).toBe(true);
-    expect(retryToolNames).toEqual(expect.arrayContaining(MEMORY_REMEMBER_TOOL_NAMES));
+    expect(retryToolNames).toEqual(expect.arrayContaining([...MEMORY_REMEMBER_TOOL_NAMES]));
     expect(retryToolNames).not.toContain('memory_remember');
     expect(loadSyncState(cwd, sessionId)).toEqual(expect.objectContaining({ lastProcessedIndex: throughIndex, conversationId: 'conversation-new' }));
     expect(fs.existsSync(markerFile)).toBe(false);
@@ -346,7 +346,7 @@ describe('task 06 pre-merge old-tool and paused-backfill recovery acceptance', (
     expect(completion).toBe('completed');
     expect(client.bodies.every((item) => item.conversationId === state.conversation_id)).toBe(true);
     const toolNames = client.bodies[0].body.client_tools.map((tool: any) => tool.name);
-    expect(toolNames).toEqual(expect.arrayContaining(MEMORY_REMEMBER_TOOL_NAMES));
+    expect(toolNames).toEqual(expect.arrayContaining([...MEMORY_REMEMBER_TOOL_NAMES]));
     expect(toolNames).not.toContain('memory_remember');
     const store = new RelationshipMemoryStore(path.join(root, 'canonical'), 'subject-acceptance');
     expect(store.listMemories()).toEqual([expect.objectContaining({ kind: 'user_preference' })]);
