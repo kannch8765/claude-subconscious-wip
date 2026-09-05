@@ -7,6 +7,7 @@ import {
   assertCanonicalStoreWriterAccess,
   assertPrivilegedSnapshotRuntimeSafety,
 } from './backfill_runtime_safety.js';
+import { runRelationshipMemoryBackfill } from './relationship_memory_backfill_runner.js';
 
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -141,16 +142,21 @@ describe('privileged historical backfill runtime safety', () => {
     expect(() => assertCanonicalStoreWriterAccess(f.canonical, accessSync)).not.toThrow();
   });
 
-  it('keeps the privileged writer preflight before snapshot/API/agent resolution in the runner', () => {
-    const runner = fs.readFileSync(path.resolve('scripts/relationship_memory_backfill.ts'), 'utf8');
-    const preflight = runner.indexOf('assertPrivilegedSnapshotRuntimeSafety(');
-    const snapshotResolve = runner.indexOf('resolveBackfillTranscriptInput(');
-    const apiKey = runner.indexOf('process.env.LETTA_API_KEY');
-    const agentResolve = runner.indexOf('getBackfillAgentId(');
-    expect(preflight).toBeGreaterThanOrEqual(0);
-    expect(snapshotResolve).toBeGreaterThan(preflight);
-    expect(apiKey).toBeGreaterThan(preflight);
-    expect(agentResolve).toBeGreaterThan(preflight);
+  it('fails privileged runner preflight before any Letta API work', async () => {
+    const f = fixture();
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    process.env.LETTA_API_KEY = 'test-key';
+    try {
+      await expect(runRelationshipMemoryBackfill('default', {
+        snapshotManifest: f.snapshot, state: f.state, root: f.canonical,
+        maxBatches: 1, maxRecords: 40, maxBytes: 1024,
+      })).rejects.toThrow();
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.LETTA_API_KEY;
+      vi.unstubAllGlobals();
+    }
   });
 
   it('does not impose production-only guards on ordinary caller-owned transcript runs', () => {

@@ -44,14 +44,18 @@ interface AgentDetails {
   tags?: string[];
   model?: string | null;
   embedding?: string | null;
+  context_window_limit?: number | null;
   llm_config?: { handle?: string; context_window?: number; parallel_tool_calls?: boolean };
   embedding_config?: { handle?: string } | null;
-  model_settings?: { parallel_tool_calls?: boolean } | null;
+  model_settings?: { provider_type?: string; parallel_tool_calls?: boolean } | null;
 }
+
+export type BackfillRuntime = 'default' | 'omen';
 
 export interface BackfillAgentResolveOptions {
   agentId?: string;
   reconcileCanonicalPrompt?: boolean;
+  runtime?: BackfillRuntime;
 }
 
 export const LEGACY_FILL_VERIFIED_RUNTIME = {
@@ -118,6 +122,7 @@ async function reconcileDedicatedAgent(
   agentId: string,
   reconcileCanonicalPrompt = true,
   canonical?: CanonicalManagedAgentConfig,
+  useOperatorRuntimeOverrides = true,
 ): Promise<void> {
   const agent = await fetchAgent(apiKey, agentId);
   const tags = Array.isArray(agent.tags) ? agent.tags : [];
@@ -128,7 +133,7 @@ async function reconcileDedicatedAgent(
   const canonicalSystem = reconcileCanonicalPrompt ? canonical?.system : undefined;
   if (reconcileCanonicalPrompt) {
     if (!canonical) throw new Error('Managed backfill reconciliation requires a resolved canonical configuration');
-    await reconcileManagedAgentConfiguration(apiKey, agentId, () => {}, DEFAULT_AGENT_FILE, canonical);
+    await reconcileManagedAgentConfiguration(apiKey, agentId, () => {}, DEFAULT_AGENT_FILE, canonical, { useOperatorRuntimeOverrides });
   }
   const verified = await fetchAgent(apiKey, agentId);
   if (!Array.isArray(verified.tags) || !verified.tags.includes(BACKFILL_PURPOSE_TAG)) {
@@ -139,6 +144,27 @@ async function reconcileDedicatedAgent(
   }
 }
 
+function runtimeMismatch(agent: AgentDetails, profile: VerifiedBackfillRuntime): string | undefined {
+  const modelHandles = [agent.model, agent.llm_config?.handle].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const embeddingHandles = [agent.embedding, agent.embedding_config?.handle].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const contextWindows = [agent.context_window_limit, agent.llm_config?.context_window].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+  const providerType = agent.model_settings?.provider_type;
+  const modelSettingsParallel = agent.model_settings?.parallel_tool_calls;
+  const legacyConfigParallel = agent.llm_config?.parallel_tool_calls;
+  if (
+    modelHandles.length > 0
+    && modelHandles.every((value) => value === profile.model)
+    && embeddingHandles.length > 0
+    && embeddingHandles.every((value) => value === profile.embedding)
+    && contextWindows.length > 0
+    && contextWindows.every((value) => value === profile.contextWindow)
+    && providerType === profile.providerType
+    && modelSettingsParallel === profile.parallelToolCalls
+    && legacyConfigParallel === profile.parallelToolCalls
+  ) return undefined;
+  return `model=${modelHandles.join('|') || 'missing'}, embedding=${embeddingHandles.join('|') || 'missing'}, context=${contextWindows.join('|') || 'missing'}, provider_type=${providerType ?? 'missing'}, model_settings.parallel_tool_calls=${String(modelSettingsParallel)}, llm_config.parallel_tool_calls=${String(legacyConfigParallel)}`;
+}
+
 async function configureVerifiedBackfillRuntime(
   apiKey: string,
   agentId: string,
@@ -146,6 +172,13 @@ async function configureVerifiedBackfillRuntime(
   label: string,
   log: (message: string) => void,
 ): Promise<void> {
+  const current = await fetchAgent(apiKey, agentId);
+  let mismatch = runtimeMismatch(current, profile);
+  if (mismatch === undefined) {
+    log(`Verified ${label} backfill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=${profile.parallelToolCalls}`);
+    return;
+  }
+
   await patchAgent(apiKey, agentId, {
     model: profile.model,
     embedding: profile.embedding,
@@ -153,24 +186,13 @@ async function configureVerifiedBackfillRuntime(
     model_settings: { provider_type: profile.providerType, parallel_tool_calls: profile.parallelToolCalls },
   }, `Failed to apply verified ${label} backfill runtime`);
 
-  let verified: AgentDetails | undefined;
-  let mismatch = 'runtime state not yet visible';
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    verified = await fetchAgent(apiKey, agentId);
-    const modelHandle = verified.model ?? verified.llm_config?.handle;
-    const embeddingHandle = verified.embedding ?? verified.embedding_config?.handle;
-    const contextWindow = verified.llm_config?.context_window;
-    const parallel = verified.model_settings?.parallel_tool_calls ?? verified.llm_config?.parallel_tool_calls;
-    if (
-      modelHandle === profile.model
-      && embeddingHandle === profile.embedding
-      && contextWindow === profile.contextWindow
-      && parallel === profile.parallelToolCalls
-    ) {
+    const verified = await fetchAgent(apiKey, agentId);
+    mismatch = runtimeMismatch(verified, profile);
+    if (mismatch === undefined) {
       log(`Verified ${label} backfill runtime on ${agentId}: ${profile.model}, ${profile.embedding}, context=${profile.contextWindow}, parallel_tool_calls=${profile.parallelToolCalls}`);
       return;
     }
-    mismatch = `model=${modelHandle ?? 'missing'}, embedding=${embeddingHandle ?? 'missing'}, context=${contextWindow ?? 'missing'}, parallel_tool_calls=${String(parallel)}`;
     if (attempt < 19) await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`Verified ${label} backfill runtime mismatch after PATCH: ${mismatch}`);
@@ -191,11 +213,30 @@ export async function configureVerifiedOmenBackfillRuntime(
 ): Promise<void> {
   return configureVerifiedBackfillRuntime(apiKey, agentId, OMEN_BACKFILL_VERIFIED_RUNTIME, 'Omen Alpha', log);
 }
-async function importDedicatedAgent(apiKey: string, canonical: CanonicalManagedAgentConfig): Promise<string> {
+function canonicalForBackfillRuntime(
+  canonical: CanonicalManagedAgentConfig,
+  runtime: BackfillRuntime,
+): CanonicalManagedAgentConfig {
+  if (runtime !== 'omen') return canonical;
+  return {
+    ...canonical,
+    model: OMEN_BACKFILL_VERIFIED_RUNTIME.model,
+    embedding: OMEN_BACKFILL_VERIFIED_RUNTIME.embedding,
+    contextWindowLimit: OMEN_BACKFILL_VERIFIED_RUNTIME.contextWindow,
+    modelSettingsProviderType: OMEN_BACKFILL_VERIFIED_RUNTIME.providerType,
+    parallelToolCalls: OMEN_BACKFILL_VERIFIED_RUNTIME.parallelToolCalls,
+  };
+}
+
+async function importDedicatedAgent(
+  apiKey: string,
+  canonical: CanonicalManagedAgentConfig,
+  useOperatorRuntimeOverrides: boolean,
+): Promise<string> {
   const file = buildManagedAgentImportPayload(DEFAULT_AGENT_FILE, canonical);
   const form = new FormData();
   form.append('file', new Blob([file], { type: 'application/json' }), 'SubconsciousBackfill.af');
-  form.append('model', process.env.LETTA_MODEL || canonical.model);
+  form.append('model', useOperatorRuntimeOverrides ? (process.env.LETTA_MODEL || canonical.model) : canonical.model);
   form.append('embedding', canonical.embedding);
   const response = await fetch(buildLettaApiUrl('/agents/import'), {
     method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form,
@@ -212,6 +253,8 @@ export async function getBackfillAgentId(apiKey: string, log: (message: string) 
   const liveAgentId = knownLiveAgentId();
   const explicit = options.agentId ?? process.env.LETTA_BACKFILL_AGENT_ID;
   const reconcileCanonicalPrompt = options.reconcileCanonicalPrompt ?? true;
+  const runtime = options.runtime ?? 'default';
+  const useOperatorRuntimeOverrides = runtime === 'default';
   let agentId: string;
   let canonical: CanonicalManagedAgentConfig | undefined;
 
@@ -230,8 +273,8 @@ export async function getBackfillAgentId(apiKey: string, log: (message: string) 
     } else {
       // A new managed import always needs the bundled prompt. Resolve it before
       // the POST and reuse the same snapshot for the post-import reconciliation.
-      canonical = getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE);
-      agentId = await importDedicatedAgent(apiKey, canonical);
+      canonical = canonicalForBackfillRuntime(getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE), runtime);
+      agentId = await importDedicatedAgent(apiKey, canonical, useOperatorRuntimeOverrides);
       assertDedicated(agentId, liveAgentId);
       saveBackfillConfig({ agentId, importedAt: new Date().toISOString() });
       log(`Provisioned dedicated backfill agent: ${agentId}`);
@@ -242,8 +285,8 @@ export async function getBackfillAgentId(apiKey: string, log: (message: string) 
     // Existing managed agents load the authored prompt only when canonical
     // reconciliation is requested. Canary/self-managed prompt opt-out remains
     // independent of bundled prompt resources.
-    canonical = getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE);
+    canonical = canonicalForBackfillRuntime(getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE), runtime);
   }
-  await reconcileDedicatedAgent(apiKey, agentId, reconcileCanonicalPrompt, canonical);
+  await reconcileDedicatedAgent(apiKey, agentId, reconcileCanonicalPrompt, canonical, useOperatorRuntimeOverrides);
   return agentId;
 }
