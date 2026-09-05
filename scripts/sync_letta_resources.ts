@@ -157,9 +157,11 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
   }
   const attachedTools = Array.isArray(verified?.tools) ? verified.tools : [];
   const verifiedBlocks = Array.isArray(verified?.blocks) ? verified.blocks : [];
-  const syncBlockIds = [...new Set(verifiedBlocks
-    .map((block: any) => block?.id)
-    .filter((id: unknown): id is string => typeof id === 'string' && id.length > 0))];
+  const syncBlockIds: string[] = [];
+  for (const block of verifiedBlocks) {
+    const blockId = block?.id;
+    if (typeof blockId === 'string' && blockId.length > 0 && !syncBlockIds.includes(blockId)) syncBlockIds.push(blockId);
+  }
   const expectedLabels = [...memoryBlocks.map((block) => block.label)].sort();
   const actualLabels = [...new Set(verifiedBlocks.map((block: any) => String(block?.label ?? '')).filter(Boolean))].sort();
   if (attachedTools.length !== 0 || syncBlockIds.length !== memoryBlocks.length || JSON.stringify(actualLabels) !== JSON.stringify(expectedLabels)) {
