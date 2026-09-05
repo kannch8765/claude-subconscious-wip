@@ -17,6 +17,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { buildLettaApiUrl } from './letta_api_url.js';
+import { readBundledManagedSystemPromptForAgentFile, readManagedSystemPromptFile } from './managed_system_prompt.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -247,11 +248,14 @@ async function renameAgent(apiKey: string, agentId: string, name: string): Promi
 /**
  * Read the canonical managed-agent configuration from the bundled .af file.
  *
- * Subconscious.af is the source of truth for project-managed live runtime
- * policy. Explicit operator overrides remain supported for model/context below,
+ * Subconscious.af remains the source of truth for managed runtime structure/settings,
+ * while config/live-system.md is the bundled source of truth for the live system prompt. Explicit operator overrides remain supported for model/context below,
  * but imported/saved/owned agents otherwise converge to this configuration.
  */
-export function getCanonicalManagedAgentConfig(agentFile: string = DEFAULT_AGENT_FILE): CanonicalManagedAgentConfig {
+export function getCanonicalManagedAgentConfig(
+  agentFile: string = DEFAULT_AGENT_FILE,
+  managedSystemPromptFile?: string,
+): CanonicalManagedAgentConfig {
   let content: unknown;
   try {
     content = JSON.parse(fs.readFileSync(agentFile, 'utf-8'));
@@ -264,9 +268,13 @@ export function getCanonicalManagedAgentConfig(agentFile: string = DEFAULT_AGENT
     throw new Error('Canonical Subconscious.af must contain exactly one agent');
   }
   const agent = agents[0];
+  const managedSystem = managedSystemPromptFile
+    ? readManagedSystemPromptFile(managedSystemPromptFile)
+    : readBundledManagedSystemPromptForAgentFile(agentFile);
+  const system = managedSystem ?? agent.system;
   const modelSettings = agent.model_settings as { provider_type?: unknown; parallel_tool_calls?: unknown } | null | undefined;
   if (
-    typeof agent.system !== 'string' || agent.system.length === 0
+    typeof system !== 'string' || system.trim().length === 0
     || typeof agent.model !== 'string' || agent.model.length === 0
     || typeof agent.embedding !== 'string' || agent.embedding.length === 0
     || typeof agent.context_window_limit !== 'number' || agent.context_window_limit <= 0
@@ -277,7 +285,7 @@ export function getCanonicalManagedAgentConfig(agentFile: string = DEFAULT_AGENT
   }
 
   return {
-    system: agent.system,
+    system,
     model: agent.model,
     embedding: agent.embedding,
     contextWindowLimit: agent.context_window_limit,
@@ -314,8 +322,8 @@ export function getCanonicalManagedAgentSurface(agentFile: string = DEFAULT_AGEN
   return { blocks: desiredBlocks, toolNames };
 }
 
-export function getCanonicalManagedSystemPrompt(agentFile: string = DEFAULT_AGENT_FILE): string {
-  return getCanonicalManagedAgentConfig(agentFile).system;
+export function getCanonicalManagedSystemPrompt(agentFile: string = DEFAULT_AGENT_FILE, managedSystemPromptFile?: string): string {
+  return getCanonicalManagedAgentConfig(agentFile, managedSystemPromptFile).system;
 }
 
 function operatorContextWindow(defaultValue: number): number {
@@ -475,8 +483,9 @@ export async function reconcileManagedAgentConfiguration(
   agentId: string,
   log: (msg: string) => void = console.log,
   agentFile: string = DEFAULT_AGENT_FILE,
+  canonicalOverride?: CanonicalManagedAgentConfig,
 ): Promise<void> {
-  const canonical = getCanonicalManagedAgentConfig(agentFile);
+  const canonical = canonicalOverride ?? getCanonicalManagedAgentConfig(agentFile);
   const desiredModel = process.env.LETTA_MODEL || canonical.model;
   const desiredContextWindow = operatorContextWindow(canonical.contextWindowLimit);
   const url = buildLettaApiUrl(`/agents/${agentId}`);
@@ -516,7 +525,7 @@ export async function reconcileManagedAgentConfiguration(
   }
 
   if (Object.keys(patch).length === 0) {
-    log('Managed Subconscious runtime configuration already matches canonical Subconscious.af');
+    log('Managed Subconscious runtime configuration already matches canonical managed configuration');
     return;
   }
 
@@ -858,14 +867,53 @@ async function updateAgentModel(
   log(`Agent model updated to: ${modelHandle}`);
 }
 
+export function buildManagedAgentImportPayload(
+  agentFile: string = DEFAULT_AGENT_FILE,
+  canonical: CanonicalManagedAgentConfig = getCanonicalManagedAgentConfig(agentFile),
+): string {
+  let content: any;
+  try {
+    content = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+  } catch (error) {
+    throw new Error(`Failed to read managed AgentFile import payload from ${path.basename(agentFile)}: ${error}`);
+  }
+  if (!Array.isArray(content?.agents) || content.agents.length !== 1) {
+    throw new Error(`Managed ${path.basename(agentFile)} must contain exactly one agent`);
+  }
+  const agent = content.agents[0];
+  const serializedSystem = typeof agent.system === 'string' ? agent.system : '';
+  if (!serializedSystem) throw new Error(`Managed ${path.basename(agentFile)} is missing its serialized system snapshot`);
+
+  // Letta AgentFiles also carry a compiled system-role bootstrap message whose
+  // text starts with the serialized system prompt. Keep that derived snapshot
+  // consistent in the in-memory import payload without rewriting the .af file.
+  const messages = Array.isArray(agent.messages) ? agent.messages : [];
+  let bootstrapMatches = 0;
+  for (const message of messages) {
+    if (message?.role !== 'system' || !Array.isArray(message.content)) continue;
+    for (const part of message.content) {
+      if (part?.type === 'text' && typeof part.text === 'string' && part.text.startsWith(serializedSystem)) {
+        bootstrapMatches += 1;
+        part.text = canonical.system + part.text.slice(serializedSystem.length);
+      }
+    }
+  }
+  if (bootstrapMatches !== 1) {
+    throw new Error(`Managed ${path.basename(agentFile)} must contain exactly one compiled system bootstrap prefix; found ${bootstrapMatches}`);
+  }
+  content.agents[0] = { ...agent, system: canonical.system };
+  return JSON.stringify(content);
+}
+
 /**
  * Import agent from .af file
  */
-async function importDefaultAgent(apiKey: string): Promise<string> {
+async function importDefaultAgent(apiKey: string, canonical: CanonicalManagedAgentConfig): Promise<string> {
   const url = buildLettaApiUrl('/agents/import');
   
-  // Read the agent file
-  const agentFileContent = fs.readFileSync(DEFAULT_AGENT_FILE);
+  // Build the upload in memory so bundled managed prompt authority is applied
+  // before the remote import. The on-disk .af remains a compatibility snapshot.
+  const agentFileContent = buildManagedAgentImportPayload(DEFAULT_AGENT_FILE, canonical);
   
   // Get original name for later rename
   const originalName = getAgentNameFromFile();
@@ -876,7 +924,6 @@ async function importDefaultAgent(apiKey: string): Promise<string> {
   formData.append('file', blob, 'Subconscious.af');
   // Import-time overrides prevent deprecated/stale serialized provider details
   // from blocking creation before the managed post-import reconcile can run.
-  const canonical = getCanonicalManagedAgentConfig();
   formData.append('model', process.env.LETTA_MODEL || canonical.model);
   formData.append('embedding', canonical.embedding);
   
@@ -931,11 +978,12 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
   let agentId: string;
   let config = readConfig();
   let agentSource: 'env' | 'saved' | 'imported';
-  
-  // 1. Check environment variable
+  let canonical: CanonicalManagedAgentConfig | undefined;
+
+  // 1. Check environment variable. Ordinary external env agents intentionally
+  // do not load bundled prompt resources at all.
   const envAgentId = process.env.LETTA_AGENT_ID;
   if (envAgentId) {
-    // Validate format before using
     if (!isValidAgentId(envAgentId)) {
       const errorMsg = getInvalidAgentIdMessage(envAgentId);
       log(`WARNING: ${errorMsg}`);
@@ -944,85 +992,73 @@ export async function getAgentId(apiKey: string, log: (msg: string) => void = co
     log(`Using agent ID from LETTA_AGENT_ID: ${envAgentId}`);
     agentId = envAgentId;
     agentSource = 'env';
-  }
-  // 2. Check saved config
-  else if (config.agentId) {
-    // Validate saved config (in case it was manually edited or corrupted)
-    if (!isValidAgentId(config.agentId)) {
-      log(`WARNING: Saved agent ID has invalid format: ${config.agentId}`);
-      log(`Ignoring invalid saved config and attempting to import default agent...`);
-      // Fall through to import default agent
-      agentId = await importAndSaveAgent(apiKey, log);
-      config = readConfig(); // Reload config after import
-      agentSource = 'imported';
+  } else {
+    // Saved/imported identities are managed by definition. Resolve the bundled
+    // prompt before any remote mutation, and reuse this exact snapshot for an
+    // import plus the reconciliation that follows.
+    canonical = getCanonicalManagedAgentConfig();
+    if (config.agentId) {
+      if (!isValidAgentId(config.agentId)) {
+        log(`WARNING: Saved agent ID has invalid format: ${config.agentId}`);
+        log('Ignoring invalid saved config and attempting to import default agent...');
+        agentId = await importAndSaveAgent(apiKey, log, canonical);
+        config = readConfig();
+        agentSource = 'imported';
+      } else {
+        log(`Using saved agent ID: ${config.agentId}`);
+        agentId = config.agentId;
+        agentSource = 'saved';
+      }
     } else {
-      log(`Using saved agent ID: ${config.agentId}`);
-      agentId = config.agentId;
-      agentSource = 'saved';
+      agentId = await importAndSaveAgent(apiKey, log, canonical);
+      config = readConfig();
+      agentSource = 'imported';
     }
   }
-  // 3. Import default agent
-  else {
-    agentId = await importAndSaveAgent(apiKey, log);
-    config = readConfig(); // Reload config after import
-    agentSource = 'imported';
-  }
-  
-  // 4. Reconcile only Subconscious-managed agents.
-  //
-  // Saved/imported configuration is managed by definition. An env-selected
-  // LETTA_AGENT_ID may be either the already-adopted Subconscious agent or an
-  // ordinary external Letta/Letta Code agent. For env IDs, perform one read-only
-  // ownership probe: origin:claude-subconcious permits system reconciliation;
-  // absence of that tag means zero managed PATCHes. Never scan the global agent
-  // inventory by tag.
+
   if (agentSource !== 'env') {
     try {
       await ensureRequiredAgentTags(apiKey, agentId, log);
     } catch (error) {
       log(`Warning: Could not ensure required tags: ${error}`);
     }
-
-    // Live runtime/surface reconciliation is authority-critical: a stale managed agent
-    // must not silently continue under obsolete memory/tool rules. Let failures
-    // propagate instead of importing/replacing the agent or pretending success.
-    await reconcileManagedAgentConfiguration(apiKey, agentId, log);
+    await reconcileManagedAgentConfiguration(apiKey, agentId, log, DEFAULT_AGENT_FILE, canonical);
     await reconcileManagedLiveAgentSurface(apiKey, agentId, log);
-
-    // 5. Availability discovery is diagnostic only after managed reconciliation.
     try {
       const configuredModel = await ensureModelAvailable(apiKey, agentId, log, false);
       if (configuredModel && config.model !== configuredModel) {
-        saveConfig({
-          ...config,
-          model: configuredModel,
-        });
+        saveConfig({ ...config, model: configuredModel });
       }
     } catch (error) {
       log(`Warning: Could not verify model availability: ${error}`);
     }
   } else if (await isManagedEnvAgent(apiKey, agentId, log)) {
+    canonical = getCanonicalManagedAgentConfig();
     log('LETTA_AGENT_ID is an origin-tagged managed Subconscious agent; reconciling canonical runtime configuration');
-    await reconcileManagedAgentConfiguration(apiKey, agentId, log);
+    await reconcileManagedAgentConfiguration(apiKey, agentId, log, DEFAULT_AGENT_FILE, canonical);
     await reconcileManagedLiveAgentSurface(apiKey, agentId, log);
   } else {
     log('Using ordinary external LETTA_AGENT_ID; skipping all Subconscious-managed mutation');
   }
-  
+
   return agentId;
 }
 
 /**
  * Import default agent and save to config
  */
-async function importAndSaveAgent(apiKey: string, log: (msg: string) => void): Promise<string> {
+async function importAndSaveAgent(
+  apiKey: string,
+  log: (msg: string) => void,
+  canonical: CanonicalManagedAgentConfig,
+): Promise<string> {
   log('No agent configured - importing default Subconscious agent...');
   
   if (!fs.existsSync(DEFAULT_AGENT_FILE)) {
     throw new Error(`Default agent file not found: ${DEFAULT_AGENT_FILE}`);
   }
   
-  const agentId = await importDefaultAgent(apiKey);
+  const agentId = await importDefaultAgent(apiKey, canonical);
   log(`Imported agent: ${agentId}`);
   
   // Save for future use

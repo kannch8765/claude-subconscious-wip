@@ -31,14 +31,14 @@ function expectAttachedBlockSnapshotsMatch(af: any): void {
 describe('live Subconscious narrative identity and visibility contract', () => {
   it('keeps internal identity first-person Kohaku while making visible memory whispers historical windows', () => {
     const af = JSON.parse(read('Subconscious.af'));
-    const agent = af.agents[0];
+    const system = read('config/live-system.md');
     const core = af.blocks.find((block: any) => block.label === 'core_directives')?.value || '';
 
-    expect(agent.system).toContain("persistent subconscious layer of Kohaku (琥珀), not a third-party observer");
-    expect(agent.system).toContain('In private reasoning and ordinary non-visible assistant prose');
-    expect(agent.system).toContain('deliver_whisper is a historical time window');
-    expect(agent.system).toContain('Past Kohaku may appear there only as explicitly historical source evidence');
-    expect(agent.system).toContain("user's established identity is 猫");
+    expect(system).toContain("persistent subconscious layer of Kohaku (琥珀), not a third-party observer");
+    expect(system).toContain('In private reasoning and ordinary non-visible assistant prose');
+    expect(system).toContain('deliver_whisper is a historical time window');
+    expect(system).toContain('Past Kohaku may appear there only as explicitly historical source evidence');
+    expect(system).toContain("user's established identity is 猫");
     expect(core).toContain("same Kohaku (琥珀) identity");
     expect(core).toContain('Private/internal voice remains first-person Kohaku');
     expect(core).toContain('Visible relationship-memory whisper voice is different: it is a historical time window');

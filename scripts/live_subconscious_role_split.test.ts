@@ -40,7 +40,9 @@ describe('live/backfill Subconscious role split', () => {
   it('makes the dedicated backfill resolver name its own AgentFile explicitly', () => {
     const source = fs.readFileSync(path.join(process.cwd(), 'scripts/backfill_agent_config.ts'), 'utf8');
     expect(source).toContain("'SubconsciousBackfill.af'");
-    expect(source).toContain('getCanonicalManagedSystemPrompt(DEFAULT_AGENT_FILE)');
-    expect(source).toContain('getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE)');
+    expect(source).toContain('canonical = getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE)');
+    expect(source).toContain('buildManagedAgentImportPayload(DEFAULT_AGENT_FILE, canonical)');
+    expect(source).toContain('reconcileManagedAgentConfiguration(apiKey, agentId, () => {}, DEFAULT_AGENT_FILE, canonical)');
+    expect(source).not.toContain('getCanonicalManagedSystemPrompt(DEFAULT_AGENT_FILE)');
   });
 });

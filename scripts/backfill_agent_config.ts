@@ -10,10 +10,11 @@ import * as path from 'path';
 import { fileURLToPath } from 'url';
 import {
   getCanonicalManagedAgentConfig,
-  getCanonicalManagedSystemPrompt,
   getConfigPath,
   isValidAgentId,
   reconcileManagedAgentConfiguration,
+  buildManagedAgentImportPayload,
+  type CanonicalManagedAgentConfig,
 } from './agent_config.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
 
@@ -112,23 +113,29 @@ async function patchAgent(apiKey: string, agentId: string, body: Record<string, 
   });
   if (!response.ok) throw new Error(`${reason}: ${response.status} ${await response.text()}`);
 }
-async function reconcileDedicatedAgent(apiKey: string, agentId: string, reconcileCanonicalPrompt = true): Promise<void> {
+async function reconcileDedicatedAgent(
+  apiKey: string,
+  agentId: string,
+  reconcileCanonicalPrompt = true,
+  canonical?: CanonicalManagedAgentConfig,
+): Promise<void> {
   const agent = await fetchAgent(apiKey, agentId);
   const tags = Array.isArray(agent.tags) ? agent.tags : [];
   const missingTags = REQUIRED_TAGS.filter((tag) => !tags.includes(tag));
   if (missingTags.length) {
     await patchAgent(apiKey, agentId, { tags: [...tags, ...missingTags] }, 'Failed to reconcile dedicated backfill agent tags');
   }
-  const canonicalSystem = reconcileCanonicalPrompt ? getCanonicalManagedSystemPrompt(DEFAULT_AGENT_FILE) : undefined;
+  const canonicalSystem = reconcileCanonicalPrompt ? canonical?.system : undefined;
   if (reconcileCanonicalPrompt) {
-    await reconcileManagedAgentConfiguration(apiKey, agentId, () => {}, DEFAULT_AGENT_FILE);
+    if (!canonical) throw new Error('Managed backfill reconciliation requires a resolved canonical configuration');
+    await reconcileManagedAgentConfiguration(apiKey, agentId, () => {}, DEFAULT_AGENT_FILE, canonical);
   }
   const verified = await fetchAgent(apiKey, agentId);
   if (!Array.isArray(verified.tags) || !verified.tags.includes(BACKFILL_PURPOSE_TAG)) {
     throw new Error(`Dedicated backfill agent is missing required purpose tag: ${BACKFILL_PURPOSE_TAG}`);
   }
   if (canonicalSystem !== undefined && verified.system !== canonicalSystem) {
-    throw new Error('Dedicated backfill agent system prompt does not match canonical SubconsciousBackfill.af');
+    throw new Error('Dedicated backfill agent system prompt does not match config/backfill-system.md');
   }
 }
 
@@ -184,11 +191,10 @@ export async function configureVerifiedOmenBackfillRuntime(
 ): Promise<void> {
   return configureVerifiedBackfillRuntime(apiKey, agentId, OMEN_BACKFILL_VERIFIED_RUNTIME, 'Omen Alpha', log);
 }
-async function importDedicatedAgent(apiKey: string): Promise<string> {
-  const file = fs.readFileSync(DEFAULT_AGENT_FILE);
+async function importDedicatedAgent(apiKey: string, canonical: CanonicalManagedAgentConfig): Promise<string> {
+  const file = buildManagedAgentImportPayload(DEFAULT_AGENT_FILE, canonical);
   const form = new FormData();
   form.append('file', new Blob([file], { type: 'application/json' }), 'SubconsciousBackfill.af');
-  const canonical = getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE);
   form.append('model', process.env.LETTA_MODEL || canonical.model);
   form.append('embedding', canonical.embedding);
   const response = await fetch(buildLettaApiUrl('/agents/import'), {
@@ -205,7 +211,10 @@ async function importDedicatedAgent(apiKey: string): Promise<string> {
 export async function getBackfillAgentId(apiKey: string, log: (message: string) => void = console.log, options: BackfillAgentResolveOptions = {}): Promise<string> {
   const liveAgentId = knownLiveAgentId();
   const explicit = options.agentId ?? process.env.LETTA_BACKFILL_AGENT_ID;
+  const reconcileCanonicalPrompt = options.reconcileCanonicalPrompt ?? true;
   let agentId: string;
+  let canonical: CanonicalManagedAgentConfig | undefined;
+
   if (explicit) {
     assertDedicated(explicit, liveAgentId);
     agentId = explicit;
@@ -219,12 +228,22 @@ export async function getBackfillAgentId(apiKey: string, log: (message: string) 
       agentId = config.agentId;
       log(`Using saved dedicated backfill agent: ${agentId}`);
     } else {
-      agentId = await importDedicatedAgent(apiKey);
+      // A new managed import always needs the bundled prompt. Resolve it before
+      // the POST and reuse the same snapshot for the post-import reconciliation.
+      canonical = getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE);
+      agentId = await importDedicatedAgent(apiKey, canonical);
       assertDedicated(agentId, liveAgentId);
       saveBackfillConfig({ agentId, importedAt: new Date().toISOString() });
       log(`Provisioned dedicated backfill agent: ${agentId}`);
     }
   }
-  await reconcileDedicatedAgent(apiKey, agentId, options.reconcileCanonicalPrompt ?? true);
+
+  if (reconcileCanonicalPrompt && !canonical) {
+    // Existing managed agents load the authored prompt only when canonical
+    // reconciliation is requested. Canary/self-managed prompt opt-out remains
+    // independent of bundled prompt resources.
+    canonical = getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE);
+  }
+  await reconcileDedicatedAgent(apiKey, agentId, reconcileCanonicalPrompt, canonical);
   return agentId;
 }
