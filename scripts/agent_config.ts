@@ -484,10 +484,12 @@ export async function reconcileManagedAgentConfiguration(
   log: (msg: string) => void = console.log,
   agentFile: string = DEFAULT_AGENT_FILE,
   canonicalOverride?: CanonicalManagedAgentConfig,
+  options: { useOperatorRuntimeOverrides?: boolean } = {},
 ): Promise<void> {
   const canonical = canonicalOverride ?? getCanonicalManagedAgentConfig(agentFile);
-  const desiredModel = process.env.LETTA_MODEL || canonical.model;
-  const desiredContextWindow = operatorContextWindow(canonical.contextWindowLimit);
+  const useOperatorRuntimeOverrides = options.useOperatorRuntimeOverrides ?? true;
+  const desiredModel = useOperatorRuntimeOverrides ? (process.env.LETTA_MODEL || canonical.model) : canonical.model;
+  const desiredContextWindow = useOperatorRuntimeOverrides ? operatorContextWindow(canonical.contextWindowLimit) : canonical.contextWindowLimit;
   const url = buildLettaApiUrl(`/agents/${agentId}`);
   const getResponse = await fetch(url, {
     method: 'GET',
