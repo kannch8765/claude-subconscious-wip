@@ -3,11 +3,12 @@ from pathlib import Path
 p = Path('scripts/task_06_apply.py')
 s = p.read_text()
 
-old_line = "s=regex_once(s, r\"const payloadKeys = \\\\{.*?\\\\} satisfies Record<MemoryKind, \\\\{ required: string\\\\[\\\\]; optional: string\\\\[\\\\]; arrays: string\\\\[\\\\]; nonEmptyArrays\\\\?: string\\\\[\\\\] \\\\}>;\", new_defs, 'replace payloadKeys')"
-new_line = "s=regex_once(s, r\"const payloadKeys: Record<MemoryKind, \\\\{ required: string\\\\[\\\\]; optional: string\\\\[\\\\]; arrays\\\\?: string\\\\[\\\\]; nonEmptyArrays\\\\?: string\\\\[\\\\] \\\\}> = \\\\{.*?\\\\n\\\\};\", new_defs, 'replace payloadKeys')"
-if s.count(old_line) != 1:
-    raise RuntimeError(f'payloadKeys apply pattern drifted: {s.count(old_line)}')
-s = s.replace(old_line, new_line, 1)
+lines = s.splitlines()
+payload_indexes = [i for i, line in enumerate(lines) if "'replace payloadKeys'" in line]
+if len(payload_indexes) != 1:
+    raise RuntimeError(f'payloadKeys apply line drifted: {len(payload_indexes)}')
+lines[payload_indexes[0]] = "s=regex_once(s, r\"const payloadKeys.*?\\n\\};\", new_defs, 'replace payloadKeys')"
+s = '\n'.join(lines) + ('\n' if s.endswith('\n') else '')
 
 start = s.index("old_validator=r'''", s.index('replace payloadKeys'))
 end = s.index("\nnew_validator=r'''", start)
@@ -48,12 +49,15 @@ actual = """old_validator=r'''  const rules = payloadKeys[kind];
 '''
 """
 s = s[:start] + actual + s[end + 1:]
-sync_line = "s=replace_once(s,\"    expect(worker).toContain(\\\"['memory_remember', 'memory_reinforce', 'entity_remember']\\\");\", \"    expect(worker).toContain('isRelationshipMutationClientTool(tool.name)');\",'sync mutation test')"
-sync_extra = "s=replace_once(s,\"    expect(worker).toContain('openStdioMcpToolsFromEnvironment(log)');\", \"    expect(worker).toContain('(dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log)');\",'sync stdio fallback test')"
-if sync_extra not in s:
-    if s.count(sync_line) != 1:
-        raise RuntimeError(f'sync mutation apply line drifted: {s.count(sync_line)}')
-    s = s.replace(sync_line, sync_line + '\n' + sync_extra, 1)
+
+lines = s.splitlines()
+sync_indexes = [i for i, line in enumerate(lines) if "'sync mutation test'" in line]
+if len(sync_indexes) != 1:
+    raise RuntimeError(f'sync mutation apply line drifted: {len(sync_indexes)}')
+extra = "s=replace_once(s,\"    expect(worker).toContain('openStdioMcpToolsFromEnvironment(log)');\", \"    expect(worker).toContain('(dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log)');\",'sync stdio fallback test')"
+if extra not in lines:
+    lines.insert(sync_indexes[0] + 1, extra)
+s = '\n'.join(lines) + ('\n' if s.endswith('\n') else '')
 
 p.write_text(s)
-print('task-06 prepatch: aligned apply script to exact branch schema syntax and sync fallback assertion')
+print('task-06 prepatch: aligned exact schema block and sync fallback assertion')
