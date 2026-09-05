@@ -7,9 +7,13 @@ on:
   pull_request:
     branches: [main]
     paths:
+      - 'relationship-memory/src/store/**'
       - 'relationship-memory/tests/concurrent-writer-safety.test.ts'
       - 'relationship-memory/tests/concurrent-writer-child.ts'
       - '.github/workflows/task-093ap-tests.yml'
+
+permissions:
+  contents: read
 
 jobs:
   test:
@@ -31,4 +35,4 @@ jobs:
               -t 'surfaces lock contention as an explicit retryable failure'
           done
       - name: Full test suite
-        run: npm test
+        run: npm run test:ci
