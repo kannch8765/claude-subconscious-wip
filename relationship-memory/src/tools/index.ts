@@ -16,6 +16,7 @@ import type {
 } from '../schema/index.js';
 import { normalizeEntityAlias, validateEntityIdentityProposal, validateProposal } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
+import { materializeEffectiveMemory } from '../owner/index.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
@@ -266,30 +267,9 @@ export class RelationshipMemoryRuntime {
       bucket.push(revision);
       revisionsByMemory.set(revision.memory_id, bucket);
     }
-    return this.store.listMemories().map((genesis) => {
-      let semantic = {
-        kind: genesis.kind,
-        summary: genesis.summary,
-        participants: genesis.participants,
-        payload: genesis.payload,
-        ...(genesis.linked_memory_ids ? { linked_memory_ids: genesis.linked_memory_ids } : {}),
-      };
-      let status: 'active' | 'inactive' = 'active';
-      let latest: OwnerRevisionRecord | undefined;
-      for (const revision of revisionsByMemory.get(genesis.memory_id) ?? []) {
-        latest = revision;
-        if (revision.action === 'revise' && revision.replacement) semantic = revision.replacement;
-        else if (revision.action === 'deactivate') status = 'inactive';
-        else if (revision.action === 'restore') status = 'active';
-      }
-      return {
-        ...genesis,
-        ...semantic,
-        status,
-        owner_corrected: Boolean(latest),
-        ...(latest ? { latest_revision_id: latest.revision_id, latest_revision_at: latest.recorded_at } : {}),
-      };
-    });
+    return this.store.listMemories().map((genesis) =>
+      materializeEffectiveMemory(genesis, revisionsByMemory.get(genesis.memory_id) ?? []),
+    );
   }
 
   async memorySearchRecallHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
