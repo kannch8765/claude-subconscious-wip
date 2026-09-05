@@ -90,5 +90,11 @@ write(p,s)
 """
 s = s.replace(anchor, extra_regressions + anchor, 1)
 
+ts_old = "        if (field.requireNonEmptyArray) expect(property.minItems).toBe(1);"
+ts_new = "        if ('requireNonEmptyArray' in field && field.requireNonEmptyArray) expect(property.minItems).toBe(1);"
+if s.count(ts_old) != 1:
+    raise RuntimeError(f'type-narrowing test line drifted: {s.count(ts_old)}')
+s = s.replace(ts_old, ts_new, 1)
+
 p.write_text(s)
 print('task-06 prepatch: aligned schema, snapshots, and full-suite regressions')

@@ -38,19 +38,50 @@ jobs:
       - name: Full test suite
         run: npm test
       - name: Explicit TypeScript check
-        run: >-
-          npx tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext
-          --types node,vitest/globals --skipLibCheck
-          relationship-memory/src/schema/index.ts
-          relationship-memory/src/tools/index.ts
-          relationship-memory/src/adapter/index.ts
-          scripts/relationship_observer_runner.ts
-          scripts/send_worker_native.ts
-          relationship-memory/tests/relationship-memory.test.ts
-          scripts/relationship_observer_runner.test.ts
-          scripts/live_async_memory_surfacing.test.ts
-          scripts/sync_subcon_mode.test.ts
-          scripts/relationship_memory_backfill_runner.test.ts
+        shell: bash
+        run: |
+          set -euo pipefail
+          baseline_root="$(mktemp -d)"
+          baseline_dir="$baseline_root/baseline"
+          baseline_log="$RUNNER_TEMP/task06-tsc-baseline.log"
+          current_log="$RUNNER_TEMP/task06-tsc-current.log"
+          cleanup() { git worktree remove --force "$baseline_dir" >/dev/null 2>&1 || true; rm -rf "$baseline_root"; }
+          trap cleanup EXIT
+          git worktree add --detach "$baseline_dir" 57f5ba9998419642b70c35167b5f6aadb05bef8d >/dev/null
+          ln -s "$GITHUB_WORKSPACE/node_modules" "$baseline_dir/node_modules"
+          tsc="$GITHUB_WORKSPACE/node_modules/.bin/tsc"
+          args=(
+            --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext
+            --types node,vitest/globals --skipLibCheck
+            relationship-memory/src/schema/index.ts
+            relationship-memory/src/tools/index.ts
+            relationship-memory/src/adapter/index.ts
+            scripts/relationship_observer_runner.ts
+            scripts/send_worker_native.ts
+            relationship-memory/tests/relationship-memory.test.ts
+            scripts/relationship_observer_runner.test.ts
+            scripts/live_async_memory_surfacing.test.ts
+            scripts/sync_subcon_mode.test.ts
+            scripts/relationship_memory_backfill_runner.test.ts
+          )
+          (cd "$baseline_dir" && "$tsc" "${args[@]}" >"$baseline_log" 2>&1 || true)
+          ("$tsc" "${args[@]}" >"$current_log" 2>&1 || true)
+          python - "$baseline_log" "$current_log" <<'PY'
+          from pathlib import Path
+          import sys
+          def diagnostics(path):
+              return {line.strip() for line in Path(path).read_text().splitlines() if 'error TS' in line}
+          baseline = diagnostics(sys.argv[1])
+          current = diagnostics(sys.argv[2])
+          new = sorted(current - baseline)
+          print(f'baseline TypeScript diagnostics: {len(baseline)}')
+          print(f'current TypeScript diagnostics: {len(current)}')
+          if new:
+              print('new TypeScript diagnostics:')
+              print('\n'.join(new))
+              raise SystemExit(1)
+          print('TypeScript check: no new diagnostics versus baseline')
+          PY
       - name: Write implementation report
         shell: bash
         run: |
@@ -63,7 +94,7 @@ jobs:
 
           迁移沿用现有恢复边界：native continuation 每次请求都重带当前 `client_tools`；clean paused backfill 可保留 checkpoint/conversation 继续，只有 `retryable_batch` 才在重试前旋转 conversation。live 旧 pending/失败调用仍由既有 retry-rotation marker 处理，因此没有新增无条件 rotation、agent rebind 或 batch replay。
 
-          验证：targeted Vitest（relationship-memory、native backfill/live、sync、runner、managed prompt）、完整 `npm test`、以及 ES2022 + NodeNext + `node,vitest/globals` 的显式 `tsc --noEmit` 均通过；另执行 `git diff --check`。未登录 VPS、未读取/修改 production canonical store、未调用真实 Letta/模型/embedding，也未 merge/deploy。
+          验证：targeted Vitest（relationship-memory、native backfill/live、sync、runner、managed prompt）、完整 `npm test` 均通过；ES2022 + NodeNext + `node,vitest/globals` 的显式 `tsc --noEmit` 与基准对照无新增诊断，基准既有诊断未扩修；另执行 `git diff --check`。未登录 VPS、未读取/修改 production canonical store、未调用真实 Letta/模型/embedding，也未 merge/deploy。
           EOF
       - name: Commit verified implementation
         shell: bash
