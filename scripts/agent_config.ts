@@ -870,7 +870,7 @@ async function updateAgentModel(
 export function buildManagedAgentImportPayload(
   agentFile: string = DEFAULT_AGENT_FILE,
   canonical: CanonicalManagedAgentConfig = getCanonicalManagedAgentConfig(agentFile),
-): Buffer {
+): string {
   let content: any;
   try {
     content = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
@@ -888,16 +888,21 @@ export function buildManagedAgentImportPayload(
   // text starts with the serialized system prompt. Keep that derived snapshot
   // consistent in the in-memory import payload without rewriting the .af file.
   const messages = Array.isArray(agent.messages) ? agent.messages : [];
+  let bootstrapMatches = 0;
   for (const message of messages) {
     if (message?.role !== 'system' || !Array.isArray(message.content)) continue;
     for (const part of message.content) {
       if (part?.type === 'text' && typeof part.text === 'string' && part.text.startsWith(serializedSystem)) {
+        bootstrapMatches += 1;
         part.text = canonical.system + part.text.slice(serializedSystem.length);
       }
     }
   }
+  if (bootstrapMatches !== 1) {
+    throw new Error(`Managed ${path.basename(agentFile)} must contain exactly one compiled system bootstrap prefix; found ${bootstrapMatches}`);
+  }
   content.agents[0] = { ...agent, system: canonical.system };
-  return Buffer.from(JSON.stringify(content), 'utf8');
+  return JSON.stringify(content);
 }
 
 /**

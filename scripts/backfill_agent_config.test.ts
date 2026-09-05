@@ -42,8 +42,11 @@ describe('dedicated historical backfill agent resolver', () => {
   });
 
 
-  it('can resolve a fill agent without reconciling the drifting canonical prompt', async () => {
+  it('can resolve a fill agent without the bundled prompt resource when canonical prompt reconciliation is opted out', async () => {
     process.env.LETTA_AGENT_ID = LIVE;
+    const promptModule = await import('./managed_system_prompt.js');
+    const originalPromptFile = promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.backfill;
+    promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.backfill = path.join(os.tmpdir(), 'missing-backfill-system.md');
     const patches: Array<Record<string, unknown>> = [];
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input); expect(url).toContain(`/agents/${BACKFILL}`);
@@ -53,8 +56,12 @@ describe('dedicated historical backfill agent resolver', () => {
       }
       return jsonResponse({ id: BACKFILL, name: 'backfill', tags: REQUIRED, system: 'canary-owned prompt' });
     }));
-    await expect(getBackfillAgentId('test-key', () => {}, { agentId: BACKFILL, reconcileCanonicalPrompt: false })).resolves.toBe(BACKFILL);
-    expect(patches.some((body) => 'system' in body)).toBe(false);
+    try {
+      await expect(getBackfillAgentId('test-key', () => {}, { agentId: BACKFILL, reconcileCanonicalPrompt: false })).resolves.toBe(BACKFILL);
+      expect(patches.some((body) => 'system' in body)).toBe(false);
+    } finally {
+      promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.backfill = originalPromptFile;
+    }
   });
 
   it('applies and verifies the bounded verified DeepSeek fill runtime profile', async () => {

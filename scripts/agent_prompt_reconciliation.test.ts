@@ -143,6 +143,24 @@ describe('managed adopted-agent system prompt reconciliation', () => {
     expect(requests.some((request) => request.pathname === '/v1/agents/import')).toBe(false);
   });
 
+  it('does not issue a second system PATCH after the first reconciliation converges', async () => {
+    const home = makeHome();
+    writeSavedAgent(home);
+    const mod = await loadAgentConfig(home);
+    const canonical = mod.getCanonicalManagedSystemPrompt();
+    const { requests, getLiveSystem } = installManagedFetch('obsolete four-kind prompt');
+
+    await expect(mod.getAgentId('test-key', () => undefined)).resolves.toBe(MANAGED_AGENT_ID);
+    const requestCountAfterFirstPass = requests.length;
+    await expect(mod.getAgentId('test-key', () => undefined)).resolves.toBe(MANAGED_AGENT_ID);
+
+    const systemPatches = requests.filter((request) => request.method === 'PATCH' && request.body?.system !== undefined);
+    expect(systemPatches).toHaveLength(1);
+    expect(systemPatches[0].body).toEqual({ system: canonical });
+    expect(getLiveSystem()).toBe(canonical);
+    expect(requests.slice(requestCountAfterFirstPass).filter((request) => request.method === 'PATCH' && request.body?.system !== undefined)).toHaveLength(0);
+  });
+
   it('does not let availability fallback undo canonical managed runtime reconciliation', async () => {
     const home = makeHome();
     writeSavedAgent(home);
@@ -276,6 +294,51 @@ describe('managed adopted-agent system prompt reconciliation', () => {
 
     await expect(mod.getAgentId('test-key', () => undefined)).resolves.toBe(EXTERNAL_AGENT_ID);
     expect(requests).toEqual([{ method: 'GET', pathname: `/v1/agents/${EXTERNAL_AGENT_ID}` }]);
+  });
+
+  it('keeps an ordinary external env agent usable even when the bundled live prompt resource is missing', async () => {
+    const home = makeHome();
+    process.env.LETTA_AGENT_ID = EXTERNAL_AGENT_ID;
+    const mod = await loadAgentConfig(home);
+    const promptModule = await import('./managed_system_prompt.js');
+    const originalPromptFile = promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.live;
+    promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.live = path.join(home, 'missing-live-system.md');
+    const requests: Array<{ method: string; pathname: string }> = [];
+    const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url);
+      const method = init?.method || 'GET';
+      requests.push({ method, pathname: url.pathname });
+      if (url.pathname === `/v1/agents/${EXTERNAL_AGENT_ID}` && method === 'GET') {
+        return jsonResponse({ id: EXTERNAL_AGENT_ID, name: 'Ordinary Agent', tags: [], system: 'external prompt' });
+      }
+      throw new Error(`ordinary external agent must not receive managed request: ${method} ${url.pathname}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      await expect(mod.getAgentId('test-key', () => undefined)).resolves.toBe(EXTERNAL_AGENT_ID);
+      expect(requests).toEqual([{ method: 'GET', pathname: `/v1/agents/${EXTERNAL_AGENT_ID}` }]);
+    } finally {
+      promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.live = originalPromptFile;
+    }
+  });
+
+  it('fails before any remote request when a saved managed agent needs a missing bundled live prompt resource', async () => {
+    const home = makeHome();
+    writeSavedAgent(home);
+    const mod = await loadAgentConfig(home);
+    const promptModule = await import('./managed_system_prompt.js');
+    const originalPromptFile = promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.live;
+    promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.live = path.join(home, 'missing-live-system.md');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      await expect(mod.getAgentId('test-key', () => undefined)).rejects.toThrow('Failed to read managed system prompt missing-live-system.md');
+      expect(fetchMock).not.toHaveBeenCalled();
+    } finally {
+      promptModule.BUNDLED_MANAGED_SYSTEM_PROMPTS.live = originalPromptFile;
+    }
   });
 
   it('fails closed on managed prompt PATCH failure without importing a replacement agent', async () => {

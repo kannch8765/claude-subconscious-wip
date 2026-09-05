@@ -147,3 +147,101 @@ No model/profile/runtime JSON migration, backfill runner consolidation, sync pro
 ## Follow-up real-service verification
 
 Before production release, run the repository's normal dependency-backed test suite and a bounded managed-agent canary in an approved environment. The useful live-service checks are: edit one Markdown prompt, resolve the corresponding managed agent, confirm exactly one system PATCH for an existing agent and zero second-pass PATCHes; and separately provision a disposable managed import and confirm the created agent begins with the edited prompt without relying on a corrective system PATCH. This implementation does not perform those production/service calls itself.
+
+## VPS acceptance follow-up — 2026-09-05
+
+A follow-up acceptance pass was run in an isolated VPS checkout at the implementation head, with normal registry-backed dependencies installed by `npm ci`. No production service, Letta agent, Omen/backfill runner, model provider, embedding provider, or production state directory was used or mutated.
+
+### Focused source review finding and hardening
+
+The bundled AgentFiles currently each contain exactly one system-role text part whose text starts with the serialized `agents[0].system` snapshot. The remainder of that text is not prompt text: the live AgentFile has 15,835 trailing characters of compiled memory-block/bootstrap content, while the backfill AgentFile has 298 trailing characters of relationship-memory projection bootstrap content.
+
+The original implementation preserved those suffixes by replacing only the serialized-system prefix, but it did not fail if a future AgentFile had zero matching bootstrap parts, and it would rewrite all matches if there were multiple. The acceptance review hardened `buildManagedAgentImportPayload()` to require exactly one compiled system bootstrap prefix. Zero or multiple matches now fail closed before import. The payload is returned as JSON text rather than a Node `Buffer`, which is directly accepted by `Blob` and removes two task-introduced `Buffer`/`BlobPart` type errors.
+
+Permanent regression coverage now verifies, for both bundled AgentFiles, that:
+
+- exactly one compiled bootstrap text part is rewritten;
+- every character after the old serialized system prefix is byte-for-byte/text-for-text unchanged;
+- all non-system/non-bootstrap payload data is unchanged;
+- zero bootstrap matches fail closed;
+- multiple bootstrap matches fail closed.
+
+### Repeatable boundary evidence
+
+The acceptance pass converted the earlier manual-only boundary checks into repeatable Vitest coverage where it was missing:
+
+- a stale saved managed live agent converges with one system PATCH, and a second resolver pass emits no additional system PATCH;
+- an ordinary untagged env-selected external agent remains usable even when the bundled live prompt resource path is missing, and performs only its read-only ownership GET;
+- a saved managed live agent with a missing bundled prompt fails before any remote request;
+- an explicit backfill canary with `reconcileCanonicalPrompt:false` remains usable even when the bundled backfill prompt resource path is missing and performs no system PATCH;
+- an explicit custom AgentFile still keeps its own `system` unless a managed prompt file is explicitly supplied.
+
+The stale source-level role-split test was also updated to match the new single-snapshot architecture: backfill resolves `getCanonicalManagedAgentConfig(DEFAULT_AGENT_FILE)` once, passes that same canonical object into `buildManagedAgentImportPayload(...)`, and reuses it for `reconcileManagedAgentConfiguration(...)` instead of independently reading the old prompt helper.
+
+### Dependency-backed test results
+
+Environment:
+
+```text
+npm ci --no-audit --no-fund
+added 146 packages
+Vitest 3.2.4
+```
+
+Focused editable-prompt suite:
+
+```text
+npx vitest run \
+  scripts/managed_system_prompt.test.ts \
+  scripts/agent_prompt_reconciliation.test.ts \
+  scripts/backfill_agent_config.test.ts \
+  scripts/subcon_voice_contract.test.ts \
+  --reporter=verbose
+```
+
+Result: **PASS — 4 files, 33 tests**.
+
+A normal full `npm test` was also run. The first run exposed one stale source-string assertion in `scripts/live_subconscious_role_split.test.ts`; after updating that assertion to the new canonical-config reuse contract, the editable-prompt and role-split tests passed. The remaining full-suite failures were confined to pre-existing child-process/concurrency tests outside this task:
+
+- `relationship-memory/tests/concurrent-writer-safety.test.ts`
+- `relationship-memory/tests/legacy-ombre-concurrency.test.ts`
+
+On the task checkout, an isolated run of those two files produced 7 passes / 2 failures. The same two files run with the same installed dependencies against the fixed baseline `e83e75956b468dc43491bcb8fafff8ac70d0e854` produced 3 passes / 6 failures, including the same child exit `1`/`null` and timeout class. A separate `recall_mcp_entrypoint.test.ts` child-process failure seen during the broad run passed immediately when rerun alone on the task checkout, while the baseline isolated rerun failed. This is evidence of an existing VPS child-process/concurrency test instability rather than an editable-prompt regression; those unrelated tests were not modified.
+
+Accordingly this acceptance pass does **not** claim a synthetic `421/421` full-suite green result. It records the raw broad-suite behavior and the baseline comparison, while the complete task-specific suite is green.
+
+### Real TypeScript check
+
+With dependencies installed, the modified TypeScript was checked without `--noCheck`:
+
+```text
+npx tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext \
+  --types node,vitest/globals --skipLibCheck \
+  scripts/managed_system_prompt.ts \
+  scripts/agent_config.ts \
+  scripts/backfill_agent_config.ts \
+  scripts/managed_system_prompt.test.ts \
+  scripts/agent_prompt_reconciliation.test.ts \
+  scripts/backfill_agent_config.test.ts \
+  scripts/subcon_voice_contract.test.ts
+```
+
+After fixing the two task-introduced `Buffer`/`BlobPart` errors, the task checkout reports only:
+
+```text
+scripts/agent_config.ts(318,113): error TS2339: Property 'name' does not exist on type 'unknown'.
+```
+
+The same check against the fixed baseline reports the same pre-existing error at the corresponding baseline line 310. Therefore the acceptance patch introduces **zero new TypeScript errors relative to baseline**, but the repository still does not have a globally clean type-check baseline and this report does not label TypeScript as fully green.
+
+### Final packaging/diff checks
+
+`npm pack --dry-run --json` passed again in the dependency-backed VPS checkout and included both AgentFiles, both `config/*-system.md` files, and `docs/EDITABLE-SYSTEM-PROMPTS.md`. `git diff --check` also passed.
+
+Acceptance-follow-up code/test changes are limited to:
+
+- hardening compiled bootstrap replacement to require exactly one match;
+- returning the generated AgentFile payload as JSON text for `Blob` compatibility;
+- strengthening editable-prompt/boundary/reconcile tests;
+- updating the stale role-split source assertion;
+- this validation report.
