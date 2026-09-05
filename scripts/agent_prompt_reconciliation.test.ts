@@ -127,7 +127,7 @@ function expectAttachedBlockSnapshotsMatch(af: any): void {
 }
 
 describe('managed adopted-agent system prompt reconciliation', () => {
-  it('patches a stale saved managed agent exactly once with the canonical .af system', async () => {
+  it('patches a stale saved managed agent exactly once with the managed Markdown system', async () => {
     const home = makeHome();
     writeSavedAgent(home);
     const mod = await loadAgentConfig(home);
@@ -207,9 +207,6 @@ describe('managed adopted-agent system prompt reconciliation', () => {
       if (url.pathname === `/v1/agents/${MANAGED_AGENT_ID}/tools` && method === 'GET') return jsonResponse(surface.tools);
       if (url.pathname === '/v1/tools/' && method === 'GET') return jsonResponse(surface.tools);
       if (url.pathname === '/v1/models/' && method === 'GET') {
-        // The canonical DeepSeek handle is deliberately absent. Before R1 this
-        // caused ensureModelAvailable() to PATCH the just-reconciled agent back
-        // to the first available model in the same getAgentId() call.
         return jsonResponse([
           { model: 'gpt-5.2', name: 'gpt-5.2', provider_type: 'openai', handle: 'openai/gpt-5.2' },
         ]);
@@ -293,12 +290,13 @@ describe('managed adopted-agent system prompt reconciliation', () => {
 });
 
 describe('canonical Subconscious prompt contract', () => {
-  it('loads the live prompt directly from Subconscious.af as the default source of truth', async () => {
+  it('loads the live prompt from config/live-system.md while keeping AgentFile block snapshots intact', async () => {
     const home = makeHome();
     const mod = await loadAgentConfig(home);
     const af = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf-8'));
+    const authored = fs.readFileSync(path.join(process.cwd(), 'config', 'live-system.md'), 'utf-8');
 
-    expect(mod.getCanonicalManagedSystemPrompt()).toBe(af.agents[0].system);
+    expect(mod.getCanonicalManagedSystemPrompt()).toBe(authored);
     expectAttachedBlockSnapshotsMatch(af);
   });
 
@@ -322,10 +320,10 @@ describe('canonical Subconscious prompt contract', () => {
     const home = makeHome();
     const mod = await loadAgentConfig(home);
     const file = path.join(process.cwd(), 'SubconsciousBackfill.af');
-    const af = JSON.parse(fs.readFileSync(file, 'utf-8'));
     const prompt = mod.getCanonicalManagedSystemPrompt(file);
+    const authored = fs.readFileSync(path.join(process.cwd(), 'config', 'backfill-system.md'), 'utf-8');
 
-    expect(prompt).toBe(af.agents[0].system);
+    expect(prompt).toBe(authored);
     expect(prompt).toContain('reconfigured as a relationship-memory observer');
     expect(prompt).toContain('no Claude builtin filesystem, shell, or task tools');
     expect(prompt).toContain('role=assistant');
