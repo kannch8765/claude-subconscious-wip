@@ -59,5 +59,36 @@ if extra not in lines:
     lines.insert(sync_indexes[0] + 1, extra)
 s = '\n'.join(lines) + ('\n' if s.endswith('\n') else '')
 
+old_snapshot_patch = """        old_tg=block['value']
+        if old_tg not in text: raise RuntimeError('live compiled bootstrap lacks tool_guidelines snapshot')
+        text=text.replace(old_tg,new_tg,1); block['value']=new_tg
+"""
+new_snapshot_patch = """        old_tg=block['value']
+        if old_tg not in text: raise RuntimeError('live compiled bootstrap lacks tool_guidelines snapshot')
+        old_snapshot=f\"- chars_current={len(old_tg)}\\n- chars_limit=20000\\n</metadata>\\n<value>\\n{old_tg}\"
+        new_snapshot=f\"- chars_current={len(new_tg)}\\n- chars_limit=20000\\n</metadata>\\n<value>\\n{new_tg}\"
+        if text.count(old_snapshot) != 1: raise RuntimeError(f'live tool_guidelines compiled snapshot drift: {text.count(old_snapshot)}')
+        text=text.replace(old_snapshot,new_snapshot,1); block['value']=new_tg
+"""
+if s.count(old_snapshot_patch) != 1:
+    raise RuntimeError(f'AgentFile snapshot apply block drifted: {s.count(old_snapshot_patch)}')
+s = s.replace(old_snapshot_patch, new_snapshot_patch, 1)
+
+anchor = "p='scripts/relationship_memory_backfill_runner.test.ts'; s=read(p)\n"
+if s.count(anchor) != 1:
+    raise RuntimeError(f'backfill test apply anchor drifted: {s.count(anchor)}')
+extra_regressions = """p='scripts/stdio_mcp_client.test.ts'; s=read(p)
+s=replace_once(s,\"    expect(worker).toContain('openStdioMcpToolsFromEnvironment(log)');\", \"    expect(worker).toContain('(dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log)');\",'stdio mcp fallback test')
+write(p,s)
+
+p='relationship-memory/tests/assistant-originated-intent.test.ts'; s=read(p)
+s=replace_once(s,'  memoryRememberToolSchema,','  memoryRememberKindToolSchema,','assistant intent schema import')
+s=replace_once(s,\"  it('does not expose feel as a memory_remember authority field and projects the exact stored feel', () => {\", \"  it('does not expose feel as a kind-specific memory-create authority field and projects the exact stored feel', () => {\",'assistant intent test title')
+s=replace_once(s,'    const schema = memoryRememberToolSchema() as any;',\"    const schema = memoryRememberKindToolSchema('personal_experience') as any;\",'assistant intent schema call')
+write(p,s)
+
+"""
+s = s.replace(anchor, extra_regressions + anchor, 1)
+
 p.write_text(s)
-print('task-06 prepatch: aligned exact schema block and sync fallback assertion')
+print('task-06 prepatch: aligned schema, snapshots, and full-suite regressions')
