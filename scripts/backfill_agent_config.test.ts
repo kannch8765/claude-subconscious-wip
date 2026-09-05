@@ -20,6 +20,14 @@ afterEach(() => {
 });
 
 describe('dedicated historical backfill agent resolver', () => {
+  it('keeps affective-field guidance aligned with the v1 kind-specific payload schema', () => {
+    const raw = fs.readFileSync(BACKFILL_AF, 'utf8');
+    expect(raw).not.toContain('Optional affective fields such as emotional_tone or why_memorable may be used');
+    expect(raw).toContain('emotional_tone and why_memorable are optional only for personal_experience');
+    expect(raw).toContain('relationship_event accepts only event, meaning, prior_context, and resulting_change');
+    expect(raw).toContain('Never add undeclared payload fields');
+  });
+
   it('uses the dedicated override and never falls through to live LETTA_AGENT_ID', async () => {
     process.env.LETTA_AGENT_ID = LIVE; process.env.LETTA_BACKFILL_AGENT_ID = BACKFILL;
     const canonical = getCanonicalManagedSystemPrompt(BACKFILL_AF); const calls: string[] = [];
