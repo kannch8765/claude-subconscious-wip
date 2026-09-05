@@ -88,7 +88,7 @@ async function waitForFile(path: string, timeoutMs = 800): Promise<void> {
 describe('stdio MCP native client-tool bridge', () => {
   it('composes optional MCP tools around the current identity-grounding relationship inventory', () => {
     const worker = readFileSync(join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
-    expect(worker).toContain('openStdioMcpToolsFromEnvironment(log)');
+    expect(worker).toContain('(dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log)');
     expect(worker).toContain('const liveTools = [...relationshipTools, ...mcpTools]');
     expect(worker).toContain('tools: liveTools');
     expect(worker).toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");

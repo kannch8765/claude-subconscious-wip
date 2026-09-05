@@ -14,7 +14,7 @@ import type {
   RememberOutcome,
   ReinforcementRecord,
 } from '../schema/index.js';
-import { normalizeEntityAlias, validateEntityIdentityProposal, validateProposal } from '../schema/index.js';
+import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { materializeEffectiveMemory } from '../owner/index.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
@@ -56,6 +56,14 @@ export interface RememberResult {
   rejection_code?: string;
   reason?: string;
 }
+
+export type MemoryRememberToolName = `memory_remember_${MemoryKind}`;
+
+export function memoryRememberToolName(kind: MemoryKind): MemoryRememberToolName {
+  return `memory_remember_${kind}`;
+}
+
+export const MEMORY_REMEMBER_TOOL_NAMES = MEMORY_KINDS.map(memoryRememberToolName) as readonly MemoryRememberToolName[];
 
 function boundedSearchLimit(value: number | undefined): number {
   return Math.max(1, Math.min(value ?? 8, 20));
@@ -764,6 +772,17 @@ export class RelationshipMemoryRuntime {
     return this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now);
   }
 
+  rememberKind(batchId: string, kind: MemoryKind, rawInput: unknown): RememberResult {
+    const input = rawInput !== null && typeof rawInput === 'object' && !Array.isArray(rawInput)
+      ? rawInput as Record<string, unknown>
+      : {};
+    return this.remember(batchId, {
+      ...input,
+      schema_version: 1,
+      kind,
+    });
+  }
+
   remember(batchId: string, rawProposal: unknown): RememberResult {
     const now = this.now();
     this.ensureRetryAttempt(batchId, now);
@@ -966,72 +985,60 @@ export function cursorShouldAdvance(completion: BatchCompletion): boolean {
   return completion === 'completed';
 }
 
-export function memoryRememberToolSchema(): Record<string, unknown> {
-  const string = { type: 'string', minLength: 1 };
-  const strings = { type: 'array', uniqueItems: true, items: string };
+export function memoryRememberKindToolSchema(kind: MemoryKind): Record<string, unknown> {
+  const stringSchema = (): Record<string, unknown> => ({ type: 'string', minLength: 1 });
+  const stringArraySchema = (requireNonEmpty = false): Record<string, unknown> => ({
+    type: 'array',
+    ...(requireNonEmpty ? { minItems: 1 } : {}),
+    uniqueItems: true,
+    items: stringSchema(),
+  });
+  const fieldDefinitions = MEMORY_KIND_DEFINITIONS[kind].fields as Record<string, MemoryPayloadFieldDefinition>;
+  const payloadProperties = Object.fromEntries(Object.entries(fieldDefinitions).map(([name, definition]) => [
+    name,
+    {
+      ...(definition.valueType === 'string_array'
+        ? stringArraySchema(definition.requireNonEmptyArray ?? false)
+        : stringSchema()),
+      ...(definition.description ? { description: definition.description } : {}),
+    },
+  ]));
+  const payloadRequired = Object.entries(fieldDefinitions)
+    .filter(([, definition]) => definition.required)
+    .map(([name]) => name);
+
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['schema_version', 'kind', 'summary', 'participants', 'payload'],
-    oneOf: [{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }],
+    required: ['summary', 'participants', 'evidence_ids', 'payload'],
     properties: {
-      schema_version: { type: 'integer', enum: [1], description: 'Relationship-memory proposal schema version; must be 1.' },
-      kind: {
-        type: 'string',
-        enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'],
-        description: 'Canonical relationship-memory kind. payload fields must match this kind exactly.',
+      summary: {
+        ...stringSchema(),
+        description: 'Concise source-grounded historical event or stable-fact index. State what happened or what was explicitly stated; do not infer present feelings, motives, fulfillment, or relationship conclusions.',
       },
-      summary: { ...string, description: 'Concise source-grounded historical event or stable-fact index. State what happened or what was explicitly stated; do not infer present feelings, motives, fulfillment, or relationship conclusions.' },
-      participants: { type: 'array', minItems: 1, maxItems: 2, uniqueItems: true, items: { type: 'string', enum: ['user', 'assistant'] } },
-      evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Exact evidence_id values copied from the trusted current-batch transcript-event evidence catalog.' },
-      evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: string, description: 'Legacy message_id compatibility alias. A message_id is accepted only when it uniquely identifies one trusted event in the current batch; ambiguous multi-event messages are rejected and require an exact evidence_id. Do not send both fields.' },
-      linked_memory_ids: strings,
+      participants: {
+        type: 'array', minItems: 1, maxItems: 2, uniqueItems: true,
+        items: { type: 'string', enum: ['user', 'assistant'] },
+      },
+      evidence_ids: {
+        type: 'array', minItems: 1, uniqueItems: true, items: stringSchema(),
+        description: 'Exact evidence_id values copied from the trusted current-batch transcript-event evidence catalog.',
+      },
+      linked_memory_ids: stringArraySchema(),
       assistant_intent_id: {
-        type: 'string', minLength: 1,
+        ...stringSchema(),
         description: 'Optional trusted assistant remember-intent ID copied exactly from the current-batch assistant intent catalog. Never supply feel text here.',
       },
       payload: {
         type: 'object',
         additionalProperties: false,
-        description: [
-          'Kind-specific payload. Trusted validation remains authoritative.',
-          'personal_experience requires title, experience; optional time_text, places, themes, emotional_tone, why_memorable, recall_triggers.',
-          'shared_experience requires title, event, shared_meaning; optional symbols, recall_triggers.',
-          'relationship_event requires event, meaning; optional prior_context, resulting_change.',
-          'inside_joke requires name, meaning, trigger_phrases; optional origin, callbacks, tone.',
-          'user_preference requires topic, preference; optional context, reason, recall_triggers.',
-          'For DS-authored new writes, summary and narrative semantic prose must be Chinese; literal names, aliases, trigger tokens, code, provider names, paths, URLs, and trusted evidence stay source-faithful.',
-        ].join(' '),
-        properties: {
-          title: string,
-          experience: string,
-          time_text: string,
-          places: strings,
-          themes: strings,
-          emotional_tone: { ...string, description: 'Optional historical affect only when trusted evidence directly expresses or unambiguously demonstrates it; keep it perspective-neutral and do not project it onto present Kohaku.' },
-          why_memorable: { ...string, description: 'Optional source-supported historical reason only. Omit when the evidence does not explicitly support why the event was memorable; never invent present-day significance.' },
-          recall_triggers: strings,
-          event: string,
-          shared_meaning: { ...string, description: 'Required minimal factual relationship description. Prefer an evidence-backed restatement of what was shared/explicitly said; do not infer feelings, fulfillment, or relationship conclusions.' },
-          symbols: strings,
-          meaning: { ...string, description: 'Required minimal factual relationship-event description. Use only source-supported meaning; when no stronger meaning is explicit, keep this as a factual restatement rather than an interpretation.' },
-          prior_context: string,
-          resulting_change: { ...string, description: 'Optional historical change only when trusted evidence explicitly establishes it; do not infer that a wish was fulfilled, a bond deepened, or a present state changed.' },
-          name: string,
-          trigger_phrases: { type: 'array', minItems: 1, uniqueItems: true, items: string },
-          origin: string,
-          callbacks: strings,
-          tone: string,
-          topic: string,
-          preference: string,
-          context: string,
-          reason: string,
-        },
+        required: payloadRequired,
+        description: `Payload for ${kind}. Only the declared fields are accepted. For model-authored new writes, summary and narrative semantic prose must be Chinese; literal names, aliases, trigger tokens, code, provider names, paths, URLs, and trusted evidence stay source-faithful.`,
+        properties: payloadProperties,
       },
     },
   };
 }
-
 export function entitySearchToolSchema(): Record<string, unknown> {
   return { type: 'object', additionalProperties: false, properties: { query: { type: 'string', minLength: 1 }, limit: { type: 'integer', minimum: 1, maximum: 20 } } };
 }

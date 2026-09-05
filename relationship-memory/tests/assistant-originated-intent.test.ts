@@ -7,7 +7,7 @@ import {
   appendTrustedRelationshipCatalog,
   cursorShouldAdvance,
   extractAssistantRememberIntents,
-  memoryRememberToolSchema,
+  memoryRememberKindToolSchema,
   persistAssistantRememberIntents,
   rebuildProjection,
   RelationshipMemoryRuntime,
@@ -155,7 +155,7 @@ describe('trusted intent processing and batch completeness', () => {
     }));
   });
 
-  it('does not expose feel as a memory_remember authority field and projects the exact stored feel', () => {
+  it('does not expose feel as a kind-specific memory-create authority field and projects the exact stored feel', () => {
     const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
     const intent = persistIntent(store, 'Remember this exact wording.', 'This exact feeling must survive unchanged.');
     const rt = runtime(store, [intent]);
@@ -163,7 +163,7 @@ describe('trusted intent processing and batch completeness', () => {
     const accepted = rt.remember('batch-feel', proposal(intent.intent_id));
     expect(accepted.outcome).toBe('accepted');
 
-    const schema = memoryRememberToolSchema() as any;
+    const schema = memoryRememberKindToolSchema('personal_experience') as any;
     expect(schema.properties.assistant_intent_id).toBeDefined();
     expect(schema.properties.feel).toBeUndefined();
     const projection = rebuildProjection(store);

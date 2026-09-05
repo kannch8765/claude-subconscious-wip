@@ -16,6 +16,8 @@ import {
   appendTrustedRelationshipCatalog,
   buildRelationshipTools,
   createRuntime,
+  isRelationshipMutationClientTool,
+  RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS,
   relationshipMemoryRoot,
 } from '../relationship-memory/src/adapter/index.js';
 import { stableJson } from '../relationship-memory/src/store/index.js';
@@ -106,6 +108,7 @@ export interface LiveWorkerDependencies {
   runConversation?: typeof runNativeClientToolConversation;
   cancelAndDefer?: typeof cancelAndDeferSyncResources;
   cleanupCompleted?: typeof cleanupCompletedSyncResources;
+  openStdioMcp?: typeof openStdioMcpToolsFromEnvironment;
 }
 
 export async function sendViaNativeClient(
@@ -141,8 +144,9 @@ export async function sendViaNativeClient(
     const entitySearchObservations: EntitySearchObservation[] = [];
     const surfacedQuoteSnippets = new Map<string, Map<string, { snippet_id: string; source_kind: 'transcript' | 'legacy_memory'; role?: string; quote: string; captured_at: string }>>();
     const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId);
+    const syncAllowedTools = new Set<string>(RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS);
     const modeRelationshipTools = isSync
-      ? baseRelationshipTools.filter((tool) => ['memory_search', 'entity_search'].includes(tool.name))
+      ? baseRelationshipTools.filter((tool) => syncAllowedTools.has(tool.name))
       : baseRelationshipTools;
     const relationshipTools: NativeClientTool[] = modeRelationshipTools.map((tool) => {
       const execute = tool.execute.bind(tool);
@@ -215,7 +219,7 @@ export async function sendViaNativeClient(
           },
         };
       }
-      if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
+      if (!isRelationshipMutationClientTool(tool.name)) return tool;
       return {
         ...tool,
         async execute(toolCallId: string, args: unknown) {
@@ -304,7 +308,7 @@ export async function sendViaNativeClient(
         clientToolRoundGate: syncClientToolRoundGate,
       });
     } else {
-      const stdioMcp = await openStdioMcpToolsFromEnvironment(log);
+      const stdioMcp = await (dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log);
       const nativeToolNames = new Set(relationshipTools.map((tool) => tool.name));
       const mcpTools = stdioMcp.tools.filter((tool) => {
         if (!nativeToolNames.has(tool.name)) return true;

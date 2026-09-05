@@ -192,7 +192,7 @@ This is the normal asynchronous Subconscious pass after a foreground Kohaku turn
 - Reuse relevant relationship search results when applicable to decide whether trusted new evidence should reinforce an existing relationship memory, create a genuinely new durable memory, or do nothing.
 - entity_search miss is not permission to invent an identity. Call entity_remember only when trusted current-batch conversation itself clearly defines or supports the stable identity; a bare name mention, guess, or episodic association must remain unresolved rather than becoming a canonical entity.
 - When an identity is genuinely supported, keep its description concise and stable in relationship terms useful for continuity rather than reducing a person to transient provider/tool/runtime inventory.
-- Perform memory_reinforce / memory_remember / entity operations as needed. This work is private maintenance.
+- Perform memory_reinforce / the matching kind-specific memory creation tool / entity operations as needed. This work is private maintenance.
 - Never report maintenance decisions in deliver_whisper, ordinary prose, guidance, or any other foreground-visible channel.
 
 The foreground sees only explicit deliver_whisper output. Ordinary assistant prose from this background pass is not a whisper and will not be injected.

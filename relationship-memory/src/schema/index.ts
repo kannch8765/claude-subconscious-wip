@@ -194,33 +194,89 @@ const forbiddenAuthorityKeys = new Set([
   'memory_id', 'subject_id', 'status', 'observed_at', 'created_at', 'conversation_id', 'role', 'quote', 'captured_at',
 ]);
 
-const payloadKeys: Record<MemoryKind, { required: string[]; optional: string[]; arrays?: string[]; nonEmptyArrays?: string[] }> = {
+export type MemoryPayloadValueType = 'string' | 'string_array';
+
+export interface MemoryPayloadFieldDefinition {
+  valueType: MemoryPayloadValueType;
+  required: boolean;
+  requireNonEmptyArray?: boolean;
+  description?: string;
+}
+
+export interface MemoryKindDefinition {
+  fields: Record<string, MemoryPayloadFieldDefinition>;
+}
+
+/**
+ * Single schema-version-1 source of truth for per-kind payload structure.
+ * Canonical validation and model-facing kind-specific create tools both derive
+ * their allowed fields, value types, and requiredness from this definition.
+ */
+export const MEMORY_KIND_DEFINITIONS = {
   personal_experience: {
-    required: ['title', 'experience'],
-    optional: ['time_text', 'places', 'themes', 'emotional_tone', 'why_memorable', 'recall_triggers'],
-    arrays: ['places', 'themes', 'recall_triggers'],
+    fields: {
+      title: { valueType: 'string', required: true },
+      experience: { valueType: 'string', required: true },
+      time_text: { valueType: 'string', required: false },
+      places: { valueType: 'string_array', required: false },
+      themes: { valueType: 'string_array', required: false },
+      emotional_tone: {
+        valueType: 'string', required: false,
+        description: 'Optional historical affect only when trusted evidence directly expresses or unambiguously demonstrates it; keep it perspective-neutral and do not project it onto present Kohaku.',
+      },
+      why_memorable: {
+        valueType: 'string', required: false,
+        description: 'Optional source-supported historical reason only. Omit when the evidence does not explicitly support why the event was memorable; never invent present-day significance.',
+      },
+      recall_triggers: { valueType: 'string_array', required: false },
+    },
   },
   shared_experience: {
-    required: ['title', 'event', 'shared_meaning'],
-    optional: ['symbols', 'recall_triggers'],
-    arrays: ['symbols', 'recall_triggers'],
+    fields: {
+      title: { valueType: 'string', required: true },
+      event: { valueType: 'string', required: true },
+      shared_meaning: {
+        valueType: 'string', required: true,
+        description: 'Required minimal factual relationship description. Prefer an evidence-backed restatement of what was shared or explicitly said; do not infer feelings, fulfillment, or relationship conclusions.',
+      },
+      symbols: { valueType: 'string_array', required: false },
+      recall_triggers: { valueType: 'string_array', required: false },
+    },
   },
   relationship_event: {
-    required: ['event', 'meaning'],
-    optional: ['prior_context', 'resulting_change'],
+    fields: {
+      event: { valueType: 'string', required: true },
+      meaning: {
+        valueType: 'string', required: true,
+        description: 'Required minimal factual relationship-event description. Use only source-supported meaning; when no stronger meaning is explicit, keep this as a factual restatement rather than an interpretation.',
+      },
+      prior_context: { valueType: 'string', required: false },
+      resulting_change: {
+        valueType: 'string', required: false,
+        description: 'Optional historical change only when trusted evidence explicitly establishes it; do not infer that a wish was fulfilled, a bond deepened, or a present state changed.',
+      },
+    },
   },
   inside_joke: {
-    required: ['name', 'meaning', 'trigger_phrases'],
-    optional: ['origin', 'callbacks', 'tone'],
-    arrays: ['trigger_phrases', 'callbacks'],
-    nonEmptyArrays: ['trigger_phrases'],
+    fields: {
+      name: { valueType: 'string', required: true },
+      meaning: { valueType: 'string', required: true },
+      trigger_phrases: { valueType: 'string_array', required: true, requireNonEmptyArray: true },
+      origin: { valueType: 'string', required: false },
+      callbacks: { valueType: 'string_array', required: false },
+      tone: { valueType: 'string', required: false },
+    },
   },
   user_preference: {
-    required: ['topic', 'preference'],
-    optional: ['context', 'reason', 'recall_triggers'],
-    arrays: ['recall_triggers'],
+    fields: {
+      topic: { valueType: 'string', required: true },
+      preference: { valueType: 'string', required: true },
+      context: { valueType: 'string', required: false },
+      reason: { valueType: 'string', required: false },
+      recall_triggers: { valueType: 'string_array', required: false },
+    },
   },
-};
+} satisfies Record<MemoryKind, MemoryKindDefinition>;
 
 function plainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -313,17 +369,18 @@ export function validateSemanticContent(
   }
 
   if (!plainObject(input.payload)) return { ok: false, code: 'invalid_payload', reason: 'payload must be an object.' };
-  const rules = payloadKeys[kind];
-  const allowed = new Set([...rules.required, ...rules.optional]);
+  const definition = MEMORY_KIND_DEFINITIONS[kind];
+  const fieldDefinitions = definition.fields as Record<string, MemoryPayloadFieldDefinition>;
+  const allowed = new Set(Object.keys(fieldDefinitions));
   for (const key of Object.keys(input.payload)) {
     if (!allowed.has(key)) return { ok: false, code: 'unknown_payload_field', reason: `Unknown ${kind} payload field: ${key}` };
   }
 
   const payload: Record<string, unknown> = {};
-  for (const key of rules.required) {
-    const isArray = rules.arrays?.includes(key) ?? false;
-    if (isArray) {
-      const cleaned = cleanStringArray(input.payload[key], rules.nonEmptyArrays?.includes(key) ?? false);
+  const requiredFields = Object.entries(fieldDefinitions).filter(([, rule]) => rule.required);
+  for (const [key, rule] of requiredFields) {
+    if (rule.valueType === 'string_array') {
+      const cleaned = cleanStringArray(input.payload[key], rule.requireNonEmptyArray ?? false);
       if (!cleaned) return { ok: false, code: 'invalid_payload_field', reason: `${kind}.${key} must be a valid non-empty unique string array.` };
       payload[key] = cleaned;
     } else {
@@ -333,11 +390,11 @@ export function validateSemanticContent(
     }
   }
 
-  for (const key of rules.optional) {
+  const optionalFields = Object.entries(fieldDefinitions).filter(([, rule]) => !rule.required);
+  for (const [key, rule] of optionalFields) {
     if (!(key in input.payload)) continue;
     if (input.payload[key] === null) return { ok: false, code: 'invalid_optional_null', reason: `${kind}.${key} must be omitted rather than null.` };
-    const isArray = rules.arrays?.includes(key) ?? false;
-    if (isArray) {
+    if (rule.valueType === 'string_array') {
       const cleaned = cleanStringArray(input.payload[key]);
       if (!cleaned) return { ok: false, code: 'invalid_payload_field', reason: `${kind}.${key} must be a unique non-empty string array.` };
       payload[key] = cleaned;

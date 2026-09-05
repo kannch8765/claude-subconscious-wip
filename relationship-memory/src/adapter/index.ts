@@ -1,15 +1,15 @@
 import * as os from 'os';
 import * as path from 'path';
 import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
-import type { AssistantRememberIntentRecord, CanonicalMessage, ParticipantRole, TranscriptEvidenceKind } from '../schema/index.js';
+import { MEMORY_KINDS, type AssistantRememberIntentRecord, type CanonicalMessage, type MemoryKind, type ParticipantRole, type TranscriptEvidenceKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
-import { entityRememberToolSchema, entitySearchToolSchema, memoryRememberToolSchema, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime } from '../tools/index.js';
+import { MEMORY_REMEMBER_TOOL_NAMES, entityRememberToolSchema, entitySearchToolSchema, memoryRememberKindToolSchema, memoryRememberToolName, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime, type MemoryRememberToolName } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
 import { createSemanticRetrieverFromEnvironment } from '../retrieval/index.js';
 
 export interface RelationshipTool {
   label: string;
-  name: 'memory_search' | 'memory_remember' | 'memory_reinforce' | 'entity_search' | 'entity_remember';
+  name: 'memory_search' | MemoryRememberToolName | 'memory_reinforce' | 'entity_search' | 'entity_remember';
   description: string;
   parameters: Record<string, unknown>;
   execute(toolCallId: string, args: unknown): Promise<unknown>;
@@ -182,6 +182,18 @@ export function createRuntime(
   );
 }
 
+const MEMORY_REMEMBER_KIND_DESCRIPTIONS: Record<MemoryKind, string> = {
+  personal_experience: 'Create one personal_experience for a source-grounded historical episode involving the user or assistant. Use only this kind\'s declared fields; historical affect belongs here only when directly evidenced.',
+  shared_experience: 'Create one shared_experience for a source-grounded episode explicitly shared by user and assistant. Keep shared_meaning factual and evidence-backed rather than inferring relationship conclusions.',
+  relationship_event: 'Create one relationship_event for a source-grounded event about the relationship itself. Keep meaning and any resulting_change factual and evidence-backed; this kind does not accept personal affect fields.',
+  inside_joke: 'Create one inside_joke for a durable recurring joke, callback, or phrase with source-grounded meaning and trigger phrases.',
+  user_preference: 'Create one user_preference for a durable preference explicitly supported by trusted evidence. Prefer memory_reinforce when current evidence repeats an existing canonical preference.',
+};
+
+function memoryRememberToolDescription(kind: MemoryKind): string {
+  return `${MEMORY_REMEMBER_KIND_DESCRIPTIONS[kind]} Bind the proposal to exact current-batch evidence_ids. Write a concise source-grounded historical event/stable-fact index, never invent quotes, and copy assistant_intent_id only from a trusted current-batch remember intent.`;
+}
+
 export function buildRelationshipTools(
   runtime: RelationshipMemoryRuntime,
   batchId: string,
@@ -212,18 +224,26 @@ export function buildRelationshipTools(
       parameters: memoryReinforceToolSchema(),
       async execute(_toolCallId, args) { return wrapResult(runtime.reinforce(batchId, args as never)); },
     },
-    {
-      label: 'memory_remember', name: 'memory_remember',
-      description: 'Propose one schema-version-1 relationship memory bound to trusted transcript evidence. Write a source-grounded historical event/stable-fact index, not a relationship essay: summarize what happened or what was explicitly stated, and do not infer feelings, motives, fulfillment, present-day meaning, or relationship conclusions. Historical affect may be represented only when directly evidenced. Never invent quotes. When processing a trusted assistant remember intent, copy its assistant_intent_id; never invent or rewrite feel text.',
-      parameters: memoryRememberToolSchema(),
-      async execute(_toolCallId, args) { return wrapResult(runtime.remember(batchId, args)); },
-    },
+    ...MEMORY_KINDS.map((kind): RelationshipTool => ({
+      label: memoryRememberToolName(kind),
+      name: memoryRememberToolName(kind),
+      description: memoryRememberToolDescription(kind),
+      parameters: memoryRememberKindToolSchema(kind),
+      async execute(_toolCallId, args) { return wrapResult(runtime.rememberKind(batchId, kind, args)); },
+    })),
   ];
 }
 
 export const RELATIONSHIP_ALLOWED_BUILTIN_TOOLS = [] as const;
-export const RELATIONSHIP_EXTERNAL_TOOLS = ['memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember'] as const;
+export const RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS = ['memory_search', 'entity_search'] as const;
+export const RELATIONSHIP_MUTATION_CLIENT_TOOLS = ['memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_remember'] as const;
+export const RELATIONSHIP_EXTERNAL_TOOLS = ['memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember'] as const;
 export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = [...RELATIONSHIP_ALLOWED_BUILTIN_TOOLS, ...RELATIONSHIP_EXTERNAL_TOOLS] as const;
+const RELATIONSHIP_MUTATION_CLIENT_TOOL_SET = new Set<string>(RELATIONSHIP_MUTATION_CLIENT_TOOLS);
+
+export function isRelationshipMutationClientTool(name: string): boolean {
+  return RELATIONSHIP_MUTATION_CLIENT_TOOL_SET.has(name);
+}
 export const RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS = [
   'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'Glob', 'Grep', 'TaskStop', 'Read', 'Skill', 'Task', 'TodoWrite', 'Write', 'AskUserQuestion',
 ] as const;
