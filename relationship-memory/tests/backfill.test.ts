@@ -298,7 +298,7 @@ describe('relationship-memory historical backfill', () => {
     const recall = new RelationshipMemoryRecallSession({ rootDir: store, subjectId: 'subject', transcriptRoots: [] });
     const results = recall.relationshipMemorySearch({ query: 'orange baumkuchen' });
     expect(results.results).toHaveLength(1);
-    expect(results.results[0].summary).toContain('orange baumkuchen');
+    expect(results.results[0]).toMatchObject({ summary: expect.stringContaining('orange baumkuchen') });
   });
 
   it('keeps processable ownership bounded to the current batch (no overlap ownership)', async () => {
