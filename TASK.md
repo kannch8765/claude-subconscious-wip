@@ -1,80 +1,52 @@
-# 实施单 03：让两份 system prompt 可以直接编辑 Markdown
+# 实施单 04：收拢 backfill runner 与目标 runtime 收敛
 
-收到这个分支名后，从本文件开始。你是实施窗口；主窗口晴负责最终讨论与验收。本单授权在此分支实现、离线验证并提交代码与完成报告，不授权合并或部署。
-
-## 位置与背景
+从本文件开始，在同一分支实现、验证并回传。主窗口晴负责综合验收。
 
 - 仓库：kannch8765/claude-subconscious-wip
-- 实施及回传分支：task/03-editable-system-prompts
-- 建分支源码基准：e83e75956b468dc43491bcb8fafff8ac70d0e854
-- 完成报告：docs/IMPLEMENTATION-03-EDITABLE-SYSTEM-PROMPTS.md
-- 调查依据：docs/INVESTIGATION-02-CONFIG-AND-CLEANUP.md，位于 investigation/02-config-and-cleanup 的 exact commit 8dc02411f01e3dee85c414a78a566f11edb6283f。请定点复核相关发现，不把调查报告当测试结果。
-- 用户确认 VPS 上 Omen lane 正在运行。这是现役入口，本次工作完全留在隔离开发环境，不访问或更新 VPS，也不启动另一只真实 backfill。
-- sync 仍在实验阶段，工具不同是有意设计；显式 recall 的不可用反馈另案处理。
+- 分支：task/04-backfill-runner-convergence
+- 基准 main：5f3638a4795ad96980c020a5ff6978e03ce89d37（#79，可编辑 prompt 已合并）
+- 完成报告：docs/IMPLEMENTATION-04-BACKFILL-RUNNER.md
+- 前期依据：investigation/02-config-and-cleanup @ 8dc02411f01e3dee85c414a78a566f11edb6283f，docs/INVESTIGATION-02-CONFIG-AND-CLEANUP.md。只读其中 backfill 相关部分即可，发现需以当前源码复核。
+- 用户最新状态：Omen backfill 因额度暂停，仍是需要恢复的现役入口。暂停不是废弃，不自动恢复或消耗额度。
 
-先读适用仓库说明，确认分支和工作区，保留他人改动。基准之后如有重叠变更，说明差异并处理任务内兼容，不自动合并其他分支。
+## 目标
 
-## 想获得的结果
+普通与 Omen backfill 共用一份执行流程；启动时直接向选定的目标 runtime 收敛，消除先 canonical DeepSeek、再 Omen 的中间模型 PATCH。保留现有可用命令和恢复语义。
 
-用户以后可以直接编辑两份易读的 Markdown 来修改 managed live / backfill system prompt，不必编辑 AgentFile 内的长 JSON 字符串。第一轮迁移本身不改变 prompt 内容或任何模型/运行策略。
+先定点核实两个入口、backfill_agent_config 及直接调用的 reconciler/测试，随后完成实现，无需再做一轮全仓调查。读取适用仓库说明，保留他人改动。
 
-建议位置为 config/live-system.md 和 config/backfill-system.md；若仓库已有更自然的目录可沿用并解释。文件只包含实际 prompt，不添加说明标题或 front matter。
+## 实现方向
 
-请先查清现有 canonical config、AgentFile import 和 reconciliation 的连接点，再以最小改动实现。沿用现有 reconciliation，不搭建通用配置或模板框架。
+1. 将 relationship_memory_backfill.ts 与 relationship_memory_backfill_omen.ts 的共享 CLI、preflight、输入解析、checkpoint、重试与 observer 调度收进共用 runner。保留原路径作为薄入口，使已有运行脚本无需改命令。模块 import 不应触发 CLI 执行。
+2. 让目标 runtime 在第一次可能修改 agent 的操作前确定。普通入口保持现有默认/env 覆盖行为，Omen 保持明确的 verified runtime，不因全局 live model 覆盖而跑到别的模型。使用小而明确的内部选择，不新增通用 runtime JSON 或可注入任意绕过验证的回调。
+3. 使用现有 reconciliation 机制尽量一次收敛目标。Omen 已匹配时可跳过 PATCH，但仍须验证 effective state；真正需要修改时保留 post-GET/poll 对 briefly stale state 的处理与有效 parallel_tool_calls 检查。验证失败必须阻止 conversation/batch 执行。
+4. 检查新 agent import 是否也携带选定 runtime，避免把旧模型先 import 再改成 Omen。如果现有 API/import 格式限制了这种实现，给出具体证据与最小安全处理，不宣称已经消除所有中间状态。
+5. 保留 #79 的 MD prompt 权威、同一次解析快照复用、新建与已有 agent 一致性，以及自定义 AgentFile、canary 自管 prompt 的适用语义。reconcileCanonicalPrompt 名称若需调整，逐一迁移仓内调用；保留外部可能使用的旧参数兼容，不顺手扩大 API 清理。
+6. CLI 参数、退出状态、checkpoint 路径/格式/agent binding、retry conversation rotation、purpose/live-agent 隔离、权限和 semantic-index preflight、canonical locking 与 Omen 验证均保持原保护。profile 更换不自动抹掉或重新绑定 checkpoint。
 
-## 关键设计问题
+基准没有证据支持将这些保护删掉。单独标记真正发现的问题；与本单无关的 legacy migration、sync/recall、model 配置外置留待后续。
 
-### 一份可编辑内容，覆盖新建与已有 agent
+## 验证重点
 
-从基准 Subconscious.af / SubconsciousBackfill.af 的 system 字符串无损提取两份 MD，作为 bundled managed system prompt 的唯一编辑来源。
+先用临时目录/mock clients 跑直接相关测试，证明：
+- 原两个入口参数/执行/退出语义相同，安全 preflight 失败时没有 API/embedding 调用。
+- 普通入口没有 Omen 操作；Omen 的新建和已有 agent 路径没有普通模型的中间 mutation。
+- 匹配的 Omen 有有效状态验证且无多余 PATCH；发生漂移时修复并 post-verify；第二次解析无多余 runtime PATCH。
+- stale GET、provider/context/parallel 不符或验证失败时，不进入 batch；保留既有超时边界。
+- prompt-only 更新保持正确 runtime，MD import/bootstrap 保护继续通过。
+- 原 checkpoint 可继续使用，agent mismatch 仍拒绝，retry rotation 和写入顺序不变。不使用真实 checkpoint 做实验。
 
-- 已有 managed agent 的 reconciliation 从 MD 取 system。
-- 新建/import 的 payload 在发出前也取得同一份 system，不能先用陈旧 prompt 建出 agent 再依赖后续 PATCH 修正。
-- 找出共享 canonical helper 的其他消费者（包括 sync sibling），让它们仍收到与原来等价的 system；不改变 sync 自己的 per-turn policy。
-- AgentFile 中 blocks/tools/runtime/bootstrap 信息继续承担原职责，不顺带迁移。
-- 明确 .af 中 system 的剩余角色。若为兼容保留副本，它只能是非权威快照/派生物，应用内 import 与 reconcile 都不能悄悄回读它。说明直接向外部工具导入原始 .af 的语义和限制，不能宣称所有外部导入自动获得新 MD。
-- 对显式传入的自定义 AgentFile、外部非 managed agent，以及 canary 自管 prompt 的路径，先查调用方并保持原有语义。不要用 bundled MD 无条件覆盖所有传入文件。
+补的是行为/顺序证据，不依赖“源码含某字符串”证明正确。正常依赖环境下跑相关 regression，再运行 npm test 和适用类型/静态检查；已知基准失败仅在再次出现时做必要对照，不能写成全绿，也不扩修无关测试。可利用适用的 GitHub CI。真实 Letta/model/embedding canary 留待另行安排。
 
-无需预设用哪种内存 payload/loader 形式；选能让来源最清楚、改动最少的方案。不要启动时改写仓库文件。
+## 权限与交付
 
-### 内容、加载与失败
+本单授权隔离开发环境中的代码、测试、文档修改和 commit/push；不修改 VPS 安装目录/服务/生产 agent/数据，不恢复 backfill，不消耗模型或 embedding 额度，不 merge 或部署。优先 GitHub 与沙盒完成；遇环境限制报告具体缺口。
 
-- 初始有效 system 必须与迁移前精确相等，包括原有空白。验证非空可以用 trim 判断，但不要把 trim 后的文本当输出。
-- 定义简单明确的 UTF-8/末尾换行策略；优先原样读取。避免隐式替换、通用插值或自动加标题。
-- 模块相对路径定位，不能依赖 cwd。
-- 在需要 bundled managed prompt 的路径中，缺失/不可读/空白文件应在 import/PATCH 等远端变更前明确失败，不能静默退回旧 prompt；外部 unmanaged 路径不应被新增的无关文件校验意外阻断。
-- 同一次解析/导入与 reconciliation 使用一致的已读取内容；不要因为反复读取导致一次操作前后取到不同版本。
-- 保留现有生效时机，避免永久缓存导致之后编辑 MD 不被下一次 managed resolution 发现。
-- 只记录必要的非敏感诊断信息；不打印完整 prompt、凭据或用户数据，不为这单建立新的观测系统。
+代码与完成报告提交回本分支。报告保持 concise，目标 500–800 中文字或等量英文，必要证据不省：
+- 结论及关键改动；
+- 测试命令、结果、CI 链接（若有）；
+- 剩余风险/阻断与恢复兼容性；
+- 值得 reviewer 定点看的文件/符号。
+不复述任务单、旧报告、全部文件清单或原始日志。后续更新仅补新增结论。
 
-## 此次保持不变的边界
-
-模型/provider/context/embedding 配置、env 优先级、managed ownership、purpose/origin tags、parallel-tool 修复和 post-GET 验证、tool surface、canonical store、checkpoint/index/cooldown、Omen runtime verification、backfill 入口与执行顺序保持原语义。
-
-runtime JSON、backfill runner 收拢、DeepSeek→Omen 双收敛优化、sync profile 决策都留在后续小单。本单只处理 prompt 来源与必要的导入/测试/文档连接。
-
-## 验证方向
-
-请先检查测试外部依赖，使用隔离临时目录、mock client 和无生产凭据的环境。重点证明：
-
-1. 两份初始加载结果与基准 .af system 精确相等。基准证据应独立于新 loader，不能让两边都从新 MD 读取形成自证；后续正常编辑 prompt 时也不应被永久“必须等于旧版”的测试锁死。
-2. 修改一份测试 prompt 后，已有 managed agent 的 system PATCH 和新 import payload 使用相同新文本；另一角色不被误改。匹配后第二次 reconcile 无多余 PATCH。
-3. 新建/import 不先发旧 system；失败的 prompt 加载不产生远端变更。
-4. managed ownership、外部 env agent、自定义 AgentFile、canary prompt opt-out 语义保持；根据真实调用面覆盖，未适用项说明原因。
-5. 更换 cwd 和 package/install-shaped fixture 后仍读取到正确文件；模拟缺失资源有明确错误。检查实际打包包含规则，不能只在源码树测试成功。
-6. prompt-only 改动不顺带改变 model/provider/context/tool surface；既有相关 regression tests 仍通过。
-7. 同一解析操作的一致性，以及后续解析可观察到文件更新。
-
-运行直接相关离线测试，再在确认安全与资源可承受后运行完整 npm test；可运行已有类型/静态检查。报告准确记录命令、结果、未运行项及原因，区分既有失败与本次回归。不要删除/弱化旧测试以取得绿灯。
-
-补一段简短用户文档：以后编辑哪里、何时生效、怎样验证与回退、发布包要带什么，以及原始 .af 直接导入的边界。
-
-## 回传方式
-
-在本分支 commit/push 实现、测试和完成报告，不新开另一条回传分支，不创建 PR、不 merge、不部署，不调用实际 Letta/模型/embedding。报告给出：
-- 最终采用的内容来源与 import/reconcile 关系；
-- 改动范围、兼容路径与 .af 副本处理；
-- 基准等价证据、测试结果、打包检查；
-- 已知限制与后续真实服务验证需求。
-
-最后回主窗口只需：分支名、实现 exact commit、报告路径、最重要的两三句结论。报告本身不必包含自己的 commit hash。若遇到权限或超出本单的架构阻断，带回具体缺口，不自行扩大任务。
+最后回传分支名、exact commit、报告路径和两三句结论。遇到超出范围或权限阻断，带回证据，不自行扩大实施。
