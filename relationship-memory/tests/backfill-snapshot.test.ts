@@ -102,6 +102,8 @@ describe('backfill snapshot authority boundary', () => {
     const f = fixture();
     const result = validateBackfillSnapshot(f.manifest, { expectedOwnerUid: f.uid });
     expect(result.transcriptPath).toBe(f.transcript);
+    expect('source_path' in result.manifest).toBe(true);
+    if (!('source_path' in result.manifest)) throw new Error('expected a file snapshot manifest');
     expect(result.manifest.source_path).toBe('/root/.claude/projects/example.jsonl');
   });
 
