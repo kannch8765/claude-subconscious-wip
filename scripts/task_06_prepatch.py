@@ -3,8 +3,8 @@ from pathlib import Path
 p = Path('scripts/task_06_apply.py')
 s = p.read_text()
 
-old_line = "s=regex_once(s, r\"const payloadKeys = \\{.*?\\} satisfies Record<MemoryKind, \\{ required: string\\[\\]; optional: string\\[\\]; arrays: string\\[\\]; nonEmptyArrays\\?: string\\[\\] \\}>;\", new_defs, 'replace payloadKeys')"
-new_line = "s=regex_once(s, r\"const payloadKeys: Record<MemoryKind, \\{ required: string\\[\\]; optional: string\\[\\]; arrays\\?: string\\[\\]; nonEmptyArrays\\?: string\\[\\] \\}> = \\{.*?\\n\\};\", new_defs, 'replace payloadKeys')"
+old_line = "s=regex_once(s, r\"const payloadKeys = \\\\{.*?\\\\} satisfies Record<MemoryKind, \\\\{ required: string\\\\[\\\\]; optional: string\\\\[\\\\]; arrays: string\\\\[\\\\]; nonEmptyArrays\\\\?: string\\\\[\\\\] \\\\}>;\", new_defs, 'replace payloadKeys')"
+new_line = "s=regex_once(s, r\"const payloadKeys: Record<MemoryKind, \\\\{ required: string\\\\[\\\\]; optional: string\\\\[\\\\]; arrays\\\\?: string\\\\[\\\\]; nonEmptyArrays\\\\?: string\\\\[\\\\] \\\\}> = \\\\{.*?\\\\n\\\\};\", new_defs, 'replace payloadKeys')"
 if s.count(old_line) != 1:
     raise RuntimeError(f'payloadKeys apply pattern drifted: {s.count(old_line)}')
 s = s.replace(old_line, new_line, 1)
@@ -48,5 +48,12 @@ actual = """old_validator=r'''  const rules = payloadKeys[kind];
 '''
 """
 s = s[:start] + actual + s[end + 1:]
+sync_line = "s=replace_once(s,\"    expect(worker).toContain(\\\"['memory_remember', 'memory_reinforce', 'entity_remember']\\\");\", \"    expect(worker).toContain('isRelationshipMutationClientTool(tool.name)');\",'sync mutation test')"
+sync_extra = "s=replace_once(s,\"    expect(worker).toContain('openStdioMcpToolsFromEnvironment(log)');\", \"    expect(worker).toContain('(dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log)');\",'sync stdio fallback test')"
+if sync_extra not in s:
+    if s.count(sync_line) != 1:
+        raise RuntimeError(f'sync mutation apply line drifted: {s.count(sync_line)}')
+    s = s.replace(sync_line, sync_line + '\n' + sync_extra, 1)
+
 p.write_text(s)
-print('task-06 prepatch: aligned apply script to exact branch schema syntax')
+print('task-06 prepatch: aligned apply script to exact branch schema syntax and sync fallback assertion')
