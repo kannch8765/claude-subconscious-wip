@@ -37,9 +37,10 @@ jobs:
           cat > "$RUNNER_TEMP/task06-validator-probe.ts" <<'TS'
           import * as path from 'node:path';
           import { pathToFileURL } from 'node:url';
-          const root = process.argv[2];
-          const schema = await import(pathToFileURL(path.join(root, 'relationship-memory/src/schema/index.ts')).href);
-          const base = {
+          async function main() {
+            const root = process.argv[2];
+            const schema = await import(pathToFileURL(path.join(root, 'relationship-memory/src/schema/index.ts')).href);
+            const base = {
             schema_version: 1,
             summary: '猫明确表达了一项稳定信息。',
             participants: ['user'],
@@ -63,8 +64,10 @@ jobs:
             { ...valid.personal_experience, unexpected: true },
             { ...valid.personal_experience, subject_id: 'forbidden' },
           ];
-          const results = fixtures.map((fixture) => schema.validateProposal(fixture));
-          process.stdout.write(JSON.stringify(results, null, 2) + '\n');
+            const results = fixtures.map((fixture) => schema.validateProposal(fixture));
+            process.stdout.write(JSON.stringify(results, null, 2) + '\n');
+          }
+          void main();
           TS
           "$GITHUB_WORKSPACE/node_modules/.bin/tsx" "$RUNNER_TEMP/task06-validator-probe.ts" "$baseline_dir" > "$RUNNER_TEMP/task06-validator-baseline.json"
           "$GITHUB_WORKSPACE/node_modules/.bin/tsx" "$RUNNER_TEMP/task06-validator-probe.ts" "$GITHUB_WORKSPACE" > "$RUNNER_TEMP/task06-validator-current.json"
