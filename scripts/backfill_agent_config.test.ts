@@ -132,6 +132,32 @@ describe('dedicated historical backfill agent resolver', () => {
     expect(logs.join(' ')).toContain('context=400000');
   });
 
+  it('does not accept stale effective llm_config when top-level Omen fields already match', async () => {
+    const profile = OMEN_BACKFILL_VERIFIED_RUNTIME;
+    let patched = false;
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'PATCH') {
+        patched = true;
+        return jsonResponse({ ok: true });
+      }
+      return jsonResponse({
+        id: BACKFILL,
+        model: profile.model,
+        embedding: profile.embedding,
+        context_window_limit: profile.contextWindow,
+        llm_config: {
+          handle: patched ? profile.model : LEGACY_FILL_VERIFIED_RUNTIME.model,
+          context_window: patched ? profile.contextWindow : 90000,
+          parallel_tool_calls: true,
+        },
+        model_settings: { provider_type: profile.providerType, parallel_tool_calls: true },
+      });
+    }));
+
+    await expect(configureVerifiedOmenBackfillRuntime('test-key', BACKFILL, () => {})).resolves.toBeUndefined();
+    expect(patched).toBe(true);
+  });
+
   it('verifies an already-matching Omen runtime without PATCH', async () => {
     const profile = OMEN_BACKFILL_VERIFIED_RUNTIME;
     const fetchMock = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
@@ -182,7 +208,7 @@ describe('dedicated historical backfill agent resolver', () => {
     process.env.LETTA_MODEL = 'zai/glm-5'; process.env.LETTA_CONTEXT_WINDOW = '90000';
     const canonical = getCanonicalManagedSystemPrompt(BACKFILL_AF);
     const profile = OMEN_BACKFILL_VERIFIED_RUNTIME;
-    let model = LEGACY_FILL_VERIFIED_RUNTIME.model; let embedding = profile.embedding; let contextWindow = profile.contextWindow; let providerType = LEGACY_FILL_VERIFIED_RUNTIME.providerType; let parallel = true;
+    let model: string = LEGACY_FILL_VERIFIED_RUNTIME.model; let embedding: string = profile.embedding; let contextWindow: number = profile.contextWindow; let providerType: string = LEGACY_FILL_VERIFIED_RUNTIME.providerType; let parallel = true;
     const runtimeModels: string[] = [];
     vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
       if ((init?.method ?? 'GET') === 'PATCH') {
@@ -203,6 +229,33 @@ describe('dedicated historical backfill agent resolver', () => {
     expect(runtimeModels).toEqual([profile.model]);
     expect(runtimeModels).not.toContain(LEGACY_FILL_VERIFIED_RUNTIME.model);
     expect(model).toBe(profile.model); expect(contextWindow).toBe(profile.contextWindow); expect(providerType).toBe(profile.providerType);
+  });
+
+  it('keeps operator context overrides enabled for ordinary backfill by default', async () => {
+    process.env.LETTA_AGENT_ID = LIVE; process.env.LETTA_BACKFILL_AGENT_ID = BACKFILL;
+    process.env.LETTA_CONTEXT_WINDOW = '91000';
+    const canonical = getCanonicalManagedAgentConfig(BACKFILL_AF);
+    let contextWindow = canonical.contextWindowLimit;
+    const patches: Array<Record<string, any>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = String(input); expect(url).toContain(`/agents/${BACKFILL}`);
+      if ((init?.method ?? 'GET') === 'PATCH') {
+        const body = JSON.parse(String(init?.body)) as Record<string, any>;
+        patches.push(body);
+        if (typeof body.context_window_limit === 'number') contextWindow = body.context_window_limit;
+        return jsonResponse({ ok: true });
+      }
+      return jsonResponse({
+        id: BACKFILL, name: 'backfill', tags: REQUIRED, system: canonical.system,
+        model: canonical.model, embedding: canonical.embedding, context_window_limit: contextWindow,
+        model_settings: { provider_type: canonical.modelSettingsProviderType, parallel_tool_calls: true },
+        llm_config: { handle: canonical.model, context_window: contextWindow, parallel_tool_calls: true },
+      });
+    }));
+
+    await expect(getBackfillAgentId('test-key', () => {})).resolves.toBe(BACKFILL);
+    expect(patches.some((body) => body.context_window_limit === 91000)).toBe(true);
+    expect(contextWindow).toBe(91000);
   });
 
   it('fails closed before any mutation if dedicated and live identities collapse', async () => {
@@ -243,7 +296,7 @@ describe('dedicated historical backfill agent resolver', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'backfill-agent-omen-'));
     process.env.LETTA_BACKFILL_CONFIG_FILE = path.join(dir, 'backfill.json');
     const canonical = getCanonicalManagedSystemPrompt(BACKFILL_AF); const profile = OMEN_BACKFILL_VERIFIED_RUNTIME;
-    let tags: string[] = []; let model = profile.model; let embedding = profile.embedding; let contextWindow = profile.contextWindow; let providerType = profile.providerType; let parallel = true;
+    let tags: string[] = []; let model: string = profile.model; let embedding: string = profile.embedding; let contextWindow: number = profile.contextWindow; let providerType: string = profile.providerType; let parallel = true;
     let importedModel: FormDataEntryValue | null = null;
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       const url = String(input); const method = init?.method ?? 'GET';

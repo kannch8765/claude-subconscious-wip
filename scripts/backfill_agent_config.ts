@@ -145,21 +145,24 @@ async function reconcileDedicatedAgent(
 }
 
 function runtimeMismatch(agent: AgentDetails, profile: VerifiedBackfillRuntime): string | undefined {
-  const modelHandle = agent.model ?? agent.llm_config?.handle;
-  const embeddingHandle = agent.embedding ?? agent.embedding_config?.handle;
-  const contextWindow = agent.context_window_limit ?? agent.llm_config?.context_window;
+  const modelHandles = [agent.model, agent.llm_config?.handle].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const embeddingHandles = [agent.embedding, agent.embedding_config?.handle].filter((value): value is string => typeof value === 'string' && value.length > 0);
+  const contextWindows = [agent.context_window_limit, agent.llm_config?.context_window].filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
   const providerType = agent.model_settings?.provider_type;
   const modelSettingsParallel = agent.model_settings?.parallel_tool_calls;
   const legacyConfigParallel = agent.llm_config?.parallel_tool_calls;
   if (
-    modelHandle === profile.model
-    && embeddingHandle === profile.embedding
-    && contextWindow === profile.contextWindow
+    modelHandles.length > 0
+    && modelHandles.every((value) => value === profile.model)
+    && embeddingHandles.length > 0
+    && embeddingHandles.every((value) => value === profile.embedding)
+    && contextWindows.length > 0
+    && contextWindows.every((value) => value === profile.contextWindow)
     && providerType === profile.providerType
     && modelSettingsParallel === profile.parallelToolCalls
     && legacyConfigParallel === profile.parallelToolCalls
   ) return undefined;
-  return `model=${modelHandle ?? 'missing'}, embedding=${embeddingHandle ?? 'missing'}, context=${contextWindow ?? 'missing'}, provider_type=${providerType ?? 'missing'}, model_settings.parallel_tool_calls=${String(modelSettingsParallel)}, llm_config.parallel_tool_calls=${String(legacyConfigParallel)}`;
+  return `model=${modelHandles.join('|') || 'missing'}, embedding=${embeddingHandles.join('|') || 'missing'}, context=${contextWindows.join('|') || 'missing'}, provider_type=${providerType ?? 'missing'}, model_settings.parallel_tool_calls=${String(modelSettingsParallel)}, llm_config.parallel_tool_calls=${String(legacyConfigParallel)}`;
 }
 
 async function configureVerifiedBackfillRuntime(
