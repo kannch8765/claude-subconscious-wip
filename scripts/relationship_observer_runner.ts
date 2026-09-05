@@ -3,6 +3,7 @@ import {
   appendTrustedRelationshipCatalog,
   buildRelationshipTools,
   createRuntime,
+  isRelationshipMutationClientTool,
   relationshipMemoryRoot,
 } from '../relationship-memory/src/adapter/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
@@ -70,7 +71,7 @@ export async function runRelationshipObserverBatch(input: RelationshipObserverBa
     assertNativeRelationshipAgentBoundary(agent);
 
     const relationshipTools = buildRelationshipTools(runtime, input.batchId).map((tool) => {
-      if (!['memory_remember', 'memory_reinforce', 'entity_remember'].includes(tool.name)) return tool;
+      if (!isRelationshipMutationClientTool(tool.name)) return tool;
       const execute = tool.execute.bind(tool);
       return {
         ...tool,

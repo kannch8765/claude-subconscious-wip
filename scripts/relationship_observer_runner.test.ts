@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runRelationshipObserverBatch } from './relationship_observer_runner.js';
+import { MEMORY_REMEMBER_TOOL_NAMES } from '../relationship-memory/src/tools/index.js';
 import type { NativeLettaClientLike } from './native_letta_backfill.js';
 
 const roots: string[] = [];
@@ -71,8 +72,17 @@ describe('realtime relationship observer native Letta client lane', () => {
     expect(client.bodies).toHaveLength(2);
     expect(client.bodies[0]).toEqual(expect.objectContaining({ agent_id: 'agent-test', streaming: true }));
     expect(client.bodies[0].client_tools.map((tool: any) => tool.name).sort()).toEqual([
-      'entity_remember', 'entity_search', 'memory_reinforce', 'memory_remember', 'memory_search',
+      'entity_remember', 'entity_search', 'memory_reinforce', 'memory_search', ...MEMORY_REMEMBER_TOOL_NAMES,
     ].sort());
+    expect(client.bodies[0].client_tools.some((tool: any) => tool.name === 'memory_remember')).toBe(false);
+    const relationshipEvent = client.bodies[0].client_tools.find((tool: any) => tool.name === 'memory_remember_relationship_event');
+    const personalExperience = client.bodies[0].client_tools.find((tool: any) => tool.name === 'memory_remember_personal_experience');
+    expect(Object.keys(relationshipEvent.parameters.properties.payload.properties)).toEqual(['event', 'meaning', 'prior_context', 'resulting_change']);
+    expect(relationshipEvent.parameters.properties.payload.required).toEqual(['event', 'meaning']);
+    expect(relationshipEvent.parameters.properties.payload.properties).not.toHaveProperty('emotional_tone');
+    expect(personalExperience.parameters.properties.payload.properties).toHaveProperty('emotional_tone');
+    expect(personalExperience.parameters.properties.payload.properties).toHaveProperty('why_memorable');
+    expect(client.bodies[1].client_tools.map((tool: any) => tool.name).sort()).toEqual(client.bodies[0].client_tools.map((tool: any) => tool.name).sort());
     expect(client.bodies[1].messages).toEqual([{
       type: 'tool_return',
       tool_returns: [{ type: 'tool', tool_call_id: 'call-search', tool_return: '{"results":[]}', status: 'success' }],

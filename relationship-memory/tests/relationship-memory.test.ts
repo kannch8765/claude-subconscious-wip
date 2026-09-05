@@ -10,10 +10,15 @@ import {
   cursorShouldAdvance,
   FORBIDDEN_MARKDOWN_MEMORY_TOOLS,
   makeBatchId,
-  memoryRememberToolSchema,
+  MEMORY_KINDS,
+  MEMORY_KIND_DEFINITIONS,
+  MEMORY_REMEMBER_TOOL_NAMES,
+  memoryRememberKindToolSchema,
   memoryReinforceToolSchema,
   RELATIONSHIP_ALLOWED_CLIENT_TOOLS,
   RELATIONSHIP_DISALLOWED_CLIENT_TOOLS,
+  RELATIONSHIP_MUTATION_CLIENT_TOOLS,
+  RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
   LegacyMemorySourceStore,
@@ -89,8 +94,24 @@ function joke() {
   };
 }
 
+function preference() {
+  return {
+    schema_version: 1,
+    kind: 'user_preference',
+    summary: 'The user prefers quiet cafes',
+    participants: ['user'],
+    evidence_message_ids: ['msg-user-1'],
+    payload: { topic: 'cafes', preference: 'The user prefers quiet cafes.', context: 'When choosing somewhere to sit.' },
+  };
+}
+
+function memoryToolInput(proposal: Record<string, any>): Record<string, unknown> {
+  const { schema_version: _schemaVersion, kind: _kind, evidence_message_ids: evidenceMessageIds, ...rest } = proposal;
+  return { ...rest, evidence_ids: evidenceMessageIds };
+}
+
 describe('schema_version 1', () => {
-  it('accepts all four authorized kinds', () => {
+  it('accepts all five authorized kinds', () => {
     expect(validateProposal(personal()).ok).toBe(true);
     expect(validateProposal({ ...shared('mem_parent'), linked_memory_ids: undefined })).toEqual(expect.objectContaining({ ok: false }));
     const sharedNoLink = shared('mem_parent'); delete (sharedNoLink as any).linked_memory_ids;
@@ -98,6 +119,7 @@ describe('schema_version 1', () => {
     expect(validateProposal(sharedNoLink).ok).toBe(true);
     expect(validateProposal(relationshipNoLink).ok).toBe(true);
     expect(validateProposal(joke()).ok).toBe(true);
+    expect(validateProposal(preference()).ok).toBe(true);
   });
 
   it('rejects unknown fields, empty required strings, invalid participants, duplicate arrays and null optionals', () => {
@@ -335,44 +357,66 @@ describe('batch completion and cursor', () => {
 });
 
 describe('observer contract correction', () => {
-  it('exposes an SDK-0.1.11-compatible top-level proposal schema for all four frozen kinds', () => {
-    const schema = memoryRememberToolSchema() as any;
-    // SDK 0.1.11 preserves these top-level fields for external tools.
-    const sdkVisible = Object.fromEntries(
-      ['type', 'properties', 'required', 'additionalProperties', 'description']
-        .filter((key) => key in schema)
-        .map((key) => [key, schema[key]]),
-    ) as any;
+  it('derives every kind-specific model schema from the canonical kind definitions', () => {
+    for (const kind of MEMORY_KINDS) {
+      const schema = memoryRememberKindToolSchema(kind) as any;
+      const definition = MEMORY_KIND_DEFINITIONS[kind];
+      const expectedFields = Object.keys(definition.fields);
+      const expectedRequired = Object.entries(definition.fields).filter(([, field]) => field.required).map(([name]) => name);
+      expect(schema.type).toBe('object');
+      expect(schema.additionalProperties).toBe(false);
+      expect(schema.required).toEqual(['summary', 'participants', 'evidence_ids', 'payload']);
+      expect(Object.keys(schema.properties).sort()).toEqual(['assistant_intent_id', 'evidence_ids', 'linked_memory_ids', 'participants', 'payload', 'summary']);
+      expect(schema.properties).not.toHaveProperty('kind');
+      expect(schema.properties).not.toHaveProperty('schema_version');
+      expect(schema.properties).not.toHaveProperty('evidence_message_ids');
+      expect(schema.properties.payload.additionalProperties).toBe(false);
+      expect(Object.keys(schema.properties.payload.properties)).toEqual(expectedFields);
+      expect(schema.properties.payload.required).toEqual(expectedRequired);
+      for (const [name, field] of Object.entries(definition.fields)) {
+        const property = schema.properties.payload.properties[name];
+        expect(property.type).toBe(field.valueType === 'string_array' ? 'array' : 'string');
+        if ('requireNonEmptyArray' in field && field.requireNonEmptyArray) expect(property.minItems).toBe(1);
+      }
+    }
+    const personalSchema = memoryRememberKindToolSchema('personal_experience') as any;
+    const relationshipSchema = memoryRememberKindToolSchema('relationship_event') as any;
+    expect(personalSchema.properties.payload.properties).toHaveProperty('emotional_tone');
+    expect(personalSchema.properties.payload.properties).toHaveProperty('why_memorable');
+    expect(relationshipSchema.properties.payload.properties).not.toHaveProperty('emotional_tone');
+    expect(relationshipSchema.properties.payload.properties).not.toHaveProperty('why_memorable');
+  });
 
-    expect(sdkVisible.type).toBe('object');
-    expect(sdkVisible.required).toEqual(['schema_version', 'kind', 'summary', 'participants', 'payload']);
-    expect((schema as any).oneOf).toEqual([{ required: ['evidence_ids'] }, { required: ['evidence_message_ids'] }]);
-    expect(Object.keys(sdkVisible.properties)).toEqual(expect.arrayContaining([
-      'schema_version', 'kind', 'summary', 'participants', 'evidence_message_ids', 'payload', 'linked_memory_ids',
-    ]));
-    expect(sdkVisible.properties.kind.enum).toEqual([
-      'personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference',
-    ]);
-    expect(Object.keys(sdkVisible.properties.payload.properties)).toEqual(expect.arrayContaining([
-      'title', 'experience', 'event', 'shared_meaning', 'meaning', 'name', 'trigger_phrases',
-    ]));
-    expect(sdkVisible.properties.payload.description).toContain('personal_experience requires title, experience');
-    expect(sdkVisible.properties.payload.description).toContain('shared_experience requires title, event, shared_meaning');
-    expect(sdkVisible.properties.payload.description).toContain('relationship_event requires event, meaning');
-    expect(sdkVisible.properties.payload.description).toContain('inside_joke requires name, meaning, trigger_phrases');
+  it('keeps validator behavior aligned and rejects cross-kind or malformed payloads without canonical memory/evidence mutation', () => {
+    const proposals = [personal(), (() => { const value = shared('unused'); delete (value as any).linked_memory_ids; return value; })(), (() => { const value = relationship('unused'); delete (value as any).linked_memory_ids; return value; })(), joke(), preference()];
+    expect(proposals.map((proposal) => proposal.kind)).toEqual(MEMORY_KINDS);
+    for (const proposal of proposals) expect(validateProposal(proposal).ok).toBe(true);
+    const rt = runtime(); rt.store.beginBatch('kind-rejects', '2026-01-01T00:00:00.000Z');
+    const base = memoryToolInput(relationship('unused')); delete (base as any).linked_memory_ids;
+    expect(rt.rememberKind('kind-rejects', 'relationship_event', { ...base, payload: { event: 'A supported event.', meaning: 'A supported meaning.', emotional_tone: 'wrong kind' } })).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unknown_payload_field' }));
+    expect(rt.rememberKind('kind-rejects', 'relationship_event', { ...base, payload: { event: 'A supported event.' } })).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'invalid_payload_field' }));
+    expect(rt.rememberKind('kind-rejects', 'relationship_event', { ...base, payload: { event: 'A supported event.', meaning: 'A supported meaning.', prior_context: null } })).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'invalid_optional_null' }));
+    expect(rt.rememberKind('kind-rejects', 'relationship_event', { ...base, payload: { event: ['wrong type'], meaning: 'A supported meaning.' } })).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'invalid_payload_field' }));
+    expect(rt.store.listMemories()).toHaveLength(0); expect(rt.store.listEvidence()).toHaveLength(0);
+  });
 
-    // Model-facing compatibility must not weaken trusted validation.
-    expect(validateProposal({ ...personal(), unexpected: true }).ok).toBe(false);
-    expect(validateProposal(personal({ payload: { title: 'x', experience: 'y', event: 'wrong-kind field' } })).ok).toBe(false);
+  it('dispatches a fixed kind into the existing canonical remember path with equivalent idempotency', () => {
+    const input = memoryToolInput(personal());
+    const rt = runtime(); rt.store.beginBatch('kind-equivalence', '2026-01-01T00:00:00.000Z');
+    const first = rt.rememberKind('kind-equivalence', 'personal_experience', input);
+    const duplicate = rt.rememberKind('kind-equivalence', 'personal_experience', { ...input, kind: 'relationship_event', schema_version: 99 });
+    expect(first).toEqual(expect.objectContaining({ outcome: 'accepted' }));
+    expect(duplicate).toEqual(expect.objectContaining({ outcome: 'duplicate', memory_id: first.memory_id }));
+    expect(rt.store.listMemories()).toHaveLength(1);
+    const canonicalRt = runtime(); canonicalRt.store.beginBatch('kind-equivalence', '2026-01-01T00:00:00.000Z');
+    const canonical = canonicalRt.remember('kind-equivalence', { ...input, schema_version: 1, kind: 'personal_experience' });
+    expect(canonical).toEqual(expect.objectContaining({ outcome: 'accepted', memory_id: first.memory_id }));
+    expect(canonicalRt.store.listMemories()[0]).toEqual(rt.store.listMemories()[0]);
   });
 
   it('appends exact current-batch canonical evidence IDs, roles, and safely escaped quotes', () => {
-    const canonical = [
-      { ...messages[0], message_id: 'msg-&-"-1', quote: '<gift> & "shared"' },
-      messages[1],
-    ];
+    const canonical = [{ ...messages[0], message_id: 'msg-&-"-1', quote: '<gift> & "shared"' }, messages[1]];
     const observerMessage = appendCanonicalEvidenceCatalog('<claude_code_session_update>fixture</claude_code_session_update>', canonical);
-
     expect(observerMessage).toContain('<relationship_memory_evidence_semantics>');
     expect(observerMessage).toContain('<relationship_memory_evidence_catalog trusted="transcript_provenance_only">');
     expect(observerMessage).toContain('message_id="msg-&amp;-&quot;-1" role="user"');
@@ -387,20 +431,11 @@ describe('observer contract correction', () => {
     const store = new RelationshipMemoryStore(tempDir(), 'subject-fixture');
     const rt = new RelationshipMemoryRuntime(store, new Map(canonical.map((message) => [message.message_id, message])), () => '2026-01-02T00:00:00.000Z');
     store.beginBatch('same-authority', '2026-01-01T00:00:00.000Z');
-
     expect(observerMessage).toContain(messages[0].message_id);
     expect(rt.remember('same-authority', personal()).outcome).toBe('accepted');
-    expect(rt.store.listEvidence()[0]).toEqual(expect.objectContaining({
-      message_id: messages[0].message_id,
-      role: messages[0].role,
-      quote: messages[0].quote,
-    }));
-
+    expect(rt.store.listEvidence()[0]).toEqual(expect.objectContaining({ message_id: messages[0].message_id, role: messages[0].role, quote: messages[0].quote }));
     expect(observerMessage).not.toContain(messages[2].message_id);
-    expect(rt.remember('same-authority', personal({
-      summary: 'Out-of-batch evidence must fail',
-      evidence_message_ids: [messages[2].message_id],
-    }))).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unresolvable_evidence' }));
+    expect(rt.remember('same-authority', personal({ summary: 'Out-of-batch evidence must fail', evidence_message_ids: [messages[2].message_id] }))).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unresolvable_evidence' }));
   });
 });
 
@@ -408,17 +443,20 @@ describe('adopted SDK/configuration boundary', () => {
   it('registers only relationship semantic tools and denies every builtin tool', async () => {
     const rt = runtime(); rt.store.beginBatch('tools', '2026-01-01T00:00:00.000Z');
     const tools = buildRelationshipTools(rt, 'tools');
-    expect(tools.map((t) => t.name)).toEqual(['memory_search', 'entity_search', 'entity_remember', 'memory_reinforce', 'memory_remember']);
-    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember']);
+    expect(tools.map((t) => t.name)).toEqual(['memory_search', 'entity_search', 'entity_remember', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES]);
+    expect(tools.some((tool) => tool.name === ('memory_remember' as any))).toBe(false);
+    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember']);
+    expect(RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'entity_search']);
+    expect(RELATIONSHIP_MUTATION_CLIENT_TOOLS).toEqual(['memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_remember']);
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).not.toContain(forbidden as any);
     expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).toEqual(expect.arrayContaining(['Bash', 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'Task', 'Skill', 'TodoWrite']));
     for (const allowed of RELATIONSHIP_ALLOWED_CLIENT_TOOLS) expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).not.toContain(allowed as any);
     expect(() => assertRelationshipClientToolInventory([
       'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'Glob', 'Grep', 'TaskStop', 'Read', 'Skill', 'Task', 'TodoWrite', 'Write',
-      'memory_search', 'memory_reinforce', 'memory_remember', 'entity_search', 'entity_remember',
+      'memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember',
     ])).not.toThrow();
     expect(() => assertRelationshipClientToolInventory(['Read', 'FutureUnknownBuiltin'])).toThrow(/FutureUnknownBuiltin/);
-    const remembered = await tools.find((tool) => tool.name === 'memory_remember')!.execute('call-1', personal());
+    const remembered = await tools.find((tool) => tool.name === 'memory_remember_personal_experience')!.execute('call-1', memoryToolInput(personal()));
     expect(remembered).toEqual(expect.objectContaining({ outcome: 'accepted' }));
     const searched = await tools[0].execute('call-2', { query: 'historic city' });
     expect((searched as any).results).toHaveLength(1);
@@ -431,7 +469,8 @@ describe('adopted SDK/configuration boundary', () => {
     const toolNames = agent.tool_ids.map((id: string) => af.tools.find((tool: any) => tool.id === id)?.name);
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(toolNames).not.toContain(forbidden);
     expect(agent.system).toContain('memory_search');
-    expect(agent.system).toContain('memory_remember');
+    expect(agent.system).toContain('memory_remember_personal_experience');
+    expect(agent.system).toContain('memory_remember_user_preference');
     expect(agent.system).toContain('memory_reinforce');
     expect(agent.system).toContain('Lexical or topical similarity alone');
     expect(agent.system).not.toContain('memory_replace(');

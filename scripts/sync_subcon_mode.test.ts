@@ -1,6 +1,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { describe, expect, it } from 'vitest';
+import { MEMORY_REMEMBER_TOOL_NAMES } from '../relationship-memory/src/tools/index.js';
+import { RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS } from '../relationship-memory/src/adapter/index.js';
 
 describe('additive synchronous Subcon mode contract', () => {
   it('keeps the existing Stop lane asynchronous and makes sync explicit opt-in', () => {
@@ -19,15 +21,17 @@ describe('additive synchronous Subcon mode contract', () => {
 
   it('makes sync recall read-only while preserving the full async mutation surface', () => {
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
-    expect(worker).toContain("baseRelationshipTools.filter((tool) => ['memory_search', 'entity_search'].includes(tool.name))");
+    expect(RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'entity_search']);
+    for (const name of MEMORY_REMEMBER_TOOL_NAMES) expect(RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS).not.toContain(name as any);
+    expect(worker).toContain('baseRelationshipTools.filter((tool) => syncAllowedTools.has(tool.name))');
     expect(worker).toContain("name: 'deliver_whisper'");
-    expect(worker).toContain("['memory_remember', 'memory_reinforce', 'entity_remember']");
+    expect(worker).toContain('isRelationshipMutationClientTool(tool.name)');
     expect(worker).toContain('runtime.memorySearchRecallHybrid');
     expect(worker).toContain('runtime.entitySearchRecallHybrid');
     expect(worker).toContain('stdio MCP client tools: (disabled in sync mode)');
     expect(worker).toContain('continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 }');
     expect(worker.match(/continuationBusyRetry/g)?.length).toBe(1);
-    expect(worker).toContain('openStdioMcpToolsFromEnvironment(log)');
+    expect(worker).toContain('(dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log)');
   });
 
   it('scopes sync whispers to the runtime-armed UserPromptSubmit without changing async/pretool delivery', () => {
