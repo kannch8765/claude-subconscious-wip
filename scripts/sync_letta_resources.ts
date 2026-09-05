@@ -135,9 +135,6 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
     if (!response.ok) throw new Error(`Failed to create tool-stripped sync agent: ${response.status} ${await response.text()}`);
     created = await response.json();
   } catch (error) {
-    // A timeout can happen after Letta committed the POST. The deterministic
-    // per-turn name lets us recover that exact sibling instead of leaking an
-    // unknown agent or blindly creating a duplicate.
     const recovered = await recoverSyncAgentByName(apiKey, syncName);
     if (!recovered) throw error;
     created = recovered;
@@ -148,9 +145,6 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
   if (!Array.isArray(verified?.tools) || !Array.isArray(verified?.blocks)) {
     try { verified = await fetchSyncAgentSnapshot(apiKey, syncAgentId); }
     catch (error) {
-      // We know the agent id but not its newly-created block ids. Preserve an
-      // agent-only cleanup receipt; the reaper will re-fetch the snapshot before
-      // deleting the agent so the blocks remain discoverable.
       deferSyncResourceCleanup(null, syncAgentId, []);
       throw error;
     }
@@ -158,8 +152,8 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
   const attachedTools = Array.isArray(verified?.tools) ? verified.tools : [];
   const verifiedBlocks = Array.isArray(verified?.blocks) ? verified.blocks : [];
   const syncBlockIds = [...new Set(verifiedBlocks
-    .map((block: any) => typeof block?.id === 'string' ? block.id : '')
-    .filter(Boolean))];
+    .map((block: any) => block?.id)
+    .filter((id: unknown): id is string => typeof id === 'string' && id.length > 0))];
   const expectedLabels = [...memoryBlocks.map((block) => block.label)].sort();
   const actualLabels = [...new Set(verifiedBlocks.map((block: any) => String(block?.label ?? '')).filter(Boolean))].sort();
   if (attachedTools.length !== 0 || syncBlockIds.length !== memoryBlocks.length || JSON.stringify(actualLabels) !== JSON.stringify(expectedLabels)) {
@@ -181,8 +175,6 @@ export async function createSyncConversation(apiKey: string, syncAgentId: string
     if (typeof created?.id !== 'string' || !created.id) throw new Error('Letta did not return an id for the sync conversation');
     return created.id;
   } catch (error) {
-    // The sibling agent is unique to this exact sync turn, so a committed POST
-    // with a lost response can be recovered unambiguously by agent_id.
     const recovered = await recoverConversationForAgent(apiKey, syncAgentId);
     if (recovered) return recovered;
     throw error;
