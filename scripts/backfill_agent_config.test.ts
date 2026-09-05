@@ -9,6 +9,7 @@ const LIVE = 'agent-11111111-1111-4111-8111-111111111111';
 const BACKFILL = 'agent-22222222-2222-4222-8222-222222222222';
 const REQUIRED = ['git-memory-enabled', 'origin:claude-subconcious', BACKFILL_PURPOSE_TAG];
 const BACKFILL_AF = path.join(process.cwd(), 'SubconsciousBackfill.af');
+const BACKFILL_SYSTEM = path.join(process.cwd(), 'config', 'backfill-system.md');
 function jsonResponse(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 }
@@ -21,7 +22,7 @@ afterEach(() => {
 
 describe('dedicated historical backfill agent resolver', () => {
   it('keeps affective-field guidance aligned with the v1 kind-specific payload schema', () => {
-    const raw = fs.readFileSync(BACKFILL_AF, 'utf8');
+    const raw = fs.readFileSync(BACKFILL_SYSTEM, 'utf8');
     expect(raw).not.toContain('Optional affective fields such as emotional_tone or why_memorable may be used');
     expect(raw).toContain('emotional_tone and why_memorable are optional only for personal_experience');
     expect(raw).toContain('relationship_event accepts only event, meaning, prior_context, and resulting_change');
@@ -154,7 +155,7 @@ describe('dedicated historical backfill agent resolver', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('reconciles from canonical SubconsciousBackfill.af and adds durable purpose identity', async () => {
+  it('reconciles from canonical backfill Markdown and adds durable purpose identity', async () => {
     process.env.LETTA_AGENT_ID = LIVE; process.env.LETTA_BACKFILL_AGENT_ID = BACKFILL;
     const canonical = getCanonicalManagedSystemPrompt(BACKFILL_AF);
     let tags: string[] = ['git-memory-enabled', 'origin:claude-subconcious']; let system = 'stale prompt'; let model = 'zai/glm-5'; let embedding = 'openai/text-embedding-3-small'; let contextWindow = 90000; let parallel = false;
