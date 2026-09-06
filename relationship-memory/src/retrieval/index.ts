@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { monotonicNow, timingDurationMs } from '../recall/instrumentation.js';
 
 export interface SemanticDocument {
   id: string;
@@ -17,13 +18,26 @@ export interface EmbeddingProvider {
   embedQuery(text: string, signal?: AbortSignal): Promise<number[]>;
 }
 
+export interface SemanticRankTiming {
+  segment(name: 'semantic_index_lookup' | 'query_embedding' | 'vector_compare', durationMs: number, counts?: Record<string, number>): void;
+}
+
+function emitSemanticRankTiming(
+  timing: SemanticRankTiming | undefined,
+  name: 'semantic_index_lookup' | 'query_embedding' | 'vector_compare',
+  durationMs: number,
+  counts?: Record<string, number>,
+): void {
+  try { timing?.segment(name, durationMs, counts); } catch { /* timing must never affect retrieval */ }
+}
+
 export interface SemanticRetriever {
   rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>>;
   /**
    * Rank only vectors already present in the derivative index. This path never
    * refreshes or embeds documents and is intended for foreground read-only recall.
    */
-  rankExisting?(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>>;
+  rankExisting?(documents: SemanticDocument[], query: string, signal?: AbortSignal, timing?: SemanticRankTiming): Promise<Map<string, number>>;
 }
 
 interface SemanticIndexEntry {
@@ -397,8 +411,9 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     }
   }
 
-  async rankExisting(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>> {
+  async rankExisting(documents: SemanticDocument[], query: string, signal?: AbortSignal, timing?: SemanticRankTiming): Promise<Map<string, number>> {
     if (!query.trim() || documents.length === 0) return new Map();
+    const lookupStartedAt = timing ? monotonicNow() : 0;
     assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
     const index = readIndex(this.indexFile, this.provider.fingerprint);
     const usable = documents.flatMap((document) => {
@@ -409,17 +424,24 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
         || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) return [];
       return [[document.id, cached.vector] as const];
     });
+    if (timing) emitSemanticRankTiming(timing, 'semantic_index_lookup', timingDurationMs(lookupStartedAt), { document_count: documents.length, usable_vectors: usable.length });
     // Missing vectors and content-hash mismatches are lexical fallback signals,
     // never permission for foreground sync recall to refresh document embeddings.
     if (usable.length === 0) return new Map();
     let queryVector: number[];
+    const embeddingStartedAt = timing ? monotonicNow() : 0;
     try {
       queryVector = await this.provider.embedQuery(query, signal);
     } catch (error) {
       if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
       throw error;
+    } finally {
+      if (timing) emitSemanticRankTiming(timing, 'query_embedding', timingDurationMs(embeddingStartedAt), { usable_vectors: usable.length });
     }
-    return new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));
+    const compareStartedAt = timing ? monotonicNow() : 0;
+    const ranked = new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));
+    if (timing) emitSemanticRankTiming(timing, 'vector_compare', timingDurationMs(compareStartedAt), { usable_vectors: usable.length });
+    return ranked;
   }
 
   async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
