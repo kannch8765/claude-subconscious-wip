@@ -11,6 +11,42 @@ import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, 
 
 export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
+export type RecallEvidencePolicy = 'explicit_recall';
+
+export const RECALL_EVIDENCE_LIMITS = Object.freeze({
+  relationship_results: 8,
+  transcript_hits: 6,
+  transcript_windows: 3,
+  transcript_before: 2,
+  transcript_after: 2,
+});
+
+export interface RecallTranscriptWindow {
+  hit_source_ref: string;
+  source_ref: string;
+  context: unknown[];
+}
+
+export interface RecallEvidenceBundle {
+  schema_version: 1;
+  policy: RecallEvidencePolicy;
+  query: string;
+  generated_at: string;
+  limits: typeof RECALL_EVIDENCE_LIMITS;
+  relationship_results: unknown[];
+  transcript_hits: unknown[];
+  transcript_windows: RecallTranscriptWindow[];
+  source_refs: string[];
+}
+
+export interface RecallEvidenceBundleInput {
+  query: string;
+  kind?: MemoryKind;
+  time_start?: string;
+  time_end?: string;
+}
+
+export type ExpandRecallInput = RecallEvidenceBundleInput;
 
 export interface RecallSourceSummary {
   source_ref: string;
@@ -79,7 +115,7 @@ interface TranscriptCandidate extends TranscriptLocator {
 
 export interface RecallTool {
   label: string;
-  name: 'relationship_memory_search' | 'transcript_search' | 'transcript_read' | 'deliver_recall';
+  name: 'relationship_memory_search' | 'transcript_search' | 'transcript_read' | 'expand_recall' | 'deliver_recall';
   description: string;
   parameters: Record<string, unknown>;
   execute(toolCallId: string, args: unknown): Promise<unknown>;
@@ -164,6 +200,12 @@ function truncate(value: string, limit: number): string {
   return value.length <= limit ? value : `${value.slice(0, limit)}…`;
 }
 
+function resultSourceRef(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const sourceRef = (value as Record<string, unknown>).source_ref;
+  return typeof sourceRef === 'string' && sourceRef ? sourceRef : undefined;
+}
+
 function transcriptRootsFromEnvironment(): string[] {
   const configured = process.env.RELATIONSHIP_MEMORY_TRANSCRIPT_DIR;
   if (configured) return configured.split(path.delimiter).map((item) => item.trim()).filter(Boolean);
@@ -222,6 +264,7 @@ export class RelationshipMemoryRecallSession {
   private resolveDelivery!: (result: RecallResult) => void;
   private closedReason?: 'timeout' | 'cancelled' | 'failed';
   private readonly semanticRetriever?: SemanticRetriever;
+  private expansionCount = 0;
 
   constructor(options: {
     recallId?: string;
@@ -456,6 +499,78 @@ export class RelationshipMemoryRecallSession {
     return { source_ref: readRef, context };
   }
 
+  async evidenceBundle(input: RecallEvidenceBundleInput): Promise<RecallEvidenceBundle> {
+    this.assertOpen();
+    const query = cleanText(input?.query, 'query');
+    const relationship = await this.relationshipMemorySearchHybrid({
+      query,
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.time_start ? { time_start: input.time_start } : {}),
+      ...(input.time_end ? { time_end: input.time_end } : {}),
+      limit: RECALL_EVIDENCE_LIMITS.relationship_results,
+    });
+    this.assertOpen();
+
+    const transcript = await this.transcriptSearch({
+      query,
+      ...(input.time_start ? { time_start: input.time_start } : {}),
+      ...(input.time_end ? { time_end: input.time_end } : {}),
+      limit: RECALL_EVIDENCE_LIMITS.transcript_hits,
+    });
+    this.assertOpen();
+
+    const transcriptWindows: RecallTranscriptWindow[] = [];
+    for (const hit of transcript.results.slice(0, RECALL_EVIDENCE_LIMITS.transcript_windows)) {
+      const hitSourceRef = resultSourceRef(hit);
+      if (!hitSourceRef) continue;
+      const read = await this.transcriptRead({
+        source_ref: hitSourceRef,
+        before: RECALL_EVIDENCE_LIMITS.transcript_before,
+        after: RECALL_EVIDENCE_LIMITS.transcript_after,
+      });
+      transcriptWindows.push({ hit_source_ref: hitSourceRef, ...read });
+    }
+
+    const sourceRefs = new Set<string>();
+    for (const item of relationship.results) {
+      const sourceRef = resultSourceRef(item);
+      if (sourceRef) sourceRefs.add(sourceRef);
+    }
+    for (const item of transcript.results) {
+      const sourceRef = resultSourceRef(item);
+      if (sourceRef) sourceRefs.add(sourceRef);
+    }
+    for (const item of transcriptWindows) {
+      sourceRefs.add(item.hit_source_ref);
+      sourceRefs.add(item.source_ref);
+    }
+
+    return {
+      schema_version: 1,
+      policy: 'explicit_recall',
+      query,
+      generated_at: new Date().toISOString(),
+      limits: RECALL_EVIDENCE_LIMITS,
+      relationship_results: relationship.results,
+      transcript_hits: transcript.results,
+      transcript_windows: transcriptWindows,
+      source_refs: [...sourceRefs],
+    };
+  }
+
+  async expandEvidenceBundle(input: ExpandRecallInput): Promise<RecallEvidenceBundle> {
+    this.assertOpen();
+    const query = cleanText(input?.query, 'query');
+    if (this.expansionCount >= 1) throw new Error('expand_recall may be called at most once per recall.');
+    this.expansionCount += 1;
+    return this.evidenceBundle({
+      query,
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.time_start ? { time_start: input.time_start } : {}),
+      ...(input.time_end ? { time_end: input.time_end } : {}),
+    });
+  }
+
   deliver(input: DeliverRecallInput): RecallResult {
     this.assertOpen();
     if (cleanText(input?.recall_id, 'recall_id') !== this.recallId) throw new Error('deliver_recall recall_id does not match the pending recall.');
@@ -527,6 +642,35 @@ export function deliverRecallToolSchema(): Record<string, unknown> {
   };
 }
 
+export function expandRecallToolSchema(): Record<string, unknown> {
+  return {
+    type: 'object', additionalProperties: false, required: ['query'],
+    properties: {
+      query: { type: 'string', minLength: 1, description: 'One revised natural-language search concept for the single allowed expansion.' },
+      kind: { type: 'string', enum: ['personal_experience', 'shared_experience', 'relationship_event', 'inside_joke', 'user_preference'] },
+      time_start: { type: 'string', description: 'Optional ISO-compatible lower time bound.' },
+      time_end: { type: 'string', description: 'Optional ISO-compatible upper time bound.' },
+    },
+  };
+}
+
+export function buildBundleFirstRecallTools(session: RelationshipMemoryRecallSession, wrapResult: RecallResultWrapper = (value) => value): RecallTool[] {
+  return [
+    {
+      label: 'expand_recall', name: 'expand_recall',
+      description: 'Optional single fallback search. The runtime performs trusted canonical-memory and transcript retrieval and returns another bounded evidence bundle. Use only when the initial bundle is materially insufficient.',
+      parameters: expandRecallToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(await session.expandEvidenceBundle(args as ExpandRecallInput)); },
+    },
+    {
+      label: 'deliver_recall', name: 'deliver_recall',
+      description: 'Terminally deliver the synthesized recall answer. Cite only source_ref values present in the runtime-provided evidence bundle(s) for this recall.',
+      parameters: deliverRecallToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(session.deliver(args as DeliverRecallInput)); },
+    },
+  ];
+}
+
 export function buildRecallTools(session: RelationshipMemoryRecallSession, wrapResult: RecallResultWrapper = (value) => value): RecallTool[] {
   return [
     {
@@ -557,6 +701,7 @@ export function buildRecallTools(session: RelationshipMemoryRecallSession, wrapR
 }
 
 export const RECALL_ALLOWED_CLIENT_TOOLS = ['relationship_memory_search', 'transcript_search', 'transcript_read', 'deliver_recall'] as const;
+export const RECALL_BUNDLE_ALLOWED_CLIENT_TOOLS = ['expand_recall', 'deliver_recall'] as const;
 export const RECALL_FORBIDDEN_CLIENT_TOOLS = [
   'memory_remember', 'memory', 'memory_insert', 'memory_replace', 'memory_rethink',
   'owner_revise', 'owner_deactivate', 'owner_restore', 'Write', 'Edit', 'Bash', 'Read', 'Grep', 'Glob',

@@ -1,7 +1,8 @@
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RECALL_TOOL } from './recall_mcp.js';
 
@@ -47,4 +48,52 @@ describe('recall MCP executable entrypoint', () => {
     }));
     expect(responses[1].result.tools).toEqual([RECALL_TOOL]);
   });
+
+  it('serves a real stdio tools/call response with an injected offline recall mock', () => {
+    const root = mkdtempSync(join(tmpdir(), 'recall-mcp-stdio-mock-'));
+    roots.push(root);
+    const child = join(root, 'mock_recall_mcp.ts');
+    const entrypointUrl = pathToFileURL(join(process.cwd(), 'scripts', 'recall_mcp.ts')).href;
+    writeFileSync(child, `
+      import { RecallMcpServer, runRecallStdio } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts', 'recall_mcp.ts')).href)};
+      runRecallStdio(new RecallMcpServer(async (query) => ({
+        status: 'ok',
+        recall_id: 'recall-stdio-mock',
+        answer: 'offline remembered: ' + query,
+        source_refs: [],
+        sources: [],
+      })));
+    `);
+
+    const input = [
+      JSON.stringify({
+        jsonrpc: '2.0', id: 11, method: 'initialize',
+        params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'stdio-tools-call', version: '1' } },
+      }),
+      JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }),
+      JSON.stringify({ jsonrpc: '2.0', id: 12, method: 'tools/list', params: {} }),
+      JSON.stringify({ jsonrpc: '2.0', id: 13, method: 'tools/call', params: { name: 'recall', arguments: { query: 'Kyoto cake?' } } }),
+      '',
+    ].join('\n');
+
+    const result = spawnSync(
+      process.execPath,
+      [join(process.cwd(), 'hooks', 'silent-npx.cjs'), 'tsx', child],
+      { cwd: process.cwd(), input, encoding: 'utf8', timeout: 5_000 },
+    );
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe('');
+    const responses = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
+    expect(responses).toHaveLength(3);
+    expect(responses[1].result.tools).toEqual([RECALL_TOOL]);
+    expect(responses[2]).toEqual(expect.objectContaining({
+      id: 13,
+      result: expect.objectContaining({
+        content: [{ type: 'text', text: 'offline remembered: Kyoto cake?' }],
+        structuredContent: expect.objectContaining({ status: 'ok', recall_id: 'recall-stdio-mock' }),
+      }),
+    }));
+  });
+
 });
