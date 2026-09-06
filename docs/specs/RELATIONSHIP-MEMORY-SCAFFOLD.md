@@ -1,0 +1,927 @@
+# Relationship Memory Scaffold
+
+## Status
+
+```text
+ARCHITECTURE AND ADOPTION CONTRACT
+DOCUMENTATION ONLY
+NO RUNTIME IMPLEMENTATION
+NO MODEL EXECUTION
+NO REAL TRANSCRIPT ACCESS
+```
+
+## Repository identity
+
+```text
+repository:
+kannch8765/claude-subconscious-wip
+
+frozen upstream base:
+365e7e6e0d788f9f6d5c3066d1421474653081cc
+
+upstream project:
+letta-ai/claude-subconscious
+```
+
+This document defines the boundary for the first relationship-memory scaffold. It does not authorize deployment, production data access, historical backfill, or modification of the adopted hook and Letta runtime architecture.
+
+## 1. Product purpose
+
+This project is not a second general-purpose work-memory system. It does not initially target project status, TODOs, generic workflow preferences, or ordinary user-profile facts.
+
+Its first product purpose is to preserve a shared conversational world:
+
+- personal experiences described by the user;
+- shared experiences that acquire meaning between the user and assistant;
+- relationship events that clarify or change the relationship;
+- inside jokes, callbacks, and shared language.
+
+The first scaffold recognizes exactly four canonical memory kinds:
+
+```text
+personal_experience
+shared_experience
+relationship_event
+inside_joke
+```
+
+No additional kinds are authorized by this document.
+
+## 2. Adopted upstream capabilities
+
+The implementation must adopt the existing Claude Subconscious and Letta runtime capabilities instead of reimplementing them.
+
+### Claude Subconscious — adopt
+
+```text
+Claude Code hook lifecycle
+transcript incremental cursor
+session-to-conversation mapping
+detached background worker
+late-result synchronization
+UserPromptSubmit and PreToolUse injection lifecycle
+```
+
+### Letta Code / Letta core — adopt
+
+```text
+persistent agent identity
+persistent conversations
+model execution
+tool-call loop
+agent state restoration
+client-side Read / Grep / Glob execution
+```
+
+These capabilities are classified:
+
+```text
+ADOPT — DO NOT REIMPLEMENT
+```
+
+The fork does not bundle or replace the Letta server. It connects to an official compatible Letta runtime through the existing SDK boundary.
+
+## 3. One adopted agent, reconfigured memory surface
+
+The first implementation reconfigures the adopted Subconscious agent. It must not introduce a second relationship-memory agent, a parallel transcript consumer, or a second Letta runtime.
+
+The implementation must preserve:
+
+```text
+the existing persistent agent identity
+the existing hook lifecycle
+the existing worker and conversation lifecycle
+the existing Letta SDK/runtime boundary
+```
+
+The implementation may change only the agent's memory-facing configuration:
+
+```text
+remove default Markdown memory mutation tools
+attach memory_search and memory_remember
+replace instructions that require mutable Markdown work-memory
+expose generated projection blocks as read-only
+```
+
+The existing `Subconscious.af` may be narrowly updated or deterministically transformed by an adjacent configuration asset. Either approach must configure the same adopted agent identity. It must not create or run a second agent.
+
+The final configured instructions must not ask the agent to call tools that are absent or forbidden.
+
+## 4. Memory authority boundary
+
+The authoritative memory store must contain structured canonical records and bound evidence.
+
+```text
+structured canonical memory records
+= authority
+
+source evidence and user quotes
+= authority
+
+Letta Markdown memory blocks
+= read-only, rebuildable projection
+
+agent-generated guidance
+= temporary suggestion, not authority
+```
+
+The memory agent must not directly edit the authoritative database, JSONL files, generated Markdown projections, or raw transcript data.
+
+## 5. Default Markdown memory mutation
+
+The configured Subconscious agent must not retain unrestricted access to the default long-term Markdown mutation surface.
+
+The scaffold must demonstrate that the following operations are absent from the configured tool surface or explicitly denied:
+
+```text
+memory
+memory_insert
+memory_replace
+memory_rethink
+unrestricted memory filesystem create / delete / rename / rewrite
+```
+
+Read-only projection blocks may remain visible in the agent context. A trusted renderer may update those blocks through the Letta API after canonical records change.
+
+Read, Grep, and Glob are independent investigation tools and remain available under the existing read-only policy.
+
+## 6. Canonical proposal schema — version 1
+
+The first implementation must implement exactly `schema_version: 1`.
+
+Unknown fields are rejected at every object level. Required strings are trimmed and must remain non-empty. Optional values are omitted rather than set to `null`. String arrays must contain unique, non-empty trimmed strings.
+
+### 6.1 Common agent proposal
+
+Every `memory_remember` proposal must contain:
+
+```text
+schema_version        required literal integer 1
+kind                  required enum of the four authorized kinds
+summary               required non-empty string
+participants          required array of one or two unique roles
+evidence_message_ids  required non-empty array of unique message IDs
+payload               required kind-specific object
+linked_memory_ids     optional array of existing canonical memory IDs
+```
+
+For schema version 1, `participants` accepts only:
+
+```text
+user
+assistant
+```
+
+The trusted backend maps these roles to canonical identities. Third parties may be described inside the event text but are not canonical participants in schema version 1.
+
+`linked_memory_ids` may contain only canonical IDs returned by previously accepted writes. Temporary proposal references are not supported in schema version 1. A model that creates linked records in one run must create the parent first and use its returned `memory_id` in later calls.
+
+The agent must not submit authoritative values for:
+
+```text
+memory_id
+subject_id
+status
+observed_at
+created_at
+conversation_id
+role
+quote
+captured_at
+```
+
+Those values are generated or resolved by the trusted backend.
+
+### 6.2 Evidence binding
+
+Every accepted record must bind to one or more real canonical message identifiers.
+
+```text
+evidence_id
+memory_id
+conversation_id
+message_id
+role
+quote
+captured_at
+```
+
+The backend resolves `quote`, `role`, conversation identity, and source time from the referenced canonical message. The model cannot submit or overwrite authoritative quote text.
+
+### 6.3 Kind-specific payloads
+
+#### `personal_experience`
+
+Required:
+
+```text
+title       non-empty string
+experience  non-empty string
+```
+
+Optional:
+
+```text
+time_text        non-empty string
+places           array of unique non-empty strings
+themes           array of unique non-empty strings
+emotional_tone   non-empty string
+why_memorable    non-empty string
+recall_triggers  array of unique non-empty strings
+```
+
+#### `shared_experience`
+
+Required:
+
+```text
+title           non-empty string
+event           non-empty string
+shared_meaning  non-empty string
+```
+
+Optional:
+
+```text
+symbols          array of unique non-empty strings
+recall_triggers  array of unique non-empty strings
+```
+
+Parent or related experiences use the common `linked_memory_ids` field.
+
+#### `relationship_event`
+
+Required:
+
+```text
+event    non-empty string
+meaning  non-empty string
+```
+
+Optional:
+
+```text
+prior_context     non-empty string
+resulting_change  non-empty string
+```
+
+Related experiences or earlier relationship events use the common `linked_memory_ids` field.
+
+#### `inside_joke`
+
+Required:
+
+```text
+name             non-empty string
+meaning          non-empty string
+trigger_phrases  non-empty array of unique non-empty strings
+```
+
+Optional:
+
+```text
+origin     non-empty string
+callbacks  array of unique non-empty strings
+tone       non-empty string
+```
+
+## 7. Custom tool surface
+
+The first implementation may expose only these two working relationship-memory tools:
+
+```text
+memory_search
+memory_remember
+```
+
+The interfaces must reserve future compatibility for:
+
+```text
+memory_reinforce
+memory_evolve
+memory_get_evidence
+```
+
+### `memory_search`
+
+Searches existing canonical records before any write attempt. It may filter by memory kind, participant role, trigger, time, linked memory, or semantic query.
+
+### `memory_remember`
+
+Proposes one new schema-version-1 memory using semantic fields and real evidence message identifiers.
+
+The trusted backend must:
+
+```text
+validate the exact kind-specific schema
+bind the actual subject and participant identities
+resolve evidence from canonical messages
+generate IDs and timestamps
+reject invented or inaccessible evidence
+perform source idempotency and duplicate checks
+append an auditable storage event
+record the outcome against the active transcript batch_id
+```
+
+Each completed `memory_remember` call must return exactly one business outcome:
+
+```text
+accepted
+duplicate
+permanently_rejected
+retryable_failed
+```
+
+Definitions:
+
+```text
+accepted
+the proposal is valid, its evidence is resolvable, and a new canonical memory
+record was durably committed; return the new canonical memory_id
+
+duplicate
+the same source-idempotency key was already handled; do not create another
+record and return the existing canonical memory_id when available
+
+permanently_rejected
+the proposal violates schema or authority rules and unchanged replay cannot
+succeed; durably record a rejection code and reason
+
+retryable_failed
+the proposal may be valid, but a transient storage, dependency, transaction,
+or tool-transport failure prevented a durable terminal result
+```
+
+A schema or evidence rejection is a successful execution of the custom tool with a `permanently_rejected` business outcome. It is not disguised as a Letta transport failure. A transient inability to produce a durable result returns `retryable_failed` or causes the Letta session itself to fail.
+
+The memory agent may inspect the returned outcome, correct a permanently rejected proposal, or make another tool call before ending the same Letta turn. The memory agent must not receive direct SQL, filesystem, or unrestricted JSON mutation tools for authoritative memory.
+
+## 8. Trusted transcript-batch completion
+
+A completed Letta SDK session is not by itself proof that relationship-memory processing reached durable terminal outcomes.
+
+Before sending a transcript batch, the adopted worker must create a stable `batch_id` and a trusted pending batch record. Because the custom tools execute through trusted local adapter code, the backend records each `memory_remember` outcome against that `batch_id` when the tool call completes. The worker must not infer outcomes by parsing agent prose.
+
+After the session stream ends, trusted worker code finalizes the batch as exactly one of:
+
+```text
+completed
+retryable_failure
+```
+
+Definitions:
+
+```text
+completed
+the Letta session completed normally and every attempted memory mutation has
+a durable terminal outcome: accepted, duplicate, or permanently_rejected;
+zero attempted memory mutations is also completed and is reported as
+no_memory_required detail
+
+retryable_failure
+the Letta session failed, or at least one memory_remember call returned
+retryable_failed; the batch remains pending for replay
+```
+
+Cursor rule:
+
+```text
+completed          → advance source cursor
+retryable_failure  → do not advance source cursor
+```
+
+A mixed batch containing accepted writes and permanently rejected proposals is `completed`: accepted records remain committed, permanent rejections remain in the durable rejection journal, and the source cursor advances. A mixed batch containing any `retryable_failed` outcome is `retryable_failure`: the source cursor does not advance, and accepted records are protected from duplication by source idempotency when the batch is replayed.
+
+The first scaffold does not define automated quarantine or maximum-retry policy. Permanent rejections must be inspectable but must not poison the transcript cursor. Retryable failures must remain visible for later replay rather than being silently consumed.
+
+The batch-completion journal is narrow adoption glue. It must wrap the existing worker cursor lifecycle rather than replacing the transcript scanner or worker architecture.
+
+## 9. Projection model
+
+Canonical records may be rendered into compact, read-only Letta blocks such as:
+
+```text
+shared_language
+remembered_experiences
+relationship_context
+```
+
+The projection renderer must be deterministic and must not invoke an LLM.
+
+Recommended lifecycle:
+
+```text
+completed memory-agent run finishes
+→ canonical revision changed
+→ trusted background renderer reads active records
+→ renderer rebuilds affected Markdown projection
+→ trusted adapter updates read-only Letta blocks
+→ projection revision advances
+```
+
+A projection can be deleted and rebuilt without losing authoritative memory.
+
+Agent-generated `guidance` may remain separate. Guidance is not copied into the canonical store without a custom memory tool call and valid evidence.
+
+## 10. First scaffold module boundary
+
+The implementation should add an isolated module rather than reorganizing the upstream repository:
+
+```text
+relationship-memory/
+├─ src/
+│  ├─ schema/
+│  ├─ store/
+│  ├─ tools/
+│  ├─ projection/
+│  └─ adapter/
+└─ tests/
+```
+
+Changes to existing upstream hooks, scripts, and agent configuration must be limited to narrow adapter wiring:
+
+```text
+attach relationship-memory custom tools to the adopted agent
+remove default Markdown mutation tools from the adopted agent
+replace conflicting Markdown-mutation instructions
+create and finalize trusted batch-completion records
+trigger projection synchronization after a completed run
+```
+
+The upstream hook lifecycle, transcript parser, worker scheduling, agent identity, and Letta conversation behavior must not be redesigned in the scaffold.
+
+## 11. Sanitized acceptance fixture
+
+The first implementation must use a fictional sanitized fixture. It must not include the owner's real memories or transcript excerpts.
+
+Example scenario:
+
+```text
+An adult user visited a historic city.
+During the trip, the user selected a symbolic gift for a long-term AI companion.
+The user explained why including the companion in the gesture mattered.
+```
+
+Scripted repository tests may submit three sequential accepted proposals:
+
+```text
+personal_experience
+shared_experience linked to the accepted personal_experience memory_id
+relationship_event linked to the accepted shared_experience memory_id
+```
+
+A separate fixture may establish one `inside_joke` record.
+
+## 12. Repository acceptance — required for the first implementation
+
+The first implementation must pass deterministic repository-level acceptance without a real model or a live Letta server:
+
+```text
+PASS custom tool definitions register through the adopted SDK/configuration boundary
+PASS a deterministic fake/session harness exercises memory_search and memory_remember
+PASS the configured adopted agent surface excludes default Markdown mutation tools
+PASS the configured instructions do not request forbidden or absent tools
+PASS Read / Grep / Glob remain available under the adopted read-only policy
+PASS schema_version 1 accepts every valid kind-specific fixture
+PASS schema_version 1 rejects unknown fields, empty required strings, and invalid participants
+PASS a valid typed canonical record is stored
+PASS evidence binds to a real fixture message ID
+PASS the authoritative quote is resolved by the backend
+PASS linked records use accepted canonical memory IDs
+PASS replaying the same source batch does not create duplicate records
+PASS accepted, duplicate, and permanently_rejected tool outcomes are durable terminal results
+PASS retryable_failed is the only non-terminal memory_remember business outcome
+PASS a completed batch, including no_memory_required, advances the cursor
+PASS accepted write + permanently_rejected proposal finalizes as completed and advances the cursor
+PASS accepted write + retryable_failed proposal finalizes as retryable_failure and does not advance the cursor
+PASS replay after retryable_failure does not duplicate previously accepted records
+PASS deterministic renderer produces a read-only projection
+PASS canonical records remain authoritative if the projection is deleted
+PASS existing upstream tests remain green
+```
+
+Repository acceptance proves the implementation, configuration, fake tool-call handoff, storage, evidence, replay, projection, and cursor semantics. It must not claim that a real Letta runtime or real model has executed the tools.
+
+## 13. Owner canary — separately authorized follow-up
+
+A later Owner canary may prove the live adopted combination:
+
+```text
+PASS a compatible official Letta runtime loads the reconfigured adopted agent
+PASS the explicitly selected model can call memory_search
+PASS the explicitly selected model can call memory_remember
+PASS the local client-side tool result returns through the real Letta tool-call loop
+PASS the sanitized run reaches a completed batch result without retryable_failure
+```
+
+The Owner canary is not part of the first repository implementation acceptance. It requires separate authorization, an explicitly selected model, isolated sanitized data, and Owner-controlled credentials and runtime configuration.
+
+## 14. Explicit non-goals
+
+The first scaffold must not:
+
+```text
+access real Claude Code transcripts
+process the owner's existing history
+implement the 500 MB historical backfill wrapper
+call a real paid model in repository CI
+start, deploy, or configure a live Letta server as repository acceptance
+claim live-runtime proof from mocks or fake sessions
+introduce a second relationship-memory agent
+run two memory agents over the same transcript
+implement current-prompt memory recall
+inject historical raw user quotes into Claude Code
+compare memory models
+create a complete final taxonomy
+create a final relationship summary record
+fork or copy Letta core
+replace the Claude Subconscious hook architecture
+store real relationship-memory databases in Git
+```
+
+## 15. Runtime data location
+
+Real runtime data must remain outside Git. A future local default may use a path equivalent to:
+
+```text
+~/.local/share/relationship-memory/
+├─ memory.sqlite3
+├─ checkpoints/
+└─ projections/
+```
+
+The repository may contain only sanitized fixtures, schema migrations, and temporary test databases.
+
+## 16. Follow-up sequence
+
+After repository acceptance and independent review, follow-up work may be split into separate tasks:
+
+```text
+1. Owner canary with an explicitly selected model and isolated data
+2. historical backfill wrapper over canonical CCDK batches
+3. reinforcement and relationship-evolution tools
+4. current-prompt query-aware recall
+5. dual-channel injection of distilled memory and raw user quotes
+```
+
+None of these follow-up items are authorized by this documentation-only task.
+
+## 17. Reference classification key
+
+The implementation references below are normative traceability aids for the first scaffold. They identify the concrete adopted seams and do not expand task scope.
+
+```text
+ADOPTED
+use the referenced capability substantially as provided; do not reimplement it
+
+ADAPTED
+preserve the referenced lifecycle or component, with only the narrow changes authorized by this contract
+
+NEW NARROW GLUE
+new local code required only to connect adopted components or enforce this contract
+
+NOT ADOPTED
+reviewed for comparison or design provenance, but not imported as a runtime, dependency, storage layer, or authorization to expand scope
+```
+
+Architecture references are informative unless a specific surface is separately classified as `ADOPTED` or `ADAPTED`. Listing a repository here does not authorize adding it as a dependency.
+
+## 18. Implementation references
+
+Reference retrieval date:
+
+```text
+2026-08-07
+```
+
+### 18.1 Claude Subconscious
+
+```text
+repository:
+letta-ai/claude-subconscious
+
+exact adopted upstream commit:
+365e7e6e0d788f9f6d5c3066d1421474653081cc
+
+local fork:
+kannch8765/claude-subconscious-wip
+```
+
+Concrete implementation seams:
+
+#### `hooks/hooks.json`
+
+```text
+classification:
+ADOPTED
+
+adopted surface:
+Claude Code hook events, detached invocation lifecycle, and existing entrypoint routing
+
+not authorized:
+new hook architecture, second transcript consumer, or parallel relationship-memory lifecycle
+```
+
+#### `scripts/transcript_utils.ts`
+
+```text
+classification:
+ADOPTED
+
+adopted surface:
+transcript parsing, incremental source selection, and existing cursor-oriented message extraction
+
+not authorized:
+replacement transcript parser or a separate relationship-memory scanner
+```
+
+#### `scripts/conversation_utils.ts`
+
+```text
+classification:
+ADOPTED
+
+adopted surface:
+session-to-conversation identity and restoration behavior
+
+not authorized:
+second Letta conversation topology for the same transcript stream
+```
+
+#### `scripts/send_worker_sdk.ts`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+existing detached worker, Letta Code SDK session lifecycle, stream consumption, and source cursor ownership
+
+narrow adaptation:
+expose memory_search and memory_remember through the adopted client-tool boundary;
+collect trusted local tool outcomes by batch_id;
+advance the cursor only after completed batch finalization;
+hold the cursor on unresolved retryable_failure
+
+not authorized:
+replacement worker runtime, replacement scheduler, or agent-prose parsing as acknowledgement
+```
+
+#### `scripts/pretool_sync.ts`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+existing pre-tool synchronization and Claude Code injection timing
+
+narrow adaptation:
+read relationship-memory projections as generated read-only context instead of treating mutable Markdown as authority
+```
+
+#### `scripts/sync_letta_memory.ts`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+trusted Letta block synchronization boundary
+
+narrow adaptation:
+synchronize deterministic projections derived from canonical records;
+do not ingest agent-authored Markdown as authoritative relationship memory
+```
+
+#### `Subconscious.af`
+
+```text
+classification:
+ADAPTED
+
+preserved surface:
+the same adopted Subconscious agent identity and runtime role
+
+narrow adaptation:
+remove or deny vanilla Markdown memory mutation tools;
+attach memory_search and memory_remember;
+replace instructions that require forbidden mutation tools;
+expose generated relationship-memory blocks as read-only
+
+not authorized:
+second relationship-memory agent, second runtime, or wholesale replacement of the agent harness
+```
+
+### 18.2 Letta runtime and official SDK/API references
+
+The official compatible Letta runtime remains external to this repository.
+
+```text
+reference repository:
+letta-ai/letta
+
+reference snapshot commit:
+ff19ffeafeb54bd2a7dc5d4a552f10191732a235
+
+classification:
+ADOPTED AS EXTERNAL RUNTIME
+NOT MODIFIED OR COPIED
+```
+
+#### Client-side custom-tool execution
+
+```text
+reference:
+https://docs.letta.com/guides/agents/tool-execution-client-side/
+
+classification:
+ADOPTED
+
+adopted surface:
+client_tools schema handoff, local execution, tool-result return, and continuation of the same agent run
+
+new narrow glue:
+local relationship-memory handlers and trusted batch outcome recording
+```
+
+#### Agent tool configuration
+
+```text
+references:
+https://docs.letta.com/api/typescript/resources/agents/subresources/tools
+https://docs.letta.com/api/python/resources/agents/subresources/tools
+
+classification:
+ADOPTED
+
+adopted surface:
+inspect, attach, detach, and verify the configured agent tool surface
+
+not adopted:
+default mutable Markdown memory tools as the authority for relationship memory
+```
+
+#### Read-only memory blocks
+
+```text
+reference:
+https://docs.letta.com/guides/core-concepts/memory/memory-blocks
+
+classification:
+ADOPTED
+
+adopted surface:
+read-only blocks as agent-visible context that the agent cannot mutate
+```
+
+#### Trusted block update
+
+```text
+references:
+https://docs.letta.com/api/typescript/resources/agents/subresources/blocks/methods/update
+https://docs.letta.com/api/resources/blocks/methods/update/
+
+classification:
+ADOPTED
+
+adopted surface:
+trusted client update of deterministic generated projections
+
+new narrow glue:
+projection renderer, revision check, and synchronization trigger
+```
+
+### 18.3 New narrow glue owned by this fork
+
+The following capabilities do not come from an architecture reference and must remain narrow:
+
+```text
+schema_version 1 validators for the four authorized memory kinds
+canonical record and evidence store
+memory_search and memory_remember handlers
+source-idempotency keys
+per-call business outcomes:
+  accepted
+  duplicate
+  permanently_rejected
+  retryable_failed
+trusted batch journal:
+  completed
+  retryable_failure
+deterministic Markdown projection renderer
+projection revision tracking
+```
+
+These additions must connect to the adopted worker and Letta tool loop. They do not authorize a new agent runtime, message bus, workflow engine, or general memory platform.
+
+## 19. Architecture references and non-adopted alternatives
+
+These repositories preserve design provenance. They are not implementation dependencies for the first scaffold.
+
+### 19.1 Mem0
+
+```text
+repository:
+mem0ai/mem0
+
+reference snapshot commit:
+4a0a9a92a641b5da75023eca596a758a4f7ae101
+
+classification:
+ADAPTED AS DESIGN REFERENCE
+NOT ADOPTED AS RUNTIME
+```
+
+Borrowed design ideas:
+
+```text
+atomic memory records rather than one mutable memory document
+explicit search-before-write behavior
+durable memory identity
+separation between memory operations and application conversation flow
+```
+
+Explicitly not adopted:
+
+```text
+Mem0 runtime
+Mem0 storage adapters
+Mem0 extraction pipeline
+Mem0 dependency graph
+Mem0's complete lifecycle or deletion semantics
+```
+
+### 19.2 LangMem
+
+```text
+repository:
+langchain-ai/langmem
+
+reference snapshot commit:
+7c7ebf36b5e1697001f92eed77c43e3d541decd7
+
+classification:
+ADAPTED AS DESIGN REFERENCE
+NOT ADOPTED AS RUNTIME
+```
+
+Borrowed design ideas:
+
+```text
+developer-defined typed memory schemas
+different payload shapes for different memory kinds
+explicit memory tools rather than unrestricted document mutation
+```
+
+Explicitly not adopted:
+
+```text
+LangGraph runtime
+LangMem manager
+LangMem store integration
+LangMem background execution framework
+```
+
+### 19.3 Letta AI Memory SDK
+
+```text
+repository:
+letta-ai/ai-memory-sdk
+
+reference snapshot commit:
+4494e00410469082bf298b8b03b7c9f93e244f14
+
+classification:
+REFERENCE ONLY
+NOT ADOPTED
+```
+
+Useful comparison points:
+
+```text
+one persistent memory agent associated with a subject
+application-driven message submission to a background learning run
+reuse of Letta's persistent agent runtime
+```
+
+Explicitly not adopted:
+
+```text
+AI Memory SDK wrapper as the product integration layer
+mutable Letta blocks as the canonical relationship-memory authority
+its application-controlled ingestion contract in place of Claude Subconscious hooks and cursor lifecycle
+```
+
+### 19.4 Reference precedence
+
+When references differ or evolve, implementation decisions follow this order:
+
+```text
+1. this scaffold contract
+2. the frozen Claude Subconscious implementation seam at the exact adopted commit
+3. current official Letta SDK/API documentation for the pinned compatible runtime
+4. architecture references, which are informative only
+```
+
+A future dependency or API upgrade must record a new exact reference snapshot and independently verify that the adopted seams still hold. It must not silently reinterpret this contract from a newer upstream implementation.
