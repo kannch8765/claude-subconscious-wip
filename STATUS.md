@@ -20,10 +20,11 @@
 
 ### Infra / CI
 
-- 现在做到哪：任务 08 已通过 PR #83 合入统一 PR offline gate `PR offline CI / offline-ci`，覆盖 bounded full Vitest + TypeScript checking。对应报告：`docs/implementations/IMPLEMENTATION-08-UNIFIED-PR-CI.md`。
-- 当前保护规则：owner 已在 GitHub 为 `main` 启用 branch protection，要求 PR 合入并要求 GitHub Actions check `offline-ci` 通过；GitHub 分支列表现已回报 `main` 为 `protected: true`。当前规则未要求 approval，也未要求 branch 必须先更新到最新 main。
-- 下一步：任务 08 因 required-check 配置未知而挂起的 blocker 已解除；legacy workflows 的清理由后续范围明确的小任务完成，在清理前继续保留。
-- 指针：branch `task/08-unified-pr-ci`；PR #83；最新报告 `docs/implementations/IMPLEMENTATION-08-UNIFIED-PR-CI.md`。
+- 现在做到哪：任务 08 已通过 PR #83 合入统一 PR offline gate `PR offline CI / offline-ci`，覆盖 bounded full Vitest + TypeScript checking；任务 13 已完成旧 `093AA/AG/AH/AN/AO` CI workflow 的逐个清理。对应报告：`docs/implementations/IMPLEMENTATION-08-UNIFIED-PR-CI.md`、`docs/implementations/IMPLEMENTATION-13-LEGACY-CI-CLEANUP.md`。
+- 当前保护规则：owner 于 2026-09-06 直接查看 GitHub settings 确认 `main` 已启用 branch protection，required status checks **只有** `offline-ci`；不含任何 `093A*` 的 `test`。本单未修改 branch protection / required checks 配置。
+- 任务 08 legacy 迁移：已完成。任务 13 按一个 workflow 一个 PR 的顺序删除 `093AG`、`093AH`、`093AN`、`093AO`、`093AA`，每一步都在最终 head 上确认 `offline-ci` SUCCESS 后再合入。
+- 观察项：任务 12 将 `hybridScore` 在语义分缺失时的回退值改为 `-1`，因此无向量文档会排到已知负相似度之后。backfill 进行中或 embedding provider 处于 cooldown 期间可能出现大批文档无向量；该情形下的排序行为目前无测试覆盖。
+- 指针：任务 08 branch `task/08-unified-pr-ci`、PR #83；任务 13 报告 `docs/implementations/IMPLEMENTATION-13-LEGACY-CI-CLEANUP.md`。
 
 ## 已知阻塞项
 
