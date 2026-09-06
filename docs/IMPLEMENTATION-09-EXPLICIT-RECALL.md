@@ -25,3 +25,5 @@
 
 
 补充严格取消边界：总 deadline / 外部 cancel 的 `AbortSignal` 现贯穿显式 recall 的 `rankExisting → embedQuery` 与隔离模型启动前的 `createConversation` fetch，因此已经发出的 query-embedding / conversation-creation HTTP 会随本次 recall 一起中止，而不只是丢弃晚到结果；`expand_recall` 复用同一 signal。由 recall 主动取消的 query embedding 不再写 provider cooldown，真实 provider/配额错误的既有 cooldown 行为保持。离线回归会直接断言 provider / fetch 收到 abort，且取消路径不产生 cooldown/index 写入；未调用真实服务。
+
+最终代码验收 head `5d5b729033d7779dbaefb1c049ebf12aaed20386` 的统一 PR offline CI SUCCESS（run `34021583140`）：51/51 test files、453/453 tests，`recall.test.ts` 20/20、`semantic-retrieval.test.ts` 20/20、`conversation_utils.test.ts` 12/12，`npm run typecheck` PASS；同一 head 其余实际运行的专项 checks 也全部 success，另有一项按触发条件正常 skipped。完整 PR diff 已复核，仅为显式 recall recovery、上述合并前 hardening、离线回归与本报告；未合并、未部署、未调用真实 Letta / 模型 / embedding provider。
