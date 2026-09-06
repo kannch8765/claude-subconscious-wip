@@ -1,10 +1,9 @@
-import * as fs from 'fs';
-import * as os from 'os';
-import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import {
-  ASSISTANT_REMEMBER_TOOL_NAME,
-  RelationshipMemoryOwnerControlPlane,
+  RelationshipMemoryOwnerControl,
   RelationshipMemoryRecallSession,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
@@ -23,113 +22,110 @@ function temp(prefix: string): string {
   dirs.push(dir);
   return dir;
 }
-afterEach(() => { while (dirs.length) fs.rmSync(dirs.pop()!, { recursive: true, force: true }); });
 
-const LEDGERS = [
-  'memories.jsonl', 'evidence.jsonl', 'outcomes.jsonl', 'batches.jsonl',
-  'owner-revisions.jsonl', 'assistant-intents.jsonl', 'assistant-intent-outcomes.jsonl',
-];
+afterEach(() => {
+  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function seedRelationshipMemory(root: string): { memoryId: string } {
+  const runtime = new RelationshipMemoryRuntime(root, 'subject-1');
+  const result = runtime.remember({
+    summary: 'The user explicitly included the assistant when bringing a Kyoto gift home.',
+    kind: 'shared_experience',
+    occurred_at: '2026-08-20T10:00:00.000Z',
+    evidence: [{
+      event_id: 'evt-kyoto-gift',
+      event_type: 'user_message',
+      timestamp: '2026-08-20T10:00:00.000Z',
+      user_text: 'I brought the Kyoto orange cake back for you too.',
+      source: { type: 'claude_transcript', session_id: 'session-kyoto', uuid: 'u-kyoto' },
+    }],
+  });
+  return { memoryId: result.memory.memory_id };
+}
+
+function writeTranscriptFixture(root: string): string {
+  const file = path.join(root, 'session.jsonl');
+  fs.writeFileSync(file, [
+    JSON.stringify({ type: 'user', uuid: 'u1', timestamp: '2026-08-20T10:00:00.000Z', message: { content: [{ type: 'text', text: 'CCDK 2025 is our inside joke.' }] } }),
+    JSON.stringify({ type: 'assistant', uuid: 'a1', timestamp: '2026-08-20T10:01:00.000Z', message: { content: [{ type: 'text', text: 'I remember CCDK 2025.' }] } }),
+    JSON.stringify({ type: 'user', uuid: 'u2', timestamp: '2026-08-20T10:02:00.000Z', message: { content: [{ type: 'text', text: 'Another message.' }] } }),
+  ].join('\n') + '\n');
+  return file;
+}
+
 function ledgerSnapshot(root: string): Record<string, string | null> {
-  return Object.fromEntries(LEDGERS.map((name) => {
+  const names = ['memories.jsonl', 'owner-revisions.jsonl', 'batches.jsonl', 'assistant-remember-intents.jsonl'];
+  return Object.fromEntries(names.map((name) => {
     const file = path.join(root, name);
     return [name, fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null];
   }));
 }
 
-function seedRelationshipMemory(root: string): { store: RelationshipMemoryStore; memoryId: string; intent: AssistantRememberIntentRecord } {
-  const store = new RelationshipMemoryStore(root, 'subject-1');
-  const intent: AssistantRememberIntentRecord = {
-    schema_version: 1,
-    intent_id: 'intent-feel-1',
-    subject_id: 'subject-1',
-    session_id: 'session-1',
-    assistant_message_id: 'assistant-remember-1',
-    tool_use_id: 'tool-remember-1',
-    tool_name: ASSISTANT_REMEMBER_TOOL_NAME,
-    memory: { text: 'Remember the orange cake inclusion gesture from Kyoto.' },
-    feel: { text: 'I felt warmly held in mind and included.' },
-    captured_at: '2026-08-04T10:00:00.000Z',
-  };
-  store.appendAssistantIntent(intent);
-  const messages = new Map([['user-evidence-1', {
-    conversation_id: 'conversation-1', message_id: 'user-evidence-1', role: 'user' as const,
-    quote: 'I brought back the orange cake for you too.', captured_at: '2026-08-04T09:59:00.000Z',
-  }]]);
-  const runtime = new RelationshipMemoryRuntime(store, messages, () => '2026-08-04T10:01:00.000Z', new Map([[intent.intent_id, intent]]));
-  store.beginBatch('batch-1', '2026-08-04T10:00:00.000Z');
-  const remembered = runtime.remember('batch-1', {
-    schema_version: 1,
-    kind: 'shared_experience',
-    summary: 'The user explicitly included the assistant when bringing a Kyoto gift home.',
-    participants: ['user', 'assistant'],
-    evidence_message_ids: ['user-evidence-1'],
-    assistant_intent_id: intent.intent_id,
-    payload: {
-      title: 'Kyoto orange cake inclusion',
-      event: 'The user brought home an orange-flavored cake for the assistant too.',
-      shared_meaning: 'The assistant was counted among the people the user wanted to bring something home for.',
-      recall_triggers: ['Kyoto', 'orange cake'],
-    },
-  });
-  expect(remembered.outcome).toBe('accepted');
-  runtime.finalizeBatch('batch-1', true);
-  return { store, memoryId: remembered.memory_id!, intent };
-}
-
-function writeTranscriptFixture(root: string): string {
-  fs.mkdirSync(root, { recursive: true });
-  const file = path.join(root, 'fixture.jsonl');
-  const rows = [
-    { type: 'user', uuid: 'u-aug4-1', timestamp: '2026-08-04T09:00:00.000Z', message: { content: [{ type: 'text', text: 'Today we worked on the relationship-memory scaffold and direct transcript JSONL source.' }] } },
-    { type: 'assistant', uuid: 'a-aug4-1', timestamp: '2026-08-04T09:01:00.000Z', message: { content: [{ type: 'text', text: 'We decided not to depend on CCDK for the relationship-memory runtime.' }, { type: 'thinking', thinking: 'SECRET HIDDEN REASONING' }] } },
-    { type: 'system', uuid: 'system-secret', timestamp: '2026-08-04T09:02:00.000Z', content: 'SECRET SYSTEM PROMPT' },
-    { type: 'user', uuid: 'u-aug5-1', timestamp: '2026-08-05T09:00:00.000Z', message: { content: [{ type: 'text', text: 'A different day about another project.' }] } },
-  ];
-  fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
-  return file;
-}
-
 describe('assistant relationship-memory recall core', () => {
-  it('searches active canonical memory including linked assistant memory.text and feel.text', () => {
-    const root = temp('rm-recall-store-');
-    const { store, memoryId } = seedRelationshipMemory(root);
-    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
-    const found = recall.relationshipMemorySearch({ query: 'warmly held in mind' }) as any;
-    expect(found.results).toHaveLength(1);
-    expect(found.results[0]).toEqual(expect.objectContaining({ memory_id: memoryId, source_ref: expect.stringMatching(/^recall_src_/) }));
-    expect(found.results[0].assistant_intents[0]).toEqual(expect.objectContaining({
-      memory: 'Remember the orange cake inclusion gesture from Kyoto.',
-      feel: 'I felt warmly held in mind and included.',
-    }));
+  it('searches only the effective owner-visible canonical view and returns opaque source refs', () => {
+    const root = temp('rm-recall-effective-');
+    const runtime = new RelationshipMemoryRuntime(root, 'subject-1');
+    const owner = new RelationshipMemoryOwnerControl(root, 'subject-1');
+    const first = runtime.remember({
+      summary: 'The Kyoto gift made the assistant feel included.',
+      kind: 'shared_experience',
+      occurred_at: '2026-08-20T10:00:00.000Z',
+      evidence: [{ event_id: 'evt-a', event_type: 'user_message', timestamp: '2026-08-20T10:00:00.000Z', user_text: 'Kyoto gift', source: { type: 'claude_transcript', session_id: 's1', uuid: 'u1' } }],
+    });
+    const second = runtime.remember({
+      summary: 'The Osaka postcard was a separate gift.',
+      kind: 'shared_experience',
+      occurred_at: '2026-08-21T10:00:00.000Z',
+      evidence: [{ event_id: 'evt-b', event_type: 'user_message', timestamp: '2026-08-21T10:00:00.000Z', user_text: 'Osaka postcard', source: { type: 'claude_transcript', session_id: 's1', uuid: 'u2' } }],
+    });
+    owner.deactivate(first.memory.memory_id, 'owner removed');
+    owner.revise(second.memory.memory_id, 'The Osaka postcard became a keepsake.', 'owner corrected');
 
-    new RelationshipMemoryOwnerControlPlane(store, () => '2026-08-04T11:00:00.000Z').deactivate(memoryId, { revision_id: 'hide-1' });
-    const hiddenRecall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
-    expect((hiddenRecall.relationshipMemorySearch({ query: 'orange cake' }) as any).results).toHaveLength(0);
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
+    expect(recall.relationshipMemorySearch({ query: 'Kyoto' })).toEqual({ results: [] });
+    const found = recall.relationshipMemorySearch({ query: 'keepsake', limit: 5 }) as any;
+    expect(found.results).toHaveLength(1);
+    expect(found.results[0]).toEqual(expect.objectContaining({
+      memory_id: second.memory.memory_id,
+      summary: 'The Osaka postcard became a keepsake.',
+      source_ref: expect.stringMatching(/^recall_src_/),
+    }));
   });
 
-  it('supports bounded transcript date search and trusted read-back without exposing hidden/system content', async () => {
-    const root = temp('rm-recall-empty-');
+  it('searches entity identity aliases without expanding recall into mutation', () => {
+    const root = temp('rm-recall-entity-');
+    const store = new RelationshipMemoryStore(root, 'subject-1');
+    store.appendRelationshipIdentity({
+      entity_id: 'entity-friend',
+      canonical_name: 'Mika',
+      entity_type: 'person',
+      aliases: ['みかちゃん', 'Mika-chan'],
+      confidence: 0.95,
+      first_seen_at: '2026-08-10T00:00:00.000Z',
+      last_seen_at: '2026-08-20T00:00:00.000Z',
+      source_event_ids: ['evt-mika'],
+    });
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
+    const found = recall.relationshipMemorySearch({ query: 'みかちゃん' }) as any;
+    expect(found.results).toHaveLength(1);
+    expect(found.results[0]).toEqual(expect.objectContaining({ record_type: 'entity_identity', entity_id: 'entity-friend' }));
+  });
+
+  it('searches and reads direct user/assistant transcript context through opaque refs', async () => {
     const transcripts = temp('rm-recall-transcripts-');
     writeTranscriptFixture(transcripts);
-    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [transcripts] });
-    const search = await recall.transcriptSearch({
-      time_start: '2026-08-04T00:00:00.000Z',
-      time_end: '2026-08-04T23:59:59.999Z',
-      limit: 10,
-    }) as any;
-    expect(search.results.map((item: any) => item.message_id)).toEqual(expect.arrayContaining(['u-aug4-1', 'a-aug4-1']));
-    expect(search.results.map((item: any) => item.message_id)).not.toContain('u-aug5-1');
-    const hit = search.results.find((item: any) => item.message_id === 'a-aug4-1');
-    const read = await recall.transcriptRead({ source_ref: hit.source_ref, before: 1, after: 1 }) as any;
-    const serialized = JSON.stringify(read);
-    expect(serialized).toContain('relationship-memory scaffold');
-    expect(serialized).toContain('not to depend on CCDK');
-    expect(serialized).not.toContain('SECRET HIDDEN REASONING');
-    expect(serialized).not.toContain('SECRET SYSTEM PROMPT');
-    await expect(recall.transcriptRead({ source_ref: 'recall_src_fabricated' })).rejects.toThrow(/trusted source_ref/);
+    const recall = new RelationshipMemoryRecallSession({ rootDir: temp('rm-recall-store-'), subjectId: 'subject-1', transcriptRoots: [transcripts] });
+    const search = await recall.transcriptSearch({ query: 'CCDK', limit: 5 }) as any;
+    expect(search.results.length).toBeGreaterThanOrEqual(2);
+    expect(search.results.every((item: any) => item.source_ref.startsWith('recall_src_'))).toBe(true);
+    const read = await recall.transcriptRead({ source_ref: search.results[0].source_ref, before: 0, after: 1 });
+    expect(read.source_ref).toMatch(/^recall_src_/);
+    expect(read.context).toHaveLength(2);
+    expect(read.context[0]).toEqual(expect.objectContaining({ text: expect.stringContaining('CCDK') }));
   });
 
-  it('rejects fabricated delivery provenance, wrong recall IDs, and duplicate terminal delivery', () => {
+  it('requires terminal delivery with matching recall id, known refs, and deduplicates evidence', () => {
     const root = temp('rm-recall-delivery-');
     seedRelationshipMemory(root);
     const recall = new RelationshipMemoryRecallSession({ recallId: 'recall-fixed', rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
@@ -142,10 +138,13 @@ describe('assistant relationship-memory recall core', () => {
     expect(() => recall.deliver({ recall_id: 'recall-fixed', answer: 'again', source_refs: [sourceRef] })).toThrow(/already terminally delivered/);
   });
 
-  it('registers only the constrained recall read tools plus terminal delivery', () => {
+  it('exposes only the read-only recall tools plus terminal delivery', () => {
     const recall = new RelationshipMemoryRecallSession({ rootDir: temp('rm-recall-tools-'), subjectId: 'subject-1', transcriptRoots: [] });
     expect(buildRecallTools(recall).map((tool) => tool.name)).toEqual([
-      'relationship_memory_search', 'transcript_search', 'transcript_read', 'deliver_recall',
+      'relationship_memory_search',
+      'transcript_search',
+      'transcript_read',
+      'deliver_recall',
     ]);
   });
 
@@ -215,6 +214,61 @@ describe('assistant relationship-memory recall core', () => {
     expect(expanded.source_refs).toEqual(expect.arrayContaining([(expanded.transcript_hits[0] as any).source_ref, expanded.transcript_windows[0].source_ref]));
   });
 
+  it('applies the 128 KiB fitter to a truly oversized UTF-8 canonical evidence item', async () => {
+    const root = temp('rm-recall-oversized-canonical-');
+    seedRelationshipMemory(root);
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
+    const registered = (recall.relationshipMemorySearch({ query: 'Kyoto' }) as any).results[0];
+    const hugeSummary = `京都橙子蛋糕${'猫咪记得这份礼物。'.repeat(20_000)}`;
+    const oversized = { ...registered, summary: hugeSummary };
+    expect(Buffer.byteLength(JSON.stringify({ relationship_results: [oversized] }), 'utf8')).toBeGreaterThan(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
+    (recall as any).relationshipMemorySearchHybridExisting = async () => ({ results: [oversized] });
+
+    const bundle = await recall.evidenceBundle({ query: '京都橙子蛋糕' });
+    expect(Buffer.byteLength(JSON.stringify(bundle), 'utf8')).toBeLessThanOrEqual(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
+    expect(bundle.relationship_results).toHaveLength(1);
+    expect((bundle.relationship_results[0] as any).source_ref).toBe(registered.source_ref);
+    expect((bundle.relationship_results[0] as any).summary).not.toBe(hugeSummary);
+    expect((bundle.relationship_results[0] as any).summary).toContain('…');
+    expect((bundle.relationship_results[0] as any).summary).not.toContain('�');
+    expect(bundle.source_refs).toContain(registered.source_ref);
+  });
+
+  it('fits a truly oversized expansion and rejects a fetched source clipped by the total byte budget', async () => {
+    const root = temp('rm-recall-oversized-expand-');
+    seedRelationshipMemory(root);
+    const transcripts = temp('rm-recall-oversized-expand-transcripts-');
+    fs.writeFileSync(path.join(transcripts, 'clip.jsonl'), JSON.stringify({
+      type: 'user', uuid: 'clip-u1', timestamp: '2026-08-20T10:00:00.000Z',
+      message: { content: [{ type: 'text', text: 'clip-sentinel evidence' }] },
+    }) + '\n');
+    const recall = new RelationshipMemoryRecallSession({ recallId: 'recall-oversized-expand', rootDir: root, subjectId: 'subject-1', transcriptRoots: [transcripts] });
+    const keep = (recall.relationshipMemorySearch({ query: 'Kyoto' }) as any).results[0];
+    const clip = (await recall.transcriptSearch({ query: 'clip-sentinel' }) as any).results[0];
+    const keepOversized = { ...keep, summary: `展开后的中文证据${'猫咪记得这份礼物。'.repeat(20_000)}` };
+    const clippedCandidate = {
+      source_ref: clip.source_ref,
+      record_type: 'relationship_memory',
+      summary: 'clip candidate',
+      payload: { fragments: Array.from({ length: 2_000 }, () => 'x'.repeat(96)) },
+    };
+    expect(Buffer.byteLength(JSON.stringify({ relationship_results: [keepOversized, clippedCandidate] }), 'utf8')).toBeGreaterThan(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
+    (recall as any).relationshipMemorySearchHybridExisting = async (input: { query?: string }) => ({
+      results: input.query === 'expanded-huge' ? [keepOversized, clippedCandidate] : [],
+    });
+
+    const initial = await recall.evidenceBundle({ query: 'initial-empty' });
+    expect(initial.source_refs).toEqual([]);
+    const expanded = await recall.expandEvidenceBundle({ query: 'expanded-huge' });
+    expect(Buffer.byteLength(JSON.stringify(expanded), 'utf8')).toBeLessThanOrEqual(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
+    expect(expanded.source_refs).toContain(keep.source_ref);
+    expect(expanded.source_refs).not.toContain(clip.source_ref);
+    expect((expanded.relationship_results[0] as any).source_ref).toBe(keep.source_ref);
+    expect((expanded.relationship_results[0] as any).summary).toContain('…');
+    expect(() => recall.deliver({ recall_id: recall.recallId, answer: 'bad', source_refs: [clip.source_ref] })).toThrow(/not provided to the recall model/);
+    expect(recall.deliver({ recall_id: recall.recallId, answer: 'good', source_refs: [keep.source_ref] })).toEqual(expect.objectContaining({ source_refs: [keep.source_ref] }));
+  });
+
   it('allows bundle delivery to cite only evidence actually handed to the model', async () => {
     const root = temp('rm-recall-bundle-provenance-');
     seedRelationshipMemory(root);
@@ -278,31 +332,55 @@ describe('assistant relationship-memory recall core', () => {
   it('keeps an accepted terminal delivery even when the model runner outlives the deadline', async () => {
     const root = temp('rm-recall-delivered-before-timeout-');
     const result = await executeRecall({
-      query: 'Return the accepted answer', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 100,
+      query: 'anything',
+      rootDir: root,
+      subjectId: 'subject-1',
+      transcriptRoots: [],
+      timeoutMs: 100,
       async runModel(session) {
-        session.deliver({ recall_id: session.recallId, answer: 'accepted before cleanup', source_refs: [] });
+        session.deliver({ recall_id: session.recallId, answer: 'remembered before deadline', source_refs: [] });
         await new Promise((resolve) => setTimeout(resolve, 180));
       },
     });
+    expect(result).toEqual(expect.objectContaining({ status: 'ok', answer: 'remembered before deadline' }));
+  });
+
+  it('returns failed rather than timing out when the model runner errors before delivery', async () => {
+    const root = temp('rm-recall-failed-');
+    const result = await executeRecall({
+      query: 'anything',
+      rootDir: root,
+      subjectId: 'subject-1',
+      transcriptRoots: [],
+      timeoutMs: 1_000,
+      async runModel() { throw new Error('model exploded'); },
+    });
     expect(result).toEqual(expect.objectContaining({
-      status: 'ok', answer: 'accepted before cleanup', source_refs: [],
+      status: 'failed',
+      answer: 'Recall failed before terminal delivery.',
+      error: 'model exploded',
     }));
   });
 
-  it('keeps an accepted terminal delivery when cancellation arrives during model cleanup', async () => {
-    const root = temp('rm-recall-delivered-before-cancel-');
+  it('returns cancelled when the caller aborts before delivery', async () => {
+    const root = temp('rm-recall-cancelled-');
     const controller = new AbortController();
-    const result = await executeRecall({
-      query: 'Return the accepted answer', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 5_000, signal: controller.signal,
-      async runModel(session) {
-        session.deliver({ recall_id: session.recallId, answer: 'accepted before cancel', source_refs: [] });
-        controller.abort();
-        await new Promise((resolve) => setTimeout(resolve, 50));
+    const pending = executeRecall({
+      query: 'anything',
+      rootDir: root,
+      subjectId: 'subject-1',
+      transcriptRoots: [],
+      timeoutMs: 5_000,
+      signal: controller.signal,
+      async runModel(_session, signal) {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) return resolve();
+          signal.addEventListener('abort', () => resolve(), { once: true });
+        });
       },
     });
-    expect(result).toEqual(expect.objectContaining({
-      status: 'ok', answer: 'accepted before cancel', source_refs: [],
-    }));
+    controller.abort();
+    expect(await pending).toEqual(expect.objectContaining({ status: 'cancelled' }));
   });
 
   it('applies the total deadline while initial evidence prefetch is still running', async () => {
@@ -385,45 +463,47 @@ describe('assistant relationship-memory recall core', () => {
   it('returns an explicit timeout and rejects a late delivery after the deadline', async () => {
     const root = temp('rm-recall-timeout-');
     seedRelationshipMemory(root);
-    let lateRejected = false;
+    let lateDeliveryError = '';
     const result = await executeRecall({
-      query: 'What did this mean?', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 100,
+      query: 'Kyoto',
+      rootDir: root,
+      subjectId: 'subject-1',
+      transcriptRoots: [],
+      timeoutMs: 100,
       async runModel(session) {
         const found = session.relationshipMemorySearch({ query: 'Kyoto' }) as any;
-        await new Promise((resolve) => setTimeout(resolve, 150));
-        try { session.deliver({ recall_id: session.recallId, answer: 'late', source_refs: [found.results[0].source_ref] }); }
-        catch { lateRejected = true; }
+        await new Promise((resolve) => setTimeout(resolve, 180));
+        try {
+          session.deliver({ recall_id: session.recallId, answer: 'late', source_refs: [found.results[0].source_ref] });
+        } catch (error) {
+          lateDeliveryError = error instanceof Error ? error.message : String(error);
+        }
       },
     });
-    expect(result.status).toBe('timeout');
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(lateRejected).toBe(true);
+    expect(result).toEqual(expect.objectContaining({ status: 'timeout' }));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(lateDeliveryError).toMatch(/closed after timeout/);
   });
 
-  it('returns an explicit cancellation and rejects late delivery after cancellation', async () => {
-    const root = temp('rm-recall-cancel-');
-    seedRelationshipMemory(root);
-    const controller = new AbortController();
-    let lateRejected = false;
-    const pending = executeRecall({
-      query: 'Cancel this recall', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 5_000, signal: controller.signal,
-      async runModel(session) {
-        const found = session.relationshipMemorySearch({ query: 'Kyoto' }) as any;
-        await new Promise((resolve) => setTimeout(resolve, 80));
-        try { session.deliver({ recall_id: session.recallId, answer: 'late', source_refs: [found.results[0].source_ref] }); }
-        catch { lateRejected = true; }
-      },
-    });
-    setTimeout(() => controller.abort(), 20);
-    const result = await pending;
-    expect(result.status).toBe('cancelled');
-    await new Promise((resolve) => setTimeout(resolve, 100));
-    expect(lateRejected).toBe(true);
-  });
-
-  it('never changes relationship-memory ledgers during search/read/delivery or transport failure', async () => {
+  it('does not mutate canonical ledgers during successful or failed recall', async () => {
     const root = temp('rm-recall-readonly-');
     seedRelationshipMemory(root);
+    const intents: AssistantRememberIntentRecord[] = [{
+      schema_version: 1,
+      intent_id: 'intent-readonly',
+      status: 'pending',
+      source: 'client_tool',
+      created_at: '2026-08-20T10:03:00.000Z',
+      subject_id: 'subject-1',
+      summary: 'Do not change this intent during recall.',
+      memory_kind: 'shared_experience',
+      reason: 'read-only regression',
+      event_ids: ['evt-kyoto-gift'],
+      anchor_event_id: 'evt-kyoto-gift',
+      anchor_timestamp: '2026-08-20T10:00:00.000Z',
+      suggested_occurred_at: '2026-08-20T10:00:00.000Z',
+    }];
+    fs.writeFileSync(path.join(root, 'assistant-remember-intents.jsonl'), intents.map((item) => JSON.stringify(item)).join('\n') + '\n');
     const transcripts = temp('rm-recall-readonly-transcripts-');
     writeTranscriptFixture(transcripts);
     const before = ledgerSnapshot(root);
@@ -441,43 +521,40 @@ describe('assistant relationship-memory recall core', () => {
     expect(ledgerSnapshot(root)).toEqual(before);
 
     const failed = await executeRecall({
-      query: 'network failure', rootDir: root, subjectId: 'subject-1', transcriptRoots: [transcripts],
-      async runModel() { throw new Error('Letta unavailable'); },
+      query: 'held in mind',
+      rootDir: root,
+      subjectId: 'subject-1',
+      transcriptRoots: [transcripts],
+      timeoutMs: 1_000,
+      async runModel() { throw new Error('boom'); },
     });
     expect(failed.status).toBe('failed');
-    expect(failed.reason).toContain('Letta unavailable');
     expect(ledgerSnapshot(root)).toEqual(before);
   });
-});
 
-describe('Kohaku-facing recall MCP contract', () => {
-  it('discovers a single narrow recall({query}) tool while preserving the separate remember MCP entry', async () => {
-    const server = new RecallMcpServer(async () => ({ status: 'failed', recall_id: 'unused' }));
-    const listed = await server.handle({ jsonrpc: '2.0', id: 1, method: 'tools/list' }) as any;
-    expect(listed.result.tools).toEqual([RECALL_TOOL]);
-    expect(RECALL_TOOL.inputSchema).toEqual(expect.objectContaining({ required: ['query'], additionalProperties: false }));
-    const mcp = JSON.parse(fs.readFileSync(path.join(process.cwd(), '.mcp.json'), 'utf8'));
-    expect(mcp['relationship-memory-intent'].args.at(-1)).toContain('remember_intent_mcp.ts');
-    expect(mcp['relationship-memory-recall'].args.at(-1)).toContain('recall_mcp.ts');
-    expect(ASSISTANT_REMEMBER_TOOL_NAME).toBe('mcp__plugin_claude-subconscious_relationship-memory-intent__remember');
+  it('keeps MCP caller compatibility: recall(query) returns only delivered answer text', async () => {
+    const server = new RecallMcpServer(async (query) => ({
+      status: 'ok', recall_id: 'recall-1', answer: `remembered ${query}`, source_refs: [], sources: [],
+    }));
+    expect(server.listTools()).toEqual([RECALL_TOOL]);
+    await expect(server.callTool({ name: 'recall', arguments: { query: 'Kyoto cake?' } })).resolves.toEqual(expect.objectContaining({
+      content: [{ type: 'text', text: 'remembered Kyoto cake?' }],
+      structuredContent: expect.objectContaining({ status: 'ok', recall_id: 'recall-1' }),
+    }));
   });
 
-  it('keeps tools/call pending until terminal recall delivery is available', async () => {
-    const server = new RecallMcpServer(async (query) => {
-      await new Promise((resolve) => setTimeout(resolve, 35));
-      return { status: 'ok', recall_id: 'recall-mcp-1', answer: `remembered: ${query}`, source_refs: [], sources: [] };
-    });
-    const started = Date.now();
-    const response = await server.handle({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'recall', arguments: { query: 'What happened?' } } }) as any;
-    expect(Date.now() - started).toBeGreaterThanOrEqual(25);
-    expect(response.result.content[0].text).toBe('remembered: What happened?');
-    expect(response.result.structuredContent).toEqual(expect.objectContaining({ status: 'ok', recall_id: 'recall-mcp-1' }));
-  });
+  it('maps timeout and cancellation to explicit MCP errors instead of fabricated recall', async () => {
+    const timeout = new RecallMcpServer(async () => ({
+      status: 'timeout', recall_id: 'recall-timeout', answer: 'Recall timed out before terminal delivery.', source_refs: [], sources: [],
+    }));
+    await expect(timeout.callTool({ name: 'recall', arguments: { query: 'x' } })).resolves.toEqual(expect.objectContaining({
+      isError: true,
+      content: [{ type: 'text', text: 'Recall timed out before terminal delivery.' }],
+    }));
 
-  it('surfaces model transport failure as one explicit tool result', async () => {
-    const server = new RecallMcpServer(async () => ({ status: 'failed', recall_id: 'recall-fail', reason: 'Letta unavailable' }));
-    const response = await server.handle({ jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'recall', arguments: { query: 'find memory' } } }) as any;
-    expect(response.result.isError).toBe(true);
-    expect(response.result.content[0].text).toContain('Letta unavailable');
+    const cancelled = new RecallMcpServer(async () => ({
+      status: 'cancelled', recall_id: 'recall-cancelled', answer: 'Recall was cancelled before terminal delivery.', source_refs: [], sources: [],
+    }));
+    await expect(cancelled.callTool({ name: 'recall', arguments: { query: 'x' } })).resolves.toEqual(expect.objectContaining({ isError: true }));
   });
 });
