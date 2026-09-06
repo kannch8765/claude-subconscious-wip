@@ -100,6 +100,26 @@ describe('createConversation', () => {
     const [, init] = fetchMock.mock.calls[0];
     expect(JSON.parse(init.body)).toEqual({ isolated_block_labels: ['guidance', 'user_preferences'] });
   });
+
+  it('propagates cancellation to an in-flight conversation creation request', async () => {
+    vi.stubEnv('LETTA_BASE_URL', 'https://letta.example.com');
+    const controller = new AbortController();
+    fetchMock.mockImplementation(async (_url, init) => {
+      expect(init.signal).toBe(controller.signal);
+      await new Promise<void>((_resolve, reject) => {
+        const onAbort = () => reject(init.signal.reason instanceof Error ? init.signal.reason : new Error('conversation creation aborted'));
+        if (init.signal.aborted) onAbort();
+        else init.signal.addEventListener('abort', onAbort, { once: true });
+      });
+      throw new Error('unreachable');
+    });
+    const { createConversation } = await import('./conversation_utils.js');
+
+    const pending = createConversation('test-key', 'agent-123', undefined, { signal: controller.signal });
+    controller.abort(new Error('recall cancelled'));
+
+    await expect(pending).rejects.toThrow('recall cancelled');
+  });
 });
 
 describe('live retryable conversation recovery', () => {

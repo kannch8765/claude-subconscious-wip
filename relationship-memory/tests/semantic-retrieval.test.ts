@@ -211,6 +211,34 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(fs.readFileSync(indexFile, 'utf8')).toBe(before);
   });
 
+  it('aborts an in-flight existing-vector query without writing provider cooldown state', async () => {
+    const root = temp('rm-semantic-existing-abort-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }];
+    await retriever.rank(docs, 'seed cache');
+    const before = fs.readFileSync(indexFile, 'utf8');
+    let abortObserved = false;
+    provider.embedQuery = async (_text: string, signal?: AbortSignal) => new Promise<number[]>((_resolve, reject) => {
+      const onAbort = () => {
+        abortObserved = true;
+        reject(signal?.reason instanceof Error ? signal.reason : new Error('query aborted'));
+      };
+      if (signal?.aborted) onAbort();
+      else signal?.addEventListener('abort', onAbort, { once: true });
+    });
+    const controller = new AbortController();
+
+    const pending = retriever.rankExisting(docs, 'cancelled foreground query', controller.signal);
+    controller.abort(new Error('recall cancelled'));
+
+    await expect(pending).rejects.toThrow('recall cancelled');
+    expect(abortObserved).toBe(true);
+    expect(fs.readFileSync(indexFile, 'utf8')).toBe(before);
+    expect(fs.existsSync(`${indexFile}.provider-cooldown.${provider.fingerprint}.json`)).toBe(false);
+  });
+
   it('rejects a cached vector when the same document id now has different authoritative text without re-embedding documents', async () => {
     const root = temp('rm-semantic-stale-existing-');
     const indexFile = path.join(root, 'derived', 'index.json');

@@ -549,6 +549,7 @@ function conversationEntryDetails(entry: string | ConversationEntry | undefined)
  */
 export interface CreateConversationOptions {
   isolatedBlockLabels?: string[];
+  signal?: AbortSignal;
 }
 
 export async function createConversation(
@@ -569,6 +570,7 @@ export async function createConversation(
       'Content-Type': 'application/json',
     },
     ...(isolatedBlockLabels.length > 0 ? { body: JSON.stringify({ isolated_block_labels: isolatedBlockLabels }) } : {}),
+    ...(options.signal ? { signal: options.signal } : {}),
   });
 
   if (!response.ok) {
