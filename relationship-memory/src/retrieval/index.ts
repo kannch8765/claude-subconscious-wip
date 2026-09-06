@@ -259,194 +259,174 @@ function cooldownForProviderError(error: unknown): { reason: EmbeddingProviderCo
   return { reason: 'provider', code, durationMs: positiveEnvMs('RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS', DEFAULT_EMBEDDING_PROVIDER_COOLDOWN_MS) };
 }
 
-function writeProviderCooldown(indexFile: string, fingerprint: string, error: unknown): EmbeddingProviderCooldownFileV1 {
-  const policy = cooldownForProviderError(error);
+function writeProviderCooldown(indexFile: string, fingerprint: string, failure: { reason: EmbeddingProviderCooldownFileV1['reason']; code: string; durationMs: number }): void {
+  const file = providerCooldownFile(indexFile, fingerprint);
   const now = Date.now();
   const value: EmbeddingProviderCooldownFileV1 = {
     schema_version: 1,
     provider_fingerprint: fingerprint,
-    reason: policy.reason,
-    code: policy.code,
+    reason: failure.reason,
+    code: failure.code,
     created_at: new Date(now).toISOString(),
-    retry_after: new Date(now + policy.durationMs).toISOString(),
+    retry_after: new Date(now + failure.durationMs).toISOString(),
   };
-  const file = providerCooldownFile(indexFile, fingerprint);
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  const current = readProviderCooldown(indexFile, fingerprint);
-  if (current && Date.parse(current.retry_after) >= Date.parse(value.retry_after)) return current;
   const temp = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
   fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600 });
   fs.renameSync(temp, file);
   try { fs.chmodSync(file, 0o600); } catch { }
-  return value;
 }
 
-function assertProviderNotCoolingDown(indexFile: string, fingerprint: string): void {
-  const cooldown = readProviderCooldown(indexFile, fingerprint);
-  if (!cooldown) return;
-  throw new Error(`Embedding provider cooldown active (${cooldown.reason}, ${cooldown.code}) until ${cooldown.retry_after}.`);
+function providerCooldownError(value: EmbeddingProviderCooldownFileV1): Error {
+  const error = new Error(`Embedding provider is cooling down after ${value.reason} failure (${value.code}) until ${value.retry_after}.`);
+  error.name = 'EmbeddingProviderCooldownError';
+  return error;
 }
 
-function semanticLockDir(indexFile: string): string {
+function lockFile(indexFile: string): string {
   return `${indexFile}.lock`;
 }
 
-function semanticLockOwnerFile(indexFile: string): string {
-  return path.join(semanticLockDir(indexFile), 'owner.json');
-}
-
-function semanticLockOwnerIsAlive(owner: SemanticIndexLockOwner): boolean {
-  if (owner.hostname !== os.hostname()) return true;
+function processExists(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
-    process.kill(owner.pid, 0);
+    process.kill(pid, 0);
     return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  } catch (error: any) {
+    return error?.code === 'EPERM';
   }
 }
 
-function recoverStaleSemanticLock(indexFile: string, staleMs: number): boolean {
-  const lockDir = semanticLockDir(indexFile);
-  let stat: fs.Stats;
-  try { stat = fs.statSync(lockDir); } catch { return true; }
-
-  let owner: SemanticIndexLockOwner | undefined;
-  try { owner = JSON.parse(fs.readFileSync(semanticLockOwnerFile(indexFile), 'utf8')) as SemanticIndexLockOwner; }
-  catch { owner = undefined; }
-
-  const oldEnough = Date.now() - stat.mtimeMs >= staleMs;
-  const deadOwner = owner
-    ? Number.isInteger(owner.pid) && owner.pid > 0 && typeof owner.hostname === 'string' && !semanticLockOwnerIsAlive(owner)
-    : oldEnough;
-  if (!deadOwner) return false;
+function readLockOwner(file: string): SemanticIndexLockOwner | undefined {
   try {
-    fs.rmSync(lockDir, { recursive: true, force: true });
-    return true;
+    const owner = JSON.parse(fs.readFileSync(file, 'utf8')) as SemanticIndexLockOwner;
+    if (!Number.isInteger(owner?.pid) || owner.pid <= 0 || typeof owner.hostname !== 'string' || typeof owner.token !== 'string' || typeof owner.acquired_at !== 'string') return undefined;
+    return owner;
+  } catch {
+    return undefined;
+  }
+}
+
+function lockLooksStale(file: string, staleMs: number): boolean {
+  try {
+    const owner = readLockOwner(file);
+    const stat = fs.statSync(file);
+    const oldEnough = Date.now() - stat.mtimeMs >= staleMs;
+    if (!oldEnough) return false;
+    if (!owner) return true;
+    return owner.hostname === os.hostname() && !processExists(owner.pid);
   } catch {
     return false;
   }
 }
 
-async function acquireSemanticLock(indexFile: string): Promise<string> {
-  fs.mkdirSync(path.dirname(indexFile), { recursive: true, mode: 0o700 });
+async function wait(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function acquireIndexLock(indexFile: string): Promise<() => void> {
+  const file = lockFile(indexFile);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const timeoutMs = positiveEnvMs('RELATIONSHIP_MEMORY_SEMANTIC_LOCK_TIMEOUT_MS', DEFAULT_SEMANTIC_LOCK_TIMEOUT_MS);
   const staleMs = positiveEnvMs('RELATIONSHIP_MEMORY_SEMANTIC_LOCK_STALE_MS', DEFAULT_SEMANTIC_LOCK_STALE_MS);
-  const deadline = Date.now() + timeoutMs;
-  const token = `${process.pid}-${crypto.randomUUID()}`;
+  const started = Date.now();
+  const token = crypto.randomUUID();
   while (true) {
     try {
-      fs.mkdirSync(semanticLockDir(indexFile));
-      const owner: SemanticIndexLockOwner = { pid: process.pid, hostname: os.hostname(), token, acquired_at: new Date().toISOString() };
-      fs.writeFileSync(semanticLockOwnerFile(indexFile), `${JSON.stringify(owner)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      return token;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-        try { fs.rmSync(semanticLockDir(indexFile), { recursive: true, force: true }); } catch { }
-        throw new Error(`semantic index lock acquisition failed: ${error instanceof Error ? error.message : String(error)}`);
+      const fd = fs.openSync(file, 'wx', 0o600);
+      try {
+        fs.writeFileSync(fd, `${JSON.stringify({ pid: process.pid, hostname: os.hostname(), token, acquired_at: new Date().toISOString() })}\n`);
+      } finally {
+        fs.closeSync(fd);
       }
-      recoverStaleSemanticLock(indexFile, staleMs);
-      if (Date.now() >= deadline) throw new Error(`semantic index lock contention timed out after ${timeoutMs}ms`);
-      await new Promise((resolve) => setTimeout(resolve, Math.min(SEMANTIC_LOCK_POLL_MS, Math.max(1, deadline - Date.now()))));
+      return () => {
+        try {
+          if (readLockOwner(file)?.token === token) fs.rmSync(file, { force: true });
+        } catch { }
+      };
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+      if (lockLooksStale(file, staleMs)) {
+        try { fs.rmSync(file, { force: true }); } catch { }
+        continue;
+      }
+      if (Date.now() - started >= timeoutMs) throw new Error(`Timed out waiting for semantic index lock: ${file}`);
+      await wait(SEMANTIC_LOCK_POLL_MS);
     }
   }
 }
 
-function releaseSemanticLock(indexFile: string, token: string): void {
-  try {
-    const owner = JSON.parse(fs.readFileSync(semanticLockOwnerFile(indexFile), 'utf8')) as SemanticIndexLockOwner;
-    if (owner.token !== token) throw new Error('semantic index lock ownership changed before release');
-    fs.rmSync(semanticLockDir(indexFile), { recursive: true, force: false });
-  } catch (error) {
-    throw new Error(`semantic index lock release failed: ${error instanceof Error ? error.message : String(error)}`);
-  }
+function documentHash(document: SemanticDocument): string {
+  return sha256(document.text);
 }
 
 export class FileBackedSemanticRetriever implements SemanticRetriever {
-  constructor(readonly provider: EmbeddingProvider, readonly indexFile: string) {}
+  constructor(private readonly provider: EmbeddingProvider, private readonly indexFile: string) {}
 
-  private async ensureDocuments(documents: SemanticDocument[]): Promise<SemanticIndexFileV1> {
-    const token = await acquireSemanticLock(this.indexFile);
+  async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
+    if (documents.length === 0) return new Map();
+    const cooldown = readProviderCooldown(this.indexFile, this.provider.fingerprint);
+    if (cooldown) throw providerCooldownError(cooldown);
+    const release = await acquireIndexLock(this.indexFile);
     try {
-      const index = readIndex(this.indexFile, this.provider.fingerprint);
-      const missing: SemanticDocument[] = [];
-      for (const document of documents) {
-        const contentHash = sha256(document.text);
-        const cached = index.documents[document.id];
-        if (!cached || cached.content_hash !== contentHash || cached.vector.length !== this.provider.dimensions || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) missing.push(document);
-      }
-      for (let offset = 0; offset < missing.length; offset += this.provider.maxBatchSize) {
-        assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
-        const batch = missing.slice(offset, offset + this.provider.maxBatchSize);
-        let vectors: number[][];
+      let index = readIndex(this.indexFile, this.provider.fingerprint);
+      const pending = documents.filter((document) => {
+        const existing = index.documents[document.id];
+        return !existing || existing.content_hash !== documentHash(document);
+      });
+      for (let start = 0; start < pending.length; start += this.provider.maxBatchSize) {
+        const batch = pending.slice(start, start + this.provider.maxBatchSize);
         try {
-          vectors = await this.provider.embedDocuments(batch.map((document) => document.text));
+          const vectors = await this.provider.embedDocuments(batch.map((item) => item.text));
+          for (let i = 0; i < batch.length; i += 1) {
+            index.documents[batch[i].id] = { content_hash: documentHash(batch[i]), vector: vectors[i] };
+          }
+          writeIndex(this.indexFile, index);
         } catch (error) {
-          writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+          writeProviderCooldown(this.indexFile, this.provider.fingerprint, cooldownForProviderError(error));
           throw error;
         }
-        batch.forEach((document, indexInBatch) => {
-          index.documents[document.id] = { content_hash: sha256(document.text), vector: vectors[indexInBatch] };
-        });
-        // Checkpoint every successful provider batch. If a later batch fails, the next
-        // search resumes from this durable boundary instead of re-billing prior texts.
-        writeIndex(this.indexFile, index);
       }
-      return index;
     } finally {
-      releaseSemanticLock(this.indexFile, token);
+      release();
     }
+    const queryVector = await this.provider.embedQuery(query);
+    const current = readIndex(this.indexFile, this.provider.fingerprint);
+    const scores = new Map<string, number>();
+    for (const document of documents) {
+      const entry = current.documents[document.id];
+      if (entry && entry.content_hash === documentHash(document)) scores.set(document.id, cosine(queryVector, entry.vector));
+    }
+    return scores;
   }
 
   async rankExisting(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>> {
-    if (!query.trim() || documents.length === 0) return new Map();
-    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
-    const index = readIndex(this.indexFile, this.provider.fingerprint);
-    const usable = documents.flatMap((document) => {
-      const cached = index.documents[document.id];
-      if (!cached
-        || cached.content_hash !== sha256(document.text)
-        || cached.vector.length !== this.provider.dimensions
-        || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) return [];
-      return [[document.id, cached.vector] as const];
+    if (documents.length === 0) return new Map();
+    const current = readIndex(this.indexFile, this.provider.fingerprint);
+    const existing = documents.filter((document) => {
+      const entry = current.documents[document.id];
+      return entry && entry.content_hash === documentHash(document);
     });
-    // Missing vectors and content-hash mismatches are lexical fallback signals,
-    // never permission for foreground sync recall to refresh document embeddings.
-    if (usable.length === 0) return new Map();
-    let queryVector: number[];
-    try {
-      queryVector = await this.provider.embedQuery(query, signal);
-    } catch (error) {
-      if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
-      throw error;
+    if (existing.length === 0) return new Map();
+    const cooldown = readProviderCooldown(this.indexFile, this.provider.fingerprint);
+    if (cooldown) throw providerCooldownError(cooldown);
+    const queryVector = await this.provider.embedQuery(query, signal);
+    const scores = new Map<string, number>();
+    for (const document of existing) {
+      const entry = current.documents[document.id];
+      if (entry && entry.content_hash === documentHash(document)) scores.set(document.id, cosine(queryVector, entry.vector));
     }
-    return new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));
-  }
-
-  async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
-    if (!query.trim() || documents.length === 0) return new Map();
-    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
-    // Serialize derivative-cache refreshes across live MCP/Subcon processes. A waiter
-    // re-reads the index after acquiring the lock, so already-built vectors are reused.
-    const index = await this.ensureDocuments(documents);
-    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
-    let queryVector: number[];
-    try {
-      queryVector = await this.provider.embedQuery(query);
-    } catch (error) {
-      writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
-      throw error;
-    }
-    return new Map(documents.map((document) => [document.id, cosine(queryVector, index.documents[document.id].vector)]));
+    return scores;
   }
 }
 
 export function createSemanticRetrieverFromEnvironment(rootDir: string): SemanticRetriever | undefined {
-  const providerName = process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER?.trim();
-  if (!providerName) return undefined;
-  if (providerName !== 'dashscope-qwen') throw new Error(`Unsupported relationship-memory embedding provider: ${providerName}`);
+  const provider = (process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER ?? '').trim().toLowerCase();
+  if (!provider) return undefined;
+  if (provider !== 'dashscope-qwen') throw new Error(`Unsupported relationship-memory embedding provider: ${provider}`);
   const keyFile = process.env.RELATIONSHIP_MEMORY_EMBEDDING_API_KEY_FILE?.trim();
-  if (!keyFile) throw new Error('RELATIONSHIP_MEMORY_EMBEDDING_API_KEY_FILE is required when semantic retrieval is enabled.');
-  const provider = new DashScopeQwenEmbeddingProvider({
+  if (!keyFile) throw new Error('RELATIONSHIP_MEMORY_EMBEDDING_API_KEY_FILE is required for dashscope-qwen embeddings.');
+  const embeddingProvider = new DashScopeQwenEmbeddingProvider({
     apiKey: readSecretFile(keyFile),
     endpoint: process.env.RELATIONSHIP_MEMORY_EMBEDDING_ENDPOINT?.trim() || DEFAULT_QWEN_EMBEDDING_ENDPOINT,
     model: process.env.RELATIONSHIP_MEMORY_EMBEDDING_MODEL?.trim() || DEFAULT_QWEN_EMBEDDING_MODEL,
@@ -454,7 +434,7 @@ export function createSemanticRetrieverFromEnvironment(rootDir: string): Semanti
     queryInstruction: process.env.RELATIONSHIP_MEMORY_EMBEDDING_QUERY_INSTRUCTION?.trim() || DEFAULT_QWEN_QUERY_INSTRUCTION,
   });
   const indexDir = process.env.RELATIONSHIP_MEMORY_SEMANTIC_INDEX_DIR?.trim() || `${rootDir}-semantic-index`;
-  return new FileBackedSemanticRetriever(provider, path.join(indexDir, 'index.json'));
+  return new FileBackedSemanticRetriever(embeddingProvider, path.join(indexDir, 'index.json'));
 }
 
 export function semanticText(...values: unknown[]): string {
@@ -475,18 +455,66 @@ export function semanticText(...values: unknown[]): string {
   return parts.join('\n');
 }
 
+interface LexicalToken {
+  value: string;
+  weight: number;
+}
+
+const CJK_CHARACTER = /[\p{Script_Extensions=Han}\p{Script_Extensions=Hiragana}\p{Script_Extensions=Katakana}]/u;
+const LETTER_OR_NUMBER = /[\p{L}\p{N}]/u;
+const MISSING_SEMANTIC_SCORE = -1;
+
+function lexicalTokens(value: string): LexicalToken[] {
+  const tokens: LexicalToken[] = [];
+  let segment = '';
+  let segmentKind: 'cjk' | 'word' | undefined;
+
+  const flush = (): void => {
+    if (!segmentKind || !segment) return;
+    if (segmentKind === 'cjk') {
+      const chars = Array.from(segment);
+      for (let index = 0; index + 1 < chars.length; index += 1) {
+        tokens.push({ value: `${chars[index]}${chars[index + 1]}`, weight: 2 });
+      }
+    } else if (segment.length > 1) {
+      tokens.push({ value: segment, weight: segment.length >= 5 ? 4 : 2 });
+    }
+    segment = '';
+    segmentKind = undefined;
+  };
+
+  for (const char of value.toLowerCase()) {
+    const kind = CJK_CHARACTER.test(char) ? 'cjk' : LETTER_OR_NUMBER.test(char) ? 'word' : undefined;
+    if (!kind) {
+      flush();
+      continue;
+    }
+    if (segmentKind && segmentKind !== kind) flush();
+    segmentKind = kind;
+    segment += char;
+  }
+  flush();
+
+  const seen = new Set<string>();
+  return tokens.filter((token) => {
+    if (seen.has(token.value)) return false;
+    seen.add(token.value);
+    return true;
+  });
+}
+
 export function lexicalTextScore(haystack: string, query: string | undefined): number {
   if (!query?.trim()) return 1;
   const normalized = haystack.toLowerCase();
   const exact = query.trim().toLowerCase();
   let score = normalized.includes(exact) ? 100 : 0;
-  const queryTokens = [...new Set(exact.match(/[\p{L}\p{N}]+/gu) ?? [])].filter((token) => token.length > 1);
+  const queryTokens = lexicalTokens(exact);
   if (queryTokens.length === 0) return score;
   let matches = 0;
   for (const token of queryTokens) {
-    if (normalized.includes(token)) {
+    if (normalized.includes(token.value)) {
       matches += 1;
-      score += token.length >= 5 ? 4 : 2;
+      score += token.weight;
     }
   }
   if (matches === 0) return score;
@@ -494,6 +522,8 @@ export function lexicalTextScore(haystack: string, query: string | undefined): n
 }
 
 export function hybridScore(lexicalScore: number, semanticScore: number | undefined): number {
-  if (semanticScore === undefined || !Number.isFinite(semanticScore)) return lexicalScore;
-  return lexicalScore + Math.max(-1, Math.min(1, semanticScore)) * 100;
+  const resolvedSemanticScore = semanticScore === undefined || !Number.isFinite(semanticScore)
+    ? MISSING_SEMANTIC_SCORE
+    : semanticScore;
+  return lexicalScore + Math.max(-1, Math.min(1, resolvedSemanticScore)) * 100;
 }
