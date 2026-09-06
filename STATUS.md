@@ -7,8 +7,8 @@
 ### Recall
 
 - 现在做到哪：任务 09 的 bundle-first explicit recall 已经通过离线验收并经 PR #84 合入。对应实现报告：`docs/implementations/IMPLEMENTATION-09-EXPLICIT-RECALL.md`。
-- 当前阻塞：**真实 canary 尚未执行**。当前 owner 明确的阻塞原因是 embedding 额度不足；这一额度状态不是任务 09 仓库报告中的历史记录，因此此处只作为当前 owner 状态记录，不把它倒写成历史事实。
-- 下一步：额度恢复后，用隔离 synthetic store / transcript 做真实 service canary，核对真实 semantic-provider recall quality、模型行为与延迟；不得借此触碰 production 记忆数据。
+- 当前阻塞：**真实 canary 尚未执行**。当前 owner 明确的阻塞原因是 memory agent（模型）额度不足；embedding 额度仍可用。这一额度状态不是任务 09 仓库报告中的历史记录，因此此处只作为当前 owner 状态记录，不把它倒写成历史事实。
+- 下一步：memory agent（模型）额度恢复后，用隔离 synthetic store / transcript 做真实 service canary，核对真实 semantic-provider recall quality、模型行为与延迟；不得借此触碰 production 记忆数据。
 - 指针：branch `task/09-explicit-recall-recovery`；PR #84；最新报告 `docs/implementations/IMPLEMENTATION-09-EXPLICIT-RECALL.md`。
 
 ### Whisper
@@ -28,7 +28,7 @@
 
 ## 已知阻塞项
 
-- Recall 真实 canary：尚未执行；当前 owner 状态为 embedding 额度不足。
+- Recall 真实 canary：尚未执行；当前 owner 状态为 memory agent（模型）额度不足，embedding 额度仍可用。
 - Whisper 运行态 / production canary：未确认；PR #85 只提供离线交付证据。
 
 ## 命名与流程约定
