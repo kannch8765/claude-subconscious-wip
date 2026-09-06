@@ -308,9 +308,22 @@ describe('assistant relationship-memory recall core', () => {
   it('applies the total deadline while initial evidence prefetch is still running', async () => {
     const root = temp('rm-recall-prefetch-timeout-');
     seedRelationshipMemory(root);
+    let providerAbortObserved = false;
     const semanticRetriever = {
       async rank() { throw new Error('unexpected refresh'); },
-      async rankExisting(documents: Array<{ id: string }>) { await new Promise((resolve) => setTimeout(resolve, 180)); return new Map(documents.map((document) => [document.id, 0.5])); },
+      async rankExisting(documents: Array<{ id: string }>, _query: string, signal?: AbortSignal) {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(resolve, 180);
+          const onAbort = () => {
+            providerAbortObserved = true;
+            clearTimeout(timer);
+            reject(signal?.reason instanceof Error ? signal.reason : new Error('semantic query aborted'));
+          };
+          if (signal?.aborted) onAbort();
+          else signal?.addEventListener('abort', onAbort, { once: true });
+        });
+        return new Map(documents.map((document) => [document.id, 0.5]));
+      },
     };
     let lateDeliveryRejected = false;
     const result = await executeRecall({
@@ -323,7 +336,8 @@ describe('assistant relationship-memory recall core', () => {
       },
     });
     expect(result.status).toBe('timeout');
-    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(providerAbortObserved).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(lateDeliveryRejected).toBe(true);
   });
 
@@ -332,10 +346,26 @@ describe('assistant relationship-memory recall core', () => {
     seedRelationshipMemory(root);
     const controller = new AbortController();
     let calls = 0;
+    let providerAbortObserved = false;
     let lateExpansionRejected = false;
     const semanticRetriever = {
       async rank() { throw new Error('unexpected refresh'); },
-      async rankExisting(documents: Array<{ id: string }>) { calls += 1; if (calls > 1) await new Promise((resolve) => setTimeout(resolve, 150)); return new Map(documents.map((document) => [document.id, 0.5])); },
+      async rankExisting(documents: Array<{ id: string }>, _query: string, signal?: AbortSignal) {
+        calls += 1;
+        if (calls > 1) {
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, 150);
+            const onAbort = () => {
+              providerAbortObserved = true;
+              clearTimeout(timer);
+              reject(signal?.reason instanceof Error ? signal.reason : new Error('semantic query aborted'));
+            };
+            if (signal?.aborted) onAbort();
+            else signal?.addEventListener('abort', onAbort, { once: true });
+          });
+        }
+        return new Map(documents.map((document) => [document.id, 0.5]));
+      },
     };
     const pending = executeRecall({
       query: 'Kyoto', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 5_000, signal: controller.signal, semanticRetriever: semanticRetriever as any,
@@ -347,7 +377,8 @@ describe('assistant relationship-memory recall core', () => {
     setTimeout(() => controller.abort(), 30);
     const result = await pending;
     expect(result.status).toBe('cancelled');
-    await new Promise((resolve) => setTimeout(resolve, 160));
+    expect(providerAbortObserved).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
     expect(lateExpansionRejected).toBe(true);
   });
 

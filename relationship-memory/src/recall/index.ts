@@ -362,6 +362,7 @@ export class RelationshipMemoryRecallSession {
   private resolveDelivery!: (result: RecallResult) => void;
   private closedReason?: 'timeout' | 'cancelled' | 'failed';
   private readonly semanticRetriever?: SemanticRetriever;
+  private readonly signal?: AbortSignal;
   private expansionCount = 0;
   private bundleEvidenceStarted = false;
   private readonly bundleEvidenceRefs = new Set<string>();
@@ -372,12 +373,14 @@ export class RelationshipMemoryRecallSession {
     subjectId: string;
     transcriptRoots?: string[];
     semanticRetriever?: SemanticRetriever;
+    signal?: AbortSignal;
   }) {
     this.recallId = options.recallId || `recall_${crypto.randomUUID()}`;
     this.deliveryPromise = new Promise<RecallResult>((resolve) => { this.resolveDelivery = resolve; });
     // ensureRoot=false is important: recall must not create or append store files.
     this.store = new RelationshipMemoryStore(options.rootDir, options.subjectId, undefined, false);
     this.transcriptRoots = options.transcriptRoots ?? transcriptRootsFromEnvironment();
+    this.signal = options.signal;
     if (options.semanticRetriever) this.semanticRetriever = options.semanticRetriever;
     else {
       try { this.semanticRetriever = createSemanticRetrieverFromEnvironment(options.rootDir); } catch { this.semanticRetriever = undefined; }
@@ -514,7 +517,7 @@ export class RelationshipMemoryRecallSession {
       text: item.text,
     }));
     try {
-      const semantic = await rankExisting(documents, query);
+      const semantic = await rankExisting(documents, query, this.signal);
       this.assertOpen();
       const ranked = candidates.map((item, index) => {
         const score = hybridScore(item.lexicalScore, semantic.get(documents[index].id));
@@ -847,14 +850,15 @@ export async function executeRecall(options: {
 }): Promise<RecallResult> {
   const query = cleanText(options.query, 'query');
   const timeoutMs = Math.max(100, options.timeoutMs ?? 90_000);
+  const controller = new AbortController();
   const session = new RelationshipMemoryRecallSession({
     recallId: options.recallId,
     rootDir: options.rootDir,
     subjectId: options.subjectId,
     transcriptRoots: options.transcriptRoots,
     semanticRetriever: options.semanticRetriever,
+    signal: controller.signal,
   });
-  const controller = new AbortController();
   let externalCancelled = false;
   const onExternalAbort = () => {
     externalCancelled = true;

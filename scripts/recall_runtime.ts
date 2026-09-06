@@ -73,7 +73,7 @@ async function runLettaRecallModel(core: RelationshipMemoryRecallSession, query:
   const agentId = getConfiguredAgentIdReadOnly();
   disableLettaCodeAutoUpdater();
   const { resumeSession, jsonResult } = await import('@letta-ai/letta-code-sdk');
-  const conversationId = await createConversation(apiKey, agentId, log);
+  const conversationId = await createConversation(apiKey, agentId, log, { signal });
   let sdkSession: any = null;
   let deliveryResolve!: () => void;
   const delivered = new Promise<void>((resolve) => { deliveryResolve = resolve; });

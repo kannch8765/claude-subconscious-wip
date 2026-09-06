@@ -14,7 +14,7 @@ export interface EmbeddingProvider {
   readonly dimensions: number;
   readonly maxBatchSize: number;
   embedDocuments(texts: string[]): Promise<number[][]>;
-  embedQuery(text: string): Promise<number[]>;
+  embedQuery(text: string, signal?: AbortSignal): Promise<number[]>;
 }
 
 export interface SemanticRetriever {
@@ -23,7 +23,7 @@ export interface SemanticRetriever {
    * Rank only vectors already present in the derivative index. This path never
    * refreshes or embeds documents and is intended for foreground read-only recall.
    */
-  rankExisting?(documents: SemanticDocument[], query: string): Promise<Map<string, number>>;
+  rankExisting?(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>>;
 }
 
 interface SemanticIndexEntry {
@@ -135,10 +135,13 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
     }));
   }
 
-  private async embed(texts: string[], textType: 'document' | 'query'): Promise<number[][]> {
+  private async embed(texts: string[], textType: 'document' | 'query', signal?: AbortSignal): Promise<number[][]> {
     if (texts.length === 0) return [];
     if (texts.length > this.maxBatchSize) throw new Error(`DashScope ${this.model} accepts at most ${this.maxBatchSize} texts per request.`);
     const controller = new AbortController();
+    const onAbort = () => controller.abort(signal?.reason);
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
     const timeout = setTimeout(() => controller.abort(new Error('embedding request timeout')), 30_000);
     try {
       const response = await this.fetchFn(this.endpoint, {
@@ -173,6 +176,7 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
       return ordered as number[][];
     } finally {
       clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
     }
   }
 
@@ -180,8 +184,8 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
     return this.embed(texts, 'document');
   }
 
-  async embedQuery(text: string): Promise<number[]> {
-    const [vector] = await this.embed([text], 'query');
+  async embedQuery(text: string, signal?: AbortSignal): Promise<number[]> {
+    const [vector] = await this.embed([text], 'query', signal);
     return vector;
   }
 }
@@ -393,7 +397,7 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     }
   }
 
-  async rankExisting(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
+  async rankExisting(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>> {
     if (!query.trim() || documents.length === 0) return new Map();
     assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
     const index = readIndex(this.indexFile, this.provider.fingerprint);
@@ -410,9 +414,9 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     if (usable.length === 0) return new Map();
     let queryVector: number[];
     try {
-      queryVector = await this.provider.embedQuery(query);
+      queryVector = await this.provider.embedQuery(query, signal);
     } catch (error) {
-      writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+      if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
       throw error;
     }
     return new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));

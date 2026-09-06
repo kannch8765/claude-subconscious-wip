@@ -22,3 +22,6 @@
 补充离线回归还覆盖：总 deadline 在初始 evidence prefetch 尚未返回时即可 timeout 且晚到结果不能 delivery；外部取消发生在唯一一次 expand 尚未返回时立即得到 cancelled，晚到 expansion 不能继续；既有模型执行 timeout/cancel/late-delivery 回归继续保留。最终验收应以本补丁后的 exact head 与统一 PR offline CI 为准；未调用真实 Letta、模型或 embedding provider。
 
 补充精确边界：`FileBackedSemanticRetriever.rankExisting()` 只有在当前候选中至少存在一个 provider fingerprint、content hash 与向量维度都匹配的可用缓存文档向量时，才会为本次查询调用一次 `embedQuery(query)`；若没有任何可用缓存向量，则直接返回空 semantic score，不调用 query embedding，显式 recall 退回 lexical 排序。无论哪种情况都不会调用 `embedDocuments()`、不会 acquire semantic refresh lock，也不会写 derivative index。
+
+
+补充严格取消边界：总 deadline / 外部 cancel 的 `AbortSignal` 现贯穿显式 recall 的 `rankExisting → embedQuery` 与隔离模型启动前的 `createConversation` fetch，因此已经发出的 query-embedding / conversation-creation HTTP 会随本次 recall 一起中止，而不只是丢弃晚到结果；`expand_recall` 复用同一 signal。由 recall 主动取消的 query embedding 不再写 provider cooldown，真实 provider/配额错误的既有 cooldown 行为保持。离线回归会直接断言 provider / fetch 收到 abort，且取消路径不产生 cooldown/index 写入；未调用真实服务。
