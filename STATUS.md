@@ -21,16 +21,14 @@
 ### Infra / CI
 
 - 现在做到哪：任务 08 已通过 PR #83 合入统一 PR offline gate `PR offline CI / offline-ci`，覆盖 bounded full Vitest + TypeScript checking。对应报告：`docs/implementations/IMPLEMENTATION-08-UNIFIED-PR-CI.md`。
-- 当前阻塞：branch protection / ruleset / required checks 的真实仓库配置仍**未确认**，因此 08 中“迁移 required checks、再清理 legacy workflows”的后续项继续挂起。不能根据分支列表里的 `protected: false` 推导 required-check 配置为空。
-- 下一步：取得可验证的 branch protection / ruleset / required status checks 配置后，另开范围明确的迁移工单；在确认前保留 legacy workflows。
+- 当前保护规则：owner 已在 GitHub 为 `main` 启用 branch protection，要求 PR 合入并要求 GitHub Actions check `offline-ci` 通过；GitHub 分支列表现已回报 `main` 为 `protected: true`。当前规则未要求 approval，也未要求 branch 必须先更新到最新 main。
+- 下一步：任务 08 因 required-check 配置未知而挂起的 blocker 已解除；legacy workflows 的清理由后续范围明确的小任务完成，在清理前继续保留。
 - 指针：branch `task/08-unified-pr-ci`；PR #83；最新报告 `docs/implementations/IMPLEMENTATION-08-UNIFIED-PR-CI.md`。
 
 ## 已知阻塞项
 
 - Recall 真实 canary：尚未执行；当前 owner 状态为 embedding 额度不足。
-- Branch protection / ruleset / required checks：真实配置未确认；任务 08 的 required-check 迁移因此挂起。
 - Whisper 运行态 / production canary：未确认；PR #85 只提供离线交付证据。
-- 既有 docs 中因“正文不得改写”而保留的旧路径互引：见 `docs/implementations/IMPLEMENTATION-11-STATUS-INDEX.md` 的遗留项。
 
 ## 命名与流程约定
 

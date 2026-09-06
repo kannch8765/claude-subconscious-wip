@@ -14,16 +14,16 @@
 新增根目录 `STATUS.md`，作为唯一活跃状态入口。三条工作线均基于现有 PR / 报告：
 - recall：PR #84 + `docs/implementations/IMPLEMENTATION-09-EXPLICIT-RECALL.md`；离线验收通过，真实 canary 尚未执行。owner 在任务 11 明确当前阻塞为 embedding 额度不足；此前仓库报告没有独立记录额度状态，因此该历史证据缺口也在 STATUS 中明示。
 - whisper：PR #85 已合入且 offline CI / Vitest / typecheck 通过；PR 明确没有 deployment / production mutation / model / embedding / backfill。仓库无独立 IMPLEMENTATION-10 报告，因此报告路径写“未确认”而不猜测。
-- infra/CI：PR #83 + `docs/implementations/IMPLEMENTATION-08-UNIFIED-PR-CI.md`；统一 offline gate 已合入，但 branch protection / ruleset / required checks 真实配置仍未确认，08 迁移项继续挂起。
+- infra/CI：PR #83 + `docs/implementations/IMPLEMENTATION-08-UNIFIED-PR-CI.md`；统一 offline gate 已合入。合并前 owner 已为 `main` 启用 branch protection，并把 GitHub Actions `offline-ci` 设为 required status check；GitHub MCP 分支列表随后回报 `main` 为 `protected: true`。
 
 ### docs 分层
 
-仅移动既有正文，不改内容：
+既有文档先仅移动路径；合并前 owner 另行授权修复 5 处因搬迁产生的旧路径互引：
 - `docs/implementations/`：全部 `IMPLEMENTATION-*.md`。
 - `docs/canaries/`：全部 `*-CANARY-*.md`、`*-RUNTIME-EVIDENCE.md`、`*-IMPORT-EVIDENCE.md`。
 - `docs/specs/`：`RELATIONSHIP-MEMORY-SCAFFOLD.md`、`TASK-096A-SUBCON-VISIBILITY-CONTRACT.md`、`EDITABLE-SYSTEM-PROMPTS.md`、`SUBCON-CANONICAL-RUNTIME-CONFIG-RECONCILIATION-093AC.md`、`PREMERGE-ACCEPTANCE-*.md`。
 
-内容完整性以原文件 blob/content SHA 与移动后正文逐字一致为准。
+22 份既有文档先以原文件 blob/content SHA 与移动后正文逐字一致完成搬迁；随后 owner 在合并前明确授权仅修复 5 处因搬迁产生的旧路径互引。除这 5 处路径字符串外，其余既有正文保持不变。
 
 ### 分支普查
 
@@ -35,15 +35,15 @@
 
 “已合入”只在当前 branch head 与已 merged PR head 精确一致，或有等价明确 main 基准证据时使用；“活跃”只用仍 open PR / main 本身；“已废弃”只用 closed-unmerged PR 且当前 head 与 PR head 精确一致；其余全部保守写“无法判定”。
 
-## 引用检查与遗留项
+## 引用检查与修复
 
 README 与当前 `.github/workflows/**` 未发现对本次移动文件旧路径的引用，因此无需修改。
 
 发现两组位于“既有 docs 正文”中的旧路径互引：
-1. `IMPLEMENTATION-03-EDITABLE-SYSTEM-PROMPTS.md` 内 4 处 `docs/EDITABLE-SYSTEM-PROMPTS.md`；
-2. `RELATIONSHIP-MEMORY-HISTORICAL-BACKFILL-OWNER-CANARY-02.md` 内 1 处 `docs/RELATIONSHIP-MEMORY-HISTORICAL-BACKFILL-OWNER-CANARY-01.md`。
+1. `docs/implementations/IMPLEMENTATION-03-EDITABLE-SYSTEM-PROMPTS.md` 内 4 处旧的 `docs/EDITABLE-SYSTEM-PROMPTS.md`；
+2. `docs/canaries/RELATIONSHIP-MEMORY-HISTORICAL-BACKFILL-OWNER-CANARY-02.md` 内 1 处旧的 `docs/RELATIONSHIP-MEMORY-HISTORICAL-BACKFILL-OWNER-CANARY-01.md`。
 
-任务同时要求“既有 docs 正文不得改写，分层只允许移动文件路径”，因此这 5 处不能在本单安全改写；已作为显式遗留，不静默修改。后续若 owner 允许“导航引用修复”例外，可单独工单处理。
+owner 在合并前明确授权“旧路径互引允许修改”。因此这 5 处仅做导航路径替换：前者改为 `docs/specs/EDITABLE-SYSTEM-PROMPTS.md`，后者改为 `docs/canaries/RELATIONSHIP-MEMORY-HISTORICAL-BACKFILL-OWNER-CANARY-01.md`；未改写其他历史正文。
 
 ## 硬性范围证据
 
@@ -56,7 +56,7 @@ README 与当前 `.github/workflows/**` 未发现对本次移动文件旧路径�
 - `package.json`：0
 - `.mcp.json`：0
 
-除新增 `STATUS.md`、`docs/BRANCH-INVENTORY.md`、本报告外，既有 docs 的变更必须全部为内容相同的路径移动。
+除新增 `STATUS.md`、`docs/BRANCH-INVENTORY.md`、本报告外，既有 docs 的变更应为路径移动；唯一正文例外是 owner 合并前授权的两份文档共 5 处旧路径引用替换。
 
 ## 验证
 
@@ -65,16 +65,19 @@ README 与当前 `.github/workflows/**` 未发现对本次移动文件旧路径�
 - `PR offline CI / offline-ci` SUCCESS；
 - bounded full Vitest 全绿；
 - 硬性范围路径 diff 为 0；
-- docs 搬迁正文无内容变化。
+- docs 搬迁除已授权的 5 处旧路径引用替换外无正文变化。
 
 CI run：以 Draft PR 上“本报告所在最终 HEAD”的 `PR offline CI / offline-ci` check 为准；最终回传同时给出对应 run 链接与 exact head，二者必须一致。
 
+## 合并前状态更新
+
+- owner 已在 GitHub 为 `main` 配置 branch protection：要求 PR 合入，并把 GitHub Actions `offline-ci` 加为 required status check；approval 与“branch 必须 up to date”未启用。
+- GitHub MCP 分支列表随后回报 `main` 为 `protected: true`。这解除任务 08 中“真实 required-check 配置未确认”的 blocker；legacy workflow 清理仍留给后续小任务。
+
 ## 剩余项
 
-- branch protection / ruleset / required status checks：未确认；08 迁移项继续挂起。
 - recall 真实 canary：未执行；owner 当前声明因 embedding 额度不足。
 - whisper 运行态 / production canary：未确认。
-- 既有 docs 正文中的 5 处旧路径互引：因“正文不得改写”硬约束留待后续。
 - 无法判定分支共 27 条：
   - `ci/relationship-memory-01`
   - `ci/relationship-memory-02`
