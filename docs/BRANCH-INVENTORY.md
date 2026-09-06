@@ -108,7 +108,7 @@
 | `task/13-remove-093ah` | `c919a4f9a456d56c2c02911691203022089e8a30` | 已合入 main | A：main ancestry exact-head 命中 | 是 |
 | `task/13-remove-093an` | `8eb5da7bad762e1c7022abe8b81de6e1012cda1b` | 已合入 main | A：main ancestry exact-head 命中 | 是 |
 | `task/13-remove-093ao` | `c2cc771e5458a0c6851cb0bcd0d7fbcbe974a441` | 已合入 main | A：main ancestry exact-head 命中 | 是 |
-| `task/15-recall-instrumentation` | `09de69bcc10fa84e937512d91e61eda071fa5cdf` | 活跃 | O：PR #103 open 且 exact-head match | 否 |
+| `task/15-recall-instrumentation` | `09de69bcc10fa84e937512d91e61eda071fa5cdf` | 已废弃 | C：PR #103 closed-unmerged 且 exact-head match | 是 |
 | `task/16-recall-timing-coverage` | `258b48cfa6a896e1f97cb1f234e3e0fdf382ed96` | 已合入 main | A：main ancestry exact-head 命中 | 是 |
 | `task/dario-runtime-provenance-gate` | `8a2a52ee89a16b7cbecd914b8de917469408b406` | 已合入 main | A：main ancestry exact-head 命中 | 是 |
 | `task/live-subcon-entity-identity-grounding` | `208ca3d1702bd3ca9f8e9e9c69a5c3c0571eb8f7` | 已合入 main（squash/rebase） | M：ancestry 未命中；PR #64 merged 且 exact-head match | 是 |
