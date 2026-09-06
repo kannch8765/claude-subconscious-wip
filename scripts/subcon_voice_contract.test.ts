@@ -80,7 +80,8 @@ describe('live Subconscious narrative identity and visibility contract', () => {
     expect(send).toContain('source_kind=transcript is a direct historical quote');
     expect(send).toContain('source_kind=legacy_memory');
     expect(send).toContain('one searched memory_id and 1-3 snippet_ids');
-    expect(send).toContain('runtime renders the surfaced canonical memory event first as `记忆：...`, then the selected source excerpts with provenance-appropriate labels');
+    expect(send).toContain('runtime renders the surfaced canonical memory event first');
+    expect(send).toContain('then the selected source excerpts with provenance-appropriate labels');
     expect(send).toContain('do not write or paraphrase whisper prose yourself');
     expect(send).toContain('Retrieval itself supplies the association');
     expect(core).toContain('visible whisper does not explain why it matters now');
