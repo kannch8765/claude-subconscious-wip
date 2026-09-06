@@ -37,6 +37,17 @@ interface MutationLockOwner {
 const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const DEFAULT_LOCK_STALE_MS = 30_000;
 const LOCK_POLL_MS = 10;
+const WRITE_INDEX_VERSION = 1;
+
+interface WriteIndexManifest {
+  version: 1;
+  source_size: number;
+}
+
+interface WriteIndexMarkerEntry {
+  key: string;
+  value?: string;
+}
 
 function positiveEnvMs(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -105,6 +116,7 @@ export class RelationshipMemoryStore {
   readonly subjectId: string;
   readonly failureInjector?: FailureInjector;
   private mutationLockDepth = 0;
+  private mutationWriteIndexReady?: Set<string>;
 
   constructor(rootDir: string, subjectId: string, failureInjector?: FailureInjector, ensureRoot = true) {
     this.rootDir = rootDir;
@@ -201,14 +213,119 @@ export class RelationshipMemoryStore {
 
     const token = this.acquireMutationLock();
     this.mutationLockDepth = 1;
+    this.mutationWriteIndexReady = new Set();
     try { return operation(); }
     finally {
+      // Boundary-local readiness is never allowed to survive lock release.
+      this.mutationWriteIndexReady = undefined;
       this.mutationLockDepth = 0;
       this.releaseMutationLock(token);
     }
   }
 
   private file(name: string): string { return path.join(this.rootDir, name); }
+
+  private writeIndexDatasetDir(dataset: string): string { return path.join(this.rootDir, '.write-index-v1', dataset); }
+  private writeIndexMarkersDir(dataset: string): string { return path.join(this.writeIndexDatasetDir(dataset), 'markers'); }
+  private writeIndexManifestFile(dataset: string): string { return path.join(this.writeIndexDatasetDir(dataset), 'manifest.json'); }
+  private writeIndexMarkerFile(dataset: string, key: string): string {
+    const digest = crypto.createHash('sha256').update(key).digest('hex');
+    return path.join(this.writeIndexMarkersDir(dataset), digest.slice(0, 2), `${digest}.json`);
+  }
+
+  private sourceSize(fileName: string): number {
+    try { return fs.statSync(this.file(fileName)).size; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+      throw error;
+    }
+  }
+
+  private invalidateWriteIndex(dataset: string): void {
+    this.mutationWriteIndexReady?.delete(dataset);
+    try { fs.rmSync(this.writeIndexManifestFile(dataset), { force: true }); } catch { }
+  }
+
+  private readMarkerEntries(dataset: string, key: string): WriteIndexMarkerEntry[] {
+    const markerFile = this.writeIndexMarkerFile(dataset, key);
+    if (!fs.existsSync(markerFile)) return [];
+    const parsed = JSON.parse(fs.readFileSync(markerFile, 'utf8')) as WriteIndexMarkerEntry[];
+    if (!Array.isArray(parsed)) throw new Error(`invalid write index marker for ${dataset}`);
+    return parsed;
+  }
+
+  private writeMarkerEntry(dataset: string, entry: WriteIndexMarkerEntry): void {
+    const markerFile = this.writeIndexMarkerFile(dataset, entry.key);
+    const entries = this.readMarkerEntries(dataset, entry.key);
+    const existingIndex = entries.findIndex((item) => item.key === entry.key);
+    if (existingIndex >= 0) entries[existingIndex] = entry;
+    else entries.push(entry);
+    ensureDir(path.dirname(markerFile));
+    fs.writeFileSync(markerFile, `${JSON.stringify(entries)}\n`, 'utf8');
+  }
+
+  private publishWriteIndexManifest(dataset: string, fileName: string): void {
+    const manifest: WriteIndexManifest = { version: WRITE_INDEX_VERSION, source_size: this.sourceSize(fileName) };
+    ensureDir(this.writeIndexDatasetDir(dataset));
+    fs.writeFileSync(this.writeIndexManifestFile(dataset), `${JSON.stringify(manifest)}\n`, 'utf8');
+  }
+
+  private rebuildWriteIndex<T>(dataset: string, fileName: string, records: T[], entryFor: (record: T) => WriteIndexMarkerEntry): void {
+    const datasetDir = this.writeIndexDatasetDir(dataset);
+    fs.rmSync(datasetDir, { recursive: true, force: true });
+    ensureDir(this.writeIndexMarkersDir(dataset));
+    for (const record of records) this.writeMarkerEntry(dataset, entryFor(record));
+    this.publishWriteIndexManifest(dataset, fileName);
+  }
+
+  private ensureWriteIndex<T>(dataset: string, fileName: string, readRecords: () => T[], entryFor: (record: T) => WriteIndexMarkerEntry): boolean {
+    if (this.mutationWriteIndexReady?.has(dataset)) return true;
+    try {
+      const manifestFile = this.writeIndexManifestFile(dataset);
+      let valid = false;
+      if (fs.existsSync(manifestFile)) {
+        try {
+          const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8')) as WriteIndexManifest;
+          valid = manifest.version === WRITE_INDEX_VERSION && manifest.source_size === this.sourceSize(fileName);
+        } catch { valid = false; }
+      }
+      if (!valid) this.rebuildWriteIndex(dataset, fileName, readRecords(), entryFor);
+      this.mutationWriteIndexReady?.add(dataset);
+      return true;
+    } catch {
+      this.invalidateWriteIndex(dataset);
+      return false;
+    }
+  }
+
+  private indexedEntry<T>(
+    dataset: string,
+    fileName: string,
+    key: string,
+    readRecords: () => T[],
+    entryFor: (record: T) => WriteIndexMarkerEntry,
+  ): { ready: boolean; entry?: WriteIndexMarkerEntry } {
+    const ready = this.ensureWriteIndex(dataset, fileName, readRecords, entryFor);
+    if (!ready) return { ready: false };
+    try {
+      return { ready: true, entry: this.readMarkerEntries(dataset, key).find((item) => item.key === key) };
+    } catch {
+      this.invalidateWriteIndex(dataset);
+      return { ready: false };
+    }
+  }
+
+  private recordIndexedAppend(dataset: string, fileName: string, entry: WriteIndexMarkerEntry, ready: boolean): void {
+    if (!ready || !this.mutationWriteIndexReady?.has(dataset)) return;
+    try {
+      this.writeMarkerEntry(dataset, entry);
+      this.publishWriteIndexManifest(dataset, fileName);
+    } catch {
+      // Canonical JSONL is authoritative. If accelerator maintenance fails after
+      // a successful append, leave the canonical write intact and force rebuild.
+      this.invalidateWriteIndex(dataset);
+    }
+  }
 
   listMemories(): CanonicalMemoryRecord[] { return readJsonl<CanonicalMemoryRecord>(this.file('memories.jsonl')); }
   listEvidence(): EvidenceRecord[] { return readJsonl<EvidenceRecord>(this.file('evidence.jsonl')); }
@@ -249,9 +366,35 @@ export class RelationshipMemoryStore {
   appendEntity(record: EntityIdentityRecord, evidence: EntityEvidenceRecord[]): void {
     this.withMutationBoundary(() => {
       if (this.failureInjector?.('memory_commit')) throw new Error('injected entity commit failure');
-      if (!this.getEntity(record.entity_id)) appendJsonl(this.file('entities.jsonl'), record);
-      const existingEvidence = new Set(this.listEntityEvidence().map((item) => item.evidence_id));
-      for (const item of evidence) if (!existingEvidence.has(item.evidence_id)) appendJsonl(this.file('entity-evidence.jsonl'), item);
+      const entityLookup = this.indexedEntry('entities', 'entities.jsonl', record.entity_id, () => this.listEntities(), (item) => ({ key: item.entity_id }));
+      const existingEntity = entityLookup.ready ? entityLookup.entry !== undefined : this.getEntity(record.entity_id) !== undefined;
+      if (!existingEntity) {
+        appendJsonl(this.file('entities.jsonl'), record);
+        this.recordIndexedAppend('entities', 'entities.jsonl', { key: record.entity_id }, entityLookup.ready);
+      }
+
+      const entityEvidenceReady = this.ensureWriteIndex('entity-evidence', 'entity-evidence.jsonl', () => this.listEntityEvidence(), (item) => ({ key: item.evidence_id }));
+      const existingEvidence = new Set<string>();
+      if (entityEvidenceReady) {
+        for (const item of evidence) {
+          try {
+            if (this.readMarkerEntries('entity-evidence', item.evidence_id).some((entry) => entry.key === item.evidence_id)) existingEvidence.add(item.evidence_id);
+          } catch {
+            this.invalidateWriteIndex('entity-evidence');
+            existingEvidence.clear();
+            for (const existing of this.listEntityEvidence()) existingEvidence.add(existing.evidence_id);
+            break;
+          }
+        }
+      } else {
+        for (const existing of this.listEntityEvidence()) existingEvidence.add(existing.evidence_id);
+      }
+      for (const item of evidence) {
+        if (!existingEvidence.has(item.evidence_id)) {
+          appendJsonl(this.file('entity-evidence.jsonl'), item);
+          this.recordIndexedAppend('entity-evidence', 'entity-evidence.jsonl', { key: item.evidence_id }, entityEvidenceReady);
+        }
+      }
     });
   }
 
@@ -265,20 +408,88 @@ export class RelationshipMemoryStore {
   appendMemory(record: CanonicalMemoryRecord, evidence: EvidenceRecord[]): void {
     this.withMutationBoundary(() => {
       if (this.failureInjector?.('memory_commit')) throw new Error('injected memory commit failure');
-      if (!this.getMemory(record.memory_id)) appendJsonl(this.file('memories.jsonl'), record);
-      const existingEvidence = new Set(this.listEvidence().map((item) => item.evidence_id));
-      for (const item of evidence) if (!existingEvidence.has(item.evidence_id)) appendJsonl(this.file('evidence.jsonl'), item);
+      const memoryLookup = this.indexedEntry('memories', 'memories.jsonl', record.memory_id, () => this.listMemories(), (item) => ({ key: item.memory_id }));
+      const existingMemory = memoryLookup.ready ? memoryLookup.entry !== undefined : this.getMemory(record.memory_id) !== undefined;
+      if (!existingMemory) {
+        appendJsonl(this.file('memories.jsonl'), record);
+        this.recordIndexedAppend('memories', 'memories.jsonl', { key: record.memory_id }, memoryLookup.ready);
+      }
+
+      const evidenceReady = this.ensureWriteIndex('evidence', 'evidence.jsonl', () => this.listEvidence(), (item) => ({ key: item.evidence_id }));
+      const existingEvidence = new Set<string>();
+      if (evidenceReady) {
+        for (const item of evidence) {
+          try {
+            if (this.readMarkerEntries('evidence', item.evidence_id).some((entry) => entry.key === item.evidence_id)) existingEvidence.add(item.evidence_id);
+          } catch {
+            this.invalidateWriteIndex('evidence');
+            existingEvidence.clear();
+            for (const existing of this.listEvidence()) existingEvidence.add(existing.evidence_id);
+            break;
+          }
+        }
+      } else {
+        for (const existing of this.listEvidence()) existingEvidence.add(existing.evidence_id);
+      }
+      for (const item of evidence) {
+        if (!existingEvidence.has(item.evidence_id)) {
+          appendJsonl(this.file('evidence.jsonl'), item);
+          this.recordIndexedAppend('evidence', 'evidence.jsonl', { key: item.evidence_id }, evidenceReady);
+        }
+      }
     });
   }
 
   appendReinforcement(record: ReinforcementRecord, evidence: EvidenceRecord[]): void {
     this.withMutationBoundary(() => {
       if (this.failureInjector?.('reinforcement_commit')) throw new Error('injected reinforcement commit failure');
-      const existing = this.listReinforcements().find((item) => item.reinforcement_id === record.reinforcement_id);
-      if (existing && (existing.memory_id !== record.memory_id || stableJson(existing.evidence_ids) !== stableJson(record.evidence_ids))) throw new Error(`reinforcement identity collision: ${record.reinforcement_id}`);
-      const existingEvidence = new Set(this.listEvidence().map((item) => item.evidence_id));
-      for (const item of evidence) if (!existingEvidence.has(item.evidence_id)) appendJsonl(this.file('evidence.jsonl'), item);
-      if (!existing) appendJsonl(this.file('reinforcements.jsonl'), record);
+      const reinforcementLookup = this.indexedEntry(
+        'reinforcements',
+        'reinforcements.jsonl',
+        record.reinforcement_id,
+        () => this.listReinforcements(),
+        (item) => ({ key: item.reinforcement_id, value: stableJson({ memory_id: item.memory_id, evidence_ids: item.evidence_ids }) }),
+      );
+      const existing = reinforcementLookup.ready
+        ? reinforcementLookup.entry
+        : this.listReinforcements().find((item) => item.reinforcement_id === record.reinforcement_id);
+      if (existing) {
+        const existingIdentity = 'value' in existing
+          ? existing.value
+          : stableJson({ memory_id: existing.memory_id, evidence_ids: existing.evidence_ids });
+        const incomingIdentity = stableJson({ memory_id: record.memory_id, evidence_ids: record.evidence_ids });
+        if (existingIdentity !== incomingIdentity) throw new Error(`reinforcement identity collision: ${record.reinforcement_id}`);
+      }
+
+      const evidenceReady = this.ensureWriteIndex('evidence', 'evidence.jsonl', () => this.listEvidence(), (item) => ({ key: item.evidence_id }));
+      const existingEvidence = new Set<string>();
+      if (evidenceReady) {
+        for (const item of evidence) {
+          try {
+            if (this.readMarkerEntries('evidence', item.evidence_id).some((entry) => entry.key === item.evidence_id)) existingEvidence.add(item.evidence_id);
+          } catch {
+            this.invalidateWriteIndex('evidence');
+            existingEvidence.clear();
+            for (const existingEvidenceRecord of this.listEvidence()) existingEvidence.add(existingEvidenceRecord.evidence_id);
+            break;
+          }
+        }
+      } else {
+        for (const existingEvidenceRecord of this.listEvidence()) existingEvidence.add(existingEvidenceRecord.evidence_id);
+      }
+      for (const item of evidence) {
+        if (!existingEvidence.has(item.evidence_id)) {
+          appendJsonl(this.file('evidence.jsonl'), item);
+          this.recordIndexedAppend('evidence', 'evidence.jsonl', { key: item.evidence_id }, evidenceReady);
+        }
+      }
+      if (!existing) {
+        appendJsonl(this.file('reinforcements.jsonl'), record);
+        this.recordIndexedAppend('reinforcements', 'reinforcements.jsonl', {
+          key: record.reinforcement_id,
+          value: stableJson({ memory_id: record.memory_id, evidence_ids: record.evidence_ids }),
+        }, reinforcementLookup.ready);
+      }
     });
   }
 
@@ -289,17 +500,43 @@ export class RelationshipMemoryStore {
   appendAssistantIntent(record: AssistantRememberIntentRecord): void {
     this.withMutationBoundary(() => {
       if (this.failureInjector?.('intent_commit')) throw new Error('injected intent commit failure');
-      const existing = this.getAssistantIntent(record.intent_id);
-      if (!existing) { appendJsonl(this.file('assistant-intents.jsonl'), record); return; }
-      if (stableJson(existing) !== stableJson(record)) throw new Error(`assistant intent identity collision: ${record.intent_id}`);
+      const lookup = this.indexedEntry(
+        'assistant-intents',
+        'assistant-intents.jsonl',
+        record.intent_id,
+        () => this.listAssistantIntents(),
+        (item) => ({ key: item.intent_id, value: stableJson(item) }),
+      );
+      const existing = lookup.ready ? lookup.entry : this.getAssistantIntent(record.intent_id);
+      if (!existing) {
+        appendJsonl(this.file('assistant-intents.jsonl'), record);
+        this.recordIndexedAppend('assistant-intents', 'assistant-intents.jsonl', { key: record.intent_id, value: stableJson(record) }, lookup.ready);
+        return;
+      }
+      const existingStable = 'value' in existing ? existing.value : stableJson(existing);
+      if (existingStable !== stableJson(record)) throw new Error(`assistant intent identity collision: ${record.intent_id}`);
     });
   }
 
   appendAssistantIntentOutcome(record: AssistantIntentOutcome): void {
     this.withMutationBoundary(() => {
       if (this.failureInjector?.('intent_outcome_commit')) throw new Error('injected intent outcome commit failure');
-      const duplicate = this.listAssistantIntentOutcomes().some((item) => stableJson(item) === stableJson(record));
-      if (!duplicate) appendJsonl(this.file('assistant-intent-outcomes.jsonl'), record);
+      const stable = stableJson(record);
+      const key = crypto.createHash('sha256').update(stable).digest('hex');
+      const lookup = this.indexedEntry(
+        'assistant-intent-outcomes',
+        'assistant-intent-outcomes.jsonl',
+        key,
+        () => this.listAssistantIntentOutcomes(),
+        (item) => ({ key: crypto.createHash('sha256').update(stableJson(item)).digest('hex'), value: stableJson(item) }),
+      );
+      const duplicate = lookup.ready
+        ? lookup.entry?.value === stable
+        : this.listAssistantIntentOutcomes().some((item) => stableJson(item) === stable);
+      if (!duplicate) {
+        appendJsonl(this.file('assistant-intent-outcomes.jsonl'), record);
+        this.recordIndexedAppend('assistant-intent-outcomes', 'assistant-intent-outcomes.jsonl', { key, value: stable }, lookup.ready);
+      }
     });
   }
 
