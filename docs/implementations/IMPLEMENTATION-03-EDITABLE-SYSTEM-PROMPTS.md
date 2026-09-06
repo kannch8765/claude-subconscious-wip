@@ -53,7 +53,7 @@ Preserved:
 - backfill order, checkpoint/index/cooldown/canonical store behavior;
 - sync sibling tool difference and per-turn policy.
 
-The raw bundled `.af` files still contain their migration-time prompt snapshots. If an external tool imports one of those files directly, outside this application's managed import path, it will use the serialized `.af` snapshot rather than `config/*.md`. This is intentional and documented in `docs/EDITABLE-SYSTEM-PROMPTS.md`.
+The raw bundled `.af` files still contain their migration-time prompt snapshots. If an external tool imports one of those files directly, outside this application's managed import path, it will use the serialized `.af` snapshot rather than `config/*.md`. This is intentional and documented in `docs/specs/EDITABLE-SYSTEM-PROMPTS.md`.
 
 ## Baseline equivalence evidence
 
@@ -114,7 +114,7 @@ Subconscious.af
 SubconsciousBackfill.af
 config/live-system.md
 config/backfill-system.md
-docs/EDITABLE-SYSTEM-PROMPTS.md
+docs/specs/EDITABLE-SYSTEM-PROMPTS.md
 ```
 
 The package has no `files` allow-list at this baseline, so the new `config/` resources are included by the current default npm packaging shape.
@@ -140,7 +140,7 @@ Result: could not install because the sandbox npm cache does not contain `yoga-l
 - updated prompt-authority assertions in `scripts/agent_prompt_reconciliation.test.ts`
 - updated prompt-authority assertions in `scripts/backfill_agent_config.test.ts`
 - updated prompt-authority assertions in `scripts/subcon_voice_contract.test.ts`
-- added operator documentation in `docs/EDITABLE-SYSTEM-PROMPTS.md`
+- added operator documentation in `docs/specs/EDITABLE-SYSTEM-PROMPTS.md`
 
 No model/profile/runtime JSON migration, backfill runner consolidation, sync profile change, recall repair, deployment, or production mutation was included.
 
@@ -236,7 +236,7 @@ The same check against the fixed baseline reports the same pre-existing error at
 
 ### Final packaging/diff checks
 
-`npm pack --dry-run --json` passed again in the dependency-backed VPS checkout and included both AgentFiles, both `config/*-system.md` files, and `docs/EDITABLE-SYSTEM-PROMPTS.md`. `git diff --check` also passed.
+`npm pack --dry-run --json` passed again in the dependency-backed VPS checkout and included both AgentFiles, both `config/*-system.md` files, and `docs/specs/EDITABLE-SYSTEM-PROMPTS.md`. `git diff --check` also passed.
 
 Acceptance-follow-up code/test changes are limited to:
 

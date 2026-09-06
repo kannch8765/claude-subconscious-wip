@@ -6,7 +6,7 @@ Status: **PASS**
 
 This document records the second Owner-authorized historical backfill canary. It continues Canary 01 from the same checkpoint against the same transcript, with no authority changes and no parameter changes. It is an evidence report and does not modify canonical `main`.
 
-Canary 01 is recorded in `docs/RELATIONSHIP-MEMORY-HISTORICAL-BACKFILL-OWNER-CANARY-01.md`.
+Canary 01 is recorded in `docs/canaries/RELATIONSHIP-MEMORY-HISTORICAL-BACKFILL-OWNER-CANARY-01.md`.
 
 ## Repository baseline
 
