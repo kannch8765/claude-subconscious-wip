@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
+import { emitRecallTimingSegment, monotonicNow } from '../recall/instrumentation.js';
 
 export interface SemanticDocument {
   id: string;
@@ -414,12 +415,17 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     if (usable.length === 0) return new Map();
     let queryVector: number[];
     try {
+      const embedStartedAt = monotonicNow();
       queryVector = await this.provider.embedQuery(query, signal);
+      emitRecallTimingSegment('semantic_query_embedding_external', embedStartedAt, { usable_document_count: usable.length });
     } catch (error) {
       if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
       throw error;
     }
-    return new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));
+    const localCompareStartedAt = monotonicNow();
+    const ranked = new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));
+    emitRecallTimingSegment('semantic_local_vector_comparison', localCompareStartedAt, { usable_document_count: usable.length });
+    return ranked;
   }
 
   async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
