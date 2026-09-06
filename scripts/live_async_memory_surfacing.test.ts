@@ -30,7 +30,10 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(worker).toContain('const { purpose: _purpose, ...searchArgs } = rawArgs');
     expect(worker).toContain('quote_snippets');
     expect(worker).toContain("required: ['memory_id', 'snippet_ids']");
-    expect(worker).toContain('renderHistoricalWhisperQuotes(snippets)');
+    expect(worker).toContain("const summary = typeof memory?.summary === 'string' ? memory.summary.trim() : ''");
+    expect(worker).toContain('const surfacedRecallMemories = new Map<string, SurfacedRecallMemory>()');
+    expect(worker).toContain('renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets)');
+    expect(worker).toContain('The runtime renders the surfaced canonical memory summary as `记忆：...`');
     expect(worker).toContain('composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations))');
     expect(worker).not.toContain('runtime.memorySearchHybrid({ query: firstSearchQuery');
     expect(worker).not.toContain('prefetched_relationship_memory_search');
