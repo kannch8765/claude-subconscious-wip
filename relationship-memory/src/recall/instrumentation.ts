@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import { AsyncLocalStorage } from 'async_hooks';
 import { performance } from 'perf_hooks';
 
-export type RecallTimingPhase = 'initial' | 'expand_recall' | 'total';
+export type RecallTimingPhase = 'initial' | 'expand_recall' | 'unscoped' | 'total';
 
 export interface RecallTimingContext {
   recall_id: string;
@@ -29,6 +29,7 @@ export function monotonicNow(): number {
 }
 
 const recallTimingContextStore = new AsyncLocalStorage<RecallTimingContext>();
+let unscopedEventIndex = 0;
 
 export async function withRecallTimingContext<T>(context: RecallTimingContext, fn: () => Promise<T>): Promise<T> {
   return recallTimingContextStore.run(context, fn);
@@ -61,7 +62,21 @@ export function emitRecallTimingSegment(
 ): void {
   if (!recallTimingEnabled()) return;
   const context = recallTimingContext();
-  if (!context) return;
+  if (!context) {
+    unscopedEventIndex += 1;
+    emitRecallTiming({
+      schema_version: 1,
+      event: 'relationship_memory_recall_timing',
+      recall_id: 'unscoped',
+      phase: 'unscoped',
+      segment,
+      duration_ms: timingDurationMs(startedAt),
+      context_missing: true,
+      event_index: unscopedEventIndex,
+      ...extra,
+    });
+    return;
+  }
   emitRecallTiming({
     schema_version: 1,
     event: 'relationship_memory_recall_timing',
