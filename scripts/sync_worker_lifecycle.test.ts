@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
+import { renderHistoricalMemoryWhisper, renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
 import { readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import { RelationshipMemoryStore, stableId } from '../relationship-memory/src/store/index.js';
 
@@ -16,17 +16,25 @@ afterEach(() => {
 });
 
 describe('sync worker post-whisper lifecycle ownership', () => {
-  it('renders transcript quotes and legacy-memory fallbacks with different provenance labels', () => {
-    const text = renderHistoricalWhisperQuotes([
-      { source_kind: 'transcript', role: 'user', quote: '猫的原句。', captured_at: '2026-08-01T10:00:00.000Z' },
-      { source_kind: 'transcript', role: 'assistant', quote: '琥珀的原句。', captured_at: '2026-08-01T10:00:01.000Z' },
-      { source_kind: 'legacy_memory', quote: '旧系统留下的记忆记录。', captured_at: '2026-06-04T02:12:11.000Z' },
-    ]);
+  it('renders canonical memory context before source-faithful historical evidence', () => {
+    const snippets = [
+      { source_kind: 'transcript' as const, role: 'user', quote: '猫的原句。', captured_at: '2026-08-01T10:00:00.000Z' },
+      { source_kind: 'transcript' as const, role: 'assistant', quote: '琥珀的原句。', captured_at: '2026-08-01T10:00:01.000Z' },
+      { source_kind: 'legacy_memory' as const, quote: '旧系统留下的记忆记录。', captured_at: '2026-06-04T02:12:11.000Z' },
+    ];
+    const quotes = renderHistoricalWhisperQuotes(snippets);
+    expect(quotes).toContain('猫：「猫的原句。」');
+    expect(quotes).toContain('当时琥珀：「琥珀的原句。」');
+    expect(quotes).toContain('旧记忆记录：「旧系统留下的记忆记录。」');
+    expect(quotes).not.toContain('当时琥珀：「旧系统留下的记忆记录。」');
+
+    const text = renderHistoricalMemoryWhisper('猫和琥珀记得这个片段。', snippets);
+    expect(text).toContain('记忆：猫和琥珀记得这个片段。\n\n[2026-08-01]');
     expect(text).toContain('猫：「猫的原句。」');
     expect(text).toContain('当时琥珀：「琥珀的原句。」');
     expect(text).toContain('旧记忆记录：「旧系统留下的记忆记录。」');
-    expect(text).not.toContain('当时琥珀：「旧系统留下的记忆记录。」');
   });
+
   it('keeps the foreground whisper successful but cancel/defers resources when continuation fails after release', async () => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-worker-post-whisper-'));
     dirs.push(cwd);
@@ -98,6 +106,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         const searchResult = await search.execute('search-1', { query: '咖啡' });
         const hit = searchResult.results[0];
         expect(hit.memory_id).toBe('mem-coffee-scene');
+        expect(hit.summary).toBe('猫和琥珀聊到咖啡。');
         expect(hit.quote_snippets.length).toBeGreaterThanOrEqual(2);
         const userSnippet = hit.quote_snippets.find((item: any) => item.role === 'user');
         const assistantSnippet = hit.quote_snippets.find((item: any) => item.role === 'assistant');
@@ -108,7 +117,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         await expect(whisper.execute('whisper-hidden', {
           memory_id: hit.memory_id,
           snippet_ids: [hiddenCanonicalSnippet],
-        })).rejects.toThrow('only quote snippets surfaced by a prior memory_search');
+        })).rejects.toThrow('only one memory and quote snippets surfaced by a prior memory_search');
         await whisper.execute('whisper-1', {
           memory_id: hit.memory_id,
           snippet_ids: [userSnippet.snippet_id, assistantSnippet.snippet_id],
@@ -132,6 +141,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     const pending = readPendingSubconWhispers(cwd, payload.sessionId);
     expect(pending).toHaveLength(1);
     expect(pending[0].whisper).toEqual(expect.objectContaining({ source: 'sync', turn_id: 'turn-test' }));
+    expect(pending[0].whisper.text).toContain('记忆：猫和琥珀聊到咖啡。\n\n[2026-08-01]');
     expect(pending[0].whisper.text).toContain('[2026-08-01]\n猫：「猫说：「今天想喝咖啡。」');
     expect(pending[0].whisper.text).toContain('当时琥珀：「那我陪猫去找咖啡><🐾」');
     expect(pending[0].whisper.text).not.toContain('我记得猫以前提过咖啡');
