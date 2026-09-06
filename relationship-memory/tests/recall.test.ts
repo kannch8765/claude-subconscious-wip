@@ -12,6 +12,7 @@ import {
   buildRecallTools,
   RECALL_EVIDENCE_LIMITS,
   executeRecall,
+  FileBackedSemanticRetriever,
   type AssistantRememberIntentRecord,
 } from '../src/index.js';
 import { RecallMcpServer, RECALL_TOOL } from '../../scripts/recall_mcp.js';
@@ -87,6 +88,28 @@ function writeTranscriptFixture(root: string): string {
   ];
   fs.writeFileSync(file, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
   return file;
+}
+
+function withRecallTimingEnv(values: Record<string, string | undefined>, run: () => Promise<void>): Promise<void> {
+  const snapshot = {
+    RELATIONSHIP_MEMORY_RECALL_TIMING: process.env.RELATIONSHIP_MEMORY_RECALL_TIMING,
+    RELATIONSHIP_MEMORY_RECALL_TIMING_FILE: process.env.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE,
+  };
+  if (values.RELATIONSHIP_MEMORY_RECALL_TIMING === undefined) delete process.env.RELATIONSHIP_MEMORY_RECALL_TIMING;
+  else process.env.RELATIONSHIP_MEMORY_RECALL_TIMING = values.RELATIONSHIP_MEMORY_RECALL_TIMING;
+  if (values.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE === undefined) delete process.env.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE;
+  else process.env.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE = values.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE;
+  return run().finally(() => {
+    if (snapshot.RELATIONSHIP_MEMORY_RECALL_TIMING === undefined) delete process.env.RELATIONSHIP_MEMORY_RECALL_TIMING;
+    else process.env.RELATIONSHIP_MEMORY_RECALL_TIMING = snapshot.RELATIONSHIP_MEMORY_RECALL_TIMING;
+    if (snapshot.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE === undefined) delete process.env.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE;
+    else process.env.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE = snapshot.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE;
+  });
+}
+
+function readTimingEvents(file: string): any[] {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
 }
 
 describe('assistant relationship-memory recall core', () => {
@@ -490,6 +513,170 @@ describe('assistant relationship-memory recall core', () => {
     expect(result.status).toBe('cancelled');
     await new Promise((resolve) => setTimeout(resolve, 100));
     expect(lateRejected).toBe(true);
+  });
+
+  it('emits no recall timing output when instrumentation is disabled', async () => {
+    const timingFile = path.join(temp('rm-recall-timing-disabled-'), 'timing.jsonl');
+    await withRecallTimingEnv({
+      RELATIONSHIP_MEMORY_RECALL_TIMING: '0',
+      RELATIONSHIP_MEMORY_RECALL_TIMING_FILE: timingFile,
+    }, async () => {
+      const result = await executeRecall({
+        query: 'disabled instrumentation check',
+        rootDir: temp('rm-recall-disabled-'),
+        subjectId: 'subject-1',
+        transcriptRoots: [],
+        recallId: 'recall-timing-disabled',
+        async runModel(session) {
+          session.deliver({ recall_id: session.recallId, answer: 'ok', source_refs: [] });
+        },
+      });
+      expect(result.status).toBe('ok');
+    });
+    expect(fs.existsSync(timingFile)).toBe(false);
+  });
+
+  it('emits expected explicit-recall timing segments with initial/expand phases and execute total', async () => {
+    const root = temp('rm-recall-timing-enabled-');
+    seedRelationshipMemory(root);
+    const transcripts = temp('rm-recall-timing-enabled-transcripts-');
+    writeTranscriptFixture(transcripts);
+    const retriever = new FileBackedSemanticRetriever({
+      fingerprint: 'timing-test-fingerprint',
+      model: 'timing-test-model',
+      dimensions: 3,
+      maxBatchSize: 16,
+      async embedDocuments(texts: string[]) { return texts.map((_, index) => [index + 1, index + 2, index + 3]); },
+      async embedQuery() { return [1, 2, 3]; },
+    }, path.join(temp('rm-recall-timing-index-'), 'index.json'));
+    const warmup = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [transcripts], semanticRetriever: retriever });
+    await warmup.relationshipMemorySearchHybrid({ query: 'Kyoto orange cake' });
+
+    const timingFile = path.join(temp('rm-recall-timing-output-'), 'timing.jsonl');
+    await withRecallTimingEnv({
+      RELATIONSHIP_MEMORY_RECALL_TIMING: '1',
+      RELATIONSHIP_MEMORY_RECALL_TIMING_FILE: timingFile,
+    }, async () => {
+      const result = await executeRecall({
+        query: 'Kyoto relationship-memory scaffold',
+        rootDir: root,
+        subjectId: 'subject-1',
+        transcriptRoots: [transcripts],
+        semanticRetriever: retriever,
+        recallId: 'recall-timing-enabled',
+        async runModel(session) {
+          const initial = await session.evidenceBundle({ query: 'Kyoto relationship-memory scaffold' });
+          const expanded = await session.expandEvidenceBundle({ query: 'CCDK relationship-memory scaffold' });
+          const selected = initial.source_refs[0] ?? expanded.source_refs[0];
+          session.deliver({ recall_id: session.recallId, answer: 'timed', source_refs: selected ? [selected] : [] });
+        },
+      });
+      expect(result.status).toBe('ok');
+    });
+
+    const events = readTimingEvents(timingFile);
+    const seen = new Set(events.map((event) => `${event.phase}:${event.segment}`));
+    expect(seen).toContain('initial:relationship_candidate_set_construction');
+    expect(seen).toContain('initial:relationship_lexical_scoring');
+    expect(seen).toContain('initial:semantic_query_embedding_external');
+    expect(seen).toContain('initial:semantic_local_vector_comparison');
+    expect(seen).toContain('initial:relationship_local_vector_comparison');
+    expect(seen).toContain('initial:relationship_local_vector_sorting');
+    expect(seen).toContain('initial:transcript_search_total');
+    expect(seen).toContain('initial:transcript_read_window');
+    expect(seen).toContain('initial:fit_evidence_bundle_assembly');
+    expect(seen).toContain('initial:fit_evidence_bundle_truncation');
+    expect(seen).toContain('expand_recall:relationship_candidate_set_construction');
+    expect(seen).toContain('expand_recall:transcript_search_total');
+    const total = events.find((event) => event.phase === 'total' && event.segment === 'execute_recall_total');
+    expect(total).toBeTruthy();
+    expect(total.expansion_occurred).toBe(true);
+    const transcriptSearch = events.find((event) => event.segment === 'transcript_search_total');
+    expect(transcriptSearch.scanned_file_count).toBeGreaterThan(0);
+    expect(transcriptSearch.parsed_line_count).toBeGreaterThan(0);
+  });
+
+  it('returns byte-identical RecallResult with instrumentation enabled or disabled', async () => {
+    const root = temp('rm-recall-timing-stability-');
+    const run = async () => executeRecall({
+      query: 'result stability check',
+      rootDir: root,
+      subjectId: 'subject-1',
+      transcriptRoots: [],
+      recallId: 'recall-timing-stability',
+      async runModel(session) {
+        session.deliver({ recall_id: session.recallId, answer: 'stable answer', source_refs: [] });
+      },
+    });
+    let disabled: any;
+    await withRecallTimingEnv({
+      RELATIONSHIP_MEMORY_RECALL_TIMING: undefined,
+      RELATIONSHIP_MEMORY_RECALL_TIMING_FILE: undefined,
+    }, async () => { disabled = await run(); });
+    const timingFile = path.join(temp('rm-recall-timing-stability-output-'), 'timing.jsonl');
+    let enabled: any;
+    await withRecallTimingEnv({
+      RELATIONSHIP_MEMORY_RECALL_TIMING: '1',
+      RELATIONSHIP_MEMORY_RECALL_TIMING_FILE: timingFile,
+    }, async () => { enabled = await run(); });
+    expect(enabled).toEqual(disabled);
+    expect(JSON.stringify(enabled)).toBe(JSON.stringify(disabled));
+  });
+
+  it('never logs query, memory text, transcript text, or other user data in timing output', async () => {
+    const root = temp('rm-recall-timing-redaction-');
+    seedRelationshipMemory(root);
+    const transcripts = temp('rm-recall-timing-redaction-transcripts-');
+    writeTranscriptFixture(transcripts);
+    const timingFile = path.join(temp('rm-recall-timing-redaction-output-'), 'timing.jsonl');
+
+    await withRecallTimingEnv({
+      RELATIONSHIP_MEMORY_RECALL_TIMING: '1',
+      RELATIONSHIP_MEMORY_RECALL_TIMING_FILE: timingFile,
+    }, async () => {
+      const result = await executeRecall({
+        query: 'QUERY_SENTINEL_SECRET',
+        rootDir: root,
+        subjectId: 'subject-1',
+        transcriptRoots: [transcripts],
+        recallId: 'recall-timing-redaction',
+        async runModel(session) {
+          const initial = await session.evidenceBundle({ query: 'QUERY_SENTINEL_SECRET' });
+          session.deliver({ recall_id: session.recallId, answer: 'done', source_refs: initial.source_refs.slice(0, 1) });
+        },
+      });
+      expect(result.status).toBe('ok');
+    });
+
+    const output = fs.readFileSync(timingFile, 'utf8');
+    expect(output).not.toContain('QUERY_SENTINEL_SECRET');
+    expect(output).not.toContain('orange cake inclusion gesture');
+    expect(output).not.toContain('Today we worked on the relationship-memory scaffold');
+    expect(output).not.toContain('SECRET HIDDEN REASONING');
+  });
+
+  it('never fails recall when timing file path is unwritable', async () => {
+    const root = temp('rm-recall-timing-unwritable-root-');
+    seedRelationshipMemory(root);
+    const unwritablePath = temp('rm-recall-timing-unwritable-target-');
+    await withRecallTimingEnv({
+      RELATIONSHIP_MEMORY_RECALL_TIMING: '1',
+      RELATIONSHIP_MEMORY_RECALL_TIMING_FILE: unwritablePath,
+    }, async () => {
+      const result = await executeRecall({
+        query: 'Kyoto',
+        rootDir: root,
+        subjectId: 'subject-1',
+        transcriptRoots: [],
+        recallId: 'recall-timing-unwritable',
+        async runModel(session) {
+          const initial = await session.evidenceBundle({ query: 'Kyoto' });
+          session.deliver({ recall_id: session.recallId, answer: 'ok', source_refs: initial.source_refs.slice(0, 1) });
+        },
+      });
+      expect(result.status).toBe('ok');
+    });
+    expect(fs.statSync(unwritablePath).isDirectory()).toBe(true);
   });
 
   it('never changes relationship-memory ledgers during search/read/delivery or transport failure', async () => {
