@@ -47,6 +47,8 @@ interface WriteIndexManifest {
 interface WriteIndexMarkerEntry {
   key: string;
   value?: string;
+  memory_id?: never;
+  evidence_ids?: never;
 }
 
 function positiveEnvMs(name: string, fallback: number): number {
