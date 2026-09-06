@@ -5,6 +5,7 @@ import { afterEach, expect, it } from 'vitest';
 import {
   ASSISTANT_REMEMBER_TOOL_NAME,
   FileBackedSemanticRetriever,
+  RelationshipMemoryRecallSession,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
   buildRecallTools,
@@ -72,7 +73,7 @@ function seedSyntheticMemory(root: string): void {
   runtime.finalizeBatch('task16-batch-1', true);
 }
 
-it('records segmented timing for repeated buildRecallTools calls without logging user content', async () => {
+it('records visible segmented timing for repeated buildRecallTools calls without logging user content', async () => {
   const root = temp('rm-task16-store-');
   seedSyntheticMemory(root);
   const transcripts = temp('rm-task16-transcripts-');
@@ -123,24 +124,29 @@ it('records segmented timing for repeated buildRecallTools calls without logging
 
   const output = fs.readFileSync(timingFile, 'utf8');
   const events = output.trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-  console.log(`TASK16_MULTIROUND_TIMING_EVENTS ${JSON.stringify(events)}`);
+  for (const event of events) console.log(`TASK16_MULTIROUND_TIMING_SAMPLE ${JSON.stringify(event)}`);
 
-  const toolEvents = events.filter((event) => event.phase === 'tool_call');
-  const seen = new Set(toolEvents.map((event) => `${event.tool_name}:${event.segment}`));
-  expect(seen).toContain('relationship_memory_search:relationship_candidate_set_construction');
-  expect(seen).toContain('relationship_memory_search:relationship_lexical_scoring');
-  expect(seen).toContain('relationship_memory_search:semantic_query_embedding_external');
-  expect(seen).toContain('relationship_memory_search:semantic_local_vector_comparison');
-  expect(seen).toContain('relationship_memory_search:relationship_local_vector_sorting');
-  expect(seen).toContain('transcript_search:transcript_search_total');
-  expect(seen).toContain('transcript_read:transcript_read_window');
+  const segmented = events.filter((event) => event.phase !== 'total');
+  expect(segmented.length).toBeGreaterThan(0);
+  const unscoped = events.filter((event) => event.phase === 'unscoped');
+  expect(unscoped.length).toBeGreaterThan(0);
+  expect(unscoped.every((event) => event.context_missing === true)).toBe(true);
+  const eventIndices = unscoped.map((event) => event.event_index);
+  expect(new Set(eventIndices).size).toBe(eventIndices.length);
 
-  const relationshipCalls = new Set(
-    toolEvents
-      .filter((event) => event.tool_name === 'relationship_memory_search')
-      .map((event) => event.tool_call_index),
-  );
-  expect(relationshipCalls.size).toBe(2);
+  const segments = unscoped.map((event) => event.segment);
+  expect(segments).toContain('relationship_candidate_set_construction');
+  expect(segments).toContain('relationship_lexical_scoring');
+  expect(segments).toContain('relationship_local_vector_sorting');
+  expect(segments).toContain('transcript_search_total');
+  expect(segments).toContain('transcript_read_window');
+
+  const relationshipStarts = unscoped.filter((event) => event.segment === 'relationship_candidate_set_construction');
+  expect(relationshipStarts).toHaveLength(2);
+  expect(new Set(relationshipStarts.map((event) => event.event_index)).size).toBe(2);
+
+  const total = events.find((event) => event.phase === 'total' && event.segment === 'execute_recall_total');
+  expect(total?.recall_id).toBe('recall-task16-multiround');
 
   expect(output).not.toContain('TASK16_QUERY_SENTINEL');
   expect(output).not.toContain('TASK16_MEMORY_SENTINEL');
@@ -149,4 +155,27 @@ it('records segmented timing for repeated buildRecallTools calls without logging
   expect(output).not.toContain('TASK16_MEMORY_SUMMARY_SENTINEL');
   expect(output).not.toContain('TASK16_MEMORY_EVENT_SENTINEL');
   expect(output).not.toContain('TASK16_TRANSCRIPT_SENTINEL');
+});
+
+it('emits an explicit unscoped fallback instead of silently dropping a direct segment without context', () => {
+  const root = temp('rm-task16-unscoped-store-');
+  seedSyntheticMemory(root);
+  const timingFile = path.join(temp('rm-task16-unscoped-output-'), 'timing.jsonl');
+  process.env.RELATIONSHIP_MEMORY_RECALL_TIMING = '1';
+  process.env.RELATIONSHIP_MEMORY_RECALL_TIMING_FILE = timingFile;
+
+  const session = new RelationshipMemoryRecallSession({
+    rootDir: root,
+    subjectId: 'subject-1',
+    transcriptRoots: [],
+    recallId: 'recall-task16-direct-session',
+  });
+  session.relationshipMemorySearch({ query: 'task16 coverage' });
+
+  const events = fs.readFileSync(timingFile, 'utf8').trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+  expect(events.length).toBeGreaterThan(0);
+  expect(events.every((event) => event.phase === 'unscoped')).toBe(true);
+  expect(events.every((event) => event.recall_id === 'unscoped')).toBe(true);
+  expect(events.every((event) => event.context_missing === true)).toBe(true);
+  expect(new Set(events.map((event) => event.event_index)).size).toBe(events.length);
 });
