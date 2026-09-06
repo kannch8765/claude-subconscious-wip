@@ -2,11 +2,13 @@ import * as fs from 'fs';
 import { AsyncLocalStorage } from 'async_hooks';
 import { performance } from 'perf_hooks';
 
-export type RecallTimingPhase = 'initial' | 'expand_recall' | 'unscoped' | 'total';
+export type RecallTimingPhase = 'initial' | 'expand_recall' | 'tool_call' | 'unscoped' | 'total';
 
 export interface RecallTimingContext {
   recall_id: string;
-  phase: Extract<RecallTimingPhase, 'initial' | 'expand_recall'>;
+  phase: Extract<RecallTimingPhase, 'initial' | 'expand_recall' | 'tool_call'>;
+  tool_name?: 'relationship_memory_search' | 'transcript_search' | 'transcript_read';
+  tool_call_index?: number;
 }
 
 export interface RecallTimingEvent {
@@ -84,6 +86,8 @@ export function emitRecallTimingSegment(
     phase: context.phase,
     segment,
     duration_ms: timingDurationMs(startedAt),
+    ...(context.tool_name ? { tool_name: context.tool_name } : {}),
+    ...(context.tool_call_index !== undefined ? { tool_call_index: context.tool_call_index } : {}),
     ...extra,
   });
 }
