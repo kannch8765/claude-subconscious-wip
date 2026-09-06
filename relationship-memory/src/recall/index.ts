@@ -207,6 +207,103 @@ function resultSourceRef(value: unknown): string | undefined {
   return typeof sourceRef === 'string' && sourceRef ? sourceRef : undefined;
 }
 
+function truncateUtf8(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxBytes) return value;
+  const suffix = '…';
+  const suffixBytes = Buffer.byteLength(suffix, 'utf8');
+  let used = 0;
+  let out = '';
+  for (const char of value) {
+    const bytes = Buffer.byteLength(char, 'utf8');
+    if (used + bytes + suffixBytes > maxBytes) break;
+    out += char;
+    used += bytes;
+  }
+  return `${out}${suffix}`;
+}
+
+function refreshBundleProvenance(bundle: RecallEvidenceBundle): void {
+  const hitRefs = new Set(bundle.transcript_hits.map(resultSourceRef).filter((value): value is string => Boolean(value)));
+  bundle.transcript_windows = bundle.transcript_windows.filter((window) => hitRefs.has(window.hit_source_ref) && Array.isArray(window.context) && window.context.length > 0);
+  const sourceRefs = new Set<string>();
+  for (const item of bundle.relationship_results) {
+    const sourceRef = resultSourceRef(item);
+    if (sourceRef) sourceRefs.add(sourceRef);
+  }
+  for (const item of bundle.transcript_hits) {
+    const sourceRef = resultSourceRef(item);
+    if (sourceRef) sourceRefs.add(sourceRef);
+  }
+  for (const window of bundle.transcript_windows) {
+    sourceRefs.add(window.hit_source_ref);
+    sourceRefs.add(window.source_ref);
+  }
+  bundle.source_refs = [...sourceRefs];
+}
+
+function shrinkLongestBundleString(value: unknown): boolean {
+  let best: { parent: Record<string, unknown> | unknown[]; key: string | number; text: string; bytes: number } | undefined;
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => {
+        if (typeof item === 'string') {
+          const bytes = Buffer.byteLength(item, 'utf8');
+          if (bytes > 96 && (!best || bytes > best.bytes)) best = { parent: node, key: index, text: item, bytes };
+        } else visit(item);
+      });
+      return;
+    }
+    for (const [key, item] of Object.entries(node as Record<string, unknown>)) {
+      if (key === 'source_ref' || key === 'hit_source_ref') continue;
+      if (typeof item === 'string') {
+        const bytes = Buffer.byteLength(item, 'utf8');
+        if (bytes > 96 && (!best || bytes > best.bytes)) best = { parent: node as Record<string, unknown>, key, text: item, bytes };
+      } else visit(item);
+    }
+  };
+  visit(value);
+  if (!best) return false;
+  const nextBytes = Math.max(96, Math.floor(best.bytes / 2));
+  (best.parent as any)[best.key] = truncateUtf8(best.text, nextBytes);
+  return true;
+}
+
+function fitEvidenceBundle(input: RecallEvidenceBundle): RecallEvidenceBundle {
+  const bundle = JSON.parse(JSON.stringify(input)) as RecallEvidenceBundle;
+  refreshBundleProvenance(bundle);
+  const bytes = () => Buffer.byteLength(JSON.stringify(bundle), 'utf8');
+  while (bytes() > RECALL_EVIDENCE_LIMITS.max_serialized_bytes) {
+    if (shrinkLongestBundleString(bundle)) {
+      refreshBundleProvenance(bundle);
+      continue;
+    }
+    const window = [...bundle.transcript_windows].reverse().find((item) => item.context.length > 1);
+    if (window) {
+      window.context.pop();
+      refreshBundleProvenance(bundle);
+      continue;
+    }
+    if (bundle.transcript_windows.length) {
+      bundle.transcript_windows.pop();
+      refreshBundleProvenance(bundle);
+      continue;
+    }
+    if (bundle.transcript_hits.length) {
+      bundle.transcript_hits.pop();
+      refreshBundleProvenance(bundle);
+      continue;
+    }
+    if (bundle.relationship_results.length) {
+      bundle.relationship_results.pop();
+      refreshBundleProvenance(bundle);
+      continue;
+    }
+    throw new Error(`Recall evidence bundle could not fit within ${RECALL_EVIDENCE_LIMITS.max_serialized_bytes} bytes.`);
+  }
+  return bundle;
+}
+
 function transcriptRootsFromEnvironment(): string[] {
   const configured = process.env.RELATIONSHIP_MEMORY_TRANSCRIPT_DIR;
   if (configured) return configured.split(path.delimiter).map((item) => item.trim()).filter(Boolean);
@@ -266,6 +363,8 @@ export class RelationshipMemoryRecallSession {
   private closedReason?: 'timeout' | 'cancelled' | 'failed';
   private readonly semanticRetriever?: SemanticRetriever;
   private expansionCount = 0;
+  private bundleEvidenceStarted = false;
+  private readonly bundleEvidenceRefs = new Set<string>();
 
   constructor(options: {
     recallId?: string;
@@ -403,6 +502,32 @@ export class RelationshipMemoryRecallSession {
     }
   }
 
+  private async relationshipMemorySearchHybridExisting(input: RelationshipMemorySearchInput = {}): Promise<{ results: unknown[] }> {
+    this.assertOpen();
+    const query = input.query?.trim();
+    const rankExisting = this.semanticRetriever?.rankExisting?.bind(this.semanticRetriever);
+    if (!rankExisting || !query) return this.relationshipMemorySearch(input);
+    const limit = boundedLimit(input.limit, 8, 20);
+    const candidates = this.relationshipSearchCandidates(input);
+    const documents = candidates.map((item) => ({
+      id: item.kind === 'memory' ? `memory:${item.memory.memory_id}` : `entity:${item.entity.entity_id}`,
+      text: item.text,
+    }));
+    try {
+      const semantic = await rankExisting(documents, query);
+      this.assertOpen();
+      const ranked = candidates.map((item, index) => {
+        const score = hybridScore(item.lexicalScore, semantic.get(documents[index].id));
+        return item.kind === 'memory'
+          ? { kind: 'memory' as const, memory: item.memory, intents: item.intents, score }
+          : { kind: 'entity' as const, entity: item.entity, score };
+      });
+      return this.renderRelationshipSearchResults(ranked, limit);
+    } catch {
+      return this.relationshipMemorySearch(input);
+    }
+  }
+
   async transcriptSearch(input: TranscriptSearchInput = {}): Promise<{ results: unknown[] }> {
     this.assertOpen();
     const limit = boundedLimit(input.limit, 10, 20);
@@ -503,7 +628,7 @@ export class RelationshipMemoryRecallSession {
   async evidenceBundle(input: RecallEvidenceBundleInput): Promise<RecallEvidenceBundle> {
     this.assertOpen();
     const query = cleanText(input?.query, 'query');
-    const relationship = await this.relationshipMemorySearchHybrid({
+    const relationship = await this.relationshipMemorySearchHybridExisting({
       query,
       ...(input.kind ? { kind: input.kind } : {}),
       ...(input.time_start ? { time_start: input.time_start } : {}),
@@ -532,20 +657,6 @@ export class RelationshipMemoryRecallSession {
       transcriptWindows.push({ hit_source_ref: hitSourceRef, ...read });
     }
 
-    const sourceRefs = new Set<string>();
-    for (const item of relationship.results) {
-      const sourceRef = resultSourceRef(item);
-      if (sourceRef) sourceRefs.add(sourceRef);
-    }
-    for (const item of transcript.results) {
-      const sourceRef = resultSourceRef(item);
-      if (sourceRef) sourceRefs.add(sourceRef);
-    }
-    for (const item of transcriptWindows) {
-      sourceRefs.add(item.hit_source_ref);
-      sourceRefs.add(item.source_ref);
-    }
-
     const bundle: RecallEvidenceBundle = {
       schema_version: 1,
       policy: 'explicit_recall',
@@ -555,13 +666,12 @@ export class RelationshipMemoryRecallSession {
       relationship_results: relationship.results,
       transcript_hits: transcript.results,
       transcript_windows: transcriptWindows,
-      source_refs: [...sourceRefs],
+      source_refs: [],
     };
-    const serializedBytes = Buffer.byteLength(JSON.stringify(bundle), 'utf8');
-    if (serializedBytes > RECALL_EVIDENCE_LIMITS.max_serialized_bytes) {
-      throw new Error(`Recall evidence bundle exceeded ${RECALL_EVIDENCE_LIMITS.max_serialized_bytes} bytes.`);
-    }
-    return bundle;
+    const fitted = fitEvidenceBundle(bundle);
+    this.bundleEvidenceStarted = true;
+    for (const sourceRef of fitted.source_refs) this.bundleEvidenceRefs.add(sourceRef);
+    return fitted;
   }
 
   async expandEvidenceBundle(input: ExpandRecallInput): Promise<RecallEvidenceBundle> {
@@ -587,6 +697,7 @@ export class RelationshipMemoryRecallSession {
     for (const ref of sourceRefs) {
       const source = this.sources.get(ref);
       if (!source) throw new Error(`Unknown or fabricated source_ref: ${ref}`);
+      if (this.bundleEvidenceStarted && !this.bundleEvidenceRefs.has(ref)) throw new Error(`source_ref was not provided to the recall model: ${ref}`);
       summaries.push(source.summary);
     }
     this.delivered = {
@@ -730,6 +841,7 @@ export async function executeRecall(options: {
   transcriptRoots?: string[];
   timeoutMs?: number;
   signal?: AbortSignal;
+  semanticRetriever?: SemanticRetriever;
   runModel: RecallModelRunner;
   recallId?: string;
 }): Promise<RecallResult> {
@@ -740,6 +852,7 @@ export async function executeRecall(options: {
     rootDir: options.rootDir,
     subjectId: options.subjectId,
     transcriptRoots: options.transcriptRoots,
+    semanticRetriever: options.semanticRetriever,
   });
   const controller = new AbortController();
   let externalCancelled = false;

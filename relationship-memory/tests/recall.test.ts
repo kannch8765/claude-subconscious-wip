@@ -192,6 +192,58 @@ describe('assistant relationship-memory recall core', () => {
     await expect(tools[0].execute('call-2', { query: 'again' })).rejects.toThrow(/at most once/);
   });
 
+  it('fits oversized UTF-8 evidence within 128 KiB while keeping source linkage valid', async () => {
+    const root = temp('rm-recall-oversized-utf8-');
+    const transcripts = temp('rm-recall-oversized-utf8-transcripts-');
+    const huge = `京都橙子蛋糕${'猫咪记得这份礼物。'.repeat(30_000)}`;
+    fs.writeFileSync(path.join(transcripts, 'huge.jsonl'), [
+      JSON.stringify({ type: 'user', uuid: 'huge-u1', timestamp: '2026-08-20T10:00:00.000Z', message: { content: [{ type: 'text', text: huge }] } }),
+      JSON.stringify({ type: 'assistant', uuid: 'huge-a1', timestamp: '2026-08-20T10:01:00.000Z', message: { content: [{ type: 'text', text: '我记得京都橙子蛋糕。' }] } }),
+    ].join('\n') + '\n');
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [transcripts] });
+    const bundle = await recall.evidenceBundle({ query: '京都橙子蛋糕' });
+    expect(Buffer.byteLength(JSON.stringify(bundle), 'utf8')).toBeLessThanOrEqual(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
+    expect(bundle.transcript_hits.length).toBeGreaterThan(0);
+    expect(bundle.transcript_windows.length).toBeGreaterThan(0);
+    expect(bundle.transcript_windows[0].hit_source_ref).toBe((bundle.transcript_hits[0] as any).source_ref);
+    expect(bundle.source_refs).toEqual(expect.arrayContaining([(bundle.transcript_hits[0] as any).source_ref, bundle.transcript_windows[0].source_ref]));
+    expect(JSON.stringify(bundle)).toContain('…');
+
+    const expanded = await recall.expandEvidenceBundle({ query: '京都橙子蛋糕' });
+    expect(Buffer.byteLength(JSON.stringify(expanded), 'utf8')).toBeLessThanOrEqual(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
+    expect(expanded.transcript_windows[0].hit_source_ref).toBe((expanded.transcript_hits[0] as any).source_ref);
+    expect(expanded.source_refs).toEqual(expect.arrayContaining([(expanded.transcript_hits[0] as any).source_ref, expanded.transcript_windows[0].source_ref]));
+  });
+
+  it('allows bundle delivery to cite only evidence actually handed to the model', async () => {
+    const root = temp('rm-recall-bundle-provenance-');
+    seedRelationshipMemory(root);
+    const recall = new RelationshipMemoryRecallSession({ recallId: 'recall-bundle-provenance', rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
+    const preBundle = recall.relationshipMemorySearch({ query: 'Kyoto' }) as any;
+    const hiddenRef = preBundle.results[0].source_ref;
+    const bundle = await recall.evidenceBundle({ query: 'definitely absent evidence' });
+    expect(bundle.source_refs).toEqual([]);
+    expect(() => recall.deliver({ recall_id: recall.recallId, answer: 'bad', source_refs: [hiddenRef] })).toThrow(/not provided to the recall model/);
+    expect(() => recall.deliver({ recall_id: recall.recallId, answer: 'bad', source_refs: ['recall_src_unknown'] })).toThrow(/fabricated/);
+    expect(recall.deliver({ recall_id: recall.recallId, answer: 'good', source_refs: [] })).toEqual(expect.objectContaining({ source_refs: [] }));
+  });
+
+  it('uses only existing semantic document vectors during bundle search while retaining query ranking', async () => {
+    const root = temp('rm-recall-readonly-semantic-');
+    seedRelationshipMemory(root);
+    let refreshCalls = 0;
+    let existingCalls = 0;
+    const semanticRetriever = {
+      async rank() { refreshCalls += 1; throw new Error('document refresh must not run'); },
+      async rankExisting(documents: Array<{ id: string }>) { existingCalls += 1; return new Map(documents.map((document) => [document.id, 0.5])); },
+    };
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [], semanticRetriever: semanticRetriever as any });
+    const bundle = await recall.evidenceBundle({ query: 'Kyoto orange cake' });
+    expect(bundle.relationship_results).toHaveLength(1);
+    expect(refreshCalls).toBe(0);
+    expect(existingCalls).toBe(1);
+  });
+
   it('returns an empty bounded bundle without broadening scope when no evidence matches', async () => {
     const recall = new RelationshipMemoryRecallSession({
       rootDir: temp('rm-recall-empty-bundle-'),
@@ -251,6 +303,52 @@ describe('assistant relationship-memory recall core', () => {
     expect(result).toEqual(expect.objectContaining({
       status: 'ok', answer: 'accepted before cancel', source_refs: [],
     }));
+  });
+
+  it('applies the total deadline while initial evidence prefetch is still running', async () => {
+    const root = temp('rm-recall-prefetch-timeout-');
+    seedRelationshipMemory(root);
+    const semanticRetriever = {
+      async rank() { throw new Error('unexpected refresh'); },
+      async rankExisting(documents: Array<{ id: string }>) { await new Promise((resolve) => setTimeout(resolve, 180)); return new Map(documents.map((document) => [document.id, 0.5])); },
+    };
+    let lateDeliveryRejected = false;
+    const result = await executeRecall({
+      query: 'Kyoto', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 100, semanticRetriever: semanticRetriever as any,
+      async runModel(session) {
+        try {
+          const bundle = await session.evidenceBundle({ query: 'Kyoto' });
+          session.deliver({ recall_id: session.recallId, answer: 'late', source_refs: bundle.source_refs.slice(0, 1) });
+        } catch { lateDeliveryRejected = true; }
+      },
+    });
+    expect(result.status).toBe('timeout');
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(lateDeliveryRejected).toBe(true);
+  });
+
+  it('applies cancellation while the one allowed expansion is still running', async () => {
+    const root = temp('rm-recall-expand-cancel-');
+    seedRelationshipMemory(root);
+    const controller = new AbortController();
+    let calls = 0;
+    let lateExpansionRejected = false;
+    const semanticRetriever = {
+      async rank() { throw new Error('unexpected refresh'); },
+      async rankExisting(documents: Array<{ id: string }>) { calls += 1; if (calls > 1) await new Promise((resolve) => setTimeout(resolve, 150)); return new Map(documents.map((document) => [document.id, 0.5])); },
+    };
+    const pending = executeRecall({
+      query: 'Kyoto', rootDir: root, subjectId: 'subject-1', transcriptRoots: [], timeoutMs: 5_000, signal: controller.signal, semanticRetriever: semanticRetriever as any,
+      async runModel(session) {
+        await session.evidenceBundle({ query: 'Kyoto' });
+        try { await session.expandEvidenceBundle({ query: 'orange cake' }); } catch { lateExpansionRejected = true; }
+      },
+    });
+    setTimeout(() => controller.abort(), 30);
+    const result = await pending;
+    expect(result.status).toBe('cancelled');
+    await new Promise((resolve) => setTimeout(resolve, 160));
+    expect(lateExpansionRejected).toBe(true);
   });
 
   it('returns an explicit timeout and rejects a late delivery after the deadline', async () => {
