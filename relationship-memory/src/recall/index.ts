@@ -141,30 +141,6 @@ function boundedContext(value: unknown, fallback: number): number {
   return Math.min(value as number, 5);
 }
 
-function tokens(value: string | undefined): string[] {
-  if (!value?.trim()) return [];
-  return [...new Set(value.toLowerCase().match(/[\p{L}\p{N}]+/gu) ?? [])].filter((token) => token.length > 1);
-}
-
-function textScore(haystack: string, query: string | undefined): number {
-  if (!query?.trim()) return 1;
-  const normalized = haystack.toLowerCase();
-  const exact = query.trim().toLowerCase();
-  let score = normalized.includes(exact) ? 100 : 0;
-  const queryTokens = tokens(query);
-  if (queryTokens.length === 0) return score;
-  let matches = 0;
-  for (const token of queryTokens) {
-    if (normalized.includes(token)) {
-      matches += 1;
-      score += token.length >= 5 ? 4 : 2;
-    }
-  }
-  if (matches === 0) return 0;
-  score += Math.round((matches / queryTokens.length) * 20);
-  return score;
-}
-
 function inTimeWindow(timestamp: string | undefined, start: string | undefined, end: string | undefined): boolean {
   if (!start && !end) return true;
   if (!timestamp) return false;
@@ -546,7 +522,7 @@ export class RelationshipMemoryRecallSession {
         if (!visible) return;
         visibleIndex += 1;
         if (!inTimeWindow(visible.timestamp, input.time_start, input.time_end)) return;
-        const score = textScore(visible.text, input.query);
+        const score = lexicalTextScore(visible.text, input.query);
         if (score <= 0) return;
         candidates.push({
           file,

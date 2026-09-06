@@ -475,25 +475,52 @@ export function semanticText(...values: unknown[]): string {
   return parts.join('\n');
 }
 
+type LexicalTerm = { text: string; kind: 'latin' | 'cjk_bigram' };
+
+function lexicalTerms(value: string): LexicalTerm[] {
+  const normalized = value.toLowerCase();
+  const terms: LexicalTerm[] = [];
+  const seen = new Set<string>();
+  const latin = normalized.match(/[\p{Script=Latin}\p{N}]+/gu) ?? [];
+  for (const token of latin) {
+    if (token.length <= 1 || seen.has(`latin:${token}`)) continue;
+    seen.add(`latin:${token}`);
+    terms.push({ text: token, kind: 'latin' });
+  }
+  const cjkRuns = normalized.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}ーｰ]+/gu) ?? [];
+  for (const run of cjkRuns) {
+    const chars = Array.from(run);
+    for (let index = 0; index < chars.length - 1; index += 1) {
+      const bigram = `${chars[index]}${chars[index + 1]}`;
+      if (seen.has(`cjk:${bigram}`)) continue;
+      seen.add(`cjk:${bigram}`);
+      terms.push({ text: bigram, kind: 'cjk_bigram' });
+    }
+  }
+  return terms;
+}
+
 export function lexicalTextScore(haystack: string, query: string | undefined): number {
   if (!query?.trim()) return 1;
   const normalized = haystack.toLowerCase();
   const exact = query.trim().toLowerCase();
   let score = normalized.includes(exact) ? 100 : 0;
-  const queryTokens = [...new Set(exact.match(/[\p{L}\p{N}]+/gu) ?? [])].filter((token) => token.length > 1);
-  if (queryTokens.length === 0) return score;
+  const queryTerms = lexicalTerms(exact);
+  if (queryTerms.length === 0) return score;
   let matches = 0;
-  for (const token of queryTokens) {
-    if (normalized.includes(token)) {
+  for (const term of queryTerms) {
+    if (normalized.includes(term.text)) {
       matches += 1;
-      score += token.length >= 5 ? 4 : 2;
+      score += term.kind === 'latin' && term.text.length >= 5 ? 4 : 2;
     }
   }
   if (matches === 0) return score;
-  return score + Math.round((matches / queryTokens.length) * 20);
+  return score + Math.round((matches / queryTerms.length) * 20);
 }
 
 export function hybridScore(lexicalScore: number, semanticScore: number | undefined): number {
-  if (semanticScore === undefined || !Number.isFinite(semanticScore)) return lexicalScore;
-  return lexicalScore + Math.max(-1, Math.min(1, semanticScore)) * 100;
+  // Treat missing/invalid vectors as the most conservative semantic fallback so
+  // a document with no semantic signal cannot outrank one with known similarity.
+  const semantic = semanticScore === undefined || !Number.isFinite(semanticScore) ? -1 : semanticScore;
+  return lexicalScore + Math.max(-1, Math.min(1, semantic)) * 100;
 }
