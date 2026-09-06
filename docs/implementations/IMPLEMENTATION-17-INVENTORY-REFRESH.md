@@ -41,13 +41,13 @@
 
 ## 受保护路径 0 变更证据
 
-本任务交付提交的 changed-path allowlist 仅为：
+GitHub PR #108 的 changed-files 回读精确为 3 个路径：
 
 - `docs/BRANCH-INVENTORY.md`
 - `STATUS.md`
 - `docs/implementations/IMPLEMENTATION-17-INVENTORY-REFRESH.md`
 
-与禁止修改集合 `src/**`、`scripts/**`、`hooks/**`、`config/**`、`.github/workflows/**`、`package.json`、`tsconfig*.json`、`.mcp.json`、测试文件及其他既有 docs 正文的交集为空，因此受保护路径变更行数为 0。Draft PR 创建后再以 GitHub PR changed-files 回读机械复核这一点。
+PR 回读 `changed_files = 3`，没有其他路径。该集合与禁止修改集合 `src/**`、`scripts/**`、`hooks/**`、`config/**`、`.github/workflows/**`、`package.json`、`tsconfig*.json`、`.mcp.json`、测试文件及其他既有 docs 正文的交集为空，因此受保护路径变更行数为 0。
 
 ## CI 验收
 
