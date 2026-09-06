@@ -113,7 +113,13 @@ First implementation CI run:
 - typecheck initially failed on one TypeScript union-narrowing issue in the reinforcement marker path;
 - that issue was corrected with a typing-only marker declaration change, with no runtime behavior change.
 
-Final `npm run typecheck`, `npm run test:ci`, and `PR offline CI / offline-ci` status are recorded on the final PR head once the post-report run completes.
+Post-report validation on head `d8a780bb1a54eef7911bdadf16645688fc049d04` completed successfully:
+
+- `npm run test:ci`: PASS, 55 test files / 477 tests.
+- `npm run typecheck`: PASS.
+- `PR offline CI / offline-ci`: SUCCESS, run `34052554003`. GitHub Actions returned `head_sha=d8a780bb1a54eef7911bdadf16645688fc049d04`.
+
+The final report-only commit is followed by one more offline-ci run so the final PR head itself is also green.
 
 ## STATUS.md correction
 
