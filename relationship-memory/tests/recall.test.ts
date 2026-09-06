@@ -129,6 +129,22 @@ describe('assistant relationship-memory recall core', () => {
     await expect(recall.transcriptRead({ source_ref: 'recall_src_fabricated' })).rejects.toThrow(/trusted source_ref/);
   });
 
+  it('applies shared lexical scoring rules for transcript search across mixed Latin and CJK text', async () => {
+    const root = temp('rm-recall-shared-lexical-');
+    const transcripts = temp('rm-recall-shared-lexical-transcripts-');
+    fs.writeFileSync(path.join(transcripts, 'shared-lexical.jsonl'), [
+      JSON.stringify({ type: 'user', uuid: 'mixed-1', timestamp: '2026-08-06T09:00:00.000Z', message: { content: [{ type: 'text', text: 'coffee と一緒に咖啡も飲んだ' }] } }),
+      JSON.stringify({ type: 'assistant', uuid: 'cjk-1', timestamp: '2026-08-06T09:01:00.000Z', message: { content: [{ type: 'text', text: '今日はまた咖啡を飲んだ' }] } }),
+    ].join('\n') + '\n');
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [transcripts] });
+
+    const mixed = await recall.transcriptSearch({ query: 'coffee咖啡', limit: 10 }) as any;
+    expect(mixed.results.map((item: any) => item.message_id)).toContain('mixed-1');
+
+    const cjk = await recall.transcriptSearch({ query: '喜欢咖啡', limit: 10 }) as any;
+    expect(cjk.results.map((item: any) => item.message_id)).toContain('cjk-1');
+  });
+
   it('rejects fabricated delivery provenance, wrong recall IDs, and duplicate terminal delivery', () => {
     const root = temp('rm-recall-delivery-');
     seedRelationshipMemory(root);
