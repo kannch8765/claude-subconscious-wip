@@ -8,6 +8,7 @@ import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, MemoryKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
+import { emitRecallTiming, monotonicNow, recallTimingEnabled, timingDurationMs, type RecallTimingPhase } from './instrumentation.js';
 
 export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
@@ -341,6 +342,8 @@ export class RelationshipMemoryRecallSession {
   private readonly signal?: AbortSignal;
   private expansionCount = 0;
   private bundleEvidenceStarted = false;
+  private readonly timingEnabled = recallTimingEnabled();
+  private readonly timingStoreRootDir: string;
   private readonly bundleEvidenceRefs = new Set<string>();
 
   constructor(options: {
@@ -352,6 +355,7 @@ export class RelationshipMemoryRecallSession {
     signal?: AbortSignal;
   }) {
     this.recallId = options.recallId || `recall_${crypto.randomUUID()}`;
+    this.timingStoreRootDir = options.rootDir;
     this.deliveryPromise = new Promise<RecallResult>((resolve) => { this.resolveDelivery = resolve; });
     // ensureRoot=false is important: recall must not create or append store files.
     this.store = new RelationshipMemoryStore(options.rootDir, options.subjectId, undefined, false);
@@ -365,6 +369,7 @@ export class RelationshipMemoryRecallSession {
 
   get isClosed(): boolean { return Boolean(this.delivered || this.closedReason); }
   get delivery(): RecallResult | undefined { return this.delivered; }
+  get expanded(): boolean { return this.expansionCount > 0; }
   waitForDelivery(): Promise<RecallResult> { return this.deliveryPromise; }
 
   close(reason: 'timeout' | 'cancelled' | 'failed'): void {
@@ -374,6 +379,13 @@ export class RelationshipMemoryRecallSession {
   private assertOpen(): void {
     if (this.delivered) throw new Error('Recall already terminally delivered.');
     if (this.closedReason) throw new Error(`Recall is closed: ${this.closedReason}`);
+  }
+
+  private timingPhase(): Exclude<RecallTimingPhase, 'total'> { return this.expansionCount > 0 ? 'expand' : 'initial'; }
+
+  private emitTiming(segment: string, durationMs: number, counts: Record<string, number | boolean> = {}, phase: RecallTimingPhase = this.timingPhase()): void {
+    if (!this.timingEnabled) return;
+    emitRecallTiming({ schema_version: 1, event: 'relationship_memory_recall_timing', recall_id: this.recallId, phase, segment, duration_ms: durationMs, ...counts }, this.timingStoreRootDir);
   }
 
   private register(kind: RecallSourceKind, key: unknown, summary: Omit<RecallSourceSummary, 'source_ref' | 'kind'>, locator?: TranscriptLocator): string {
@@ -399,6 +411,15 @@ export class RelationshipMemoryRecallSession {
     { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string; lexicalScore: number }
     | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string; lexicalScore: number }
   > {
+    const candidateStartedAt = this.timingEnabled ? monotonicNow() : 0;
+    let lexicalDurationMs = 0;
+    let lexicalCalls = 0;
+    const scoreLexical = (text: string): number => {
+      if (!this.timingEnabled) return lexicalTextScore(text, input.query);
+      const startedAt = monotonicNow();
+      try { return lexicalTextScore(text, input.query); }
+      finally { lexicalDurationMs += timingDurationMs(startedAt); lexicalCalls += 1; }
+    };
     const owner = new RelationshipMemoryOwnerControlPlane(this.store);
     const candidates: Array<
       { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string; lexicalScore: number }
@@ -408,14 +429,19 @@ export class RelationshipMemoryRecallSession {
       if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;
       const intents = this.linkedAssistantIntents(memory.memory_id);
       const text = semanticText(memory.kind, memory.summary, memory.participants, memory.payload, intents.map((intent) => [intent.memory.text, intent.feel.text]));
-      candidates.push({ kind: 'memory', memory, intents, text, lexicalScore: lexicalTextScore(text, input.query) });
+      candidates.push({ kind: 'memory', memory, intents, text, lexicalScore: scoreLexical(text) });
     }
     if (!input.kind) {
       for (const entity of this.store.listEntities()) {
         if (!inTimeWindow(entity.observed_at, input.time_start, input.time_end)) continue;
         const text = semanticText(entity.canonical_name, entity.aliases, entity.entity_type, entity.description);
-        candidates.push({ kind: 'entity', entity, text, lexicalScore: lexicalTextScore(text, input.query) });
+        candidates.push({ kind: 'entity', entity, text, lexicalScore: scoreLexical(text) });
       }
+    }
+    if (this.timingEnabled) {
+      const totalMs = timingDurationMs(candidateStartedAt);
+      this.emitTiming('lexical_scoring', lexicalDurationMs, { lexical_calls: lexicalCalls, candidate_count: candidates.length });
+      this.emitTiming('candidate_set_build', Math.max(0, totalMs - lexicalDurationMs), { candidate_count: candidates.length });
     }
     return candidates;
   }
@@ -493,15 +519,18 @@ export class RelationshipMemoryRecallSession {
       text: item.text,
     }));
     try {
-      const semantic = await rankExisting(documents, query, this.signal);
+      const semantic = await rankExisting(documents, query, this.signal, this.timingEnabled ? { segment: (segment, durationMs, counts) => this.emitTiming(segment, durationMs, counts) } : undefined);
       this.assertOpen();
+      const rankingStartedAt = this.timingEnabled ? monotonicNow() : 0;
       const ranked = candidates.map((item, index) => {
         const score = hybridScore(item.lexicalScore, semantic.get(documents[index].id));
         return item.kind === 'memory'
           ? { kind: 'memory' as const, memory: item.memory, intents: item.intents, score }
           : { kind: 'entity' as const, entity: item.entity, score };
       });
-      return this.renderRelationshipSearchResults(ranked, limit);
+      const rendered = this.renderRelationshipSearchResults(ranked, limit);
+      if (this.timingEnabled) this.emitTiming('ranking_sort', timingDurationMs(rankingStartedAt), { candidate_count: candidates.length, result_count: rendered.results.length });
+      return rendered;
     } catch {
       return this.relationshipMemorySearch(input);
     }
@@ -513,11 +542,17 @@ export class RelationshipMemoryRecallSession {
     if (!input.query?.trim() && !input.time_start && !input.time_end) {
       throw new Error('transcript_search requires query and/or a time window');
     }
+    const transcriptSearchStartedAt = this.timingEnabled ? monotonicNow() : 0;
+    let parsedLines = 0;
+    const files = transcriptFiles(this.transcriptRoots);
+    let scannedFiles = 0;
     const candidates: TranscriptCandidate[] = [];
-    for (const file of transcriptFiles(this.transcriptRoots)) {
+    for (const file of files) {
       if (this.isClosed) break;
+      scannedFiles += 1;
       let visibleIndex = -1;
       await forEachJsonlLine(file, (raw) => {
+        parsedLines += 1;
         const visible = visibleTranscriptMessage(raw);
         if (!visible) return;
         visibleIndex += 1;
@@ -541,7 +576,7 @@ export class RelationshipMemoryRecallSession {
     }
     this.assertOpen();
     candidates.sort((a, b) => b.score - a.score || (b.timestamp ?? '').localeCompare(a.timestamp ?? '') || a.file.localeCompare(b.file) || a.visibleIndex - b.visibleIndex);
-    return {
+    const output = {
       results: candidates.slice(0, limit).map((candidate) => {
         const locator: TranscriptLocator = {
           file: candidate.file,
@@ -569,6 +604,8 @@ export class RelationshipMemoryRecallSession {
         };
       }),
     };
+    if (this.timingEnabled) this.emitTiming('transcript_search', timingDurationMs(transcriptSearchStartedAt), { scanned_files: scannedFiles, parsed_lines: parsedLines, result_count: output.results.length });
+    return output;
   }
 
   async transcriptRead(input: TranscriptReadInput): Promise<{ source_ref: string; context: unknown[] }> {
@@ -580,10 +617,13 @@ export class RelationshipMemoryRecallSession {
     }
     const before = boundedContext(input.before, 2);
     const after = boundedContext(input.after, 2);
+    const transcriptReadStartedAt = this.timingEnabled ? monotonicNow() : 0;
+    let parsedLines = 0;
     const target = source.locator.visibleIndex;
     const context: Array<{ timestamp: string | null; role: 'user' | 'assistant'; message_id: string | null; text: string }> = [];
     let visibleIndex = -1;
     await forEachJsonlLine(source.locator.file, (raw) => {
+      parsedLines += 1;
       const visible = visibleTranscriptMessage(raw);
       if (!visible) return;
       visibleIndex += 1;
@@ -601,11 +641,14 @@ export class RelationshipMemoryRecallSession {
       transcript_role: source.locator.role,
       ...(source.locator.messageId ? { transcript_message_id: source.locator.messageId } : {}),
     });
-    return { source_ref: readRef, context };
+    const output = { source_ref: readRef, context };
+    if (this.timingEnabled) this.emitTiming('transcript_read', timingDurationMs(transcriptReadStartedAt), { parsed_lines: parsedLines, context_count: context.length });
+    return output;
   }
 
   async evidenceBundle(input: RecallEvidenceBundleInput): Promise<RecallEvidenceBundle> {
     this.assertOpen();
+    const bundleStartedAt = this.timingEnabled ? monotonicNow() : 0;
     const query = cleanText(input?.query, 'query');
     const relationship = await this.relationshipMemorySearchHybridExisting({
       query,
@@ -636,6 +679,7 @@ export class RelationshipMemoryRecallSession {
       transcriptWindows.push({ hit_source_ref: hitSourceRef, ...read });
     }
 
+    const fitStartedAt = this.timingEnabled ? monotonicNow() : 0;
     const bundle: RecallEvidenceBundle = {
       schema_version: 1,
       policy: 'explicit_recall',
@@ -648,8 +692,10 @@ export class RelationshipMemoryRecallSession {
       source_refs: [],
     };
     const fitted = fitEvidenceBundle(bundle);
+    if (this.timingEnabled) this.emitTiming('fit_evidence_bundle', timingDurationMs(fitStartedAt), { serialized_bytes: Buffer.byteLength(JSON.stringify(fitted), 'utf8') });
     this.bundleEvidenceStarted = true;
     for (const sourceRef of fitted.source_refs) this.bundleEvidenceRefs.add(sourceRef);
+    if (this.timingEnabled) this.emitTiming('evidence_bundle_total', timingDurationMs(bundleStartedAt), { relationship_results: fitted.relationship_results.length, transcript_hits: fitted.transcript_hits.length, transcript_windows: fitted.transcript_windows.length });
     return fitted;
   }
 
@@ -658,12 +704,15 @@ export class RelationshipMemoryRecallSession {
     const query = cleanText(input?.query, 'query');
     if (this.expansionCount >= 1) throw new Error('expand_recall may be called at most once per recall.');
     this.expansionCount += 1;
-    return this.evidenceBundle({
+    const expansionStartedAt = this.timingEnabled ? monotonicNow() : 0;
+    try { return await this.evidenceBundle({
       query,
       ...(input.kind ? { kind: input.kind } : {}),
       ...(input.time_start ? { time_start: input.time_start } : {}),
       ...(input.time_end ? { time_end: input.time_end } : {}),
-    });
+    }); } finally {
+      if (this.timingEnabled) this.emitTiming('expand_recall', timingDurationMs(expansionStartedAt), { occurred: true }, 'expand');
+    }
   }
 
   deliver(input: DeliverRecallInput): RecallResult {
@@ -827,6 +876,8 @@ export async function executeRecall(options: {
   const query = cleanText(options.query, 'query');
   const timeoutMs = Math.max(100, options.timeoutMs ?? 90_000);
   const controller = new AbortController();
+  const timingEnabled = recallTimingEnabled();
+  const totalStartedAt = timingEnabled ? monotonicNow() : 0;
   const session = new RelationshipMemoryRecallSession({
     recallId: options.recallId,
     rootDir: options.rootDir,
@@ -893,6 +944,7 @@ export async function executeRecall(options: {
     if (timeoutHandle) clearTimeout(timeoutHandle);
     options.signal?.removeEventListener('abort', onExternalAbort);
     if (cancelRaceResolve) options.signal?.removeEventListener('abort', cancelRaceResolve);
+    if (timingEnabled) emitRecallTiming({ schema_version: 1, event: 'relationship_memory_recall_timing', recall_id: session.recallId, phase: 'total', segment: 'recall_total', duration_ms: timingDurationMs(totalStartedAt), expand_recall: session.expanded }, options.rootDir);
     // The model promise is intentionally not awaited after timeout/cancel. Its tool
     // surface points at the now-closed session, so late delivery cannot escape.
     void model.catch(() => undefined);
