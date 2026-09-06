@@ -5,6 +5,7 @@ import * as path from 'path';
 import * as readline from 'readline';
 import { extractAllContent, type TranscriptMessage } from '../../../scripts/transcript_utils.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
+import { emitRecallTiming, emitRecallTimingSegment, monotonicNow, recallTimingEnabled, timingDurationMs, withRecallTimingContext } from './instrumentation.js';
 import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, MemoryKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
@@ -245,39 +246,66 @@ function shrinkLongestBundleString(value: unknown): boolean {
   return true;
 }
 
-function fitEvidenceBundle(input: RecallEvidenceBundle): RecallEvidenceBundle {
+interface FitEvidenceBundleResult {
+  bundle: RecallEvidenceBundle;
+  truncated: boolean;
+  reduction_steps: number;
+  bytes_before: number;
+  bytes_after: number;
+}
+
+function fitEvidenceBundleDetailed(input: RecallEvidenceBundle): FitEvidenceBundleResult {
   const bundle = JSON.parse(JSON.stringify(input)) as RecallEvidenceBundle;
   refreshBundleProvenance(bundle);
   const bytes = () => Buffer.byteLength(JSON.stringify(bundle), 'utf8');
+  const bytesBefore = bytes();
+  let truncated = false;
+  let reductionSteps = 0;
   while (bytes() > RECALL_EVIDENCE_LIMITS.max_serialized_bytes) {
+    truncated = true;
     if (shrinkLongestBundleString(bundle)) {
+      reductionSteps += 1;
       refreshBundleProvenance(bundle);
       continue;
     }
     const window = [...bundle.transcript_windows].reverse().find((item) => item.context.length > 1);
     if (window) {
+      reductionSteps += 1;
       window.context.pop();
       refreshBundleProvenance(bundle);
       continue;
     }
     if (bundle.transcript_windows.length) {
+      reductionSteps += 1;
       bundle.transcript_windows.pop();
       refreshBundleProvenance(bundle);
       continue;
     }
     if (bundle.transcript_hits.length) {
+      reductionSteps += 1;
       bundle.transcript_hits.pop();
       refreshBundleProvenance(bundle);
       continue;
     }
     if (bundle.relationship_results.length) {
+      reductionSteps += 1;
       bundle.relationship_results.pop();
       refreshBundleProvenance(bundle);
       continue;
     }
     throw new Error(`Recall evidence bundle could not fit within ${RECALL_EVIDENCE_LIMITS.max_serialized_bytes} bytes.`);
   }
-  return bundle;
+  return {
+    bundle,
+    truncated,
+    reduction_steps: reductionSteps,
+    bytes_before: bytesBefore,
+    bytes_after: bytes(),
+  };
+}
+
+function fitEvidenceBundle(input: RecallEvidenceBundle): RecallEvidenceBundle {
+  return fitEvidenceBundleDetailed(input).bundle;
 }
 
 function transcriptRootsFromEnvironment(): string[] {
@@ -365,6 +393,7 @@ export class RelationshipMemoryRecallSession {
 
   get isClosed(): boolean { return Boolean(this.delivered || this.closedReason); }
   get delivery(): RecallResult | undefined { return this.delivered; }
+  get expansionOccurred(): boolean { return this.expansionCount > 0; }
   waitForDelivery(): Promise<RecallResult> { return this.deliveryPromise; }
 
   close(reason: 'timeout' | 'cancelled' | 'failed'): void {
@@ -399,24 +428,31 @@ export class RelationshipMemoryRecallSession {
     { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string; lexicalScore: number }
     | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string; lexicalScore: number }
   > {
+    const candidatesStartedAt = monotonicNow();
     const owner = new RelationshipMemoryOwnerControlPlane(this.store);
-    const candidates: Array<
-      { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string; lexicalScore: number }
-      | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string; lexicalScore: number }
+    const candidateTexts: Array<
+      { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string }
+      | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string }
     > = [];
     for (const memory of owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) })) {
       if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;
       const intents = this.linkedAssistantIntents(memory.memory_id);
       const text = semanticText(memory.kind, memory.summary, memory.participants, memory.payload, intents.map((intent) => [intent.memory.text, intent.feel.text]));
-      candidates.push({ kind: 'memory', memory, intents, text, lexicalScore: lexicalTextScore(text, input.query) });
+      candidateTexts.push({ kind: 'memory', memory, intents, text });
     }
     if (!input.kind) {
       for (const entity of this.store.listEntities()) {
         if (!inTimeWindow(entity.observed_at, input.time_start, input.time_end)) continue;
         const text = semanticText(entity.canonical_name, entity.aliases, entity.entity_type, entity.description);
-        candidates.push({ kind: 'entity', entity, text, lexicalScore: lexicalTextScore(text, input.query) });
+        candidateTexts.push({ kind: 'entity', entity, text });
       }
     }
+    emitRecallTimingSegment('relationship_candidate_set_construction', candidatesStartedAt, { candidate_count: candidateTexts.length });
+    const lexicalStartedAt = monotonicNow();
+    const candidates = candidateTexts.map((item) => item.kind === 'memory'
+      ? { kind: 'memory' as const, memory: item.memory, intents: item.intents, text: item.text, lexicalScore: lexicalTextScore(item.text, input.query) }
+      : { kind: 'entity' as const, entity: item.entity, text: item.text, lexicalScore: lexicalTextScore(item.text, input.query) });
+    emitRecallTimingSegment('relationship_lexical_scoring', lexicalStartedAt, { candidate_count: candidates.length });
     return candidates;
   }
 
@@ -427,7 +463,9 @@ export class RelationshipMemoryRecallSession {
     >,
     limit: number,
   ): { results: unknown[] } {
+    const sortingStartedAt = monotonicNow();
     ranked.sort((a, b) => b.score - a.score || (b.kind === 'memory' ? b.memory.observed_at : b.entity.observed_at).localeCompare(a.kind === 'memory' ? a.memory.observed_at : a.entity.observed_at));
+    emitRecallTimingSegment('relationship_local_vector_sorting', sortingStartedAt, { ranked_count: ranked.length });
     return { results: ranked.slice(0, limit).map((item) => {
       if (item.kind === 'entity') {
         const entity = item.entity;
@@ -495,12 +533,14 @@ export class RelationshipMemoryRecallSession {
     try {
       const semantic = await rankExisting(documents, query, this.signal);
       this.assertOpen();
+      const localCompareStartedAt = monotonicNow();
       const ranked = candidates.map((item, index) => {
         const score = hybridScore(item.lexicalScore, semantic.get(documents[index].id));
         return item.kind === 'memory'
           ? { kind: 'memory' as const, memory: item.memory, intents: item.intents, score }
           : { kind: 'entity' as const, entity: item.entity, score };
       });
+      emitRecallTimingSegment('relationship_local_vector_comparison', localCompareStartedAt, { candidate_count: candidates.length });
       return this.renderRelationshipSearchResults(ranked, limit);
     } catch {
       return this.relationshipMemorySearch(input);
@@ -513,66 +553,80 @@ export class RelationshipMemoryRecallSession {
     if (!input.query?.trim() && !input.time_start && !input.time_end) {
       throw new Error('transcript_search requires query and/or a time window');
     }
+    const startedAt = monotonicNow();
+    let scannedFileCount = 0;
+    let parsedLineCount = 0;
     const candidates: TranscriptCandidate[] = [];
-    for (const file of transcriptFiles(this.transcriptRoots)) {
-      if (this.isClosed) break;
-      let visibleIndex = -1;
-      await forEachJsonlLine(file, (raw) => {
-        const visible = visibleTranscriptMessage(raw);
-        if (!visible) return;
-        visibleIndex += 1;
-        if (!inTimeWindow(visible.timestamp, input.time_start, input.time_end)) return;
-        const score = lexicalTextScore(visible.text, input.query);
-        if (score <= 0) return;
-        candidates.push({
-          file,
-          visibleIndex,
-          role: visible.role,
-          text: visible.text,
-          score,
-          ...(visible.timestamp ? { timestamp: visible.timestamp } : {}),
-          ...(visible.messageId ? { messageId: visible.messageId } : {}),
+    try {
+      for (const file of transcriptFiles(this.transcriptRoots)) {
+        if (this.isClosed) break;
+        scannedFileCount += 1;
+        let visibleIndex = -1;
+        await forEachJsonlLine(file, (raw) => {
+          parsedLineCount += 1;
+          const visible = visibleTranscriptMessage(raw);
+          if (!visible) return;
+          visibleIndex += 1;
+          if (!inTimeWindow(visible.timestamp, input.time_start, input.time_end)) return;
+          const score = lexicalTextScore(visible.text, input.query);
+          if (score <= 0) return;
+          candidates.push({
+            file,
+            visibleIndex,
+            role: visible.role,
+            text: visible.text,
+            score,
+            ...(visible.timestamp ? { timestamp: visible.timestamp } : {}),
+            ...(visible.messageId ? { messageId: visible.messageId } : {}),
+          });
+          if (candidates.length > 200) {
+            candidates.sort((a, b) => b.score - a.score || (b.timestamp ?? '').localeCompare(a.timestamp ?? ''));
+            candidates.length = 100;
+          }
         });
-        if (candidates.length > 200) {
-          candidates.sort((a, b) => b.score - a.score || (b.timestamp ?? '').localeCompare(a.timestamp ?? ''));
-          candidates.length = 100;
-        }
+      }
+      this.assertOpen();
+      candidates.sort((a, b) => b.score - a.score || (b.timestamp ?? '').localeCompare(a.timestamp ?? '') || a.file.localeCompare(b.file) || a.visibleIndex - b.visibleIndex);
+      return {
+        results: candidates.slice(0, limit).map((candidate) => {
+          const locator: TranscriptLocator = {
+            file: candidate.file,
+            visibleIndex: candidate.visibleIndex,
+            role: candidate.role,
+            ...(candidate.timestamp ? { timestamp: candidate.timestamp } : {}),
+            ...(candidate.messageId ? { messageId: candidate.messageId } : {}),
+          };
+          const sourceRef = this.register('transcript_search', {
+            file: candidate.file,
+            visible_index: candidate.visibleIndex,
+            message_id: candidate.messageId,
+            timestamp: candidate.timestamp,
+          }, {
+            ...(candidate.timestamp ? { transcript_time: candidate.timestamp } : {}),
+            transcript_role: candidate.role,
+            ...(candidate.messageId ? { transcript_message_id: candidate.messageId } : {}),
+          }, locator);
+          return {
+            source_ref: sourceRef,
+            timestamp: candidate.timestamp ?? null,
+            role: candidate.role,
+            message_id: candidate.messageId ?? null,
+            excerpt: truncate(candidate.text, 600),
+          };
+        }),
+      };
+    } finally {
+      emitRecallTimingSegment('transcript_search_total', startedAt, {
+        scanned_file_count: scannedFileCount,
+        parsed_line_count: parsedLineCount,
+        candidate_count: candidates.length,
       });
     }
-    this.assertOpen();
-    candidates.sort((a, b) => b.score - a.score || (b.timestamp ?? '').localeCompare(a.timestamp ?? '') || a.file.localeCompare(b.file) || a.visibleIndex - b.visibleIndex);
-    return {
-      results: candidates.slice(0, limit).map((candidate) => {
-        const locator: TranscriptLocator = {
-          file: candidate.file,
-          visibleIndex: candidate.visibleIndex,
-          role: candidate.role,
-          ...(candidate.timestamp ? { timestamp: candidate.timestamp } : {}),
-          ...(candidate.messageId ? { messageId: candidate.messageId } : {}),
-        };
-        const sourceRef = this.register('transcript_search', {
-          file: candidate.file,
-          visible_index: candidate.visibleIndex,
-          message_id: candidate.messageId,
-          timestamp: candidate.timestamp,
-        }, {
-          ...(candidate.timestamp ? { transcript_time: candidate.timestamp } : {}),
-          transcript_role: candidate.role,
-          ...(candidate.messageId ? { transcript_message_id: candidate.messageId } : {}),
-        }, locator);
-        return {
-          source_ref: sourceRef,
-          timestamp: candidate.timestamp ?? null,
-          role: candidate.role,
-          message_id: candidate.messageId ?? null,
-          excerpt: truncate(candidate.text, 600),
-        };
-      }),
-    };
   }
 
   async transcriptRead(input: TranscriptReadInput): Promise<{ source_ref: string; context: unknown[] }> {
     this.assertOpen();
+    const startedAt = monotonicNow();
     const sourceRef = cleanText(input?.source_ref, 'source_ref');
     const source = this.sources.get(sourceRef);
     if (!source || source.summary.kind !== 'transcript_search' || !source.locator) {
@@ -601,56 +655,74 @@ export class RelationshipMemoryRecallSession {
       transcript_role: source.locator.role,
       ...(source.locator.messageId ? { transcript_message_id: source.locator.messageId } : {}),
     });
+    emitRecallTimingSegment('transcript_read_window', startedAt, { context_count: context.length, before, after });
     return { source_ref: readRef, context };
   }
 
   async evidenceBundle(input: RecallEvidenceBundleInput): Promise<RecallEvidenceBundle> {
     this.assertOpen();
     const query = cleanText(input?.query, 'query');
-    const relationship = await this.relationshipMemorySearchHybridExisting({
-      query,
-      ...(input.kind ? { kind: input.kind } : {}),
-      ...(input.time_start ? { time_start: input.time_start } : {}),
-      ...(input.time_end ? { time_end: input.time_end } : {}),
-      limit: RECALL_EVIDENCE_LIMITS.relationship_results,
-    });
-    this.assertOpen();
-
-    const transcript = await this.transcriptSearch({
-      query,
-      ...(input.time_start ? { time_start: input.time_start } : {}),
-      ...(input.time_end ? { time_end: input.time_end } : {}),
-      limit: RECALL_EVIDENCE_LIMITS.transcript_hits,
-    });
-    this.assertOpen();
-
-    const transcriptWindows: RecallTranscriptWindow[] = [];
-    for (const hit of transcript.results.slice(0, RECALL_EVIDENCE_LIMITS.transcript_windows)) {
-      const hitSourceRef = resultSourceRef(hit);
-      if (!hitSourceRef) continue;
-      const read = await this.transcriptRead({
-        source_ref: hitSourceRef,
-        before: RECALL_EVIDENCE_LIMITS.transcript_before,
-        after: RECALL_EVIDENCE_LIMITS.transcript_after,
+    const phase = this.expansionCount > 0 ? 'expand_recall' : 'initial';
+    return withRecallTimingContext({ recall_id: this.recallId, phase }, async () => {
+      const relationship = await this.relationshipMemorySearchHybridExisting({
+        query,
+        ...(input.kind ? { kind: input.kind } : {}),
+        ...(input.time_start ? { time_start: input.time_start } : {}),
+        ...(input.time_end ? { time_end: input.time_end } : {}),
+        limit: RECALL_EVIDENCE_LIMITS.relationship_results,
       });
-      transcriptWindows.push({ hit_source_ref: hitSourceRef, ...read });
-    }
+      this.assertOpen();
 
-    const bundle: RecallEvidenceBundle = {
-      schema_version: 1,
-      policy: 'explicit_recall',
-      query,
-      generated_at: new Date().toISOString(),
-      limits: RECALL_EVIDENCE_LIMITS,
-      relationship_results: relationship.results,
-      transcript_hits: transcript.results,
-      transcript_windows: transcriptWindows,
-      source_refs: [],
-    };
-    const fitted = fitEvidenceBundle(bundle);
-    this.bundleEvidenceStarted = true;
-    for (const sourceRef of fitted.source_refs) this.bundleEvidenceRefs.add(sourceRef);
-    return fitted;
+      const transcript = await this.transcriptSearch({
+        query,
+        ...(input.time_start ? { time_start: input.time_start } : {}),
+        ...(input.time_end ? { time_end: input.time_end } : {}),
+        limit: RECALL_EVIDENCE_LIMITS.transcript_hits,
+      });
+      this.assertOpen();
+
+      const transcriptWindows: RecallTranscriptWindow[] = [];
+      for (const hit of transcript.results.slice(0, RECALL_EVIDENCE_LIMITS.transcript_windows)) {
+        const hitSourceRef = resultSourceRef(hit);
+        if (!hitSourceRef) continue;
+        const read = await this.transcriptRead({
+          source_ref: hitSourceRef,
+          before: RECALL_EVIDENCE_LIMITS.transcript_before,
+          after: RECALL_EVIDENCE_LIMITS.transcript_after,
+        });
+        transcriptWindows.push({ hit_source_ref: hitSourceRef, ...read });
+      }
+
+      const assemblyStartedAt = monotonicNow();
+      const bundle: RecallEvidenceBundle = {
+        schema_version: 1,
+        policy: 'explicit_recall',
+        query,
+        generated_at: new Date().toISOString(),
+        limits: RECALL_EVIDENCE_LIMITS,
+        relationship_results: relationship.results,
+        transcript_hits: transcript.results,
+        transcript_windows: transcriptWindows,
+        source_refs: [],
+      };
+      emitRecallTimingSegment('fit_evidence_bundle_assembly', assemblyStartedAt, {
+        relationship_result_count: relationship.results.length,
+        transcript_hit_count: transcript.results.length,
+        transcript_window_count: transcriptWindows.length,
+      });
+      const fitStartedAt = monotonicNow();
+      const fittedResult = fitEvidenceBundleDetailed(bundle);
+      emitRecallTimingSegment('fit_evidence_bundle_truncation', fitStartedAt, {
+        truncated: fittedResult.truncated,
+        reduction_steps: fittedResult.reduction_steps,
+        bytes_before: fittedResult.bytes_before,
+        bytes_after: fittedResult.bytes_after,
+      });
+      const fitted = fittedResult.bundle;
+      this.bundleEvidenceStarted = true;
+      for (const sourceRef of fitted.source_refs) this.bundleEvidenceRefs.add(sourceRef);
+      return fitted;
+    });
   }
 
   async expandEvidenceBundle(input: ExpandRecallInput): Promise<RecallEvidenceBundle> {
@@ -825,6 +897,7 @@ export async function executeRecall(options: {
   recallId?: string;
 }): Promise<RecallResult> {
   const query = cleanText(options.query, 'query');
+  const executeStartedAt = monotonicNow();
   const timeoutMs = Math.max(100, options.timeoutMs ?? 90_000);
   const controller = new AbortController();
   const session = new RelationshipMemoryRecallSession({
@@ -893,6 +966,17 @@ export async function executeRecall(options: {
     if (timeoutHandle) clearTimeout(timeoutHandle);
     options.signal?.removeEventListener('abort', onExternalAbort);
     if (cancelRaceResolve) options.signal?.removeEventListener('abort', cancelRaceResolve);
+    if (recallTimingEnabled()) {
+      emitRecallTiming({
+        schema_version: 1,
+        event: 'relationship_memory_recall_timing',
+        recall_id: session.recallId,
+        phase: 'total',
+        segment: 'execute_recall_total',
+        duration_ms: timingDurationMs(executeStartedAt),
+        expansion_occurred: session.expansionOccurred,
+      });
+    }
     // The model promise is intentionally not awaited after timeout/cancel. Its tool
     // surface points at the now-closed session, so late delivery cannot escape.
     void model.catch(() => undefined);
