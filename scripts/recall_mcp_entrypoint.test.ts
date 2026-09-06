@@ -53,7 +53,6 @@ describe('recall MCP executable entrypoint', () => {
     const root = mkdtempSync(join(tmpdir(), 'recall-mcp-stdio-mock-'));
     roots.push(root);
     const child = join(root, 'mock_recall_mcp.ts');
-    const entrypointUrl = pathToFileURL(join(process.cwd(), 'scripts', 'recall_mcp.ts')).href;
     writeFileSync(child, `
       import { RecallMcpServer, runRecallStdio } from ${JSON.stringify(pathToFileURL(join(process.cwd(), 'scripts', 'recall_mcp.ts')).href)};
       runRecallStdio(new RecallMcpServer(async (query) => ({

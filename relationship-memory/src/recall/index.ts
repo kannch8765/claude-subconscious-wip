@@ -19,6 +19,7 @@ export const RECALL_EVIDENCE_LIMITS = Object.freeze({
   transcript_windows: 3,
   transcript_before: 2,
   transcript_after: 2,
+  max_serialized_bytes: 128 * 1024,
 });
 
 export interface RecallTranscriptWindow {
@@ -545,7 +546,7 @@ export class RelationshipMemoryRecallSession {
       sourceRefs.add(item.source_ref);
     }
 
-    return {
+    const bundle: RecallEvidenceBundle = {
       schema_version: 1,
       policy: 'explicit_recall',
       query,
@@ -556,6 +557,11 @@ export class RelationshipMemoryRecallSession {
       transcript_windows: transcriptWindows,
       source_refs: [...sourceRefs],
     };
+    const serializedBytes = Buffer.byteLength(JSON.stringify(bundle), 'utf8');
+    if (serializedBytes > RECALL_EVIDENCE_LIMITS.max_serialized_bytes) {
+      throw new Error(`Recall evidence bundle exceeded ${RECALL_EVIDENCE_LIMITS.max_serialized_bytes} bytes.`);
+    }
+    return bundle;
   }
 
   async expandEvidenceBundle(input: ExpandRecallInput): Promise<RecallEvidenceBundle> {

@@ -137,7 +137,7 @@ describe('assistant relationship-memory recall core', () => {
     const sourceRef = found.results[0].source_ref;
     expect(() => recall.deliver({ recall_id: 'other', answer: 'x', source_refs: [sourceRef] })).toThrow(/does not match/);
     expect(() => recall.deliver({ recall_id: 'recall-fixed', answer: 'x', source_refs: ['recall_src_fabricated'] })).toThrow(/fabricated/);
-    const delivered = recall.deliver({ recall_id: 'recall-fixed', answer: 'The Kyoto gift made the assistant feel included.', source_refs: [sourceRef] });
+    const delivered = recall.deliver({ recall_id: 'recall-fixed', answer: 'The Kyoto gift made the assistant feel included.', source_refs: [sourceRef, sourceRef] });
     expect(delivered).toEqual(expect.objectContaining({ status: 'ok', source_refs: [sourceRef] }));
     expect(() => recall.deliver({ recall_id: 'recall-fixed', answer: 'again', source_refs: [sourceRef] })).toThrow(/already terminally delivered/);
   });
@@ -163,6 +163,7 @@ describe('assistant relationship-memory recall core', () => {
     const bundle = await recall.evidenceBundle({ query: 'Kyoto orange cake' });
     expect(bundle.policy).toBe('explicit_recall');
     expect(bundle.limits).toEqual(RECALL_EVIDENCE_LIMITS);
+    expect(Buffer.byteLength(JSON.stringify(bundle), 'utf8')).toBeLessThanOrEqual(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
     expect(bundle.relationship_results).toHaveLength(1);
     expect(bundle.relationship_results[0]).toEqual(expect.objectContaining({
       memory_id: memoryId,
