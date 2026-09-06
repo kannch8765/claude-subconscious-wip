@@ -307,7 +307,7 @@ export function getCanonicalManagedAgentSurface(agentFile: string = DEFAULT_AGEN
   const blocks = Array.isArray(content.blocks) ? content.blocks : [];
   const tools = Array.isArray(content.tools) ? content.tools : [];
   const byBlockId = new Map(blocks.map((block: any) => [block.id, block]));
-  const byToolId = new Map(tools.map((tool: any) => [tool.id, tool]));
+  const byToolId = new Map<unknown, unknown>(tools.map((tool: any) => [tool.id, tool]));
   const desiredBlocks = (Array.isArray(agent.block_ids) ? agent.block_ids : []).map((id: string) => byBlockId.get(id)).filter(Boolean).map((block: any) => ({
     label: String(block.label),
     value: String(block.value ?? ''),
@@ -315,7 +315,10 @@ export function getCanonicalManagedAgentSurface(agentFile: string = DEFAULT_AGEN
     ...(typeof block.description === 'string' ? { description: block.description } : {}),
     readOnly: block.read_only === true,
   }));
-  const toolNames = (Array.isArray(agent.tool_ids) ? agent.tool_ids : []).map((id: string) => byToolId.get(id)?.name).filter((name: unknown): name is string => typeof name === 'string' && name.length > 0);
+  const toolNames = (Array.isArray(agent.tool_ids) ? agent.tool_ids : []).map((id: unknown) => {
+    const tool = byToolId.get(id);
+    return tool && typeof tool === 'object' && 'name' in tool ? (tool as { name?: unknown }).name : undefined;
+  }).filter((name: unknown): name is string => typeof name === 'string' && name.length > 0);
   if (desiredBlocks.length !== (agent.block_ids?.length ?? 0) || toolNames.length !== (agent.tool_ids?.length ?? 0)) {
     throw new Error(`Managed ${path.basename(agentFile)} references missing block/tool definitions`);
   }

@@ -49,6 +49,7 @@ function snapshotFixture(): SubconsciousAdminSnapshot {
           shared_experience: 0,
           relationship_event: 0,
           inside_joke: 0,
+          user_preference: 0,
         },
         ownerRevisionCount: 0,
       },

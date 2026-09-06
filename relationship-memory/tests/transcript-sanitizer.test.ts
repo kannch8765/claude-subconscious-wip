@@ -40,7 +40,8 @@ function fixture(): TranscriptMessage[] {
 describe('transcript wrapper sanitizer', () => {
   it('removes only fields ignored by both historical consumers', () => {
     const raw = fixture();
-    const sanitized = raw.map((record) => sanitizeTranscriptRecord(record)) as TranscriptMessage[];
+    const sanitizedRecords = raw.map((record) => sanitizeTranscriptRecord(record));
+    const sanitized = sanitizedRecords as unknown as TranscriptMessage[];
 
     expect(sanitized[0]).toEqual({});
     expect(sanitized[1]).toEqual({

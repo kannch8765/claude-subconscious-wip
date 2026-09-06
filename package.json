@@ -30,6 +30,8 @@
     "sync": "tsx scripts/sync_letta_memory.ts",
     "send": "tsx scripts/send_messages_to_letta.ts",
     "test": "vitest run",
+    "test:ci": "vitest run --maxWorkers=2",
+    "typecheck": "tsc -p tsconfig.ci.json",
     "test:watch": "vitest",
     "backfill": "tsx scripts/relationship_memory_backfill.ts",
     "legacy-backfill": "tsx scripts/legacy_semantic_backfill.ts",
