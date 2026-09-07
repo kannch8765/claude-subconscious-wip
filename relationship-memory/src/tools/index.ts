@@ -256,8 +256,8 @@ export class RelationshipMemoryRuntime {
     }));
   }
 
-  async memorySearchRecallHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
-    return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query));
+  async memorySearchRecallHybridWithEvidence(query: SearchQuery, signal?: AbortSignal): Promise<MemoryRecallResult[]> {
+    return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query, signal));
   }
 
   async memorySearchHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
@@ -280,7 +280,7 @@ export class RelationshipMemoryRuntime {
     );
   }
 
-  async memorySearchRecallHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
+  async memorySearchRecallHybrid(query: SearchQuery, signal?: AbortSignal): Promise<EffectiveMemoryRecord[]> {
     const semanticQuery = query.query?.trim();
     const trigger = query.trigger?.trim().toLowerCase();
     const limit = boundedSearchLimit(query.limit);
@@ -344,7 +344,7 @@ export class RelationshipMemoryRuntime {
     }));
     let semantic = new Map<string, number>();
     if (this.semanticRetriever?.rankExisting) {
-      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery); }
+      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery, signal); }
       catch { semantic = new Map(); }
     }
     const scored = candidates.map(({ memory }, index) => {

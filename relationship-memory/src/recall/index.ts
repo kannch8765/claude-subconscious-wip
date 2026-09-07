@@ -9,6 +9,7 @@ import { emitRecallTiming, emitRecallTimingSegment, monotonicNow, recallTimingEn
 import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, MemoryKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
+import { RelationshipMemoryRuntime } from '../tools/index.js';
 
 export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
@@ -366,6 +367,7 @@ export class RelationshipMemoryRecallSession {
   private resolveDelivery!: (result: RecallResult) => void;
   private closedReason?: 'timeout' | 'cancelled' | 'failed';
   private readonly semanticRetriever?: SemanticRetriever;
+  private readonly recallRuntime: RelationshipMemoryRuntime;
   private readonly signal?: AbortSignal;
   private expansionCount = 0;
   private bundleEvidenceStarted = false;
@@ -389,6 +391,10 @@ export class RelationshipMemoryRecallSession {
     else {
       try { this.semanticRetriever = createSemanticRetrieverFromEnvironment(options.rootDir); } catch { this.semanticRetriever = undefined; }
     }
+    // Explicit recall and whisper share the same canonical memory-card retrieval.
+    // The empty message map is intentional: serving-time recall only reads durable
+    // canonical memories plus evidence already bound to those memories.
+    this.recallRuntime = new RelationshipMemoryRuntime(this.store, new Map(), undefined, new Map(), false, this.semanticRetriever);
   }
 
   get isClosed(): boolean { return Boolean(this.delivered || this.closedReason); }
@@ -517,6 +523,28 @@ export class RelationshipMemoryRecallSession {
     } catch {
       return this.relationshipMemorySearch(input);
     }
+  }
+
+  private async relationshipMemoryCardsWithEvidence(input: RelationshipMemorySearchInput = {}): Promise<{ results: unknown[] }> {
+    this.assertOpen();
+    const cards = await this.recallRuntime.memorySearchRecallHybridWithEvidence({
+      ...(input.query ? { query: input.query } : {}),
+      ...(input.kind ? { kind: input.kind } : {}),
+      ...(input.time_start ? { time_start: input.time_start } : {}),
+      ...(input.time_end ? { time_end: input.time_end } : {}),
+      ...(input.limit ? { limit: input.limit } : {}),
+    }, this.signal);
+    this.assertOpen();
+    return {
+      results: cards.map((memory) => {
+        const sourceRef = this.register(
+          'relationship_memory',
+          { memory_id: memory.memory_id, latest_revision_id: memory.latest_revision_id },
+          { memory_id: memory.memory_id, observed_at: memory.observed_at },
+        );
+        return { source_ref: sourceRef, record_type: 'relationship_memory', ...memory };
+      }),
+    };
   }
 
   private async relationshipMemorySearchHybridExisting(input: RelationshipMemorySearchInput = {}): Promise<{ results: unknown[] }> {
@@ -664,34 +692,18 @@ export class RelationshipMemoryRecallSession {
     const query = cleanText(input?.query, 'query');
     const phase = this.expansionCount > 0 ? 'expand_recall' : 'initial';
     return withRecallTimingContext({ recall_id: this.recallId, phase }, async () => {
-      const relationship = await this.relationshipMemorySearchHybridExisting({
+      const relationshipStartedAt = monotonicNow();
+      const relationship = await this.relationshipMemoryCardsWithEvidence({
         query,
         ...(input.kind ? { kind: input.kind } : {}),
         ...(input.time_start ? { time_start: input.time_start } : {}),
         ...(input.time_end ? { time_end: input.time_end } : {}),
         limit: RECALL_EVIDENCE_LIMITS.relationship_results,
       });
-      this.assertOpen();
-
-      const transcript = await this.transcriptSearch({
-        query,
-        ...(input.time_start ? { time_start: input.time_start } : {}),
-        ...(input.time_end ? { time_end: input.time_end } : {}),
-        limit: RECALL_EVIDENCE_LIMITS.transcript_hits,
+      emitRecallTimingSegment('relationship_memory_cards_with_evidence_total', relationshipStartedAt, {
+        relationship_result_count: relationship.results.length,
       });
       this.assertOpen();
-
-      const transcriptWindows: RecallTranscriptWindow[] = [];
-      for (const hit of transcript.results.slice(0, RECALL_EVIDENCE_LIMITS.transcript_windows)) {
-        const hitSourceRef = resultSourceRef(hit);
-        if (!hitSourceRef) continue;
-        const read = await this.transcriptRead({
-          source_ref: hitSourceRef,
-          before: RECALL_EVIDENCE_LIMITS.transcript_before,
-          after: RECALL_EVIDENCE_LIMITS.transcript_after,
-        });
-        transcriptWindows.push({ hit_source_ref: hitSourceRef, ...read });
-      }
 
       const assemblyStartedAt = monotonicNow();
       const bundle: RecallEvidenceBundle = {
@@ -701,14 +713,16 @@ export class RelationshipMemoryRecallSession {
         generated_at: new Date().toISOString(),
         limits: RECALL_EVIDENCE_LIMITS,
         relationship_results: relationship.results,
-        transcript_hits: transcript.results,
-        transcript_windows: transcriptWindows,
+        // Kept as empty compatibility fields for schema-v1 consumers. Serving-time
+        // explicit recall no longer scans or reads raw transcript history.
+        transcript_hits: [],
+        transcript_windows: [],
         source_refs: [],
       };
       emitRecallTimingSegment('fit_evidence_bundle_assembly', assemblyStartedAt, {
         relationship_result_count: relationship.results.length,
-        transcript_hit_count: transcript.results.length,
-        transcript_window_count: transcriptWindows.length,
+        transcript_hit_count: 0,
+        transcript_window_count: 0,
       });
       const fitStartedAt = monotonicNow();
       const fittedResult = fitEvidenceBundleDetailed(bundle);
