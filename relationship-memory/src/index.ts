@@ -14,3 +14,4 @@ export * from './legacy/index.js';
 export * from './legacy/semantic.js';
 
 export * from './retrieval/index.js';
+export * from './rerank/index.js';

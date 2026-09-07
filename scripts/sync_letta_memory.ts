@@ -17,8 +17,11 @@
  *   2 - Blocking error (prevents prompt processing)
  */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
+import * as path from 'path';
 import * as readline from 'readline';
+import { fileURLToPath } from 'url';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
 import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
@@ -34,6 +37,7 @@ import {
   formatAllBlocksForStdout,
   cleanLettaFromClaudeMd,
   getMode,
+  spawnSilentWorker,
 } from './conversation_utils.js';
 
 // Configuration
@@ -84,6 +88,36 @@ async function readHookInput(): Promise<HookInput | null> {
       rl.close();
     }, 100);
   });
+}
+
+function maybeLaunchDeterministicRecallShadow(hookInput: HookInput | null, cwd: string): void {
+  if (process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_MODE?.trim().toLowerCase() !== 'shadow') return;
+  const isUserPrompt = hookInput?.hook_event_name === 'UserPromptSubmit' || typeof hookInput?.prompt === 'string';
+  const prompt = hookInput?.prompt?.trim();
+  const sessionId = hookInput?.session_id?.trim();
+  if (!isUserPrompt || !prompt || !sessionId) return;
+  const payloadDir = process.env.RELATIONSHIP_MEMORY_SYNC_RECALL_SHADOW_PAYLOAD_DIR?.trim()
+    || path.join(process.env.TMPDIR || '/tmp', 'claude-subcon-sync-recall-shadow');
+  let payloadFile = '';
+  try {
+    fs.mkdirSync(payloadDir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(payloadDir, 0o700); } catch {}
+    payloadFile = path.join(payloadDir, `shadow-${process.pid}-${crypto.randomUUID()}.json`);
+    fs.writeFileSync(payloadFile, `${JSON.stringify({
+      schema_version: 1,
+      session_id: sessionId,
+      cwd,
+      prompt,
+      recorded_at: new Date().toISOString(),
+    })}\n`, { mode: 0o600 });
+    const workerScript = path.join(path.dirname(fileURLToPath(import.meta.url)), 'sync_recall_shadow_worker.ts');
+    const child = spawnSilentWorker(workerScript, payloadFile, cwd);
+    child.once('error', () => { try { fs.rmSync(payloadFile, { force: true }); } catch {} });
+    debug('launched deterministic sync-recall shadow worker', { pid: child.pid });
+  } catch (error) {
+    if (payloadFile) { try { fs.rmSync(payloadFile, { force: true }); } catch {} }
+    debug('failed to launch deterministic sync-recall shadow worker', error);
+  }
 }
 
 function expectedSyncTurnId(hookInput: HookInput | null): string | undefined {
@@ -195,6 +229,7 @@ async function main(): Promise<void> {
     const hookInput = await readHookInput();
     const cwd = hookInput?.cwd || projectDir;
     const sessionId = hookInput?.session_id;
+    maybeLaunchDeterministicRecallShadow(hookInput, cwd);
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const expectedTurnId = expectedSyncTurnId(hookInput);
     const partitioned = partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId);
