@@ -60,6 +60,8 @@ export interface RecallSourceSummary {
   transcript_time?: string;
   transcript_role?: 'user' | 'assistant';
   transcript_message_id?: string;
+  summary?: string;
+  quote_snippets?: unknown[];
 }
 
 export interface RecallResult {
@@ -372,6 +374,7 @@ export class RelationshipMemoryRecallSession {
   private expansionCount = 0;
   private bundleEvidenceStarted = false;
   private readonly bundleEvidenceRefs = new Set<string>();
+  private readonly bundleEvidenceByRef = new Map<string, Record<string, unknown>>();
 
   constructor(options: {
     recallId?: string;
@@ -734,6 +737,13 @@ export class RelationshipMemoryRecallSession {
       });
       const fitted = fittedResult.bundle;
       this.bundleEvidenceStarted = true;
+      for (const item of fitted.relationship_results) {
+        const sourceRef = resultSourceRef(item);
+        if (!sourceRef || !item || typeof item !== 'object' || Array.isArray(item)) continue;
+        // Preserve the exact post-fit evidence card that was actually handed to
+        // the recall model. Delivery must never re-read or resurrect clipped data.
+        this.bundleEvidenceByRef.set(sourceRef, JSON.parse(JSON.stringify(item)) as Record<string, unknown>);
+      }
       for (const sourceRef of fitted.source_refs) this.bundleEvidenceRefs.add(sourceRef);
       return fitted;
     });
@@ -763,7 +773,14 @@ export class RelationshipMemoryRecallSession {
       const source = this.sources.get(ref);
       if (!source) throw new Error(`Unknown or fabricated source_ref: ${ref}`);
       if (this.bundleEvidenceStarted && !this.bundleEvidenceRefs.has(ref)) throw new Error(`source_ref was not provided to the recall model: ${ref}`);
-      summaries.push(source.summary);
+      const bundleEvidence = this.bundleEvidenceByRef.get(ref);
+      summaries.push({
+        ...source.summary,
+        ...(bundleEvidence && typeof bundleEvidence.summary === 'string' ? { summary: bundleEvidence.summary } : {}),
+        ...(bundleEvidence && Array.isArray(bundleEvidence.quote_snippets)
+          ? { quote_snippets: JSON.parse(JSON.stringify(bundleEvidence.quote_snippets)) as unknown[] }
+          : {}),
+      });
     }
     this.delivered = {
       status: 'ok',

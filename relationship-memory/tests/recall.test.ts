@@ -232,6 +232,22 @@ describe('assistant relationship-memory recall core', () => {
     expect(expanded.transcript_hits).toEqual([]);
     expect(expanded.transcript_windows).toEqual([]);
     await expect(tools[0].execute('call-2', { query: 'again' })).rejects.toThrow(/at most once/);
+
+    const sourceRef = bundle.source_refs[0];
+    const delivered = recall.deliver({ recall_id: recall.recallId, answer: 'Kyoto gift recalled.', source_refs: [sourceRef] });
+    expect(delivered.sources).toEqual([expect.objectContaining({
+      source_ref: sourceRef,
+      kind: 'relationship_memory',
+      memory_id: memoryId,
+      summary: 'The user explicitly included the assistant when bringing a Kyoto gift home.',
+      quote_snippets: expect.arrayContaining([
+        expect.objectContaining({
+          source_kind: 'transcript',
+          role: 'user',
+          quote: 'I brought back the orange cake for you too.',
+        }),
+      ]),
+    })]);
   });
 
   it('applies the 128 KiB fitter to a truly oversized UTF-8 canonical evidence item', async () => {
@@ -240,7 +256,12 @@ describe('assistant relationship-memory recall core', () => {
     const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject-1', transcriptRoots: [] });
     const registered = (recall.relationshipMemorySearch({ query: 'Kyoto' }) as any).results[0];
     const hugeSummary = `京都橙子蛋糕${'猫咪记得这份礼物。'.repeat(20_000)}`;
-    const oversized = { ...registered, summary: hugeSummary };
+    const hugeQuote = `当时原文${'这是已经绑定到记忆的历史原话。'.repeat(20_000)}`;
+    const oversized = {
+      ...registered,
+      summary: hugeSummary,
+      quote_snippets: [{ source_kind: 'transcript', role: 'user', quote: hugeQuote }],
+    };
     expect(Buffer.byteLength(JSON.stringify({ relationship_results: [oversized] }), 'utf8')).toBeGreaterThan(RECALL_EVIDENCE_LIMITS.max_serialized_bytes);
     (recall as any).relationshipMemoryCardsWithEvidence = async () => ({ results: [oversized] });
 
@@ -252,6 +273,16 @@ describe('assistant relationship-memory recall core', () => {
     expect((bundle.relationship_results[0] as any).summary).toContain('…');
     expect((bundle.relationship_results[0] as any).summary).not.toContain('�');
     expect(bundle.source_refs).toContain(registered.source_ref);
+
+    const fittedCard = bundle.relationship_results[0] as any;
+    const delivered = recall.deliver({ recall_id: recall.recallId, answer: 'bounded', source_refs: [registered.source_ref] });
+    expect(delivered.sources?.[0]).toEqual(expect.objectContaining({
+      source_ref: registered.source_ref,
+      summary: fittedCard.summary,
+      quote_snippets: fittedCard.quote_snippets,
+    }));
+    expect(delivered.sources?.[0]?.summary).not.toBe(hugeSummary);
+    expect((delivered.sources?.[0]?.quote_snippets?.[0] as any)?.quote).not.toBe(hugeQuote);
   });
 
   it('fits a truly oversized expansion and rejects a memory-card source clipped by the total byte budget', async () => {
