@@ -1,52 +1,8 @@
-diff --git a/letta/agents/letta_agent_v2.py b/letta/agents/letta_agent_v2.py
-index 961b550..462aaff 100644
---- a/letta/agents/letta_agent_v2.py
-+++ b/letta/agents/letta_agent_v2.py
-@@ -25,6 +25,7 @@ from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns, n
- from letta.helpers.reasoning_helper import scrub_inner_thoughts_from_messages
- from letta.helpers.tool_execution_helper import enable_strict_mode
- from letta.llm_api.llm_client import LLMClient
-+from letta.llm_api.openai_client import with_opencode_go_session_header
- from letta.local_llm.constants import INNER_THOUGHTS_KWARG
- from letta.log import get_logger
- from letta.otel.tracing import log_event, trace_method, tracer
-@@ -533,6 +534,11 @@ class LettaAgentV2(BaseAgentV2):
-                             yield request_data
-                             return
- 
-+                        request_data = with_opencode_go_session_header(
-+                            request_data,
-+                            self.agent_state.llm_config,
-+                            self.conversation_id or self.agent_state.id,
-+                        )
-                         step_progression, step_metrics = self._step_checkpoint_llm_request_start(step_metrics, agent_step_span)
- 
-                         invocation = llm_adapter.invoke_llm(
 diff --git a/letta/agents/letta_agent_v3.py b/letta/agents/letta_agent_v3.py
-index 8dabe57..e4abbc6 100644
+index d9ab48a..e4abbc6 100644
 --- a/letta/agents/letta_agent_v3.py
 +++ b/letta/agents/letta_agent_v3.py
-@@ -34,6 +34,7 @@ from letta.helpers import ToolRulesSolver
- from letta.helpers.datetime_helpers import get_utc_time, get_utc_timestamp_ns
- from letta.helpers.tool_execution_helper import enable_strict_mode
- from letta.llm_api.llm_client import LLMClient
-+from letta.llm_api.openai_client import with_opencode_go_session_header
- from letta.local_llm.constants import INNER_THOUGHTS_KWARG
- from letta.otel.tracing import trace_method
- from letta.schemas.agent import AgentState
-@@ -1151,6 +1152,11 @@ class LettaAgentV3(LettaAgentV2):
-                             yield request_data
-                             return
- 
-+                        request_data = with_opencode_go_session_header(
-+                            request_data,
-+                            active_llm_config,
-+                            self.conversation_id or self.agent_state.id,
-+                        )
-                         step_progression, step_metrics = self._step_checkpoint_llm_request_start(step_metrics, agent_step_span)
-                         invocation = llm_adapter.invoke_llm(
-                             request_data=request_data,
-@@ -2121,6 +2127,7 @@ class LettaAgentV3(LettaAgentV2):
+@@ -2127,6 +2127,7 @@ class LettaAgentV3(LettaAgentV2):
              trigger_threshold=trigger_threshold,
              run_id=run_id,
              step_id=step_id,
@@ -54,33 +10,6 @@ index 8dabe57..e4abbc6 100644
              use_summary_role=use_summary_role,
              trigger=trigger,
              context_tokens_before=context_tokens_before,
-diff --git a/letta/llm_api/openai_client.py b/letta/llm_api/openai_client.py
-index d36ae15..866f1e3 100644
---- a/letta/llm_api/openai_client.py
-+++ b/letta/llm_api/openai_client.py
-@@ -172,6 +172,22 @@ def supports_content_none(llm_config: LLMConfig) -> bool:
-     return True
- 
- 
-+def with_opencode_go_session_header(request_data: dict, llm_config: LLMConfig, session_id: str | None) -> dict:
-+    """Attach OpenCode Go's stable per-conversation routing header to one request.
-+
-+    The header is request-scoped rather than stored on the shared LLM client so
-+    concurrent Letta conversations cannot overwrite each other's session ID.
-+    """
-+    endpoint = (llm_config.model_endpoint or "").rstrip("/")
-+    if not session_id or not endpoint.startswith("https://opencode.ai/zen/go"):
-+        return request_data
-+    updated = dict(request_data)
-+    headers = dict(updated.get("extra_headers") or {})
-+    headers["x-opencode-session"] = session_id
-+    updated["extra_headers"] = headers
-+    return updated
-+
-+
- class OpenAIClient(LLMClientBase):
-     def _prepare_client_kwargs(self, llm_config: LLMConfig) -> dict:
-         api_key, _, _ = self.get_byok_overrides(llm_config)
 diff --git a/letta/services/summarizer/compact.py b/letta/services/summarizer/compact.py
 index 025f624..912ad96 100644
 --- a/letta/services/summarizer/compact.py
