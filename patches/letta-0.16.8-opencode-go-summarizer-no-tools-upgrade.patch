@@ -1,0 +1,46 @@
+--- a/letta/llm_api/openai_client.py
++++ b/letta/llm_api/openai_client.py
+@@ -172,6 +172,24 @@
+     return True
+ 
+ 
++def without_opencode_go_empty_tool_controls(request_data: dict, llm_config: LLMConfig) -> dict:
++    """Drop empty tool controls that OpenCode Go rejects on no-tools requests.
++
++    Letta's OpenAI request model serializes explicitly supplied ``None`` fields
++    even with ``exclude_unset=True``. OpenCode Go treats the presence of
++    ``tool_choice`` as invalid unless real tools are also supplied. Keep this
++    normalization request-scoped and endpoint-specific.
++    """
++    endpoint = (llm_config.model_endpoint or "").rstrip("/")
++    if not endpoint.startswith("https://opencode.ai/zen/go") or request_data.get("tools"):
++        return request_data
++    updated = dict(request_data)
++    updated.pop("tools", None)
++    updated.pop("tool_choice", None)
++    updated.pop("parallel_tool_calls", None)
++    return updated
++
++
+ def with_opencode_go_session_header(request_data: dict, llm_config: LLMConfig, session_id: str | None) -> dict:
+     """Attach OpenCode Go's stable per-conversation routing header to one request.
+ 
+--- a/letta/services/summarizer/summarizer.py
++++ b/letta/services/summarizer/summarizer.py
+@@ -15,7 +15,7 @@
+ from letta.errors import ContextWindowExceededError, LLMProviderOverloaded, LLMRateLimitError
+ from letta.helpers.message_helper import convert_message_creates_to_messages
+ from letta.llm_api.llm_client import LLMClient
+-from letta.llm_api.openai_client import with_opencode_go_session_header
++from letta.llm_api.openai_client import with_opencode_go_session_header, without_opencode_go_empty_tool_controls
+ from letta.log import get_logger
+ from letta.otel.tracing import trace_method
+ from letta.schemas.enums import AgentType, LLMCallType, MessageRole, ProviderCategory, ProviderType
+@@ -842,6 +842,7 @@
+ ) -> str:
+     """Execute the actual LLM request for summarization."""
+ 
++    req_data = without_opencode_go_empty_tool_controls(req_data, llm_config)
+     req_data = with_opencode_go_session_header(req_data, llm_config, opencode_session_id)
+ 
+     if llm_config.model_endpoint_type in [ProviderType.anthropic, ProviderType.bedrock]:
