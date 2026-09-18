@@ -172,8 +172,9 @@ export async function sendViaNativeClient(
 
   const hasRealUserMessage = Boolean(payload.latestUserMessage?.trim());
   let turnSucceeded = false;
-  let whisperDelivered = false;
-  let postWhisperFailureCleanupOwned = false;
+  let whisperResolved = false;
+  let foregroundReleased = false;
+  let postReleaseFailureCleanupOwned = false;
 
   try {
     const apiKey = process.env.LETTA_API_KEY;
@@ -290,7 +291,7 @@ export async function sendViaNativeClient(
         },
       },
       async execute(_toolCallId: string, args: unknown) {
-        if (whisperDelivered) throw new Error('deliver_whisper may be called at most once per batch');
+        if (whisperResolved) throw new Error('deliver_whisper may be called at most once per batch');
         const raw = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
         const memoryId = typeof raw.memory_id === 'string' ? raw.memory_id.trim() : '';
         const snippetIds = Array.isArray(raw.snippet_ids)
@@ -312,25 +313,37 @@ export async function sendViaNativeClient(
           isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
           memoryId,
         ), log, (result) => Boolean(result && result.whisper.memory_id === memoryId));
+        const releaseSyncBatch = (status: 'queued' | 'already_pending' | 'already_delivered', whisperId: string): void => {
+          if (!isSync) return;
+          if (status === 'already_delivered') writeSyncCheckpoint(payload, 'no_whisper');
+          else writeSyncCheckpoint(payload, 'whisper', whisperId);
+          foregroundReleased = true;
+        };
+
         if (!delivery.delivered) {
+          whisperResolved = true;
           if ('result' in delivery) {
             if (!delivery.result) {
               log(`Foreground whisper for ${memoryId} produced no durable batch artifact`);
               return { status: 'not_queued' };
             }
-            whisperDelivered = true;
+            releaseSyncBatch(delivery.result.status, delivery.result.whisper.whisper_id);
             log(`Skipped foreground whisper for ${memoryId}: batch ${payload.batchId} already holds ${delivery.result.whisper.memory_id ?? 'an unattributed memory'} (${delivery.result.status})`);
             return { status: `batch_${delivery.result.status}`, whisper_id: delivery.result.whisper.whisper_id };
+          }
+          if (isSync) {
+            writeSyncCheckpoint(payload, 'no_whisper');
+            foregroundReleased = true;
           }
           log(`Skipped foreground whisper for session-delivered memory ${memoryId}`);
           return { status: 'already_delivered' };
         }
         const queued = delivery.result;
+        whisperResolved = true;
+        releaseSyncBatch(queued.status, queued.whisper.whisper_id);
         log(`Foreground whisper ${queued.status}: ${queued.whisper.whisper_id} (${groundedText.length} chars)`);
-        if (isSync) writeSyncCheckpoint(payload, 'whisper', queued.whisper.whisper_id);
         // Cleanup ownership transfers only after the durable foreground release
         // checkpoint exists. A queue write alone is not enough to let Kohaku go.
-        whisperDelivered = true;
         return { status: 'ok', queue_status: queued.status, whisper_id: queued.whisper.whisper_id };
       },
     });
@@ -394,23 +407,26 @@ export async function sendViaNativeClient(
     const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';
     log(`Native live turn complete: mode=${mode}, success=${turnSucceeded}, stop_reason=${stopReason}`);
     if (result.clientToolFailure) log('Native live turn contained at least one failed client-tool execution');
-    if (isSync && !whisperDelivered) writeSyncCheckpoint(payload, 'no_whisper');
+    if (isSync && !foregroundReleased) {
+      writeSyncCheckpoint(payload, 'no_whisper');
+      foregroundReleased = true;
+    }
   } catch (error) {
     turnSucceeded = false;
     log(`Live Subconscious native-client failure: ${error instanceof Error ? error.message : String(error)}`);
     if (isSync) {
       const apiKey = process.env.LETTA_API_KEY;
       const syncAgentId = payload.syncAgentId ?? payload.agentId;
-      if (whisperDelivered && apiKey) {
-        // Foreground already consumed the durable whisper checkpoint and the
+      if (foregroundReleased && apiKey) {
+        // Foreground already received a durable release checkpoint and the
         // wrapper may have exited. From this point the worker owns cleanup:
         // cancel/defer the server resources and do NOT publish a new failed
         // checkpoint that nobody is left to consume.
         await (dependencies.cancelAndDefer ?? cancelAndDeferSyncResources)(apiKey, payload.conversationId, syncAgentId, payload.syncBlockIds ?? []);
-        // Keep the already-durable whisper checkpoint untouched. If the wrapper
+        // Keep the already-durable release checkpoint untouched. If the wrapper
         // has not observed it yet, it must still be able to release foreground;
         // if it already observed it, the wrapper has removed it itself.
-        postWhisperFailureCleanupOwned = true;
+        postReleaseFailureCleanupOwned = true;
         log(`Post-whisper sync failure cleanup deferred for conversation ${payload.conversationId}`);
       } else {
         writeSyncCheckpoint(payload, 'failed');
@@ -423,7 +439,7 @@ export async function sendViaNativeClient(
     const syncAgentId = payload.syncAgentId ?? payload.agentId;
     if (payload.cleanupSyncResourcesOnFinish && turnSucceeded && apiKey) {
       await (dependencies.cleanupCompleted ?? cleanupCompletedSyncResources)(apiKey, payload.conversationId, syncAgentId, payload.syncBlockIds ?? []);
-    } else if (!turnSucceeded && !postWhisperFailureCleanupOwned) {
+    } else if (!turnSucceeded && !postReleaseFailureCleanupOwned) {
       // Before foreground release the wrapper still owns failed-run cleanup.
       log(`Leaving failed sync resources ${payload.conversationId} / ${syncAgentId} for wrapper cancellation cleanup`);
     }

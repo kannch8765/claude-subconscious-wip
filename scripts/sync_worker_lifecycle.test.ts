@@ -2,8 +2,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { renderHistoricalMemoryWhisper, renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, type LiveWorkerPayload } from './send_worker_native.js';
-import { readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { renderHistoricalMemoryWhisper, renderHistoricalWhisperQuotes, runNativeWorkerPayloadFile, sendViaNativeClient, type LiveWorkerPayload } from './send_worker_native.js';
+import { acknowledgePendingSubconWhispers, queueSubconWhisper, readPendingSubconWhispers } from './subcon_whisper_queue.js';
+import { getSessionDeliveredMemoryIds } from './conversation_utils.js';
 import { RelationshipMemoryStore, stableId } from '../relationship-memory/src/store/index.js';
 
 const dirs: string[] = [];
@@ -14,6 +15,76 @@ afterEach(() => {
   for (const key of Object.keys(process.env)) if (!(key in savedEnv)) delete process.env[key];
   Object.assign(process.env, savedEnv);
 });
+
+
+
+function seedRecallMemory(root: string, memoryId: string, summary: string, keyword: string): void {
+  const store = new RelationshipMemoryStore(root, 'kohaku');
+  store.appendMemory({
+    schema_version: 1,
+    memory_id: memoryId,
+    subject_id: 'kohaku',
+    kind: 'shared_experience',
+    summary,
+    participants: ['user', 'assistant'],
+    payload: { title: keyword, event: summary, shared_meaning: `关于${keyword}的共同片段。` },
+    status: 'active',
+    observed_at: '2026-08-02T10:00:00.000Z',
+    created_at: '2026-08-02T10:00:00.000Z',
+    source_key: `source-${memoryId}`,
+    dedupe_key: `dedupe-${memoryId}`,
+  }, [{
+    evidence_id: `evidence-${memoryId}`,
+    memory_id: memoryId,
+    conversation_id: 'conv-old',
+    message_id: `message-${memoryId}`,
+    role: 'user',
+    quote: `猫以前说过${keyword}。`,
+    captured_at: '2026-08-02T10:00:00.000Z',
+    event_kind: 'user_text',
+  }]);
+}
+
+function syncPayload(cwd: string, checkpointFile: string, sessionId: string, batchId: string): LiveWorkerPayload {
+  return {
+    mode: 'sync',
+    agentId: 'agent-11111111-1111-4111-8111-111111111111',
+    syncAgentId: 'agent-11111111-1111-4111-8111-111111111111',
+    syncBlockIds: ['block-a'],
+    conversationId: 'conv-22222222-2222-4222-8222-222222222222',
+    sessionId,
+    message: '<subcon_sync_foreground_turn>绿茶</subcon_sync_foreground_turn>',
+    cwd,
+    batchId,
+    canonicalMessages: [],
+    assistantIntents: [],
+    latestUserMessage: '绿茶',
+    syncCheckpointFile: checkpointFile,
+    syncTurnId: 'turn-test',
+    cleanupSyncResourcesOnFinish: true,
+  };
+}
+
+async function runSyncAttemptForMemoryB(payload: LiveWorkerPayload): Promise<void> {
+  const outcome = await sendViaNativeClient(payload, {
+    createClient: () => ({}),
+    runConversation: (async (input: any) => {
+      const search = input.tools.find((tool: any) => tool.name === 'memory_search');
+      const whisper = input.tools.find((tool: any) => tool.name === 'deliver_whisper');
+      const searchResult = await search.execute('search-b', { query: '绿茶' });
+      const hit = searchResult.results.find((item: any) => item.memory_id === 'memory-B');
+      expect(hit).toBeTruthy();
+      const result = await whisper.execute('whisper-b', {
+        memory_id: hit.memory_id,
+        snippet_ids: [hit.quote_snippets[0].snippet_id],
+      });
+      expect(result.status).toMatch(/^batch_already_/);
+      return { response: { stop_reason: { stop_reason: 'end_turn' } }, clientToolFailure: false } as any;
+    }) as any,
+    cleanupCompleted: async () => {},
+  });
+  expect(outcome).toBe('completed');
+}
 
 describe('sync worker post-whisper lifecycle ownership', () => {
   it('renders canonical memory context before source-faithful historical evidence', () => {
@@ -146,4 +217,58 @@ describe('sync worker post-whisper lifecycle ownership', () => {
     expect(pending[0].whisper.text).toContain('当时琥珀：「那我陪猫去找咖啡><🐾」');
     expect(pending[0].whisper.text).not.toContain('我记得猫以前提过咖啡');
   });
+
+  it('releases the existing pending A whisper when an overlapping sync worker attempts B', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-worker-overlap-pending-'));
+    dirs.push(cwd);
+    process.env.LETTA_API_KEY = 'test-key';
+    process.env.RELATIONSHIP_MEMORY_DIR = path.join(cwd, 'relationship-memory');
+    process.env.RELATIONSHIP_MEMORY_SUBJECT_ID = 'kohaku';
+    delete process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER;
+    seedRecallMemory(process.env.RELATIONSHIP_MEMORY_DIR, 'memory-B', '猫和琥珀聊过绿茶。', '绿茶');
+
+    const sessionId = 'session-overlap-pending';
+    const batchId = 'sync_batch_overlap';
+    const existing = queueSubconWhisper(cwd, sessionId, batchId, 'existing A', { source: 'sync', turnId: 'turn-test' }, 'memory-A');
+    expect(existing?.status).toBe('queued');
+    const checkpointFile = path.join(cwd, 'checkpoint.json');
+
+    await runSyncAttemptForMemoryB(syncPayload(cwd, checkpointFile, sessionId, batchId));
+
+    expect(JSON.parse(fs.readFileSync(checkpointFile, 'utf8'))).toMatchObject({
+      status: 'whisper',
+      whisper_id: existing!.whisper.whisper_id,
+    });
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).not.toContain('memory-B');
+    const pending = readPendingSubconWhispers(cwd, sessionId);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].whisper.memory_id).toBe('memory-A');
+  });
+
+  it('publishes no_whisper when A was already consumed and an overlapping sync worker attempts B', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'sync-worker-overlap-delivered-'));
+    dirs.push(cwd);
+    process.env.LETTA_API_KEY = 'test-key';
+    process.env.RELATIONSHIP_MEMORY_DIR = path.join(cwd, 'relationship-memory');
+    process.env.RELATIONSHIP_MEMORY_SUBJECT_ID = 'kohaku';
+    delete process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER;
+    seedRecallMemory(process.env.RELATIONSHIP_MEMORY_DIR, 'memory-B', '猫和琥珀聊过绿茶。', '绿茶');
+
+    const sessionId = 'session-overlap-delivered';
+    const batchId = 'sync_batch_overlap';
+    const existing = queueSubconWhisper(cwd, sessionId, batchId, 'existing A', { source: 'sync', turnId: 'turn-test' }, 'memory-A');
+    expect(existing?.status).toBe('queued');
+    acknowledgePendingSubconWhispers(readPendingSubconWhispers(cwd, sessionId));
+    const checkpointFile = path.join(cwd, 'checkpoint.json');
+
+    await runSyncAttemptForMemoryB(syncPayload(cwd, checkpointFile, sessionId, batchId));
+
+    expect(JSON.parse(fs.readFileSync(checkpointFile, 'utf8'))).toMatchObject({ status: 'no_whisper' });
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).not.toContain('memory-B');
+    expect(readPendingSubconWhispers(cwd, sessionId)).toEqual([]);
+    const stillDelivered = queueSubconWhisper(cwd, sessionId, batchId, 'attempt C', { source: 'sync', turnId: 'turn-test' }, 'memory-C');
+    expect(stillDelivered?.status).toBe('already_delivered');
+    expect(stillDelivered?.whisper.memory_id).toBe('memory-A');
+  });
+
 });
