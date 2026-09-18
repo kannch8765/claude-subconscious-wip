@@ -2,6 +2,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { deliverSessionMemoryOnce, getSessionDeliveredMemoryIds } from './conversation_utils.js';
 import {
   acknowledgePendingSubconWhispers,
   formatPendingSubconWhispers,
@@ -17,10 +18,13 @@ afterEach(() => { while (roots.length) fs.rmSync(roots.pop()!, { recursive: true
 function temp(): string { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'sub-whisper-')); roots.push(root); return root; }
 
 describe('Subcon foreground whisper queue', () => {
-  it('delivers one idempotent whisper per background batch and acknowledges it after injection', () => {
+  it('delivers one idempotent whisper per background batch and returns the actual batch artifact', () => {
     const cwd = temp();
-    queueSubconWhisper(cwd, 'session-a', 'batch-a', '咖啡让我想起猫之前京都那次的高木珈琲。');
-    queueSubconWhisper(cwd, 'session-a', 'batch-a', '咖啡让我想起猫之前京都那次的高木珈琲。');
+    const first = queueSubconWhisper(cwd, 'session-a', 'batch-a', '咖啡让我想起猫之前京都那次的高木珈琲。');
+    const repeatedPending = queueSubconWhisper(cwd, 'session-a', 'batch-a', '这段不会覆盖实际 pending。');
+    expect(first?.status).toBe('queued');
+    expect(repeatedPending?.status).toBe('already_pending');
+    expect(repeatedPending?.whisper.text).toBe('咖啡让我想起猫之前京都那次的高木珈琲。');
     const pending = readPendingSubconWhispers(cwd, 'session-a');
     expect(pending).toHaveLength(1);
     const formatted = formatPendingSubconWhispers(pending);
@@ -30,7 +34,9 @@ describe('Subcon foreground whisper queue', () => {
     expect(formatted).not.toContain('<letta_message');
     acknowledgePendingSubconWhispers(pending);
     expect(readPendingSubconWhispers(cwd, 'session-a')).toEqual([]);
-    expect(queueSubconWhisper(cwd, 'session-a', 'batch-a', '重试时不应再次排同一张纸条。')).toBeNull();
+    const repeatedDelivered = queueSubconWhisper(cwd, 'session-a', 'batch-a', '重试时不应再次排同一张纸条。');
+    expect(repeatedDelivered?.status).toBe('already_delivered');
+    expect(repeatedDelivered?.whisper.text).toBe('咖啡让我想起猫之前京都那次的高木珈琲。');
     expect(readPendingSubconWhispers(cwd, 'session-a')).toEqual([]);
   });
 
@@ -89,9 +95,67 @@ describe('Subcon foreground whisper queue', () => {
 it('retracts only the exact pending sync turn without touching async or another sync turn', () => {
   const cwd = temp();
   queueSubconWhisper(cwd, 'session-a', 'async-a', 'async paper');
-  const current = queueSubconWhisper(cwd, 'session-a', 'sync-current', 'current paper', { source: 'sync', turnId: 'turn-current' })!;
+  const current = queueSubconWhisper(cwd, 'session-a', 'sync-current', 'current paper', { source: 'sync', turnId: 'turn-current' })!.whisper;
   queueSubconWhisper(cwd, 'session-a', 'sync-next', 'next paper', { source: 'sync', turnId: 'turn-next' });
   expect(retractPendingSyncWhisperForTurn(cwd, 'session-a', 'turn-current', current.whisper_id)).toBe(1);
   const left = readPendingSubconWhispers(cwd, 'session-a').map((item) => item.whisper);
   expect(left.map((item) => item.batch_id).sort()).toEqual(['async-a', 'sync-next']);
+});
+
+
+describe('session memory delivery truth follows the batch artifact', () => {
+  function deliverMemory(cwd: string, sessionId: string, batchId: string, memoryId: string, text: string) {
+    return deliverSessionMemoryOnce(
+      cwd,
+      sessionId,
+      memoryId,
+      () => queueSubconWhisper(cwd, sessionId, batchId, text, undefined, memoryId),
+      undefined,
+      (result) => Boolean(result && result.whisper.memory_id === memoryId),
+    );
+  }
+
+  it('does not mark memory B when the batch is already pending memory A', () => {
+    const cwd = temp();
+    const sessionId = 'session-pending-a-then-b';
+    const batchId = 'batch-shared';
+    expect(queueSubconWhisper(cwd, sessionId, batchId, 'A', undefined, 'memory-A')?.status).toBe('queued');
+
+    const attempt = deliverMemory(cwd, sessionId, batchId, 'memory-B', 'B');
+    expect(attempt.delivered).toBe(false);
+    expect(attempt.result?.status).toBe('already_pending');
+    expect(attempt.result?.whisper.memory_id).toBe('memory-A');
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).toEqual([]);
+    expect(readPendingSubconWhispers(cwd, sessionId).map(({ whisper }) => whisper.memory_id)).toEqual(['memory-A']);
+  });
+
+  it('does not mark memory B when the batch already delivered memory A', () => {
+    const cwd = temp();
+    const sessionId = 'session-delivered-a-then-b';
+    const batchId = 'batch-shared';
+    expect(queueSubconWhisper(cwd, sessionId, batchId, 'A', undefined, 'memory-A')?.status).toBe('queued');
+    acknowledgePendingSubconWhispers(readPendingSubconWhispers(cwd, sessionId));
+
+    const attempt = deliverMemory(cwd, sessionId, batchId, 'memory-B', 'B');
+    expect(attempt.delivered).toBe(false);
+    expect(attempt.result?.status).toBe('already_delivered');
+    expect(attempt.result?.whisper.memory_id).toBe('memory-A');
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).toEqual([]);
+    expect(readPendingSubconWhispers(cwd, sessionId)).toEqual([]);
+  });
+
+  it('recovers a missing session marker when the same memory already owns the batch', () => {
+    const cwd = temp();
+    const sessionId = 'session-a-recovery';
+    const batchId = 'batch-shared';
+    expect(queueSubconWhisper(cwd, sessionId, batchId, 'A', undefined, 'memory-A')?.status).toBe('queued');
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).toEqual([]);
+
+    const recovery = deliverMemory(cwd, sessionId, batchId, 'memory-A', 'A retry');
+    expect(recovery.delivered).toBe(true);
+    expect(recovery.result?.status).toBe('already_pending');
+    expect(recovery.result?.whisper.memory_id).toBe('memory-A');
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).toEqual(['memory-A']);
+    expect(readPendingSubconWhispers(cwd, sessionId)).toHaveLength(1);
+  });
 });

@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MEMORY_REMEMBER_TOOL_NAMES } from '../relationship-memory/src/tools/index.js';
-import { sendViaNativeClient } from './send_worker_native.js';
+import { annotateSessionMemoryDelivery, sendViaNativeClient } from './send_worker_native.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -13,6 +13,22 @@ afterEach(() => {
 });
 
 describe('live async relationship-memory surfacing contract', () => {
+  it('marks session-delivered recall candidates and keeps unseen memories first without hiding maintenance candidates', () => {
+    const results = annotateSessionMemoryDelivery([
+      { memory_id: 'seen-1', summary: 'old first' },
+      { memory_id: 'new-1', summary: 'fresh first' },
+      { memory_id: 'seen-2', summary: 'old second' },
+      { memory_id: 'new-2', summary: 'fresh second' },
+    ], ['seen-1', 'seen-2']);
+
+    expect(results.map((memory) => [memory.memory_id, memory.session_delivery])).toEqual([
+      ['new-1', 'new'],
+      ['new-2', 'new'],
+      ['seen-1', 'already_delivered'],
+      ['seen-2', 'already_delivered'],
+    ]);
+  });
+
   it('lets the live model choose semantic relationship searches while requiring at least one real search', () => {
     const send = fs.readFileSync(path.join(process.cwd(), 'scripts/send_messages_to_letta.ts'), 'utf8');
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
@@ -22,6 +38,7 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(send).toContain('must complete at least one relationship memory_search');
     expect(send).toContain('additional memory_search calls after seeing earlier results');
     expect(send).toContain('deliver_whisper');
+    expect(send).toContain('session_delivery=already_delivered');
     expect(worker).toContain("name: 'deliver_whisper'");
     expect(worker).toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");
     expect(worker).toContain('Model relationship memory_search: query=');
@@ -40,6 +57,9 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(send).toContain('latestUserMessage,');
     expect(worker).toContain('isRelationshipMutationClientTool(tool.name)');
     expect(worker).toContain('RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS');
+    expect(worker).toContain('getSessionDeliveredMemoryIds(payload.cwd, payload.sessionId)');
+    expect(worker).toContain('deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId');
+    expect(worker).toContain("return { status: 'already_delivered' }");
   });
 
   it('sends the five kind-specific create schemas on the final async native client-tool surface', async () => {

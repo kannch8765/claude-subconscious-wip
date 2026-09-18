@@ -48,12 +48,18 @@ describe('additive synchronous Subcon mode contract', () => {
 
   it('checkpoints after durable queueing and transfers post-release cleanup ownership to the worker', () => {
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
-    const queued = worker.indexOf('const queued = queueSubconWhisper(');
-    const checkpoint = worker.indexOf("writeSyncCheckpoint(payload, 'whisper'");
+    const deliveryGate = worker.indexOf('deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId');
+    const durableQueue = worker.indexOf('() => queueSubconWhisper(');
+    const releaseHelper = worker.indexOf('const releaseSyncBatch =');
     const completion = worker.indexOf('Native live turn complete: mode=${mode}');
-    expect(queued).toBeGreaterThan(-1);
-    expect(checkpoint).toBeGreaterThan(queued);
-    expect(completion).toBeGreaterThan(checkpoint);
+    expect(deliveryGate).toBeGreaterThan(-1);
+    expect(durableQueue).toBeGreaterThan(deliveryGate);
+    expect(releaseHelper).toBeGreaterThan(durableQueue);
+    expect(completion).toBeGreaterThan(releaseHelper);
+    expect(worker).toContain("if (status === 'already_delivered') writeSyncCheckpoint(payload, 'no_whisper')");
+    expect(worker).toContain("else writeSyncCheckpoint(payload, 'whisper', whisperId)");
+    expect(worker).toContain('if (isSync && !foregroundReleased)');
+    expect(worker).toContain('if (whisperResolved) throw new Error');
     expect(worker).toContain('clientToolRoundGate: syncClientToolRoundGate');
     expect(worker).toContain('Post-whisper sync failure cleanup deferred');
     expect(worker).toContain('cancelAndDeferSyncResources');

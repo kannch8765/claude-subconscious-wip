@@ -463,4 +463,68 @@ describe('live retryable conversation recovery', () => {
     expect(fs.existsSync(markerPath)).toBe(false);
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  it('records a canonical memory only after successful session delivery and suppresses repeats', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+
+    const {
+      deliverSessionMemoryOnce,
+      getSessionDeliveredMemoryIds,
+      getSyncStateFile,
+      saveSyncState,
+    } = await import('./conversation_utils.js');
+
+    const cwd = '/workspace';
+    const sessionId = 'session-delivery';
+    saveSyncState(cwd, { lastProcessedIndex: 3, sessionId });
+
+    let deliveryCalls = 0;
+    const first = deliverSessionMemoryOnce(cwd, sessionId, ' memory-1 ', () => {
+      deliveryCalls += 1;
+      return { whisper_id: 'whisper-1' };
+    });
+    expect(first).toEqual({ delivered: true, result: { whisper_id: 'whisper-1' } });
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).toEqual(['memory-1']);
+
+    const duplicate = deliverSessionMemoryOnce(cwd, sessionId, 'memory-1', () => {
+      deliveryCalls += 1;
+      return { whisper_id: 'should-not-run' };
+    });
+    expect(duplicate).toEqual({ delivered: false });
+    expect(deliveryCalls).toBe(1);
+
+    expect(() => deliverSessionMemoryOnce(cwd, sessionId, 'memory-2', () => {
+      throw new Error('queue failed');
+    })).toThrow('queue failed');
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).toEqual(['memory-1']);
+
+    const retry = deliverSessionMemoryOnce(cwd, sessionId, 'memory-2', () => 'queued');
+    expect(retry).toEqual({ delivered: true, result: 'queued' });
+    expect(JSON.parse(fs.readFileSync(getSyncStateFile(cwd, sessionId), 'utf8'))).toMatchObject({
+      lastProcessedIndex: 3,
+      deliveredMemoryIds: ['memory-1', 'memory-2'],
+    });
+  });
+
+  it('does not let a stale state save erase session delivery markers', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+
+    const { deliverSessionMemoryOnce, loadSyncState, saveSyncState } = await import('./conversation_utils.js');
+    const cwd = '/workspace';
+    const sessionId = 'session-stale-save';
+    saveSyncState(cwd, { lastProcessedIndex: 1, sessionId, conversationId: 'conv-1' });
+    const stale = loadSyncState(cwd, sessionId);
+
+    expect(deliverSessionMemoryOnce(cwd, sessionId, 'memory-1', () => 'queued').delivered).toBe(true);
+    stale.lastProcessedIndex = 2;
+    saveSyncState(cwd, stale);
+
+    expect(loadSyncState(cwd, sessionId)).toMatchObject({
+      lastProcessedIndex: 2,
+      deliveredMemoryIds: ['memory-1'],
+    });
+  });
+
 });

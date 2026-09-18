@@ -29,7 +29,12 @@ import {
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
-import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
+import {
+  advanceSyncStateCursor,
+  deliverSessionMemoryOnce,
+  getSessionDeliveredMemoryIds,
+  markConversationForRetryRotation,
+} from './conversation_utils.js';
 import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
 import { cancelAndDeferSyncResources, cleanupCompletedSyncResources } from './sync_letta_resources.js';
 import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
@@ -93,6 +98,26 @@ interface SurfacedRecallMemory {
   snippets: Map<string, HistoricalRecallSnippet & { snippet_id: string }>;
 }
 
+export type SessionMemoryDelivery = 'new' | 'already_delivered';
+
+export function annotateSessionMemoryDelivery(
+  results: readonly any[],
+  deliveredMemoryIds: readonly string[],
+): any[] {
+  const delivered = new Set(deliveredMemoryIds);
+  const annotated = results.map((memory) => {
+    const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id.trim() : '';
+    const sessionDelivery: SessionMemoryDelivery = memoryId && delivered.has(memoryId)
+      ? 'already_delivered'
+      : 'new';
+    return { ...memory, session_delivery: sessionDelivery };
+  });
+  return [
+    ...annotated.filter((memory) => memory.session_delivery === 'new'),
+    ...annotated.filter((memory) => memory.session_delivery === 'already_delivered'),
+  ];
+}
+
 export function renderHistoricalWhisperQuotes(snippets: readonly HistoricalRecallSnippet[]): string {
   const lines: string[] = [];
   let activeDate = '';
@@ -147,8 +172,9 @@ export async function sendViaNativeClient(
 
   const hasRealUserMessage = Boolean(payload.latestUserMessage?.trim());
   let turnSucceeded = false;
-  let whisperDelivered = false;
-  let postWhisperFailureCleanupOwned = false;
+  let whisperResolved = false;
+  let foregroundReleased = false;
+  let postReleaseFailureCleanupOwned = false;
 
   try {
     const apiKey = process.env.LETTA_API_KEY;
@@ -196,6 +222,7 @@ export async function sendViaNativeClient(
       if (tool.name === 'memory_search') {
         return {
           ...tool,
+          description: `${tool.description} Results include session_delivery=new|already_delivered for the current Claude session. Prefer new memories for foreground continuity; already_delivered memories remain searchable for private maintenance but should not be sent to deliver_whisper again.`,
           async execute(toolCallId: string, args: unknown) {
             const query = typeof (args as any)?.query === 'string' ? (args as any).query.trim() : '';
             log(`Model relationship memory_search: query=${JSON.stringify(query)}`);
@@ -203,7 +230,9 @@ export async function sendViaNativeClient(
             const result = isSync
               ? { results: await runtime.memorySearchRecallHybridWithEvidence((args ?? {}) as any) }
               : await execute(toolCallId, args);
-            const results = Array.isArray((result as any)?.results) ? (result as any).results as any[] : [];
+            const rawResults = Array.isArray((result as any)?.results) ? (result as any).results as any[] : [];
+            const deliveredMemoryIds = getSessionDeliveredMemoryIds(payload.cwd, payload.sessionId);
+            const results = annotateSessionMemoryDelivery(rawResults, deliveredMemoryIds);
             for (const memory of results) {
               const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id : '';
               const summary = typeof memory?.summary === 'string' ? memory.summary.trim() : '';
@@ -230,8 +259,9 @@ export async function sendViaNativeClient(
               }
               surfacedRecallMemories.set(memoryId, record);
             }
-            log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${results.length}`);
-            return result;
+            const alreadyDeliveredCount = results.filter((memory) => memory.session_delivery === 'already_delivered').length;
+            log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${results.length}, session_already_delivered=${alreadyDeliveredCount}`);
+            return result && typeof result === 'object' ? { ...(result as any), results } : result;
           },
         };
       }
@@ -247,8 +277,8 @@ export async function sendViaNativeClient(
     relationshipTools.push({
       name: 'deliver_whisper',
       description: isSync
-        ? 'Surface one source-faithful historical memory window for the CURRENT foreground Kohaku turn. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.'
-        : 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
+        ? 'Surface one source-faithful historical memory window for the CURRENT foreground Kohaku turn. Select a session_delivery=new memory and 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.'
+        : 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select a session_delivery=new memory and 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
       parameters: {
         type: 'object', additionalProperties: false, required: ['memory_id', 'snippet_ids'],
         properties: {
@@ -261,7 +291,7 @@ export async function sendViaNativeClient(
         },
       },
       async execute(_toolCallId: string, args: unknown) {
-        if (whisperDelivered) throw new Error('deliver_whisper may be called at most once per batch');
+        if (whisperResolved) throw new Error('deliver_whisper may be called at most once per batch');
         const raw = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
         const memoryId = typeof raw.memory_id === 'string' ? raw.memory_id.trim() : '';
         const snippetIds = Array.isArray(raw.snippet_ids)
@@ -278,16 +308,43 @@ export async function sendViaNativeClient(
         const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
         const groundedText = composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations));
         if (isSync && !payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
-        const queued = queueSubconWhisper(
+        const delivery = deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId, () => queueSubconWhisper(
           payload.cwd, payload.sessionId, payload.batchId, groundedText,
           isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
-        );
-        log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
-        if (isSync) writeSyncCheckpoint(payload, 'whisper', queued?.whisper_id);
+          memoryId,
+        ), log, (result) => Boolean(result && result.whisper.memory_id === memoryId));
+        const releaseSyncBatch = (status: 'queued' | 'already_pending' | 'already_delivered', whisperId: string): void => {
+          if (!isSync) return;
+          if (status === 'already_delivered') writeSyncCheckpoint(payload, 'no_whisper');
+          else writeSyncCheckpoint(payload, 'whisper', whisperId);
+          foregroundReleased = true;
+        };
+
+        if (!delivery.delivered) {
+          whisperResolved = true;
+          if ('result' in delivery) {
+            if (!delivery.result) {
+              log(`Foreground whisper for ${memoryId} produced no durable batch artifact`);
+              return { status: 'not_queued' };
+            }
+            releaseSyncBatch(delivery.result.status, delivery.result.whisper.whisper_id);
+            log(`Skipped foreground whisper for ${memoryId}: batch ${payload.batchId} already holds ${delivery.result.whisper.memory_id ?? 'an unattributed memory'} (${delivery.result.status})`);
+            return { status: `batch_${delivery.result.status}`, whisper_id: delivery.result.whisper.whisper_id };
+          }
+          if (isSync) {
+            writeSyncCheckpoint(payload, 'no_whisper');
+            foregroundReleased = true;
+          }
+          log(`Skipped foreground whisper for session-delivered memory ${memoryId}`);
+          return { status: 'already_delivered' };
+        }
+        const queued = delivery.result;
+        whisperResolved = true;
+        releaseSyncBatch(queued.status, queued.whisper.whisper_id);
+        log(`Foreground whisper ${queued.status}: ${queued.whisper.whisper_id} (${groundedText.length} chars)`);
         // Cleanup ownership transfers only after the durable foreground release
         // checkpoint exists. A queue write alone is not enough to let Kohaku go.
-        whisperDelivered = true;
-        return { status: 'ok', whisper_id: queued?.whisper_id };
+        return { status: 'ok', queue_status: queued.status, whisper_id: queued.whisper.whisper_id };
       },
     });
 
@@ -350,23 +407,26 @@ export async function sendViaNativeClient(
     const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';
     log(`Native live turn complete: mode=${mode}, success=${turnSucceeded}, stop_reason=${stopReason}`);
     if (result.clientToolFailure) log('Native live turn contained at least one failed client-tool execution');
-    if (isSync && !whisperDelivered) writeSyncCheckpoint(payload, 'no_whisper');
+    if (isSync && !foregroundReleased) {
+      writeSyncCheckpoint(payload, 'no_whisper');
+      foregroundReleased = true;
+    }
   } catch (error) {
     turnSucceeded = false;
     log(`Live Subconscious native-client failure: ${error instanceof Error ? error.message : String(error)}`);
     if (isSync) {
       const apiKey = process.env.LETTA_API_KEY;
       const syncAgentId = payload.syncAgentId ?? payload.agentId;
-      if (whisperDelivered && apiKey) {
-        // Foreground already consumed the durable whisper checkpoint and the
+      if (foregroundReleased && apiKey) {
+        // Foreground already received a durable release checkpoint and the
         // wrapper may have exited. From this point the worker owns cleanup:
         // cancel/defer the server resources and do NOT publish a new failed
         // checkpoint that nobody is left to consume.
         await (dependencies.cancelAndDefer ?? cancelAndDeferSyncResources)(apiKey, payload.conversationId, syncAgentId, payload.syncBlockIds ?? []);
-        // Keep the already-durable whisper checkpoint untouched. If the wrapper
+        // Keep the already-durable release checkpoint untouched. If the wrapper
         // has not observed it yet, it must still be able to release foreground;
         // if it already observed it, the wrapper has removed it itself.
-        postWhisperFailureCleanupOwned = true;
+        postReleaseFailureCleanupOwned = true;
         log(`Post-whisper sync failure cleanup deferred for conversation ${payload.conversationId}`);
       } else {
         writeSyncCheckpoint(payload, 'failed');
@@ -379,7 +439,7 @@ export async function sendViaNativeClient(
     const syncAgentId = payload.syncAgentId ?? payload.agentId;
     if (payload.cleanupSyncResourcesOnFinish && turnSucceeded && apiKey) {
       await (dependencies.cleanupCompleted ?? cleanupCompletedSyncResources)(apiKey, payload.conversationId, syncAgentId, payload.syncBlockIds ?? []);
-    } else if (!turnSucceeded && !postWhisperFailureCleanupOwned) {
+    } else if (!turnSucceeded && !postReleaseFailureCleanupOwned) {
       // Before foreground release the wrapper still owns failed-run cleanup.
       log(`Leaving failed sync resources ${payload.conversationId} / ${syncAgentId} for wrapper cancellation cleanup`);
     }
