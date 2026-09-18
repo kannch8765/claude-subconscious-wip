@@ -29,7 +29,12 @@ import {
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
-import { advanceSyncStateCursor, markConversationForRetryRotation } from './conversation_utils.js';
+import {
+  advanceSyncStateCursor,
+  deliverSessionMemoryOnce,
+  getSessionDeliveredMemoryIds,
+  markConversationForRetryRotation,
+} from './conversation_utils.js';
 import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
 import { cancelAndDeferSyncResources, cleanupCompletedSyncResources } from './sync_letta_resources.js';
 import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
@@ -91,6 +96,26 @@ type HistoricalRecallSnippet = { snippet_id?: string; source_kind: 'transcript' 
 interface SurfacedRecallMemory {
   summary: string;
   snippets: Map<string, HistoricalRecallSnippet & { snippet_id: string }>;
+}
+
+export type SessionMemoryDelivery = 'new' | 'already_delivered';
+
+export function annotateSessionMemoryDelivery(
+  results: readonly any[],
+  deliveredMemoryIds: readonly string[],
+): any[] {
+  const delivered = new Set(deliveredMemoryIds);
+  const annotated = results.map((memory) => {
+    const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id.trim() : '';
+    const sessionDelivery: SessionMemoryDelivery = memoryId && delivered.has(memoryId)
+      ? 'already_delivered'
+      : 'new';
+    return { ...memory, session_delivery: sessionDelivery };
+  });
+  return [
+    ...annotated.filter((memory) => memory.session_delivery === 'new'),
+    ...annotated.filter((memory) => memory.session_delivery === 'already_delivered'),
+  ];
 }
 
 export function renderHistoricalWhisperQuotes(snippets: readonly HistoricalRecallSnippet[]): string {
@@ -196,6 +221,7 @@ export async function sendViaNativeClient(
       if (tool.name === 'memory_search') {
         return {
           ...tool,
+          description: `${tool.description} Results include session_delivery=new|already_delivered for the current Claude session. Prefer new memories for foreground continuity; already_delivered memories remain searchable for private maintenance but should not be sent to deliver_whisper again.`,
           async execute(toolCallId: string, args: unknown) {
             const query = typeof (args as any)?.query === 'string' ? (args as any).query.trim() : '';
             log(`Model relationship memory_search: query=${JSON.stringify(query)}`);
@@ -203,7 +229,9 @@ export async function sendViaNativeClient(
             const result = isSync
               ? { results: await runtime.memorySearchRecallHybridWithEvidence((args ?? {}) as any) }
               : await execute(toolCallId, args);
-            const results = Array.isArray((result as any)?.results) ? (result as any).results as any[] : [];
+            const rawResults = Array.isArray((result as any)?.results) ? (result as any).results as any[] : [];
+            const deliveredMemoryIds = getSessionDeliveredMemoryIds(payload.cwd, payload.sessionId);
+            const results = annotateSessionMemoryDelivery(rawResults, deliveredMemoryIds);
             for (const memory of results) {
               const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id : '';
               const summary = typeof memory?.summary === 'string' ? memory.summary.trim() : '';
@@ -230,8 +258,9 @@ export async function sendViaNativeClient(
               }
               surfacedRecallMemories.set(memoryId, record);
             }
-            log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${results.length}`);
-            return result;
+            const alreadyDeliveredCount = results.filter((memory) => memory.session_delivery === 'already_delivered').length;
+            log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${results.length}, session_already_delivered=${alreadyDeliveredCount}`);
+            return result && typeof result === 'object' ? { ...(result as any), results } : result;
           },
         };
       }
@@ -247,8 +276,8 @@ export async function sendViaNativeClient(
     relationshipTools.push({
       name: 'deliver_whisper',
       description: isSync
-        ? 'Surface one source-faithful historical memory window for the CURRENT foreground Kohaku turn. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.'
-        : 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
+        ? 'Surface one source-faithful historical memory window for the CURRENT foreground Kohaku turn. Select a session_delivery=new memory and 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.'
+        : 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select a session_delivery=new memory and 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
       parameters: {
         type: 'object', additionalProperties: false, required: ['memory_id', 'snippet_ids'],
         properties: {
@@ -278,10 +307,15 @@ export async function sendViaNativeClient(
         const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
         const groundedText = composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations));
         if (isSync && !payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
-        const queued = queueSubconWhisper(
+        const delivery = deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId, () => queueSubconWhisper(
           payload.cwd, payload.sessionId, payload.batchId, groundedText,
           isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
-        );
+        ), log);
+        if (!delivery.delivered) {
+          log(`Skipped foreground whisper for session-delivered memory ${memoryId}`);
+          return { status: 'already_delivered' };
+        }
+        const queued = delivery.result;
         log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
         if (isSync) writeSyncCheckpoint(payload, 'whisper', queued?.whisper_id);
         // Cleanup ownership transfers only after the durable foreground release

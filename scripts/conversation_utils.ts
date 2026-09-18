@@ -75,6 +75,7 @@ export interface SyncState {
   conversationId?: string;
   lastBlockValues?: { [label: string]: string };
   lastSeenMessageId?: string;  // Track last message ID we've shown to avoid duplicates
+  deliveredMemoryIds?: string[];  // Canonical memories already surfaced to foreground in this Claude session
 }
 
 export interface ConversationRetryMarker {
@@ -412,6 +413,13 @@ export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLo
       merged.conversationId = durable.conversationId;
     }
 
+    const deliveredMemoryIds = [...new Set([
+      ...(durable?.deliveredMemoryIds ?? []),
+      ...(state.deliveredMemoryIds ?? []),
+    ].filter((memoryId) => typeof memoryId === 'string' && memoryId.trim().length > 0).map((memoryId) => memoryId.trim()))];
+    if (deliveredMemoryIds.length > 0) merged.deliveredMemoryIds = deliveredMemoryIds;
+    else delete merged.deliveredMemoryIds;
+
     writeSyncStateUnlocked(cwd, merged, log);
     Object.assign(state, merged);
   });
@@ -432,6 +440,48 @@ export function advanceSyncStateCursor(
     };
     writeSyncStateUnlocked(cwd, next, log);
     return next;
+  });
+}
+
+
+/** Return the canonical memory ids already surfaced to foreground in this Claude session. */
+export function getSessionDeliveredMemoryIds(cwd: string, sessionId: string): string[] {
+  return withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId);
+    return [...new Set((durable?.deliveredMemoryIds ?? [])
+      .filter((memoryId) => typeof memoryId === 'string' && memoryId.trim().length > 0)
+      .map((memoryId) => memoryId.trim()))];
+  });
+}
+
+/**
+ * Run one synchronous foreground delivery at most once per canonical memory and
+ * Claude session. The durable marker is written only after deliver() succeeds,
+ * and the existing session lock makes check -> delivery -> mark atomic across
+ * overlapping detached workers.
+ */
+export function deliverSessionMemoryOnce<T>(
+  cwd: string,
+  sessionId: string,
+  memoryId: string,
+  deliver: () => T,
+  log: LogFn = noopLog,
+): { delivered: true; result: T } | { delivered: false } {
+  const normalizedMemoryId = memoryId.trim();
+  if (!normalizedMemoryId) throw new Error('Session memory delivery requires a canonical memory id');
+
+  return withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
+    const deliveredMemoryIds = new Set((durable.deliveredMemoryIds ?? [])
+      .filter((candidate) => typeof candidate === 'string' && candidate.trim().length > 0)
+      .map((candidate) => candidate.trim()));
+    if (deliveredMemoryIds.has(normalizedMemoryId)) return { delivered: false };
+
+    const result = deliver();
+    deliveredMemoryIds.add(normalizedMemoryId);
+    const next: SyncState = { ...durable, deliveredMemoryIds: [...deliveredMemoryIds] };
+    writeSyncStateUnlocked(cwd, next, log);
+    return { delivered: true, result };
   });
 }
 
