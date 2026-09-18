@@ -9,6 +9,7 @@ export interface PendingSubconWhisper {
   batch_id: string;
   text: string;
   created_at: string;
+  memory_id?: string;
   source?: 'async' | 'sync';
   turn_id?: string;
 }
@@ -29,6 +30,13 @@ export interface PendingSubconWhisperFile {
   whisper: PendingSubconWhisper;
 }
 
+export type QueueSubconWhisperStatus = 'queued' | 'already_pending' | 'already_delivered';
+
+export interface QueueSubconWhisperResult {
+  status: QueueSubconWhisperStatus;
+  whisper: PendingSubconWhisper;
+}
+
 function queueDir(cwd: string, sessionId: string): string {
   const sessionKey = crypto.createHash('sha256').update(sessionId).digest('hex').slice(0, 24);
   return path.join(getDurableStateDir(cwd), 'subcon-whispers', sessionKey);
@@ -42,38 +50,72 @@ function escapeXmlText(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function readKnownWhisperArtifact(file: string): PendingSubconWhisper | null {
+  try {
+    const whisper = JSON.parse(fs.readFileSync(file, 'utf8')) as PendingSubconWhisper;
+    if (!whisper || typeof whisper.whisper_id !== 'string' || typeof whisper.session_id !== 'string'
+      || typeof whisper.batch_id !== 'string' || typeof whisper.text !== 'string' || !whisper.text.trim()) {
+      throw new Error(`Invalid whisper artifact ${file}`);
+    }
+    return whisper;
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function readExistingBatchWhisper(file: string, deliveredMarker: string): QueueSubconWhisperResult | null {
+  const delivered = readKnownWhisperArtifact(deliveredMarker);
+  if (delivered) return { status: 'already_delivered', whisper: delivered };
+  const pending = readKnownWhisperArtifact(file);
+  if (pending) return { status: 'already_pending', whisper: pending };
+  // Foreground acknowledgement renames .json -> .delivered without taking the
+  // session state lock, so close that single rename race before treating the
+  // batch as empty.
+  const deliveredAfterPendingRead = readKnownWhisperArtifact(deliveredMarker);
+  return deliveredAfterPendingRead
+    ? { status: 'already_delivered', whisper: deliveredAfterPendingRead }
+    : null;
+}
+
 export function queueSubconWhisper(
   cwd: string,
   sessionId: string,
   batchId: string,
   text: string,
   scope?: SubconWhisperScope,
-): PendingSubconWhisper | null {
+  memoryId?: string,
+): QueueSubconWhisperResult | null {
   const cleaned = text.replace(/\r\n/g, '\n').trim();
   if (!cleaned) return null;
   const dir = queueDir(cwd, sessionId);
   fs.mkdirSync(dir, { recursive: true });
+  const normalizedMemoryId = memoryId?.trim();
   const whisper: PendingSubconWhisper = {
     whisper_id: stableWhisperId(sessionId, batchId),
     session_id: sessionId,
     batch_id: batchId,
     text: cleaned,
     created_at: new Date().toISOString(),
+    ...(normalizedMemoryId ? { memory_id: normalizedMemoryId } : {}),
     ...(scope ? { source: scope.source, turn_id: scope.turnId } : {}),
   };
   const file = path.join(dir, `${whisper.whisper_id}.json`);
   const deliveredMarker = path.join(dir, `${whisper.whisper_id}.delivered`);
-  if (fs.existsSync(deliveredMarker)) return null;
-  if (fs.existsSync(file)) return whisper;
+  const existing = readExistingBatchWhisper(file, deliveredMarker);
+  if (existing) return existing;
+
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
   fs.writeFileSync(temp, `${JSON.stringify(whisper)}\n`, { mode: 0o600 });
   try {
     fs.renameSync(temp, file);
   } catch (error) {
     try { fs.unlinkSync(temp); } catch { /* best effort */ }
-    if (!fs.existsSync(file)) throw error;
+    const raced = readExistingBatchWhisper(file, deliveredMarker);
+    if (raced) return raced;
+    throw error;
   }
-  return whisper;
+  return { status: 'queued', whisper };
 }
 
 export function removePendingSubconWhisper(cwd: string, sessionId: string, batchId: string): void {

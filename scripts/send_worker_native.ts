@@ -310,18 +310,28 @@ export async function sendViaNativeClient(
         const delivery = deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId, () => queueSubconWhisper(
           payload.cwd, payload.sessionId, payload.batchId, groundedText,
           isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
-        ), log);
+          memoryId,
+        ), log, (result) => Boolean(result && result.whisper.memory_id === memoryId));
         if (!delivery.delivered) {
+          if ('result' in delivery) {
+            if (!delivery.result) {
+              log(`Foreground whisper for ${memoryId} produced no durable batch artifact`);
+              return { status: 'not_queued' };
+            }
+            whisperDelivered = true;
+            log(`Skipped foreground whisper for ${memoryId}: batch ${payload.batchId} already holds ${delivery.result.whisper.memory_id ?? 'an unattributed memory'} (${delivery.result.status})`);
+            return { status: `batch_${delivery.result.status}`, whisper_id: delivery.result.whisper.whisper_id };
+          }
           log(`Skipped foreground whisper for session-delivered memory ${memoryId}`);
           return { status: 'already_delivered' };
         }
         const queued = delivery.result;
-        log(`Queued foreground whisper ${queued?.whisper_id ?? 'none'} (${groundedText.length} chars)`);
-        if (isSync) writeSyncCheckpoint(payload, 'whisper', queued?.whisper_id);
+        log(`Foreground whisper ${queued.status}: ${queued.whisper.whisper_id} (${groundedText.length} chars)`);
+        if (isSync) writeSyncCheckpoint(payload, 'whisper', queued.whisper.whisper_id);
         // Cleanup ownership transfers only after the durable foreground release
         // checkpoint exists. A queue write alone is not enough to let Kohaku go.
         whisperDelivered = true;
-        return { status: 'ok', whisper_id: queued?.whisper_id };
+        return { status: 'ok', queue_status: queued.status, whisper_id: queued.whisper.whisper_id };
       },
     });
 

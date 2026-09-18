@@ -456,9 +456,9 @@ export function getSessionDeliveredMemoryIds(cwd: string, sessionId: string): st
 
 /**
  * Run one synchronous foreground delivery at most once per canonical memory and
- * Claude session. The durable marker is written only after deliver() succeeds,
- * and the existing session lock makes check -> delivery -> mark atomic across
- * overlapping detached workers.
+ * Claude session. The durable marker is written only when deliver() returns a
+ * result confirmed to represent this memory, and the existing session lock makes
+ * check -> delivery -> mark atomic across overlapping detached workers.
  */
 export function deliverSessionMemoryOnce<T>(
   cwd: string,
@@ -466,7 +466,8 @@ export function deliverSessionMemoryOnce<T>(
   memoryId: string,
   deliver: () => T,
   log: LogFn = noopLog,
-): { delivered: true; result: T } | { delivered: false } {
+  confirmsDelivery: (result: T) => boolean = () => true,
+): { delivered: true; result: T } | { delivered: false; result?: T } {
   const normalizedMemoryId = memoryId.trim();
   if (!normalizedMemoryId) throw new Error('Session memory delivery requires a canonical memory id');
 
@@ -478,6 +479,7 @@ export function deliverSessionMemoryOnce<T>(
     if (deliveredMemoryIds.has(normalizedMemoryId)) return { delivered: false };
 
     const result = deliver();
+    if (!confirmsDelivery(result)) return { delivered: false, result };
     deliveredMemoryIds.add(normalizedMemoryId);
     const next: SyncState = { ...durable, deliveredMemoryIds: [...deliveredMemoryIds] };
     writeSyncStateUnlocked(cwd, next, log);
