@@ -11,6 +11,7 @@ import type {
   EntityEvidenceRecord,
   EntityIdentityRecord,
   EntityOutcome,
+  MaintenanceReviewRecord,
   ReinforcementRecord,
   RememberOutcome,
   OwnerRevisionRecord,
@@ -341,6 +342,12 @@ export class RelationshipMemoryStore {
   listOutcomes(): RememberOutcome[] { return readJsonl<RememberOutcome>(this.file('outcomes.jsonl')); }
   listBatches(): BatchRecord[] { return readJsonl<BatchRecord>(this.file('batches.jsonl')); }
   listOwnerRevisions(): OwnerRevisionRecord[] { return readJsonl<OwnerRevisionRecord>(this.file('owner-revisions.jsonl')); }
+  listMaintenanceReviewRecords(): MaintenanceReviewRecord[] { return readJsonl<MaintenanceReviewRecord>(this.file('maintenance-reviews.jsonl')); }
+  listMaintenanceReviews(): MaintenanceReviewRecord[] {
+    const latest = new Map<string, MaintenanceReviewRecord>();
+    for (const record of this.listMaintenanceReviewRecords()) latest.set(record.review_id, record);
+    return [...latest.values()];
+  }
   listAssistantIntents(): AssistantRememberIntentRecord[] { return readJsonl<AssistantRememberIntentRecord>(this.file('assistant-intents.jsonl')); }
   listAssistantIntentOutcomes(): AssistantIntentOutcome[] { return readJsonl<AssistantIntentOutcome>(this.file('assistant-intent-outcomes.jsonl')); }
 
@@ -359,6 +366,9 @@ export class RelationshipMemoryStore {
     return [...this.listEntityOutcomes()].reverse().find((item) => item.source_key === sourceKey && item.outcome !== 'retryable_failed');
   }
   getMemory(memoryId: string): CanonicalMemoryRecord | undefined { return this.listMemories().find((item) => item.memory_id === memoryId); }
+  getMaintenanceReview(reviewId: string): MaintenanceReviewRecord | undefined {
+    return [...this.listMaintenanceReviewRecords()].reverse().find((item) => item.review_id === reviewId);
+  }
   getMemoryBySourceKey(sourceKey: string): CanonicalMemoryRecord | undefined { return this.listMemories().find((item) => item.source_key === sourceKey); }
   getMemoryByDedupeKey(dedupeKey: string): CanonicalMemoryRecord | undefined { return this.listMemories().find((item) => item.dedupe_key === dedupeKey); }
   getTerminalOutcome(sourceKey: string): RememberOutcome | undefined {
@@ -492,6 +502,33 @@ export class RelationshipMemoryStore {
           value: stableJson({ memory_id: record.memory_id, evidence_ids: record.evidence_ids }),
         }, reinforcementLookup.ready);
       }
+    });
+  }
+
+  appendMaintenanceReview(record: MaintenanceReviewRecord): boolean {
+    return this.withMutationBoundary(() => {
+      const records = this.listMaintenanceReviewRecords();
+      const latest = [...records].reverse().find((item) => item.review_id === record.review_id);
+      if (latest?.status === 'pending') return false;
+
+      const stable = stableJson(record);
+      const duplicate = records.some((item) => stableJson(item) === stable);
+      if (duplicate) return false;
+
+      const indexReady = this.ensureWriteIndex(
+        'maintenance-reviews',
+        'maintenance-reviews.jsonl',
+        () => records,
+        (item) => ({ key: item.review_id, value: stableJson(item) }),
+      );
+      appendJsonl(this.file('maintenance-reviews.jsonl'), record);
+      this.recordIndexedAppend(
+        'maintenance-reviews',
+        'maintenance-reviews.jsonl',
+        { key: record.review_id, value: stable },
+        indexReady,
+      );
+      return true;
     });
   }
 

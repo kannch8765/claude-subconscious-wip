@@ -3,19 +3,23 @@ import * as path from 'path';
 import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
 import { MEMORY_KINDS, type AssistantRememberIntentRecord, type CanonicalMessage, type MemoryKind, type ParticipantRole, type TranscriptEvidenceKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
-import { MEMORY_REMEMBER_TOOL_NAMES, entityRememberToolSchema, entitySearchToolSchema, memoryRememberKindToolSchema, memoryRememberToolName, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime, type MemoryRememberToolName } from '../tools/index.js';
+import { MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES, MEMORY_REMEMBER_TOOL_NAMES, entityRememberToolSchema, entitySearchToolSchema, memoryMaintenanceReviewToolSchema, memoryRememberKindToolSchema, memoryRememberToolName, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime, type MemoryMaintenanceReviewToolName, type MemoryRememberToolName } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
 import { createSemanticRetrieverFromEnvironment } from '../retrieval/index.js';
 
 export interface RelationshipTool {
   label: string;
-  name: 'memory_search' | MemoryRememberToolName | 'memory_reinforce' | 'entity_search' | 'entity_remember';
+  name: 'memory_search' | MemoryRememberToolName | MemoryMaintenanceReviewToolName | 'memory_reinforce' | 'entity_search' | 'entity_remember';
   description: string;
   parameters: Record<string, unknown>;
   execute(toolCallId: string, args: unknown): Promise<unknown>;
 }
 
 export type ResultWrapper = (value: unknown) => unknown;
+
+export interface BuildRelationshipToolsOptions {
+  includeMaintenanceReviewTools?: boolean;
+}
 
 export function relationshipMemoryRoot(): string {
   return process.env.RELATIONSHIP_MEMORY_DIR || path.join(os.homedir(), '.local', 'share', 'relationship-memory');
@@ -198,7 +202,18 @@ export function buildRelationshipTools(
   runtime: RelationshipMemoryRuntime,
   batchId: string,
   wrapResult: ResultWrapper = (value) => value,
+  options: BuildRelationshipToolsOptions = {},
 ): RelationshipTool[] {
+  const maintenanceReviewTools: RelationshipTool[] = options.includeMaintenanceReviewTools ? [
+    {
+      label: 'suggest_memory_relation',
+      name: 'suggest_memory_relation',
+      description: 'Queue a private owner-review suggestion describing how two or more canonical memories returned by prior purpose=maintenance memory_search calls in this same run relate: same meaning, changed over time, context-dependent, unresolved conflict, related, or unrelated. This never mutates canonical memory or performs the proposed relation.',
+      parameters: memoryMaintenanceReviewToolSchema(),
+      async execute(_toolCallId, args) { return wrapResult(runtime.suggestMaintenanceReview(batchId, 'relation', args as never)); },
+    },
+  ] : [];
+
   return [
     {
       label: 'memory_search', name: 'memory_search',
@@ -231,13 +246,14 @@ export function buildRelationshipTools(
       parameters: memoryRememberKindToolSchema(kind),
       async execute(_toolCallId, args) { return wrapResult(runtime.rememberKind(batchId, kind, args)); },
     })),
+    ...maintenanceReviewTools,
   ];
 }
 
 export const RELATIONSHIP_ALLOWED_BUILTIN_TOOLS = [] as const;
 export const RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS = ['memory_search', 'entity_search'] as const;
-export const RELATIONSHIP_MUTATION_CLIENT_TOOLS = ['memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_remember'] as const;
-export const RELATIONSHIP_EXTERNAL_TOOLS = ['memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember'] as const;
+export const RELATIONSHIP_MUTATION_CLIENT_TOOLS = ['memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_remember', ...MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES] as const;
+export const RELATIONSHIP_EXTERNAL_TOOLS = ['memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember', ...MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES] as const;
 export const RELATIONSHIP_ALLOWED_CLIENT_TOOLS = [...RELATIONSHIP_ALLOWED_BUILTIN_TOOLS, ...RELATIONSHIP_EXTERNAL_TOOLS] as const;
 const RELATIONSHIP_MUTATION_CLIENT_TOOL_SET = new Set<string>(RELATIONSHIP_MUTATION_CLIENT_TOOLS);
 
