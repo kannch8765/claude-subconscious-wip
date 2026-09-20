@@ -753,9 +753,6 @@ export class RelationshipMemoryRuntime {
       kind,
       memory_ids: memoryIds,
     });
-    const existing = this.store.getMaintenanceReview(reviewId);
-    if (existing?.status === 'pending') return { outcome: 'duplicate', review_id: reviewId };
-
     const now = this.now();
     const record: MaintenanceReviewRecord = {
       schema_version: 1,
