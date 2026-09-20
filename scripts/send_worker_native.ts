@@ -21,7 +21,7 @@ import {
   relationshipMemoryRoot,
 } from '../relationship-memory/src/adapter/index.js';
 import { stableJson } from '../relationship-memory/src/store/index.js';
-import { cursorShouldAdvance } from '../relationship-memory/src/tools/index.js';
+import { cursorShouldAdvance, MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES } from '../relationship-memory/src/tools/index.js';
 import {
   createNativeLettaClient,
   runNativeClientToolConversation,
@@ -99,6 +99,28 @@ interface SurfacedRecallMemory {
   snippets: Map<string, HistoricalRecallSnippet & { snippet_id: string }>;
 }
 
+const MEMORY_MAINTENANCE_REVIEW_TOOL_SET = new Set<string>(MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES);
+
+function maintenanceReviewMemoryIds(args: unknown): string[] {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) return [];
+  const raw = (args as Record<string, unknown>).memory_ids;
+  return Array.isArray(raw)
+    ? raw.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
+    : [];
+}
+
+function requireMaintenanceSearchProvenance(
+  toolName: string,
+  args: unknown,
+  searchedMemoryIds: ReadonlySet<string>,
+): void {
+  const memoryIds = maintenanceReviewMemoryIds(args);
+  const unseen = memoryIds.filter((memoryId) => !searchedMemoryIds.has(memoryId));
+  if (unseen.length > 0) {
+    throw new Error(`${toolName} may reference only memory_ids returned by a prior purpose=maintenance memory_search in this turn: ${unseen.join(', ')}`);
+  }
+}
+
 
 export function renderHistoricalWhisperQuotes(snippets: readonly HistoricalRecallSnippet[]): string {
   const lines: string[] = [];
@@ -165,7 +187,8 @@ export async function sendViaNativeClient(
 
     const entitySearchObservations: EntitySearchObservation[] = [];
     const surfacedRecallMemories = new Map<string, SurfacedRecallMemory>();
-    const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId);
+    const maintenanceSearchedMemoryIds = new Set<string>();
+    const baseRelationshipTools = buildRelationshipTools(runtime, payload.batchId, (value) => value, { includeMaintenanceReviewTools: !isSync });
     const syncAllowedTools = new Set<string>(RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS);
     const modeRelationshipTools = isSync
       ? baseRelationshipTools.filter((tool) => syncAllowedTools.has(tool.name))
@@ -227,6 +250,11 @@ export async function sendViaNativeClient(
             const results = isSync
               ? await runtime.memorySearchRecallHybridWithEvidence(search as any)
               : await runtime.memorySearchHybridWithEvidence(search as any);
+            if (purpose === 'maintenance') {
+              for (const memory of results as any[]) {
+                if (typeof memory?.memory_id === 'string' && memory.memory_id) maintenanceSearchedMemoryIds.add(memory.memory_id);
+              }
+            }
             if (foreground) for (const memory of results as any[]) {
               const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id : '';
               const summary = typeof memory?.summary === 'string' ? memory.summary.trim() : '';
@@ -262,6 +290,9 @@ export async function sendViaNativeClient(
       return {
         ...tool,
         async execute(toolCallId: string, args: unknown) {
+          if (MEMORY_MAINTENANCE_REVIEW_TOOL_SET.has(tool.name)) {
+            requireMaintenanceSearchProvenance(tool.name, args, maintenanceSearchedMemoryIds);
+          }
           const result = await runtime.store.withMutationBoundary(() => execute(toolCallId, args)) as any;
           if (tool.name.startsWith('memory_remember_') && result?.outcome === 'accepted' && typeof result.memory_id === 'string') {
             markSessionWrittenMemory(payload.cwd, payload.sessionId, result.memory_id, log);
