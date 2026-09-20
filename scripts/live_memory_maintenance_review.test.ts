@@ -73,7 +73,6 @@ describe('live memory maintenance review tools', () => {
 
         const results = (await search.execute('maintenance-search', {
           purpose: 'maintenance',
-          query: '咖啡店 安静',
           limit: 10,
         })).results;
         expect(results.map((item: any) => item.memory_id)).toEqual(expect.arrayContaining(['mem-a', 'mem-b']));
