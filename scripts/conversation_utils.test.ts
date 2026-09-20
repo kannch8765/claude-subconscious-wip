@@ -507,23 +507,48 @@ describe('live retryable conversation recovery', () => {
     });
   });
 
+  it('treats accepted same-session writes as foreground-known without marking them delivered', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+    const {
+      deliverSessionMemoryOnce,
+      getSessionDeliveredMemoryIds,
+      getSessionForegroundKnownMemoryIds,
+      markSessionWrittenMemory,
+      saveSyncState,
+    } = await import('./conversation_utils.js');
+    const cwd = '/workspace';
+    const sessionId = 'session-written';
+    saveSyncState(cwd, { lastProcessedIndex: 1, sessionId });
+
+    markSessionWrittenMemory(cwd, sessionId, ' memory-written ');
+    expect(getSessionDeliveredMemoryIds(cwd, sessionId)).toEqual([]);
+    expect(getSessionForegroundKnownMemoryIds(cwd, sessionId)).toEqual(['memory-written']);
+    let calls = 0;
+    expect(deliverSessionMemoryOnce(cwd, sessionId, 'memory-written', () => { calls += 1; return 'queued'; }))
+      .toEqual({ delivered: false });
+    expect(calls).toBe(0);
+  });
+
   it('does not let a stale state save erase session delivery markers', async () => {
     const home = tempHome();
     vi.stubEnv('LETTA_HOME', home);
 
-    const { deliverSessionMemoryOnce, loadSyncState, saveSyncState } = await import('./conversation_utils.js');
+    const { deliverSessionMemoryOnce, loadSyncState, markSessionWrittenMemory, saveSyncState } = await import('./conversation_utils.js');
     const cwd = '/workspace';
     const sessionId = 'session-stale-save';
     saveSyncState(cwd, { lastProcessedIndex: 1, sessionId, conversationId: 'conv-1' });
     const stale = loadSyncState(cwd, sessionId);
 
     expect(deliverSessionMemoryOnce(cwd, sessionId, 'memory-1', () => 'queued').delivered).toBe(true);
+    markSessionWrittenMemory(cwd, sessionId, 'memory-written');
     stale.lastProcessedIndex = 2;
     saveSyncState(cwd, stale);
 
     expect(loadSyncState(cwd, sessionId)).toMatchObject({
       lastProcessedIndex: 2,
       deliveredMemoryIds: ['memory-1'],
+      sessionWrittenMemoryIds: ['memory-written'],
     });
   });
 

@@ -29,6 +29,7 @@ export interface SearchQuery {
   time_end?: string;
   query?: string;
   limit?: number;
+  excludeMemoryIds?: readonly string[];  // Runtime-only foreground context mask; never exposed in the tool schema.
 }
 
 export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[] }
@@ -284,6 +285,7 @@ export class RelationshipMemoryRuntime {
     const semanticQuery = query.query?.trim();
     const trigger = query.trigger?.trim().toLowerCase();
     const limit = boundedSearchLimit(query.limit);
+    const excluded = new Set(query.excludeMemoryIds ?? []);
 
     // Preserve the existing memory_search result/search semantics without the
     // hot path's old per-memory JSONL rescans. Materialize each supporting file
@@ -326,7 +328,7 @@ export class RelationshipMemoryRuntime {
       }));
       return { memory: enriched, linkedIntents };
     }).filter(({ memory, linkedIntents }) => {
-      if (memory.status !== 'active') return false;
+      if (memory.status !== 'active' || excluded.has(memory.memory_id)) return false;
       if (query.kind && memory.kind !== query.kind) return false;
       if (query.participant && !memory.participants.includes(query.participant)) return false;
       if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
@@ -418,8 +420,9 @@ export class RelationshipMemoryRuntime {
   ) {
     const needle = includeQuery ? query.query?.trim().toLowerCase() : undefined;
     const trigger = query.trigger?.trim().toLowerCase();
+    const excluded = new Set(query.excludeMemoryIds ?? []);
     return rows.filter(({ memory, linkedIntents }) => {
-      if (memory.status !== 'active') return false;
+      if (memory.status !== 'active' || excluded.has(memory.memory_id)) return false;
       if (query.kind && memory.kind !== query.kind) return false;
       if (query.participant && !memory.participants.includes(query.participant)) return false;
       if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;

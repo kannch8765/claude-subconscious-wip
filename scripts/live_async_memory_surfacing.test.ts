@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MEMORY_REMEMBER_TOOL_NAMES } from '../relationship-memory/src/tools/index.js';
-import { annotateSessionMemoryDelivery, sendViaNativeClient } from './send_worker_native.js';
+import { sendViaNativeClient } from './send_worker_native.js';
 
 const roots: string[] = [];
 afterEach(() => {
@@ -13,22 +13,6 @@ afterEach(() => {
 });
 
 describe('live async relationship-memory surfacing contract', () => {
-  it('marks session-delivered recall candidates and keeps unseen memories first without hiding maintenance candidates', () => {
-    const results = annotateSessionMemoryDelivery([
-      { memory_id: 'seen-1', summary: 'old first' },
-      { memory_id: 'new-1', summary: 'fresh first' },
-      { memory_id: 'seen-2', summary: 'old second' },
-      { memory_id: 'new-2', summary: 'fresh second' },
-    ], ['seen-1', 'seen-2']);
-
-    expect(results.map((memory) => [memory.memory_id, memory.session_delivery])).toEqual([
-      ['new-1', 'new'],
-      ['new-2', 'new'],
-      ['seen-1', 'already_delivered'],
-      ['seen-2', 'already_delivered'],
-    ]);
-  });
-
   it('lets the live model choose semantic relationship searches while requiring at least one real search', () => {
     const send = fs.readFileSync(path.join(process.cwd(), 'scripts/send_messages_to_letta.ts'), 'utf8');
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
@@ -38,10 +22,10 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(send).toContain('must complete at least one relationship memory_search');
     expect(send).toContain('additional memory_search calls after seeing earlier results');
     expect(send).toContain('deliver_whisper');
-    expect(send).toContain('session_delivery=already_delivered');
+    expect(send).toContain('purpose=foreground_recall');
     expect(worker).toContain("name: 'deliver_whisper'");
     expect(worker).toContain("requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : []");
-    expect(worker).toContain('Model relationship memory_search: query=');
+    expect(worker).toContain('Model relationship memory_search: purpose=');
     expect(worker).toContain('foregroundGroundingIdentityAnchors(entitySearchObservations)');
     expect(worker).toContain("enum: ['foreground_grounding', 'maintenance']");
     expect(worker).toContain('const { purpose: _purpose, ...searchArgs } = rawArgs');
@@ -57,9 +41,9 @@ describe('live async relationship-memory surfacing contract', () => {
     expect(send).toContain('latestUserMessage,');
     expect(worker).toContain('isRelationshipMutationClientTool(tool.name)');
     expect(worker).toContain('RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS');
-    expect(worker).toContain('getSessionDeliveredMemoryIds(payload.cwd, payload.sessionId)');
+    expect(worker).toContain('getSessionForegroundKnownMemoryIds(payload.cwd, payload.sessionId)');
     expect(worker).toContain('deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId');
-    expect(worker).toContain("return { status: 'already_delivered' }");
+    expect(worker).toContain("return { status: 'already_known' }");
   });
 
   it('sends the five kind-specific create schemas on the final async native client-tool surface', async () => {
@@ -82,6 +66,44 @@ describe('live async relationship-memory surfacing contract', () => {
     const eventTool = capturedTools.find((tool) => tool.name === 'memory_remember_relationship_event');
     expect(Object.keys(eventTool.parameters.properties.payload.properties)).toEqual(['event', 'meaning', 'prior_context', 'resulting_change']);
     expect(eventTool.parameters.properties.payload.properties).not.toHaveProperty('emotional_tone');
+  });
+
+  it('hides same-session accepted writes from foreground recall while keeping them visible to maintenance', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'live-session-known-')); roots.push(root);
+    process.env.RELATIONSHIP_MEMORY_DIR = root; process.env.LETTA_API_KEY = 'test-only';
+    const evidence = {
+      conversation_id: 'conversation-evidence', message_id: 'message-evidence', evidence_id: 'evidence-user-1',
+      event_kind: 'user_text' as const, role: 'user' as const,
+      quote: '猫明确说自己偏好安静的咖啡店。', captured_at: '2026-09-20T12:00:00.000Z',
+    };
+
+    let observed: any;
+    const completion = await sendViaNativeClient({
+      agentId: 'agent-test', conversationId: 'conversation-test', sessionId: 'session-known',
+      message: '<claude_code_session_update>test</claude_code_session_update>', cwd: root,
+      batchId: 'batch-session-known', canonicalMessages: [evidence], assistantIntents: [], latestUserMessage: '咖啡店',
+    }, {
+      createClient: () => ({}),
+      openStdioMcp: async () => ({ tools: [], close: async () => {} } as any),
+      runConversation: async (input: any) => {
+        const remember = input.tools.find((tool: any) => tool.name === 'memory_remember_user_preference');
+        const search = input.tools.find((tool: any) => tool.name === 'memory_search');
+        const written = await remember.execute('remember-1', {
+          summary: '猫明确说自己偏好安静的咖啡店。', participants: ['user'], evidence_ids: [evidence.evidence_id],
+          payload: { topic: '咖啡店环境', preference: '猫偏好安静的咖啡店。' },
+        });
+        observed = {
+          written,
+          foreground: (await search.execute('foreground-1', { purpose: 'foreground_recall', query: '咖啡店' })).results,
+          maintenance: (await search.execute('maintenance-1', { purpose: 'maintenance', query: '咖啡店' })).results,
+        };
+        return { response: { stop_reason: { stop_reason: 'end_turn' } }, clientToolFailure: false } as any;
+      },
+    });
+    expect(observed.written.outcome).toBe('accepted');
+    expect(observed.foreground).not.toEqual(expect.arrayContaining([expect.objectContaining({ memory_id: observed.written.memory_id })]));
+    expect(observed.maintenance).toEqual(expect.arrayContaining([expect.objectContaining({ memory_id: observed.written.memory_id })]));
+    expect(completion).toBe('completed');
   });
 
   it('keeps live delivery on the native Letta client-tool conversation loop', () => {

@@ -32,8 +32,9 @@ import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type Entity
 import {
   advanceSyncStateCursor,
   deliverSessionMemoryOnce,
-  getSessionDeliveredMemoryIds,
+  getSessionForegroundKnownMemoryIds,
   markConversationForRetryRotation,
+  markSessionWrittenMemory,
 } from './conversation_utils.js';
 import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
 import { cancelAndDeferSyncResources, cleanupCompletedSyncResources } from './sync_letta_resources.js';
@@ -98,25 +99,6 @@ interface SurfacedRecallMemory {
   snippets: Map<string, HistoricalRecallSnippet & { snippet_id: string }>;
 }
 
-export type SessionMemoryDelivery = 'new' | 'already_delivered';
-
-export function annotateSessionMemoryDelivery(
-  results: readonly any[],
-  deliveredMemoryIds: readonly string[],
-): any[] {
-  const delivered = new Set(deliveredMemoryIds);
-  const annotated = results.map((memory) => {
-    const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id.trim() : '';
-    const sessionDelivery: SessionMemoryDelivery = memoryId && delivered.has(memoryId)
-      ? 'already_delivered'
-      : 'new';
-    return { ...memory, session_delivery: sessionDelivery };
-  });
-  return [
-    ...annotated.filter((memory) => memory.session_delivery === 'new'),
-    ...annotated.filter((memory) => memory.session_delivery === 'already_delivered'),
-  ];
-}
 
 export function renderHistoricalWhisperQuotes(snippets: readonly HistoricalRecallSnippet[]): string {
   const lines: string[] = [];
@@ -220,20 +202,32 @@ export async function sendViaNativeClient(
         };
       }
       if (tool.name === 'memory_search') {
+        const baseParameters = tool.parameters as any;
         return {
           ...tool,
-          description: `${tool.description} Results include session_delivery=new|already_delivered for the current Claude session. Prefer new memories for foreground continuity; already_delivered memories remain searchable for private maintenance but should not be sent to deliver_whisper again.`,
-          async execute(toolCallId: string, args: unknown) {
-            const query = typeof (args as any)?.query === 'string' ? (args as any).query.trim() : '';
-            log(`Model relationship memory_search: query=${JSON.stringify(query)}`);
+          description: `${tool.description} Set purpose=foreground_recall when choosing a whisper; that view excludes memories already written or surfaced in this Claude session. Use purpose=maintenance for reinforce/create checks; maintenance results are not eligible for deliver_whisper.`,
+          parameters: {
+            ...baseParameters,
+            required: [...new Set([...(Array.isArray(baseParameters?.required) ? baseParameters.required : []), 'purpose'])],
+            properties: {
+              ...(baseParameters?.properties ?? {}),
+              purpose: { type: 'string', enum: ['foreground_recall', 'maintenance'] },
+            },
+          },
+          async execute(_toolCallId: string, args: unknown) {
+            const rawArgs = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
+            const purpose = rawArgs.purpose;
+            const { purpose: _purpose, ...searchArgs } = rawArgs;
+            const foreground = purpose === 'foreground_recall';
+            const query = typeof searchArgs.query === 'string' ? searchArgs.query.trim() : '';
+            const excludeMemoryIds = foreground ? getSessionForegroundKnownMemoryIds(payload.cwd, payload.sessionId) : [];
+            log(`Model relationship memory_search: purpose=${String(purpose)}, query=${JSON.stringify(query)}, excluded=${excludeMemoryIds.length}`);
             const startedAt = Date.now();
-            const result = isSync
-              ? { results: await runtime.memorySearchRecallHybridWithEvidence((args ?? {}) as any) }
-              : await execute(toolCallId, args);
-            const rawResults = Array.isArray((result as any)?.results) ? (result as any).results as any[] : [];
-            const deliveredMemoryIds = getSessionDeliveredMemoryIds(payload.cwd, payload.sessionId);
-            const results = annotateSessionMemoryDelivery(rawResults, deliveredMemoryIds);
-            for (const memory of results) {
+            const search = { ...searchArgs, ...(foreground ? { excludeMemoryIds } : {}) };
+            const results = isSync
+              ? await runtime.memorySearchRecallHybridWithEvidence(search as any)
+              : await runtime.memorySearchHybridWithEvidence(search as any);
+            if (foreground) for (const memory of results as any[]) {
               const memoryId = typeof memory?.memory_id === 'string' ? memory.memory_id : '';
               const summary = typeof memory?.summary === 'string' ? memory.summary.trim() : '';
               const snippets = Array.isArray(memory?.quote_snippets) ? memory.quote_snippets : [];
@@ -259,9 +253,8 @@ export async function sendViaNativeClient(
               }
               surfacedRecallMemories.set(memoryId, record);
             }
-            const alreadyDeliveredCount = results.filter((memory) => memory.session_delivery === 'already_delivered').length;
-            log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${results.length}, session_already_delivered=${alreadyDeliveredCount}`);
-            return result && typeof result === 'object' ? { ...(result as any), results } : result;
+            log(`Model relationship memory_search completed: elapsed_ms=${Date.now() - startedAt}, results=${results.length}`);
+            return { results };
           },
         };
       }
@@ -269,7 +262,11 @@ export async function sendViaNativeClient(
       return {
         ...tool,
         async execute(toolCallId: string, args: unknown) {
-          return runtime.store.withMutationBoundary(() => execute(toolCallId, args));
+          const result = await runtime.store.withMutationBoundary(() => execute(toolCallId, args)) as any;
+          if (tool.name.startsWith('memory_remember_') && result?.outcome === 'accepted' && typeof result.memory_id === 'string') {
+            markSessionWrittenMemory(payload.cwd, payload.sessionId, result.memory_id, log);
+          }
+          return result;
         },
       };
     });
@@ -277,8 +274,8 @@ export async function sendViaNativeClient(
     relationshipTools.push({
       name: 'deliver_whisper',
       description: isSync
-        ? 'Surface one source-faithful historical memory window for the CURRENT foreground Kohaku turn. Select a session_delivery=new memory and 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.'
-        : 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select a session_delivery=new memory and 1-3 snippet_ids from quote_snippets returned by a prior memory_search for one memory_id. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
+        ? 'Surface one source-faithful historical memory window for the CURRENT foreground Kohaku turn. Select one memory and 1-3 snippet_ids returned by a prior purpose=foreground_recall memory_search. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.'
+        : 'Surface one source-faithful historical memory window for foreground Kohaku on a later sync. Select one memory and 1-3 snippet_ids returned by a prior purpose=foreground_recall memory_search. The runtime renders the surfaced canonical memory summary as `记忆：...`, then renders transcript snippets as 猫/当时琥珀 quotes and legacy_memory fallback snippets explicitly as 旧记忆记录; do not supply your own event title, prose, interpretation, feelings, fulfillment framing, or relationship conclusions. Retrieval itself supplies the association. Do not call when nothing is meaningfully useful.',
       parameters: {
         type: 'object', additionalProperties: false, required: ['memory_id', 'snippet_ids'],
         properties: {
@@ -302,7 +299,7 @@ export async function sendViaNativeClient(
         }
         const surfacedMemory = surfacedRecallMemories.get(memoryId);
         if (!surfacedMemory || snippetIds.some((snippetId) => !surfacedMemory.snippets.has(snippetId))) {
-          throw new Error('deliver_whisper may select only one memory and quote snippets surfaced by a prior memory_search in this turn');
+          throw new Error('deliver_whisper may select only one memory and quote snippets surfaced by a prior foreground_recall memory_search in this turn');
         }
         const snippets = snippetIds.map((snippetId) => surfacedMemory.snippets.get(snippetId)!);
         const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
@@ -335,8 +332,8 @@ export async function sendViaNativeClient(
             writeSyncCheckpoint(payload, 'no_whisper');
             foregroundReleased = true;
           }
-          log(`Skipped foreground whisper for session-delivered memory ${memoryId}`);
-          return { status: 'already_delivered' };
+          log(`Skipped foreground whisper for session-known memory ${memoryId}`);
+          return { status: 'already_known' };
         }
         const queued = delivery.result;
         whisperResolved = true;
