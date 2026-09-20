@@ -32,7 +32,7 @@ function memory(memoryId: string, summary: string): CanonicalMemoryRecord {
 }
 
 describe('live memory maintenance review tools', () => {
-  it('requires same-run maintenance search provenance before queueing merge review', async () => {
+  it('requires same-run maintenance search provenance before queueing relation review', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'live-maintenance-review-')); roots.push(root);
     process.env.RELATIONSHIP_MEMORY_DIR = root;
     process.env.LETTA_API_KEY = 'test-only';
@@ -60,11 +60,12 @@ describe('live memory maintenance review tools', () => {
       runConversation: async (input: any) => {
         asyncToolNames = input.tools.map((tool: any) => tool.name);
         const search = input.tools.find((tool: any) => tool.name === 'memory_search');
-        const merge = input.tools.find((tool: any) => tool.name === 'suggest_memory_merge');
+        const relation = input.tools.find((tool: any) => tool.name === 'suggest_memory_relation');
 
         try {
-          await merge.execute('merge-before-search', {
+          await relation.execute('relation-before-search', {
             memory_ids: ['mem-a', 'mem-b'],
+            relation: 'same_meaning',
             reason: '这两条似乎重复。',
           });
         } catch (error) {
@@ -77,8 +78,9 @@ describe('live memory maintenance review tools', () => {
         })).results;
         expect(results.map((item: any) => item.memory_id)).toEqual(expect.arrayContaining(['mem-a', 'mem-b']));
 
-        accepted = await merge.execute('merge-after-search', {
+        accepted = await relation.execute('relation-after-search', {
           memory_ids: ['mem-b', 'mem-a'],
+          relation: 'same_meaning',
           reason: '两条 canonical memory 都描述猫偏好安静的咖啡店。',
         });
         return { response: { stop_reason: { stop_reason: 'end_turn' } }, clientToolFailure: false } as any;
@@ -86,13 +88,14 @@ describe('live memory maintenance review tools', () => {
     });
 
     expect(completion).toBe('completed');
-    expect(asyncToolNames).toEqual(expect.arrayContaining(['flag_memory_conflict', 'suggest_memory_merge']));
+    expect(asyncToolNames).toEqual(expect.arrayContaining(['suggest_memory_relation']));
     expect(gateError).toContain('prior purpose=maintenance memory_search');
     expect(accepted.outcome).toBe('accepted');
     expect(store.listMaintenanceReviews()).toEqual([
       expect.objectContaining({
         review_id: accepted.review_id,
-        kind: 'merge',
+        kind: 'relation',
+        suggested_relation: 'same_meaning',
         memory_ids: ['mem-a', 'mem-b'],
         status: 'pending',
       }),
@@ -129,7 +132,6 @@ describe('live memory maintenance review tools', () => {
 
     expect(completion).toBe('completed');
     expect(toolNames).toEqual(expect.arrayContaining(['memory_search', 'entity_search', 'deliver_whisper']));
-    expect(toolNames).not.toContain('flag_memory_conflict');
-    expect(toolNames).not.toContain('suggest_memory_merge');
+    expect(toolNames).not.toContain('suggest_memory_relation');
   });
 });

@@ -30,7 +30,7 @@ function memory(memoryId: string, summary: string): CanonicalMemoryRecord {
 }
 
 describe('maintenance review suggestions', () => {
-  it('persists one idempotent pending merge suggestion without mutating canonical memory', () => {
+  it('persists one idempotent pending relation suggestion without mutating canonical memory', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'maintenance-review-')); roots.push(root);
     const store = new RelationshipMemoryStore(root, 'kohaku');
     store.appendMemory(memory('mem-a', '猫偏好安静的咖啡店。'), []);
@@ -41,12 +41,14 @@ describe('maintenance review suggestions', () => {
       () => '2026-09-20T13:00:00.000Z',
     );
 
-    const first = runtime.suggestMaintenanceReview('batch-1', 'merge', {
+    const first = runtime.suggestMaintenanceReview('batch-1', 'relation', {
       memory_ids: ['mem-b', 'mem-a'],
+      relation: 'same_meaning',
       reason: '两条记录描述同一个稳定偏好，内容高度重叠。',
     });
-    const second = runtime.suggestMaintenanceReview('batch-2', 'merge', {
+    const second = runtime.suggestMaintenanceReview('batch-2', 'relation', {
       memory_ids: ['mem-a', 'mem-b'],
+      relation: 'same_meaning',
       reason: '同一对 memory 再次被发现。',
     });
 
@@ -56,7 +58,8 @@ describe('maintenance review suggestions', () => {
     expect(store.listMaintenanceReviews()).toEqual([
       expect.objectContaining({
         review_id: first.review_id,
-        kind: 'merge',
+        kind: 'relation',
+        suggested_relation: 'same_meaning',
         memory_ids: ['mem-a', 'mem-b'],
         status: 'pending',
         batch_id: 'batch-1',
@@ -66,23 +69,30 @@ describe('maintenance review suggestions', () => {
     expect(store.listOwnerRevisions()).toEqual([]);
   });
 
-  it('rejects malformed or unknown conflict suggestions without writing review state', () => {
+  it('rejects malformed, invalid-relation, or unknown relation suggestions without writing review state', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'maintenance-review-invalid-')); roots.push(root);
     const store = new RelationshipMemoryStore(root, 'kohaku');
     store.appendMemory(memory('mem-a', '猫偏好安静的咖啡店。'), []);
     const runtime = new RelationshipMemoryRuntime(store, new Map());
 
-    expect(runtime.suggestMaintenanceReview('batch-1', 'conflict', {
+    expect(runtime.suggestMaintenanceReview('batch-1', 'relation', {
       memory_ids: ['mem-a', 'mem-a'],
+      relation: 'conflict',
       reason: 'duplicate ids',
     }).outcome).toBe('rejected');
-    expect(runtime.suggestMaintenanceReview('batch-1', 'conflict', {
+    expect(runtime.suggestMaintenanceReview('batch-1', 'relation', {
       memory_ids: ['mem-a', 'mem-missing'],
+      relation: 'conflict',
       reason: '互相冲突',
     })).toEqual({
       outcome: 'rejected',
       reason: 'unknown canonical memory ID: mem-missing',
     });
+    expect(runtime.suggestMaintenanceReview('batch-1', 'relation', {
+      memory_ids: ['mem-a', 'mem-missing'],
+      relation: 'made_up' as any,
+      reason: 'invalid relation',
+    }).outcome).toBe('rejected');
     expect(store.listMaintenanceReviewRecords()).toEqual([]);
   });
 });

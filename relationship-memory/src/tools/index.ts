@@ -10,13 +10,14 @@ import type {
   EntityIdentityRecord,
   MaintenanceReviewKind,
   MaintenanceReviewRecord,
+  MemoryRelationKind,
   MemoryKind,
   OwnerRevisionRecord,
   ParticipantRole,
   RememberOutcome,
   ReinforcementRecord,
 } from '../schema/index.js';
-import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
+import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { materializeEffectiveMemory } from '../owner/index.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
@@ -35,7 +36,7 @@ export interface SearchQuery {
 }
 
 export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[] }
-export interface MaintenanceReviewInput { memory_ids: string[]; reason: string }
+export interface MaintenanceReviewInput { memory_ids: string[]; relation: MemoryRelationKind; reason: string }
 export interface MaintenanceReviewResult { outcome: 'accepted' | 'duplicate' | 'rejected'; review_id?: string; reason?: string }
 export interface EntitySearchQuery { query?: string; limit?: number }
 export interface EntitySearchResult extends EntityIdentityRecord { evidence_ids: string[]; evidence_message_ids: string[] }
@@ -70,7 +71,7 @@ export function memoryRememberToolName(kind: MemoryKind): MemoryRememberToolName
 
 export const MEMORY_REMEMBER_TOOL_NAMES = MEMORY_KINDS.map(memoryRememberToolName) as readonly MemoryRememberToolName[];
 
-export const MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES = ['flag_memory_conflict', 'suggest_memory_merge'] as const;
+export const MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES = ['suggest_memory_relation'] as const;
 export type MemoryMaintenanceReviewToolName = (typeof MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES)[number];
 
 function boundedSearchLimit(value: number | undefined): number {
@@ -728,20 +729,22 @@ export class RelationshipMemoryRuntime {
 
   suggestMaintenanceReview(
     batchId: string,
-    kind: Extract<MaintenanceReviewKind, 'conflict' | 'merge'>,
+    kind: Extract<MaintenanceReviewKind, 'relation'>,
     input: MaintenanceReviewInput,
   ): MaintenanceReviewResult {
     const rawIds = Array.isArray(input?.memory_ids)
       ? input.memory_ids.map((value) => typeof value === 'string' ? value.trim() : '')
       : [];
+    const relation = typeof input?.relation === 'string' ? input.relation.trim() as MemoryRelationKind : undefined;
     const reason = typeof input?.reason === 'string' ? input.reason.trim() : '';
     if (
       rawIds.length < 2 || rawIds.length > 8
       || rawIds.some((value) => !value)
       || new Set(rawIds).size !== rawIds.length
+      || !relation || !MEMORY_RELATION_KINDS.includes(relation)
       || !reason || reason.length > 1_000
     ) {
-      return { outcome: 'rejected', reason: 'maintenance review requires 2-8 unique memory_ids and a non-empty reason up to 1000 characters' };
+      return { outcome: 'rejected', reason: 'maintenance review requires 2-8 unique memory_ids, a valid relation, and a non-empty reason up to 1000 characters' };
     }
     const memoryIds = [...rawIds].sort();
     const knownMemoryIds = new Set(this.store.listMemories().map((memory) => memory.memory_id));
@@ -759,6 +762,7 @@ export class RelationshipMemoryRuntime {
       review_id: reviewId,
       subject_id: this.store.subjectId,
       kind,
+      suggested_relation: relation,
       memory_ids: memoryIds,
       reason,
       status: 'pending',
@@ -1126,7 +1130,7 @@ export function memoryMaintenanceReviewToolSchema(): Record<string, unknown> {
   return {
     type: 'object',
     additionalProperties: false,
-    required: ['memory_ids', 'reason'],
+    required: ['memory_ids', 'relation', 'reason'],
     properties: {
       memory_ids: {
         type: 'array',
@@ -1136,11 +1140,16 @@ export function memoryMaintenanceReviewToolSchema(): Record<string, unknown> {
         items: { type: 'string', minLength: 1 },
         description: 'Canonical memory IDs returned by prior purpose=maintenance memory_search calls in this same Subcon run.',
       },
+      relation: {
+        type: 'string',
+        enum: [...MEMORY_RELATION_KINDS],
+        description: 'Suggested relationship between these memories: same meaning, changed over time, context-dependent, unresolved conflict, related, or unrelated. This is only a proposal for owner review.',
+      },
       reason: {
         type: 'string',
         minLength: 1,
         maxLength: 1000,
-        description: 'Short source-grounded explanation of the conflict or duplicate/merge relationship. Do not resolve or rewrite the memories here.',
+        description: 'Short source-grounded explanation for the suggested relation. Do not resolve, merge, supersede, scope, link, dismiss, or rewrite memories here.',
       },
     },
   };

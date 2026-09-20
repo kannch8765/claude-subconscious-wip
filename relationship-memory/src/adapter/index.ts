@@ -206,18 +206,11 @@ export function buildRelationshipTools(
 ): RelationshipTool[] {
   const maintenanceReviewTools: RelationshipTool[] = options.includeMaintenanceReviewTools ? [
     {
-      label: 'flag_memory_conflict',
-      name: 'flag_memory_conflict',
-      description: 'Queue a private owner-review suggestion when two or more canonical memories returned by prior purpose=maintenance memory_search calls in this same run materially conflict. This never edits, deactivates, or resolves memory content.',
+      label: 'suggest_memory_relation',
+      name: 'suggest_memory_relation',
+      description: 'Queue a private owner-review suggestion describing how two or more canonical memories returned by prior purpose=maintenance memory_search calls in this same run relate: same meaning, changed over time, context-dependent, unresolved conflict, related, or unrelated. This never mutates canonical memory or performs the proposed relation.',
       parameters: memoryMaintenanceReviewToolSchema(),
-      async execute(_toolCallId, args) { return wrapResult(runtime.suggestMaintenanceReview(batchId, 'conflict', args as never)); },
-    },
-    {
-      label: 'suggest_memory_merge',
-      name: 'suggest_memory_merge',
-      description: 'Queue a private owner-review suggestion when two or more canonical memories returned by prior purpose=maintenance memory_search calls in this same run appear to represent the same durable fact or episode. This never chooses a survivor or edits canonical memory.',
-      parameters: memoryMaintenanceReviewToolSchema(),
-      async execute(_toolCallId, args) { return wrapResult(runtime.suggestMaintenanceReview(batchId, 'merge', args as never)); },
+      async execute(_toolCallId, args) { return wrapResult(runtime.suggestMaintenanceReview(batchId, 'relation', args as never)); },
     },
   ] : [];
 
