@@ -507,24 +507,26 @@ export class RelationshipMemoryStore {
 
   appendMaintenanceReview(record: MaintenanceReviewRecord): boolean {
     return this.withMutationBoundary(() => {
+      const records = this.listMaintenanceReviewRecords();
+      const latest = [...records].reverse().find((item) => item.review_id === record.review_id);
+      if (latest?.status === 'pending') return false;
+
       const stable = stableJson(record);
-      const lookup = this.indexedEntry(
+      const duplicate = records.some((item) => stableJson(item) === stable);
+      if (duplicate) return false;
+
+      const indexReady = this.ensureWriteIndex(
         'maintenance-reviews',
         'maintenance-reviews.jsonl',
-        record.review_id,
-        () => this.listMaintenanceReviewRecords(),
+        () => records,
         (item) => ({ key: item.review_id, value: stableJson(item) }),
       );
-      const duplicate = lookup.ready
-        ? lookup.entry?.value === stable
-        : this.listMaintenanceReviewRecords().some((item) => stableJson(item) === stable);
-      if (duplicate) return false;
       appendJsonl(this.file('maintenance-reviews.jsonl'), record);
       this.recordIndexedAppend(
         'maintenance-reviews',
         'maintenance-reviews.jsonl',
         { key: record.review_id, value: stable },
-        lookup.ready,
+        indexReady,
       );
       return true;
     });
