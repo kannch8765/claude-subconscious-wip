@@ -497,6 +497,24 @@ export function validateEntityIdentityProposal(
   return { ok: true, proposal: { schema_version: 1, canonical_name: canonicalName, aliases, entity_type: input.entity_type as EntityType, description, evidence_message_ids: evidenceIds } };
 }
 
+export const MAINTENANCE_REVIEW_KINDS = ['conflict', 'merge', 'inactive_candidate'] as const;
+export type MaintenanceReviewKind = (typeof MAINTENANCE_REVIEW_KINDS)[number];
+export type MaintenanceReviewStatus = 'pending' | 'resolved' | 'dismissed';
+
+export interface MaintenanceReviewRecord {
+  schema_version: 1;
+  review_id: string;
+  subject_id: string;
+  kind: MaintenanceReviewKind;
+  memory_ids: string[];
+  reason: string;
+  status: MaintenanceReviewStatus;
+  created_at: string;
+  recorded_at: string;
+  batch_id?: string;
+  resolution_note?: string;
+}
+
 export type OwnerRevisionAction = 'revise' | 'deactivate' | 'restore';
 
 export interface OwnerSemanticContent {
