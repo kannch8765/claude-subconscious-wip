@@ -744,8 +744,9 @@ export class RelationshipMemoryRuntime {
       return { outcome: 'rejected', reason: 'maintenance review requires 2-8 unique memory_ids and a non-empty reason up to 1000 characters' };
     }
     const memoryIds = [...rawIds].sort();
+    const knownMemoryIds = new Set(this.store.listMemories().map((memory) => memory.memory_id));
     for (const memoryId of memoryIds) {
-      if (!this.store.getMemory(memoryId)) return { outcome: 'rejected', reason: `unknown canonical memory ID: ${memoryId}` };
+      if (!knownMemoryIds.has(memoryId)) return { outcome: 'rejected', reason: `unknown canonical memory ID: ${memoryId}` };
     }
     const reviewId = stableId('maintenance_review', {
       subject_id: this.store.subjectId,
