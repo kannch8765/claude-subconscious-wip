@@ -76,6 +76,11 @@ export interface SyncState {
   lastBlockValues?: { [label: string]: string };
   lastSeenMessageId?: string;  // Track last message ID we've shown to avoid duplicates
   deliveredMemoryIds?: string[];  // Canonical memories already surfaced to foreground in this Claude session
+  sessionWrittenMemoryIds?: string[];  // Canonical memories created from this Claude session
+}
+
+function uniqueMemoryIds(...groups: Array<readonly string[] | undefined>): string[] {
+  return [...new Set(groups.flatMap((group) => (group ?? []).map((id) => id.trim()).filter(Boolean)))];
 }
 
 export interface ConversationRetryMarker {
@@ -413,12 +418,11 @@ export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLo
       merged.conversationId = durable.conversationId;
     }
 
-    const deliveredMemoryIds = [...new Set([
-      ...(durable?.deliveredMemoryIds ?? []),
-      ...(state.deliveredMemoryIds ?? []),
-    ].filter((memoryId) => typeof memoryId === 'string' && memoryId.trim().length > 0).map((memoryId) => memoryId.trim()))];
-    if (deliveredMemoryIds.length > 0) merged.deliveredMemoryIds = deliveredMemoryIds;
-    else delete merged.deliveredMemoryIds;
+    for (const key of ['deliveredMemoryIds', 'sessionWrittenMemoryIds'] as const) {
+      const memoryIds = uniqueMemoryIds(durable?.[key], state[key]);
+      if (memoryIds.length > 0) merged[key] = memoryIds;
+      else delete merged[key];
+    }
 
     writeSyncStateUnlocked(cwd, merged, log);
     Object.assign(state, merged);
@@ -448,9 +452,27 @@ export function advanceSyncStateCursor(
 export function getSessionDeliveredMemoryIds(cwd: string, sessionId: string): string[] {
   return withSyncStateLock(cwd, sessionId, () => {
     const durable = readSyncStateForMutation(cwd, sessionId);
-    return [...new Set((durable?.deliveredMemoryIds ?? [])
-      .filter((memoryId) => typeof memoryId === 'string' && memoryId.trim().length > 0)
-      .map((memoryId) => memoryId.trim()))];
+    return uniqueMemoryIds(durable?.deliveredMemoryIds);
+  });
+}
+
+/** Memories already present in foreground context through delivery or same-session creation. */
+export function getSessionForegroundKnownMemoryIds(cwd: string, sessionId: string): string[] {
+  return withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId);
+    return uniqueMemoryIds(durable?.deliveredMemoryIds, durable?.sessionWrittenMemoryIds);
+  });
+}
+
+/** Mark one accepted canonical memory create as already present in foreground context. */
+export function markSessionWrittenMemory(cwd: string, sessionId: string, memoryId: string, log: LogFn = noopLog): void {
+  const normalizedMemoryId = memoryId.trim();
+  if (!normalizedMemoryId) return;
+  withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
+    const ids = new Set(uniqueMemoryIds(durable.sessionWrittenMemoryIds));
+    ids.add(normalizedMemoryId);
+    writeSyncStateUnlocked(cwd, { ...durable, sessionWrittenMemoryIds: [...ids] }, log);
   });
 }
 
@@ -473,10 +495,9 @@ export function deliverSessionMemoryOnce<T>(
 
   return withSyncStateLock(cwd, sessionId, () => {
     const durable = readSyncStateForMutation(cwd, sessionId) ?? { lastProcessedIndex: -1, sessionId };
-    const deliveredMemoryIds = new Set((durable.deliveredMemoryIds ?? [])
-      .filter((candidate) => typeof candidate === 'string' && candidate.trim().length > 0)
-      .map((candidate) => candidate.trim()));
-    if (deliveredMemoryIds.has(normalizedMemoryId)) return { delivered: false };
+    const deliveredMemoryIds = new Set(uniqueMemoryIds(durable.deliveredMemoryIds));
+    const foregroundKnownMemoryIds = new Set([...deliveredMemoryIds, ...uniqueMemoryIds(durable.sessionWrittenMemoryIds)]);
+    if (foregroundKnownMemoryIds.has(normalizedMemoryId)) return { delivered: false };
 
     const result = deliver();
     if (!confirmsDelivery(result)) return { delivered: false, result };

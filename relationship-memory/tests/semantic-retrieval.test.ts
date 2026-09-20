@@ -273,6 +273,32 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(refreshCalls).toBe(0);
   });
 
+  it('excludes foreground-known memories before ranking so lower-ranked unknown memories fill top-k', async () => {
+    const root = temp('rm-semantic-foreground-mask-');
+    let rankedIds: string[] = [];
+    const retriever: SemanticRetriever = {
+      async rank(documents) {
+        rankedIds = documents.map((document) => document.id);
+        return new Map(documents.map((document, index) => [document.id, 1 - index * 0.1]));
+      },
+      async rankExisting(documents) {
+        rankedIds = documents.map((document) => document.id);
+        return new Map(documents.map((document, index) => [document.id, 1 - index * 0.1]));
+      },
+    };
+    const { runtime, memoryId } = seedRuntime(root, retriever);
+    addFallbackMatches(runtime);
+    const otherMemoryId = runtime.store.listMemories().find((memory) => memory.memory_id !== memoryId)!.memory_id;
+
+    const recall = await runtime.memorySearchRecallHybrid({ query: 'gift', limit: 1, excludeMemoryIds: [memoryId] });
+    expect(rankedIds).not.toContain(`memory:${memoryId}`);
+    expect(recall.map((memory) => memory.memory_id)).toEqual([otherMemoryId]);
+
+    const asyncResult = await runtime.memorySearchHybrid({ query: 'gift', limit: 1, excludeMemoryIds: [memoryId] });
+    expect(rankedIds).not.toContain(`memory:${memoryId}`);
+    expect(asyncResult.map((memory) => memory.memory_id)).toEqual([otherMemoryId]);
+  });
+
   it('returns bounded source-faithful quote snippets from canonical evidence', async () => {
     const root = temp('rm-semantic-quote-snippets-');
     const { runtime, memoryId } = seedRuntime(root);

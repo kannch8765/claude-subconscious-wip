@@ -71,7 +71,7 @@ async function runSyncAttemptForMemoryB(payload: LiveWorkerPayload): Promise<voi
     runConversation: (async (input: any) => {
       const search = input.tools.find((tool: any) => tool.name === 'memory_search');
       const whisper = input.tools.find((tool: any) => tool.name === 'deliver_whisper');
-      const searchResult = await search.execute('search-b', { query: '绿茶' });
+      const searchResult = await search.execute('search-b', { purpose: 'foreground_recall', query: '绿茶' });
       const hit = searchResult.results.find((item: any) => item.memory_id === 'memory-B');
       expect(hit).toBeTruthy();
       const result = await whisper.execute('whisper-b', {
@@ -174,7 +174,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         const whisper = input.tools.find((tool: any) => tool.name === 'deliver_whisper');
         expect(search).toBeTruthy();
         expect(whisper).toBeTruthy();
-        const searchResult = await search.execute('search-1', { query: '咖啡' });
+        const searchResult = await search.execute('search-1', { purpose: 'foreground_recall', query: '咖啡' });
         const hit = searchResult.results[0];
         expect(hit.memory_id).toBe('mem-coffee-scene');
         expect(hit.summary).toBe('猫和琥珀聊到咖啡。');
@@ -188,7 +188,7 @@ describe('sync worker post-whisper lifecycle ownership', () => {
         await expect(whisper.execute('whisper-hidden', {
           memory_id: hit.memory_id,
           snippet_ids: [hiddenCanonicalSnippet],
-        })).rejects.toThrow('only one memory and quote snippets surfaced by a prior memory_search');
+        })).rejects.toThrow('only one memory and quote snippets surfaced by a prior foreground_recall memory_search');
         await whisper.execute('whisper-1', {
           memory_id: hit.memory_id,
           snippet_ids: [userSnippet.snippet_id, assistantSnippet.snippet_id],
