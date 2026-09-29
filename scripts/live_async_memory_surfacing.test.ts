@@ -4,12 +4,15 @@ import * as os from 'os';
 import { afterEach, describe, expect, it } from 'vitest';
 import { MEMORY_REMEMBER_TOOL_NAMES } from '../relationship-memory/src/tools/index.js';
 import { sendViaNativeClient } from './send_worker_native.js';
+import { readMirroredActivityEvents } from './subcon_visibility_mirror.js';
 
 const roots: string[] = [];
 afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
   delete process.env.RELATIONSHIP_MEMORY_DIR;
   delete process.env.LETTA_API_KEY;
+  delete process.env.SUBCON_VISIBILITY_DIR;
+  delete process.env.SUBCON_VISIBILITY_RUN_ID;
 });
 
 describe('live async relationship-memory surfacing contract', () => {
@@ -71,6 +74,7 @@ describe('live async relationship-memory surfacing contract', () => {
   it('hides same-session accepted writes from foreground recall while keeping them visible to maintenance', async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'live-session-known-')); roots.push(root);
     process.env.RELATIONSHIP_MEMORY_DIR = root; process.env.LETTA_API_KEY = 'test-only';
+    process.env.SUBCON_VISIBILITY_DIR = root; process.env.SUBCON_VISIBILITY_RUN_ID = 'run-session-known';
     const evidence = {
       conversation_id: 'conversation-evidence', message_id: 'message-evidence', evidence_id: 'evidence-user-1',
       event_kind: 'user_text' as const, role: 'user' as const,
@@ -101,6 +105,16 @@ describe('live async relationship-memory surfacing contract', () => {
       },
     });
     expect(observed.written.outcome).toBe('accepted');
+    expect(readMirroredActivityEvents(root, 'run-session-known')).toEqual([
+      expect.objectContaining({
+        activity: 'memory_write', action: 'remembered',
+        memory: expect.objectContaining({
+          memory_id: observed.written.memory_id,
+          kind: 'user_preference',
+          summary: '猫明确说自己偏好安静的咖啡店。',
+        }),
+      }),
+    ]);
     expect(observed.foreground).not.toEqual(expect.arrayContaining([expect.objectContaining({ memory_id: observed.written.memory_id })]));
     expect(observed.maintenance).toEqual(expect.arrayContaining([expect.objectContaining({ memory_id: observed.written.memory_id })]));
     expect(completion).toBe('completed');

@@ -4,7 +4,10 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import {
+  activityRunDir,
+  mirrorSubconActivity,
   mirrorSubconVisibility,
+  readMirroredActivityEvents,
   readMirroredVisibilityEvents,
   visibilityRunDir,
 } from './subcon_visibility_mirror.js';
@@ -39,6 +42,24 @@ describe('subcon visibility mirror', () => {
     expect(events.map((event) => event.phase)).toEqual(['user_prompt', 'pre_tool']);
     expect(events.map((event) => event.payload)).toEqual([initial, update]);
     expect(events.every((event) => event.session_id === 'session-a')).toBe(true);
+  });
+
+  it('keeps background memory-write activity separate from foreground visibility events', () => {
+    const dir = root();
+    const env = { SUBCON_VISIBILITY_DIR: dir, SUBCON_VISIBILITY_RUN_ID: 'run-memory' } as NodeJS.ProcessEnv;
+    expect(mirrorSubconActivity({
+      sessionId: 'session-a', activity: 'memory_write', action: 'remembered',
+      memory: { memory_id: 'mem-1', kind: 'user_preference', summary: '猫喜欢安静的咖啡店。' },
+    }, env)).toBe(true);
+    expect(readMirroredVisibilityEvents(dir, 'run-memory')).toEqual([]);
+    expect(readMirroredActivityEvents(dir, 'run-memory')).toEqual([
+      expect.objectContaining({
+        schema: 'subcon_activity_v1', session_id: 'session-a', sequence: 1,
+        activity: 'memory_write', action: 'remembered',
+        memory: { memory_id: 'mem-1', kind: 'user_preference', summary: '猫喜欢安静的咖啡店。' },
+      }),
+    ]);
+    expect(fs.statSync(activityRunDir(dir, 'run-memory')).mode & 0o777).toBe(0o700);
   });
 
   it('is disabled unless Claude-P supplies an explicit local run boundary', () => {

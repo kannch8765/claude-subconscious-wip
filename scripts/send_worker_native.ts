@@ -39,6 +39,7 @@ import {
 import { openStdioMcpToolsFromEnvironment } from './stdio_mcp_client.js';
 import { cancelAndDeferSyncResources, cleanupCompletedSyncResources } from './sync_letta_resources.js';
 import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
+import { mirrorSubconActivity } from './subcon_visibility_mirror.js';
 
 const uid = typeof process.getuid === 'function' ? process.getuid() : process.pid;
 const TEMP_STATE_DIR = path.join(os.tmpdir(), `letta-claude-sync-${uid}`);
@@ -265,6 +266,13 @@ export async function sendViaNativeClient(
           const result = await runtime.store.withMutationBoundary(() => execute(toolCallId, args)) as any;
           if (tool.name.startsWith('memory_remember_') && result?.outcome === 'accepted' && typeof result.memory_id === 'string') {
             markSessionWrittenMemory(payload.cwd, payload.sessionId, result.memory_id, log);
+            const memory = runtime.store.getMemory(result.memory_id);
+            if (memory) mirrorSubconActivity({
+              sessionId: payload.sessionId,
+              activity: 'memory_write',
+              action: 'remembered',
+              memory: { memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary },
+            });
           }
           return result;
         },
