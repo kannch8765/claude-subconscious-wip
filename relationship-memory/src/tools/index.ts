@@ -20,6 +20,7 @@ import type {
 import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { materializeEffectiveMemory } from '../owner/index.js';
+import { applyMemoryResolutions } from '../resolution/index.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
@@ -253,16 +254,25 @@ export class RelationshipMemoryRuntime {
   }
 
   private attachRecallEvidence(memories: EffectiveMemoryRecord[]): MemoryRecallResult[] {
-    const evidence = this.store.listEvidenceForMemoryIds(memories.map((memory) => memory.memory_id));
-    const transcript = new Map(memories.map((memory) => [memory.memory_id, this.recallQuoteSnippets(memory.memory_id, evidence)]));
-    const missing = memories.filter((memory) => (transcript.get(memory.memory_id)?.length ?? 0) === 0).map((memory) => memory.memory_id);
-    const legacy = this.legacyQuoteSnippetsForMemories(missing);
-    return memories.map((memory) => ({
-      ...memory,
-      quote_snippets: transcript.get(memory.memory_id)?.length
-        ? transcript.get(memory.memory_id)!
-        : legacy.get(memory.memory_id) ?? [],
+    const evidenceMemoryIds = [...new Set(memories.flatMap((memory) => memory.resolution_source_memory_ids ?? [memory.memory_id]))];
+    const evidence = this.store.listEvidenceForMemoryIds(evidenceMemoryIds);
+    const transcript = new Map(memories.map((memory) => {
+      const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+      const snippets = sourceIds.flatMap((memoryId) => this.recallQuoteSnippets(memoryId, evidence, 12));
+      return [memory.memory_id, this.boundRecallSnippets(snippets, 8)] as const;
     }));
+    const missingSources = [...new Set(memories
+      .filter((memory) => (transcript.get(memory.memory_id)?.length ?? 0) === 0)
+      .flatMap((memory) => memory.resolution_source_memory_ids ?? [memory.memory_id]))];
+    const legacy = this.legacyQuoteSnippetsForMemories(missingSources, 12);
+    return memories.map((memory) => {
+      const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+      const legacySnippets = this.boundRecallSnippets(sourceIds.flatMap((memoryId) => legacy.get(memoryId) ?? []), 8);
+      return {
+        ...memory,
+        quote_snippets: transcript.get(memory.memory_id)?.length ? transcript.get(memory.memory_id)! : legacySnippets,
+      };
+    });
   }
 
   async memorySearchRecallHybridWithEvidence(query: SearchQuery, signal?: AbortSignal): Promise<MemoryRecallResult[]> {
@@ -274,10 +284,9 @@ export class RelationshipMemoryRuntime {
   }
 
 
-  private recallEffectiveMemories(): EffectiveMemoryRecord[] {
-    // Foreground recall must not pay OwnerControlPlane.listEffective()'s repeated
-    // JSONL reads. Materialize genesis + owner revisions once while preserving
-    // the same owner-correction semantics as getEffective().
+  private effectiveMemories(): EffectiveMemoryRecord[] {
+    // Materialize genesis + owner revisions once. Maintenance search uses this
+    // raw effective view so owner review can still inspect every canonical memory.
     const revisionsByMemory = new Map<string, OwnerRevisionRecord[]>();
     for (const revision of this.store.listOwnerRevisions()) {
       const bucket = revisionsByMemory.get(revision.memory_id) ?? [];
@@ -287,6 +296,45 @@ export class RelationshipMemoryRuntime {
     return this.store.listMemories().map((genesis) =>
       materializeEffectiveMemory(genesis, revisionsByMemory.get(genesis.memory_id) ?? []),
     );
+  }
+
+  private linkedIntentSemanticByMemory(): Map<string, Array<{ memory: string; feel: string }>> {
+    const intentsById = new Map(this.store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
+    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
+    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
+    const byMemory = new Map<string, Array<{ intent_id: string; memory: string; feel: string }>>();
+    for (const [intentId, outcome] of latestOutcomeByIntent) {
+      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
+      const intent = intentsById.get(intentId);
+      if (!intent) continue;
+      const bucket = byMemory.get(outcome.memory_id) ?? [];
+      bucket.push({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text });
+      byMemory.set(outcome.memory_id, bucket);
+    }
+    return new Map([...byMemory].map(([memoryId, intents]) => [
+      memoryId,
+      [...new Map(intents.map((intent) => [intent.intent_id, intent])).values()].map(({ memory, feel }) => ({ memory, feel })),
+    ]));
+  }
+
+  private resolvedRecallMemories(): EffectiveMemoryRecord[] {
+    return applyMemoryResolutions(this.effectiveMemories(), this.store.listActiveMemoryResolutions());
+  }
+
+  async prepareCurrentMemorySemanticIndex(): Promise<void> {
+    if (!this.semanticRetriever?.prepare) return;
+    const intentsByMemory = this.linkedIntentSemanticByMemory();
+    const documents = this.resolvedRecallMemories()
+      .filter((memory) => memory.status === 'active')
+      .map((memory) => {
+        const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+        const linkedIntents = sourceIds.flatMap((memoryId) => intentsByMemory.get(memoryId) ?? []);
+        return {
+          id: `memory:${memory.memory_id}`,
+          text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, memory.resolution_context ?? '', linkedIntents),
+        };
+      });
+    await this.semanticRetriever.prepare(documents);
   }
 
   async memorySearchRecallHybrid(query: SearchQuery, signal?: AbortSignal): Promise<EffectiveMemoryRecord[]> {
@@ -304,21 +352,11 @@ export class RelationshipMemoryRuntime {
       bucket.push(reinforcement);
       reinforcementsByMemory.set(reinforcement.memory_id, bucket);
     }
-    const intentsById = new Map(this.store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
-    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
-    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
-    const linkedIntentsByMemory = new Map<string, AssistantRememberIntentRecord[]>();
-    for (const [intentId, outcome] of latestOutcomeByIntent) {
-      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
-      const intent = intentsById.get(intentId);
-      if (!intent) continue;
-      const bucket = linkedIntentsByMemory.get(outcome.memory_id) ?? [];
-      bucket.push(intent);
-      linkedIntentsByMemory.set(outcome.memory_id, bucket);
-    }
+    const linkedIntentsByMemory = this.linkedIntentSemanticByMemory();
 
-    const candidates = this.recallEffectiveMemories().map((memory) => {
-      const reinforcements = reinforcementsByMemory.get(memory.memory_id) ?? [];
+    const candidates = this.resolvedRecallMemories().map((memory) => {
+      const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+      const reinforcements = sourceIds.flatMap((memoryId) => reinforcementsByMemory.get(memoryId) ?? []);
       const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
       const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
       const enriched: EffectiveMemoryRecord = {
@@ -330,19 +368,17 @@ export class RelationshipMemoryRuntime {
           latest_reinforcement_at: latest,
         } : {}),
       };
-      const linkedIntents = (linkedIntentsByMemory.get(memory.memory_id) ?? []).map((intent) => ({
-        memory: intent.memory.text,
-        feel: intent.feel.text,
-      }));
+      const linkedIntents = sourceIds.flatMap((memoryId) => linkedIntentsByMemory.get(memoryId) ?? []);
       return { memory: enriched, linkedIntents };
     }).filter(({ memory, linkedIntents }) => {
-      if (memory.status !== 'active' || excluded.has(memory.memory_id)) return false;
+      const foregroundIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+      if (memory.status !== 'active' || foregroundIds.some((memoryId) => excluded.has(memoryId))) return false;
       if (query.kind && memory.kind !== query.kind) return false;
       if (query.participant && !memory.participants.includes(query.participant)) return false;
       if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
       if (query.time_start && memory.observed_at < query.time_start) return false;
       if (query.time_end && memory.observed_at > query.time_end) return false;
-      const haystack = stableJson({ summary: memory.summary, payload: memory.payload, assistant_intents: linkedIntents }).toLowerCase();
+      const haystack = stableJson({ summary: memory.summary, payload: memory.payload, context: memory.resolution_context, assistant_intents: linkedIntents }).toLowerCase();
       if (trigger && !haystack.includes(trigger)) return false;
       return true;
     });
@@ -350,7 +386,7 @@ export class RelationshipMemoryRuntime {
 
     const documents = candidates.map(({ memory, linkedIntents }) => ({
       id: `memory:${memory.memory_id}`,
-      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
+      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, memory.resolution_context ?? '', linkedIntents),
     }));
     let semantic = new Map<string, number>();
     if (this.semanticRetriever?.rankExisting) {
@@ -398,7 +434,7 @@ export class RelationshipMemoryRuntime {
       linkedIntentsByMemory.set(outcome.memory_id, bucket);
     }
 
-    return this.recallEffectiveMemories().map((memory) => {
+    return this.effectiveMemories().map((memory) => {
       const reinforcements = reinforcementsByMemory.get(memory.memory_id) ?? [];
       const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
       const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);

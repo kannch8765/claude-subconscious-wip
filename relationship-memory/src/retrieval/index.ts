@@ -20,6 +20,8 @@ export interface EmbeddingProvider {
 
 export interface SemanticRetriever {
   rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>>;
+  /** Prepare/refresh derivative document vectors without embedding a query. */
+  prepare?(documents: SemanticDocument[]): Promise<void>;
   /**
    * Rank only vectors already present in the derivative index. This path never
    * refreshes or embeds documents and is intended for foreground read-only recall.
@@ -396,6 +398,11 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     } finally {
       releaseSemanticLock(this.indexFile, token);
     }
+  }
+
+  async prepare(documents: SemanticDocument[]): Promise<void> {
+    if (documents.length === 0) return;
+    await this.ensureDocuments(documents);
   }
 
   async rankExisting(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>> {

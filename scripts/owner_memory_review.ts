@@ -1,14 +1,17 @@
-import { relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
+import { createRuntime, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
-import { MEMORY_KINDS, type MemoryKind } from '../relationship-memory/src/schema/index.js';
-import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
+import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
+import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
+import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
 export type OwnerMemoryReviewCommand =
   | { action: 'show'; memory_id: string }
   | { action: 'search'; query?: string; kind?: MemoryKind; active?: boolean; limit?: number }
   | { action: 'list_pending_reviews'; limit?: number }
   | { action: 'status' }
+  | { action: 'resolve_review'; review_id: string; resolution_id: string; relation: MemoryRelationKind; target_memory_id?: string; owner_summary?: string; contexts?: Record<string, string>; note?: string }
+  | { action: 'undo_review'; review_id: string; resolution_id: string; note?: string }
   | { action: 'revise_summary'; memory_id: string; revision_id: string; summary: string; note?: string }
   | { action: 'deactivate'; memory_id: string; revision_id: string; note?: string }
   | { action: 'restore'; memory_id: string; revision_id: string; note?: string };
@@ -37,6 +40,21 @@ function memoryKind(value: unknown): MemoryKind | undefined {
   return text as MemoryKind;
 }
 
+function memoryRelation(value: unknown): MemoryRelationKind {
+  const text = requiredText(value, 'relation');
+  if (!MEMORY_RELATION_KINDS.includes(text as MemoryRelationKind)) throw new Error(`unsupported relation: ${text}`);
+  return text as MemoryRelationKind;
+}
+
+function contexts(value: unknown): Record<string, string> | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('contexts must be an object keyed by memory_id');
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([memoryId, context]) => [
+    requiredText(memoryId, 'contexts memory_id'),
+    requiredText(context, `contexts.${memoryId}`),
+  ]));
+}
+
 export function executeOwnerMemoryReviewCommand(
   command: OwnerMemoryReviewCommand,
   env: NodeJS.ProcessEnv = process.env,
@@ -48,20 +66,23 @@ export function executeOwnerMemoryReviewCommand(
 
   if (command.action === 'show') {
     const memoryId = requiredText(command.memory_id, 'memory_id');
-    const memory = owner.getEffective(memoryId);
+    const current = materializeCurrentMemoryView(store).find((memory) => memory.memory_id === memoryId);
+    const memory = current ?? owner.getEffective(memoryId);
     if (!memory) throw new Error(`Unknown canonical memory ID: ${memoryId}`);
+    const evidenceMemoryIds = memory.resolution_source_memory_ids ?? [memoryId];
     return {
       memory,
-      evidence_count: store.listEvidenceForMemoryIds([memoryId]).length,
+      evidence_count: store.listEvidenceForMemoryIds(evidenceMemoryIds).length,
       revision_count: owner.history(memoryId).length,
     };
   }
 
   if (command.action === 'search') {
-    const rows = owner.search({
-      ...(command.query ? { query: command.query } : {}),
-      ...(command.kind ? { kind: command.kind } : {}),
-      ...(command.active !== undefined ? { active: command.active } : {}),
+    const needle = command.query?.trim().toLowerCase();
+    const rows = materializeCurrentMemoryView(store).filter((memory) => {
+      if (command.kind && memory.kind !== command.kind) return false;
+      if (command.active !== undefined && (memory.status === 'active') !== command.active) return false;
+      return !needle || stableJson({ summary: memory.summary, payload: memory.payload, context: memory.resolution_context }).toLowerCase().includes(needle);
     });
     rows.sort((a, b) => b.created_at.localeCompare(a.created_at));
     return { memories: rows.slice(0, command.limit ?? 8), total: rows.length };
@@ -82,7 +103,8 @@ export function executeOwnerMemoryReviewCommand(
   }
 
   if (command.action === 'status') {
-    const memories = owner.listEffective();
+    const canonicalMemories = owner.listEffective();
+    const memories = materializeCurrentMemoryView(store);
     const reviews = store.listMaintenanceReviews();
     const countsByKind = Object.fromEntries(MEMORY_KINDS.map((kind) => [kind, 0])) as Record<MemoryKind, number>;
     let active = 0;
@@ -101,6 +123,8 @@ export function executeOwnerMemoryReviewCommand(
         total: memories.length,
         active,
         inactive,
+        canonical_total: canonicalMemories.length,
+        canonical_active: canonicalMemories.filter((memory) => memory.status === 'active').length,
         owner_corrected: ownerCorrected,
         by_kind: countsByKind,
         latest: latest ? {
@@ -117,6 +141,29 @@ export function executeOwnerMemoryReviewCommand(
         dismissed: reviews.filter((review) => review.status === 'dismissed').length,
       },
     };
+  }
+
+  if (command.action === 'resolve_review') {
+    const control = new RelationshipMemoryResolutionControlPlane(store);
+    const resolution = control.resolveReview(command.review_id, {
+      resolution_id: command.resolution_id, relation: command.relation,
+      ...(command.target_memory_id ? { target_memory_id: command.target_memory_id } : {}),
+      ...(command.owner_summary ? { owner_summary: command.owner_summary } : {}),
+      ...(command.contexts ? { contexts: command.contexts } : {}),
+      ...(command.note ? { note: command.note } : {}),
+    });
+    rebuildProjection(store);
+    return { resolution, review: store.getMaintenanceReview(command.review_id) };
+  }
+
+  if (command.action === 'undo_review') {
+    const control = new RelationshipMemoryResolutionControlPlane(store);
+    const resolution = control.undoReview(command.review_id, {
+      resolution_id: command.resolution_id,
+      ...(command.note ? { note: command.note } : {}),
+    });
+    rebuildProjection(store);
+    return { resolution, review: store.getMaintenanceReview(command.review_id) };
   }
 
   const memoryId = requiredText(command.memory_id, 'memory_id');
@@ -171,6 +218,25 @@ function parseCommand(raw: unknown): OwnerMemoryReviewCommand {
       limit: limit(command.limit, 8, 20),
     };
   }
+  if (action === 'resolve_review') {
+    const targetMemoryId = optionalText(command.target_memory_id);
+    const ownerSummary = optionalText(command.owner_summary);
+    const parsedContexts = contexts(command.contexts);
+    return {
+      action, review_id: requiredText(command.review_id, 'review_id'), resolution_id: requiredText(command.resolution_id, 'resolution_id'),
+      relation: memoryRelation(command.relation),
+      ...(targetMemoryId ? { target_memory_id: targetMemoryId } : {}),
+      ...(ownerSummary ? { owner_summary: ownerSummary } : {}),
+      ...(parsedContexts ? { contexts: parsedContexts } : {}),
+      ...(typeof command.note === 'string' && command.note.trim() ? { note: command.note.trim() } : {}),
+    };
+  }
+  if (action === 'undo_review') {
+    return {
+      action, review_id: requiredText(command.review_id, 'review_id'), resolution_id: requiredText(command.resolution_id, 'resolution_id'),
+      ...(typeof command.note === 'string' && command.note.trim() ? { note: command.note.trim() } : {}),
+    };
+  }
   if (action === 'revise_summary') {
     return {
       action,
@@ -196,7 +262,16 @@ async function main(): Promise<void> {
   for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   if (!raw) throw new Error('expected one JSON command on stdin');
-  const result = executeOwnerMemoryReviewCommand(parseCommand(JSON.parse(raw)));
+  const command = parseCommand(JSON.parse(raw));
+  const result = executeOwnerMemoryReviewCommand(command);
+  if (['resolve_review', 'undo_review', 'revise_summary', 'deactivate', 'restore'].includes(command.action)) {
+    const root = process.env.RELATIONSHIP_MEMORY_DIR?.trim() || relationshipMemoryRoot();
+    const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID?.trim() || 'local-user';
+    try { await createRuntime([], subjectId, root).prepareCurrentMemorySemanticIndex(); }
+    catch (error) {
+      process.stderr.write(`semantic projection refresh warning: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 

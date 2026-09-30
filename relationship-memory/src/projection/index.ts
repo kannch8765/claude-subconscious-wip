@@ -5,7 +5,7 @@ import type {
   EffectiveMemoryRecord,
 } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
-import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
+import { materializeCurrentMemoryView } from '../resolution/index.js';
 
 export interface ProjectionBundle {
   revision: string;
@@ -70,9 +70,22 @@ function buildAssistantProvenance(store: RelationshipMemoryStore): Map<string, A
   return grouped;
 }
 
+function projectAssistantProvenance(
+  memories: EffectiveMemoryRecord[],
+  canonical: Map<string, AssistantRememberIntentRecord[]>,
+): Map<string, AssistantRememberIntentRecord[]> {
+  const projected = new Map<string, AssistantRememberIntentRecord[]>();
+  for (const memory of memories) {
+    const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+    const unique = new Map<string, AssistantRememberIntentRecord>();
+    for (const memoryId of sourceIds) for (const intent of canonical.get(memoryId) ?? []) unique.set(intent.intent_id, intent);
+    const items = [...unique.values()].sort((a, b) => b.captured_at.localeCompare(a.captured_at) || b.intent_id.localeCompare(a.intent_id)).slice(0, MAX_ASSISTANT_INTENTS_PER_MEMORY);
+    if (items.length) projected.set(memory.memory_id, items);
+  }
+  return projected;
+}
+
 export function rebuildProjection(store: RelationshipMemoryStore): ProjectionBundle {
-  return renderProjection(
-    new RelationshipMemoryOwnerControlPlane(store).search({ active: true }),
-    buildAssistantProvenance(store),
-  );
+  const memories = materializeCurrentMemoryView(store).filter((memory) => memory.status === 'active');
+  return renderProjection(memories, projectAssistantProvenance(memories, buildAssistantProvenance(store)));
 }
