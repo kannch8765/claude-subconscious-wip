@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { CanonicalMemoryRecord } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
 import { sendViaNativeClient } from './send_worker_native.js';
+import { readMirroredActivityEvents } from './subcon_visibility_mirror.js';
 
 const roots: string[] = [];
 
@@ -12,6 +13,8 @@ afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
   delete process.env.RELATIONSHIP_MEMORY_DIR;
   delete process.env.LETTA_API_KEY;
+  delete process.env.SUBCON_VISIBILITY_DIR;
+  delete process.env.SUBCON_VISIBILITY_RUN_ID;
 });
 
 function memory(memoryId: string, summary: string): CanonicalMemoryRecord {
@@ -36,6 +39,9 @@ describe('live memory maintenance review tools', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'live-maintenance-review-')); roots.push(root);
     process.env.RELATIONSHIP_MEMORY_DIR = root;
     process.env.LETTA_API_KEY = 'test-only';
+    const visibilityRoot = path.join(root, 'visibility');
+    process.env.SUBCON_VISIBILITY_DIR = visibilityRoot;
+    process.env.SUBCON_VISIBILITY_RUN_ID = 'run-maintenance-review';
 
     const store = new RelationshipMemoryStore(root, 'local-user');
     store.appendMemory(memory('mem-a', '猫偏好安静的咖啡店。'), []);
@@ -43,6 +49,7 @@ describe('live memory maintenance review tools', () => {
 
     let gateError = '';
     let accepted: any;
+    let duplicate: any;
     let asyncToolNames: string[] = [];
     const completion = await sendViaNativeClient({
       agentId: 'agent-test',
@@ -83,6 +90,11 @@ describe('live memory maintenance review tools', () => {
           relation: 'same_meaning',
           reason: '两条 canonical memory 都描述猫偏好安静的咖啡店。',
         });
+        duplicate = await relation.execute('relation-duplicate', {
+          memory_ids: ['mem-a', 'mem-b'],
+          relation: 'same_meaning',
+          reason: '两条 canonical memory 都描述猫偏好安静的咖啡店。',
+        });
         return { response: { stop_reason: { stop_reason: 'end_turn' } }, clientToolFailure: false } as any;
       },
     });
@@ -91,6 +103,7 @@ describe('live memory maintenance review tools', () => {
     expect(asyncToolNames).toEqual(expect.arrayContaining(['suggest_memory_relation']));
     expect(gateError).toContain('prior purpose=maintenance memory_search');
     expect(accepted.outcome).toBe('accepted');
+    expect(duplicate.outcome).toBe('duplicate');
     expect(store.listMaintenanceReviews()).toEqual([
       expect.objectContaining({
         review_id: accepted.review_id,
@@ -102,6 +115,16 @@ describe('live memory maintenance review tools', () => {
     ]);
     expect(store.listMemories()).toHaveLength(2);
     expect(store.listOwnerRevisions()).toEqual([]);
+    expect(readMirroredActivityEvents(visibilityRoot, 'run-maintenance-review')).toEqual([
+      expect.objectContaining({
+        activity: 'relation_review', action: 'queued', session_id: 'session-test',
+        review: expect.objectContaining({
+          review_id: accepted.review_id,
+          suggested_relation: 'same_meaning',
+          memory_ids: ['mem-a', 'mem-b'],
+        }),
+      }),
+    ]);
   });
 
   it('does not expose maintenance review mutation tools to sync foreground recall', async () => {
