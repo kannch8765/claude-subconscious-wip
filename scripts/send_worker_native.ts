@@ -305,6 +305,20 @@ export async function sendViaNativeClient(
               memory: { memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary },
             });
           }
+          if (tool.name === 'suggest_memory_relation' && result?.outcome === 'accepted' && typeof result.review_id === 'string') {
+            const review = runtime.store.getMaintenanceReview(result.review_id);
+            if (review?.kind === 'relation' && review.status === 'pending') mirrorSubconActivity({
+              sessionId: payload.sessionId,
+              activity: 'relation_review',
+              action: 'queued',
+              review: {
+                review_id: review.review_id,
+                suggested_relation: review.suggested_relation,
+                memory_ids: [...review.memory_ids],
+                reason: review.reason,
+              },
+            });
+          }
           return result;
         },
       };

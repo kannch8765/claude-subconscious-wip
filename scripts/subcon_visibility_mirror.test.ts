@@ -62,6 +62,28 @@ describe('subcon visibility mirror', () => {
     expect(fs.statSync(activityRunDir(dir, 'run-memory')).mode & 0o777).toBe(0o700);
   });
 
+  it('mirrors accepted relation-review activity without pretending it is a memory write', () => {
+    const dir = root();
+    const env = { SUBCON_VISIBILITY_DIR: dir, SUBCON_VISIBILITY_RUN_ID: 'run-review' } as NodeJS.ProcessEnv;
+    expect(mirrorSubconActivity({
+      sessionId: 'session-a', activity: 'relation_review', action: 'queued',
+      review: {
+        review_id: 'review-1', suggested_relation: 'same_meaning',
+        memory_ids: ['mem-a', 'mem-b'], reason: '两条 canonical memory 看起来重复。',
+      },
+    }, env)).toBe(true);
+    expect(readMirroredActivityEvents(dir, 'run-review')).toEqual([
+      expect.objectContaining({
+        schema: 'subcon_activity_v1', session_id: 'session-a', sequence: 1,
+        activity: 'relation_review', action: 'queued',
+        review: {
+          review_id: 'review-1', suggested_relation: 'same_meaning',
+          memory_ids: ['mem-a', 'mem-b'], reason: '两条 canonical memory 看起来重复。',
+        },
+      }),
+    ]);
+  });
+
   it('is disabled unless Claude-P supplies an explicit local run boundary', () => {
     const dir = root();
     expect(mirrorSubconVisibility(

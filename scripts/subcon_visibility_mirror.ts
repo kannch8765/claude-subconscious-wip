@@ -4,8 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 
 export type SubconVisibilityPhase = 'user_prompt' | 'pre_tool';
-export type SubconActivityKind = 'memory_write';
-export type SubconActivityAction = 'remembered';
+export type SubconActivityKind = 'memory_write' | 'relation_review';
+export type SubconActivityAction = 'remembered' | 'queued';
 
 export interface SubconVisibilityEvent {
   schema: 'subcon_visibility_v1';
@@ -29,6 +29,13 @@ export interface SubconMemoryReceipt {
   summary: string;
 }
 
+export interface SubconRelationReviewReceipt {
+  review_id: string;
+  suggested_relation: string;
+  memory_ids: string[];
+  reason: string;
+}
+
 export interface SubconActivityEvent {
   schema: 'subcon_activity_v1';
   run_id: string;
@@ -36,16 +43,14 @@ export interface SubconActivityEvent {
   sequence: number;
   activity: SubconActivityKind;
   action: SubconActivityAction;
-  memory: SubconMemoryReceipt;
+  memory?: SubconMemoryReceipt;
+  review?: SubconRelationReviewReceipt;
   created_at: string;
 }
 
-export interface MirrorSubconActivityInput {
-  sessionId: string;
-  activity: SubconActivityKind;
-  action: SubconActivityAction;
-  memory: SubconMemoryReceipt;
-}
+export type MirrorSubconActivityInput =
+  | { sessionId: string; activity: 'memory_write'; action: 'remembered'; memory: SubconMemoryReceipt }
+  | { sessionId: string; activity: 'relation_review'; action: 'queued'; review: SubconRelationReviewReceipt };
 
 const DEFAULT_MAX_EVENTS_PER_RUN = 64;
 const DEFAULT_MAX_RUNS = 8;
@@ -289,10 +294,28 @@ export function mirrorSubconActivity(
   try {
     const root = getSubconVisibilityRoot(env);
     const runId = env.SUBCON_VISIBILITY_RUN_ID?.trim();
-    const memoryId = input.memory?.memory_id?.trim();
-    const kind = input.memory?.kind?.trim();
-    const summary = input.memory?.summary?.trim();
-    if (!root || !runId || !input.sessionId || !memoryId || !kind || !summary) return false;
+    if (!root || !runId || !input.sessionId) return false;
+
+    let payload: Pick<SubconActivityEvent, 'activity' | 'action' | 'memory' | 'review'>;
+    if (input.activity === 'memory_write') {
+      const memoryId = input.memory?.memory_id?.trim();
+      const kind = input.memory?.kind?.trim();
+      const summary = input.memory?.summary?.trim();
+      if (!memoryId || !kind || !summary) return false;
+      payload = { activity: input.activity, action: input.action, memory: { memory_id: memoryId, kind, summary } };
+    } else {
+      const reviewId = input.review?.review_id?.trim();
+      const relation = input.review?.suggested_relation?.trim();
+      const reason = input.review?.reason?.trim();
+      const memoryIds = Array.isArray(input.review?.memory_ids)
+        ? input.review.memory_ids.map((memoryId) => memoryId.trim()).filter(Boolean)
+        : [];
+      if (!reviewId || !relation || !reason || memoryIds.length < 2) return false;
+      payload = {
+        activity: input.activity, action: input.action,
+        review: { review_id: reviewId, suggested_relation: relation, memory_ids: memoryIds, reason },
+      };
+    }
 
     const maxPayloadBytes = boundedPositiveInt(env.SUBCON_VISIBILITY_MAX_PAYLOAD_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, 8 * 1024 * 1024);
     const maxEvents = boundedPositiveInt(env.SUBCON_VISIBILITY_MAX_EVENTS, DEFAULT_MAX_EVENTS_PER_RUN, 512);
@@ -309,8 +332,7 @@ export function mirrorSubconActivity(
       const sequence = nextSequence(runDir);
       const event: SubconActivityEvent = {
         schema: 'subcon_activity_v1', run_id: runId, session_id: input.sessionId, sequence,
-        activity: input.activity, action: input.action,
-        memory: { memory_id: memoryId, kind, summary },
+        ...payload,
         created_at: new Date().toISOString(),
       };
       const encoded = `${JSON.stringify(event)}
