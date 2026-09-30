@@ -178,6 +178,30 @@ describe('owner-confirmed relation resolution', () => {
     expect(fs.readFileSync(path.join(store.rootDir, 'evidence.jsonl'), 'utf8')).toBe(evidenceBefore);
   });
 
+  it('prepares the resolved current semantic document outside foreground recall', async () => {
+    const { store, runtime, resolution } = fixture();
+    const reviewId = review(runtime, 'same_meaning');
+    resolution.resolveReview(reviewId, {
+      resolution_id: 'resolve-semantic', relation: 'same_meaning', target_memory_id: 'mem-b',
+      owner_summary: '猫最终确认喜欢安静又能久坐的咖啡店。',
+    });
+    const prepared: Array<Array<{ id: string; text: string }>> = [];
+    const preparingRuntime = new RelationshipMemoryRuntime(
+      store, new Map(), undefined, new Map(), false,
+      {
+        async rank() { return new Map(); },
+        async prepare(documents) { prepared.push(documents); },
+      },
+    );
+
+    await preparingRuntime.prepareCurrentMemorySemanticIndex();
+
+    expect(prepared).toHaveLength(1);
+    expect(prepared[0]).toHaveLength(1);
+    expect(prepared[0][0].id).toBe('memory:mem-b');
+    expect(prepared[0][0].text).toContain('猫最终确认喜欢安静又能久坐的咖啡店。');
+  });
+
   it('validates relation-specific owner inputs and resolution ids', () => {
     const { store, runtime, resolution } = fixture();
     const reviewId = review(runtime, 'context_dependent');

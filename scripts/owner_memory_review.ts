@@ -1,4 +1,4 @@
-import { relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
+import { createRuntime, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
@@ -262,7 +262,16 @@ async function main(): Promise<void> {
   for await (const chunk of process.stdin) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   if (!raw) throw new Error('expected one JSON command on stdin');
-  const result = executeOwnerMemoryReviewCommand(parseCommand(JSON.parse(raw)));
+  const command = parseCommand(JSON.parse(raw));
+  const result = executeOwnerMemoryReviewCommand(command);
+  if (['resolve_review', 'undo_review', 'revise_summary', 'deactivate', 'restore'].includes(command.action)) {
+    const root = process.env.RELATIONSHIP_MEMORY_DIR?.trim() || relationshipMemoryRoot();
+    const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID?.trim() || 'local-user';
+    try { await createRuntime([], subjectId, root).prepareCurrentMemorySemanticIndex(); }
+    catch (error) {
+      process.stderr.write(`semantic projection refresh warning: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  }
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 

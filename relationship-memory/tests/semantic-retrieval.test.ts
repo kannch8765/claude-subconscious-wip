@@ -192,6 +192,22 @@ describe('relationship-memory semantic retrieval foundation', () => {
     expect(fs.existsSync(`${indexFile}.lock`)).toBe(false);
   });
 
+  it('prepares derivative document vectors without embedding a throwaway query', async () => {
+    const root = temp('rm-semantic-prepare-only-');
+    const indexFile = path.join(root, 'derived', 'index.json');
+    const provider = new FakeProvider();
+    const retriever = new FileBackedSemanticRetriever(provider, indexFile);
+    const docs = [{ id: 'm1', text: 'Kyoto gift inclusion' }];
+
+    await retriever.prepare(docs);
+
+    expect(provider.documentCalls).toEqual([['Kyoto gift inclusion']]);
+    expect(provider.queryCalls).toEqual([]);
+    const scores = await retriever.rankExisting(docs, 'foreground query');
+    expect(scores.get('m1')).toBeCloseTo(1);
+    expect(provider.documentCalls).toHaveLength(1);
+  });
+
   it('ranks only existing cached vectors for foreground recall without refreshing document embeddings', async () => {
     const root = temp('rm-semantic-existing-only-');
     const indexFile = path.join(root, 'derived', 'index.json');

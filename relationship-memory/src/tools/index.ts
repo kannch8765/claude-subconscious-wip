@@ -298,8 +298,43 @@ export class RelationshipMemoryRuntime {
     );
   }
 
+  private linkedIntentSemanticByMemory(): Map<string, Array<{ memory: string; feel: string }>> {
+    const intentsById = new Map(this.store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
+    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
+    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
+    const byMemory = new Map<string, Array<{ intent_id: string; memory: string; feel: string }>>();
+    for (const [intentId, outcome] of latestOutcomeByIntent) {
+      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
+      const intent = intentsById.get(intentId);
+      if (!intent) continue;
+      const bucket = byMemory.get(outcome.memory_id) ?? [];
+      bucket.push({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text });
+      byMemory.set(outcome.memory_id, bucket);
+    }
+    return new Map([...byMemory].map(([memoryId, intents]) => [
+      memoryId,
+      [...new Map(intents.map((intent) => [intent.intent_id, intent])).values()].map(({ memory, feel }) => ({ memory, feel })),
+    ]));
+  }
+
   private resolvedRecallMemories(): EffectiveMemoryRecord[] {
     return applyMemoryResolutions(this.effectiveMemories(), this.store.listActiveMemoryResolutions());
+  }
+
+  async prepareCurrentMemorySemanticIndex(): Promise<void> {
+    if (!this.semanticRetriever?.prepare) return;
+    const intentsByMemory = this.linkedIntentSemanticByMemory();
+    const documents = this.resolvedRecallMemories()
+      .filter((memory) => memory.status === 'active')
+      .map((memory) => {
+        const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+        const linkedIntents = sourceIds.flatMap((memoryId) => intentsByMemory.get(memoryId) ?? []);
+        return {
+          id: `memory:${memory.memory_id}`,
+          text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, memory.resolution_context ?? '', linkedIntents),
+        };
+      });
+    await this.semanticRetriever.prepare(documents);
   }
 
   async memorySearchRecallHybrid(query: SearchQuery, signal?: AbortSignal): Promise<EffectiveMemoryRecord[]> {
@@ -317,21 +352,11 @@ export class RelationshipMemoryRuntime {
       bucket.push(reinforcement);
       reinforcementsByMemory.set(reinforcement.memory_id, bucket);
     }
-    const intentsById = new Map(this.store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
-    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
-    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
-    const linkedIntentsByMemory = new Map<string, AssistantRememberIntentRecord[]>();
-    for (const [intentId, outcome] of latestOutcomeByIntent) {
-      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
-      const intent = intentsById.get(intentId);
-      if (!intent) continue;
-      const bucket = linkedIntentsByMemory.get(outcome.memory_id) ?? [];
-      bucket.push(intent);
-      linkedIntentsByMemory.set(outcome.memory_id, bucket);
-    }
+    const linkedIntentsByMemory = this.linkedIntentSemanticByMemory();
 
     const candidates = this.resolvedRecallMemories().map((memory) => {
-      const reinforcements = reinforcementsByMemory.get(memory.memory_id) ?? [];
+      const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
+      const reinforcements = sourceIds.flatMap((memoryId) => reinforcementsByMemory.get(memoryId) ?? []);
       const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
       const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
       const enriched: EffectiveMemoryRecord = {
@@ -343,10 +368,7 @@ export class RelationshipMemoryRuntime {
           latest_reinforcement_at: latest,
         } : {}),
       };
-      const linkedIntents = (linkedIntentsByMemory.get(memory.memory_id) ?? []).map((intent) => ({
-        memory: intent.memory.text,
-        feel: intent.feel.text,
-      }));
+      const linkedIntents = sourceIds.flatMap((memoryId) => linkedIntentsByMemory.get(memoryId) ?? []);
       return { memory: enriched, linkedIntents };
     }).filter(({ memory, linkedIntents }) => {
       const foregroundIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
