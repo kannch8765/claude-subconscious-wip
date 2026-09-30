@@ -86,6 +86,7 @@ export interface CanonicalManagedAgentConfig {
   model: string;
   embedding: string;
   contextWindowLimit: number;
+  modelSettings: Record<string, unknown>;
   modelSettingsProviderType: string;
   parallelToolCalls: boolean;
 }
@@ -272,7 +273,7 @@ export function getCanonicalManagedAgentConfig(
     ? readManagedSystemPromptFile(managedSystemPromptFile)
     : readBundledManagedSystemPromptForAgentFile(agentFile);
   const system = managedSystem ?? agent.system;
-  const modelSettings = agent.model_settings as { provider_type?: unknown; parallel_tool_calls?: unknown } | null | undefined;
+  const modelSettings = agent.model_settings as Record<string, unknown> | null | undefined;
   if (
     typeof system !== 'string' || system.trim().length === 0
     || typeof agent.model !== 'string' || agent.model.length === 0
@@ -289,7 +290,8 @@ export function getCanonicalManagedAgentConfig(
     model: agent.model,
     embedding: agent.embedding,
     contextWindowLimit: agent.context_window_limit,
-    modelSettingsProviderType: modelSettings.provider_type,
+    modelSettings: { ...modelSettings },
+    modelSettingsProviderType: modelSettings.provider_type as string,
     parallelToolCalls: true,
   };
 }
@@ -351,6 +353,11 @@ function currentModelSettingsProviderType(agent: AgentDetails): string | null {
   const endpointType = agent.llm_config?.model_endpoint_type;
   if (typeof endpointType === 'string' && endpointType.length > 0) return endpointType;
   return null;
+}
+
+function modelSettingsContain(current: Record<string, unknown> | null | undefined, desired: Record<string, unknown>): boolean {
+  const actual = current ?? {};
+  return Object.entries(desired).every(([key, value]) => JSON.stringify(actual[key]) === JSON.stringify(value));
 }
 
 async function resolveManagedModelSettingsProviderType(
@@ -519,14 +526,20 @@ export async function reconcileManagedAgentConfiguration(
   const legacyConfigParallel = agent.llm_config?.parallel_tool_calls;
   const parallelIsEffective = modelSettingsParallel === canonical.parallelToolCalls
     && legacyConfigParallel === canonical.parallelToolCalls;
+  const canonicalModelSettings = desiredModel === canonical.model ? canonical.modelSettings : {};
+  const canonicalModelSettingsEffective = modelSettingsContain(agent.model_settings, canonicalModelSettings);
   // Letta 0.16.8 rebuilds effective llm_config when model/context changes. Carry
   // canonical model_settings in the same PATCH even when both parallel flags are
-  // already true, otherwise that rebuild can silently drop provider parallelism.
+  // already true, otherwise that rebuild can silently drop provider parallelism
+  // or model-specific settings such as disabling thinking for tool continuations.
   const effectiveLlmConfigWillRebuild = modelWillChange || currentContext !== desiredContextWindow;
-  if (currentProviderType !== desiredProviderType || !parallelIsEffective || effectiveLlmConfigWillRebuild) {
-    patch.model_settings = currentProviderType === desiredProviderType
-      ? { ...(agent.model_settings ?? {}), provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls }
-      : { provider_type: desiredProviderType, parallel_tool_calls: canonical.parallelToolCalls };
+  if (currentProviderType !== desiredProviderType || !parallelIsEffective || !canonicalModelSettingsEffective || effectiveLlmConfigWillRebuild) {
+    patch.model_settings = {
+      ...(currentProviderType === desiredProviderType ? (agent.model_settings ?? {}) : {}),
+      ...canonicalModelSettings,
+      provider_type: desiredProviderType,
+      parallel_tool_calls: canonical.parallelToolCalls,
+    };
   }
 
   if (Object.keys(patch).length === 0) {
@@ -557,10 +570,13 @@ export async function reconcileManagedAgentConfiguration(
     const verified = await verifyResponse.json() as AgentDetails;
     const verifiedModelSettingsParallel = verified.model_settings?.parallel_tool_calls;
     const verifiedLegacyConfigParallel = verified.llm_config?.parallel_tool_calls;
+    const verifiedCanonicalModelSettings = desiredModel !== canonical.model
+      || modelSettingsContain(verified.model_settings, canonical.modelSettings);
     if (verifiedModelSettingsParallel !== canonical.parallelToolCalls
-      || verifiedLegacyConfigParallel !== canonical.parallelToolCalls) {
+      || verifiedLegacyConfigParallel !== canonical.parallelToolCalls
+      || !verifiedCanonicalModelSettings) {
       throw new Error(
-        `Managed Subconscious effective parallel_tool_calls reconciliation failed: model_settings=${String(verifiedModelSettingsParallel)}, llm_config=${String(verifiedLegacyConfigParallel)}, expected=${String(canonical.parallelToolCalls)}`,
+        `Managed Subconscious effective model_settings reconciliation failed: parallel(model_settings)=${String(verifiedModelSettingsParallel)}, parallel(llm_config)=${String(verifiedLegacyConfigParallel)}, canonical_fields=${String(verifiedCanonicalModelSettings)}`,
       );
     }
   }

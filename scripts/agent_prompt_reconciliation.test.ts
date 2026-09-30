@@ -48,6 +48,7 @@ async function loadAgentConfig(home: string) {
 function installManagedFetch(initialSystem: string, patchStatus = 200) {
   let liveSystem = initialSystem;
   const surface = canonicalSurfaceFixtures();
+  const canonicalAgent = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'Subconscious.af'), 'utf-8')).agents[0];
   const requests: Array<{ method: string; pathname: string; body?: Record<string, unknown> }> = [];
 
   const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
@@ -62,11 +63,11 @@ function installManagedFetch(initialSystem: string, patchStatus = 200) {
         name: 'Subconscious_093B_110855',
         tags: REQUIRED_TAGS,
         system: liveSystem,
-        model: 'openai-proxy/mimo-v2.5',
-        embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
-        context_window_limit: 400000,
-        model_settings: { provider_type: 'openai', parallel_tool_calls: true },
-        llm_config: { handle: 'openai-proxy/mimo-v2.5', model: 'mimo-v2.5', provider_name: 'opencode-go-openai', context_window: 400000, parallel_tool_calls: true },
+        model: canonicalAgent.model,
+        embedding: canonicalAgent.embedding,
+        context_window_limit: canonicalAgent.context_window_limit,
+        model_settings: canonicalAgent.model_settings,
+        llm_config: { handle: canonicalAgent.model, model: String(canonicalAgent.model).split('/').pop(), provider_name: 'opencode-go-openai', context_window: canonicalAgent.context_window_limit, parallel_tool_calls: true },
       });
     }
 

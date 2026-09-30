@@ -54,9 +54,9 @@ describe('tool-stripped sync sibling agent', () => {
     expect(create.body.include_base_tools).toBe(false);
     expect(create.body.include_multi_agent_tools).toBe(false);
     expect(create.body.include_base_tool_rules).toBe(false);
-    expect(create.body.model).toBe('openai-proxy/mimo-v2.5');
+    expect(create.body.model).toBe('openai-proxy/deepseek-v4.1-flash');
     expect(create.body.context_window_limit).toBe(400000);
-    expect(create.body.model_settings).toEqual(expect.objectContaining({ provider_type: 'openai', parallel_tool_calls: true, max_output_tokens: 16384, temperature: 1.0 }));
+    expect(create.body.model_settings).toEqual(expect.objectContaining({ provider_type: 'openai', parallel_tool_calls: true, reasoning: { reasoning_effort: 'none' }, max_output_tokens: 16384, temperature: 1.0 }));
     const guidance = create.body.memory_blocks.find((block: any) => block.label === 'guidance');
     expect(guidance.value).toBe('LIVE GUIDANCE');
     expect(create.body.block_ids).toBeUndefined();

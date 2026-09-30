@@ -118,6 +118,7 @@ export async function createToolStrippedSyncAgent(apiKey: string, syncKey: strin
     context_window_limit: canonical.contextWindowLimit,
     model_settings: {
       ...(live?.model_settings && typeof live.model_settings === 'object' && !Array.isArray(live.model_settings) ? live.model_settings : {}),
+      ...canonical.modelSettings,
       provider_type: canonical.modelSettingsProviderType,
       parallel_tool_calls: canonical.parallelToolCalls,
     },

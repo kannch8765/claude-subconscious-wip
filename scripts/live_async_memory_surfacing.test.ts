@@ -167,8 +167,8 @@ describe('live async relationship-memory surfacing contract', () => {
     for (const name of MEMORY_REMEMBER_TOOL_NAMES) expect(blocks.get('tool_guidelines')).toContain(name);
     expect(blocks.get('tool_guidelines')).not.toContain('the exact latest user message is prefetched once');
 
-    expect(agent.model).toBe('openai-proxy/mimo-v2.5');
-    expect(agent.model_settings?.parallel_tool_calls).toBe(true);
+    expect(agent.model).toBe('openai-proxy/deepseek-v4.1-flash');
+    expect(agent.model_settings).toEqual(expect.objectContaining({ parallel_tool_calls: true, reasoning: { reasoning_effort: 'none' } }));
     expect(typeof agent.embedding).toBe('string');
     expect(agent.embedding.length).toBeGreaterThan(0);
   });
