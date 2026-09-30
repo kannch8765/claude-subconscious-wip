@@ -93,4 +93,56 @@ describe('owner memory review command', () => {
     expect((executeOwnerMemoryReviewCommand({ action: 'show', memory_id: memoryId }, env) as any).memory.status).toBe('active');
     expect(store.getMemory(memoryId)?.summary).toBe('猫喜欢安静的咖啡店。');
   });
+
+  it('lists searchable effective memories, enriches pending reviews, and reports status counts', () => {
+    const { store, env, memoryId } = fixture();
+    store.appendMaintenanceReview({
+      schema_version: 1,
+      review_id: 'review-1',
+      subject_id: 'kohaku',
+      kind: 'relation',
+      suggested_relation: 'changed_over_time',
+      memory_ids: [memoryId],
+      reason: 'newer preference may supersede older wording',
+      status: 'pending',
+      created_at: '2026-09-30T00:00:02.000Z',
+      recorded_at: '2026-09-30T00:00:02.000Z',
+    });
+
+    const search = executeOwnerMemoryReviewCommand({
+      action: 'search',
+      query: '安静',
+      active: true,
+      limit: 5,
+    }, env) as any;
+    expect(search.total).toBe(1);
+    expect(search.memories[0]).toEqual(expect.objectContaining({
+      memory_id: memoryId,
+      summary: '猫喜欢安静的咖啡店。',
+      status: 'active',
+    }));
+
+    const reviews = executeOwnerMemoryReviewCommand({ action: 'list_pending_reviews', limit: 5 }, env) as any;
+    expect(reviews.total).toBe(1);
+    expect(reviews.reviews[0]).toEqual(expect.objectContaining({
+      review_id: 'review-1',
+      suggested_relation: 'changed_over_time',
+      status: 'pending',
+    }));
+    expect(reviews.reviews[0].memories[0]).toEqual(expect.objectContaining({
+      memory_id: memoryId,
+      summary: '猫喜欢安静的咖啡店。',
+    }));
+
+    const status = executeOwnerMemoryReviewCommand({ action: 'status' }, env) as any;
+    expect(status.subject_id).toBe('kohaku');
+    expect(status.memory).toEqual(expect.objectContaining({
+      total: 1,
+      active: 1,
+      inactive: 0,
+      owner_corrected: 0,
+    }));
+    expect(status.review).toEqual({ pending: 1, resolved: 0, dismissed: 0 });
+    expect(status.memory.latest).toEqual(expect.objectContaining({ memory_id: memoryId }));
+  });
 });
