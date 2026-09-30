@@ -38,11 +38,14 @@
       "metadata": null,
       "llm_config": null,
       "embedding_config": null,
-      "model": "openai-proxy/mimo-v2.5",
+      "model": "openai-proxy/deepseek-v4.1-flash",
       "embedding": "local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768",
       "model_settings": {
         "provider_type": "openai",
-        "parallel_tool_calls": true
+        "parallel_tool_calls": true,
+        "reasoning": {
+          "reasoning_effort": "none"
+        }
       },
       "compaction_settings": null,
       "context_window_limit": 400000,

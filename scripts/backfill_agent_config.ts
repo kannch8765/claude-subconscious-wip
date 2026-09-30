@@ -223,6 +223,10 @@ function canonicalForBackfillRuntime(
     model: OMEN_BACKFILL_VERIFIED_RUNTIME.model,
     embedding: OMEN_BACKFILL_VERIFIED_RUNTIME.embedding,
     contextWindowLimit: OMEN_BACKFILL_VERIFIED_RUNTIME.contextWindow,
+    modelSettings: {
+      provider_type: OMEN_BACKFILL_VERIFIED_RUNTIME.providerType,
+      parallel_tool_calls: OMEN_BACKFILL_VERIFIED_RUNTIME.parallelToolCalls,
+    },
     modelSettingsProviderType: OMEN_BACKFILL_VERIFIED_RUNTIME.providerType,
     parallelToolCalls: OMEN_BACKFILL_VERIFIED_RUNTIME.parallelToolCalls,
   };

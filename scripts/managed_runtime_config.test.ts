@@ -12,10 +12,11 @@ afterEach(() => {
 describe('Task 093AC managed runtime configuration authority', () => {
   it('reads the intended runtime policy from canonical Subconscious.af', () => {
     expect(getCanonicalManagedAgentConfig()).toEqual(expect.objectContaining({
-      model: 'openai-proxy/mimo-v2.5',
+      model: 'openai-proxy/deepseek-v4.1-flash',
       embedding: 'local-fastembed/paraphrase-multilingual-minilm-l12-v2-padded768',
       contextWindowLimit: 400000,
       modelSettingsProviderType: 'openai',
+      modelSettings: { provider_type: 'openai', parallel_tool_calls: true, reasoning: { reasoning_effort: 'none' } },
       parallelToolCalls: true,
     }));
   });
@@ -58,7 +59,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true },
+      model_settings: canonical.modelSettings,
     }]);
     expect(live.model_settings.parallel_tool_calls).toBe(true);
     expect(live.llm_config.parallel_tool_calls).toBe(true);
@@ -75,7 +76,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
+      model_settings: { ...canonical.modelSettings } as Record<string, unknown>,
       llm_config: {
         handle: canonical.model,
         model_endpoint_type: 'openai',
@@ -113,7 +114,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
 
     expect(patches).toEqual([{
       context_window_limit: overrideContext,
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true },
+      model_settings: canonical.modelSettings,
     }]);
     expect(live.context_window_limit).toBe(overrideContext);
     expect(live.model_settings.parallel_tool_calls).toBe(true);
@@ -129,7 +130,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
+      model_settings: { ...canonical.modelSettings } as Record<string, unknown>,
       llm_config: {
         handle: canonical.model,
         model_endpoint_type: 'openai',
@@ -156,7 +157,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
     await reconcileManagedAgentConfiguration('test-key', ID, () => {});
 
     expect(patches).toEqual([{
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true },
+      model_settings: canonical.modelSettings,
     }]);
     expect(live.model_settings.parallel_tool_calls).toBe(true);
     expect(live.llm_config.parallel_tool_calls).toBe(true);
@@ -171,7 +172,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
+      model_settings: { ...canonical.modelSettings } as Record<string, unknown>,
       llm_config: {
         handle: canonical.model,
         model_endpoint_type: 'openai',
@@ -187,7 +188,37 @@ describe('Task 093AC managed runtime configuration authority', () => {
     }));
 
     await expect(reconcileManagedAgentConfiguration('test-key', ID, () => {}))
-      .rejects.toThrow('effective parallel_tool_calls reconciliation failed');
+      .rejects.toThrow('effective model_settings reconciliation failed');
+  });
+
+  it('repairs canonical model-specific reasoning settings without changing model/context', async () => {
+    const canonical = getCanonicalManagedAgentConfig();
+    const live = {
+      id: ID,
+      name: 'Subconscious',
+      system: canonical.system,
+      model: canonical.model,
+      embedding: canonical.embedding,
+      context_window_limit: canonical.contextWindowLimit,
+      model_settings: { provider_type: 'openai', parallel_tool_calls: true, reasoning: { reasoning_effort: 'high' } } as Record<string, unknown>,
+      llm_config: { handle: canonical.model, model_endpoint_type: 'openai', context_window: canonical.contextWindowLimit, parallel_tool_calls: true },
+    };
+    const patches: Array<Record<string, unknown>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      if ((init?.method ?? 'GET') === 'PATCH') {
+        const patch = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        patches.push(patch);
+        if (patch.model_settings && typeof patch.model_settings === 'object') live.model_settings = patch.model_settings as Record<string, unknown>;
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify(live), { status: 200, headers: { 'content-type': 'application/json' } });
+    }));
+
+    await reconcileManagedAgentConfiguration('test-key', ID, () => {});
+    await reconcileManagedAgentConfiguration('test-key', ID, () => {});
+
+    expect(patches).toEqual([{ model_settings: canonical.modelSettings }]);
+    expect(live.model_settings).toEqual(canonical.modelSettings);
   });
 
   it('pairs a cross-provider operator model override with Letta metadata and is idempotent', async () => {
@@ -201,7 +232,7 @@ describe('Task 093AC managed runtime configuration authority', () => {
       model: canonical.model,
       embedding: canonical.embedding,
       context_window_limit: canonical.contextWindowLimit,
-      model_settings: { provider_type: 'openai', parallel_tool_calls: true } as Record<string, unknown>,
+      model_settings: { ...canonical.modelSettings } as Record<string, unknown>,
       llm_config: { handle: canonical.model, model_endpoint_type: 'openai', context_window: canonical.contextWindowLimit, parallel_tool_calls: true },
     };
     const patches: Array<Record<string, unknown>> = [];
