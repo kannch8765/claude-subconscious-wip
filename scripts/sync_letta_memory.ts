@@ -21,6 +21,7 @@ import * as fs from 'fs';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
+import { readExternalPromptContext } from './external_prompt_context.js';
 import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import {
   loadSyncState,
@@ -195,6 +196,11 @@ async function main(): Promise<void> {
     const hookInput = await readHookInput();
     const cwd = hookInput?.cwd || projectDir;
     const sessionId = hookInput?.session_id;
+    const externalPromptContext = readExternalPromptContext(
+      process.env.RELATIONSHIP_MEMORY_DIR,
+      sessionId,
+      hookInput?.prompt,
+    );
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const expectedTurnId = expectedSyncTurnId(hookInput);
     const partitioned = partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId);
@@ -206,9 +212,10 @@ async function main(): Promise<void> {
     // agent state, or inspect conversation history on the foreground hot path.
     if (mode === 'whisper') {
       cleanLettaFromClaudeMd(cwd);
-      const injectionPayload = formatPendingSubconWhispers(pendingWhispers);
-      if (sessionId && injectionPayload) {
-        mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: injectionPayload });
+      const subconPayload = formatPendingSubconWhispers(pendingWhispers);
+      const injectionPayload = [externalPromptContext, subconPayload].filter(Boolean).join('\n\n');
+      if (sessionId && subconPayload) {
+        mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: subconPayload });
       }
       if (injectionPayload) console.log(injectionPayload);
       if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
@@ -254,9 +261,10 @@ async function main(): Promise<void> {
     const messageOutput = formatPendingSubconWhispers(pendingWhispers);
     if (messageOutput) outputs.push(messageOutput);
 
-    const injectionPayload = outputs.join('\n\n');
-    if (sessionId && injectionPayload) {
-      mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: injectionPayload });
+    const subconPayload = outputs.join('\n\n');
+    const injectionPayload = [externalPromptContext, subconPayload].filter(Boolean).join('\n\n');
+    if (sessionId && subconPayload) {
+      mirrorSubconVisibility({ sessionId, phase: 'user_prompt', payload: subconPayload });
     }
     if (injectionPayload) console.log(injectionPayload);
     if (pendingWhispers.length > 0) acknowledgePendingSubconWhispers(pendingWhispers);
