@@ -4,6 +4,8 @@ import * as os from 'os';
 import * as path from 'path';
 
 export type SubconVisibilityPhase = 'user_prompt' | 'pre_tool';
+export type SubconActivityKind = 'memory_write';
+export type SubconActivityAction = 'remembered';
 
 export interface SubconVisibilityEvent {
   schema: 'subcon_visibility_v1';
@@ -19,6 +21,30 @@ export interface MirrorSubconVisibilityInput {
   sessionId: string;
   phase: SubconVisibilityPhase;
   payload: string;
+}
+
+export interface SubconMemoryReceipt {
+  memory_id: string;
+  kind: string;
+  summary: string;
+}
+
+export interface SubconActivityEvent {
+  schema: 'subcon_activity_v1';
+  run_id: string;
+  session_id: string;
+  sequence: number;
+  activity: SubconActivityKind;
+  action: SubconActivityAction;
+  memory: SubconMemoryReceipt;
+  created_at: string;
+}
+
+export interface MirrorSubconActivityInput {
+  sessionId: string;
+  activity: SubconActivityKind;
+  action: SubconActivityAction;
+  memory: SubconMemoryReceipt;
 }
 
 const DEFAULT_MAX_EVENTS_PER_RUN = 64;
@@ -52,6 +78,10 @@ export function visibilityRunKey(runId: string): string {
 
 export function visibilityRunDir(root: string, runId: string): string {
   return path.join(root, visibilityRunKey(runId));
+}
+
+export function activityRunDir(root: string, runId: string): string {
+  return path.join(visibilityRunDir(root, runId), 'activity');
 }
 
 function sleepSync(milliseconds: number): void {
@@ -244,6 +274,66 @@ export function readMirroredVisibilityEvents(
     try {
       const parsed = JSON.parse(fs.readFileSync(path.join(runDir, name), 'utf8')) as SubconVisibilityEvent;
       return parsed.schema === 'subcon_visibility_v1' && parsed.run_id === runId ? [parsed] : [];
+    } catch {
+      return [];
+    }
+  });
+}
+
+
+/** Mirror a durable Subcon background activity that is not scoped to one foreground turn. */
+export function mirrorSubconActivity(
+  input: MirrorSubconActivityInput,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  try {
+    const root = getSubconVisibilityRoot(env);
+    const runId = env.SUBCON_VISIBILITY_RUN_ID?.trim();
+    const memoryId = input.memory?.memory_id?.trim();
+    const kind = input.memory?.kind?.trim();
+    const summary = input.memory?.summary?.trim();
+    if (!root || !runId || !input.sessionId || !memoryId || !kind || !summary) return false;
+
+    const maxPayloadBytes = boundedPositiveInt(env.SUBCON_VISIBILITY_MAX_PAYLOAD_BYTES, DEFAULT_MAX_PAYLOAD_BYTES, 8 * 1024 * 1024);
+    const maxEvents = boundedPositiveInt(env.SUBCON_VISIBILITY_MAX_EVENTS, DEFAULT_MAX_EVENTS_PER_RUN, 512);
+    const maxRuns = boundedPositiveInt(env.SUBCON_VISIBILITY_MAX_RUNS, DEFAULT_MAX_RUNS, 64);
+
+    ensurePrivateDirectory(root);
+    const parentRunDir = visibilityRunDir(root, runId);
+    ensurePrivateDirectory(parentRunDir);
+    const runDir = activityRunDir(root, runId);
+    ensurePrivateDirectory(runDir);
+    const lock = acquireLock(runDir);
+    if (!lock) return false;
+    try {
+      const sequence = nextSequence(runDir);
+      const event: SubconActivityEvent = {
+        schema: 'subcon_activity_v1', run_id: runId, session_id: input.sessionId, sequence,
+        activity: input.activity, action: input.action,
+        memory: { memory_id: memoryId, kind, summary },
+        created_at: new Date().toISOString(),
+      };
+      const encoded = `${JSON.stringify(event)}
+`;
+      if (Buffer.byteLength(encoded, 'utf8') > maxPayloadBytes) return false;
+      atomicWrite(path.join(runDir, `${String(sequence).padStart(12, '0')}.json`), encoded);
+      cleanupRun(runDir, maxEvents);
+    } finally {
+      fs.rmSync(lock, { recursive: true, force: true });
+    }
+    cleanupRoot(root, parentRunDir, maxRuns);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function readMirroredActivityEvents(root: string, runId: string): SubconActivityEvent[] {
+  const runDir = activityRunDir(root, runId);
+  return eventFiles(runDir).flatMap((name) => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(runDir, name), 'utf8')) as SubconActivityEvent;
+      return parsed.schema === 'subcon_activity_v1' && parsed.run_id === runId ? [parsed] : [];
     } catch {
       return [];
     }

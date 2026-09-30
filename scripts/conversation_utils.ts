@@ -77,6 +77,7 @@ export interface SyncState {
   lastSeenMessageId?: string;  // Track last message ID we've shown to avoid duplicates
   deliveredMemoryIds?: string[];  // Canonical memories already surfaced to foreground in this Claude session
   sessionWrittenMemoryIds?: string[];  // Canonical memories created from this Claude session
+  startedAt?: string;  // First time this Claude session state was initialized
 }
 
 function uniqueMemoryIds(...groups: Array<readonly string[] | undefined>): string[] {
@@ -426,6 +427,37 @@ export function saveSyncState(cwd: string, state: SyncState, log: LogFn = noopLo
 
     writeSyncStateUnlocked(cwd, merged, log);
     Object.assign(state, merged);
+  });
+}
+
+/**
+ * Initialize or resume one Claude session without discarding durable progress.
+ * SessionStart may run again when Claude-P resumes the same Claude session, so
+ * this preserves the transcript cursor and foreground-known memory markers.
+ * The current Letta conversation is authoritative for this lifecycle boundary.
+ */
+export function initializeSessionSyncState(
+  cwd: string,
+  sessionId: string,
+  conversationId: string,
+  log: LogFn = noopLog,
+): SyncState {
+  return withSyncStateLock(cwd, sessionId, () => {
+    const durable = readSyncStateForMutation(cwd, sessionId);
+    const next: SyncState = durable
+      ? {
+          ...durable,
+          conversationId,
+          startedAt: durable.startedAt ?? new Date().toISOString(),
+        }
+      : {
+          lastProcessedIndex: -1,
+          sessionId,
+          conversationId,
+          startedAt: new Date().toISOString(),
+        };
+    writeSyncStateUnlocked(cwd, next, log);
+    return next;
   });
 }
 

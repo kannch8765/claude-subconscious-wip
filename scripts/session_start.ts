@@ -32,6 +32,7 @@ import {
   getMode,
   getTempStateDir,
   expandPath,
+  initializeSessionSyncState,
 } from './conversation_utils.js';
 import { buildLettaApiUrl } from './letta_api_url.js';
 
@@ -71,10 +72,6 @@ function getDurableStateDir(cwd: string): string {
 
 function getConversationsFile(cwd: string): string {
   return path.join(getDurableStateDir(cwd), 'conversations.json');
-}
-
-function getSyncStateFile(cwd: string, sessionId: string): string {
-  return path.join(getDurableStateDir(cwd), `session-${sessionId}.json`);
 }
 
 /**
@@ -148,20 +145,6 @@ function loadConversationsMap(cwd: string): ConversationsMap {
 function saveConversationsMap(cwd: string, map: ConversationsMap): void {
   ensureDurableStateDir(cwd);
   fs.writeFileSync(getConversationsFile(cwd), JSON.stringify(map, null, 2), 'utf-8');
-}
-
-/**
- * Save session state
- */
-function saveSessionState(cwd: string, sessionId: string, conversationId: string): void {
-  ensureDurableStateDir(cwd);
-  const state = {
-    sessionId,
-    conversationId,
-    lastProcessedIndex: -1,
-    startedAt: new Date().toISOString(),
-  };
-  fs.writeFileSync(getSyncStateFile(cwd, sessionId), JSON.stringify(state, null, 2), 'utf-8');
 }
 
 /**
@@ -347,8 +330,9 @@ async function main(): Promise<void> {
       saveConversationsMap(hookInput.cwd, conversationsMap);
     }
 
-    // Save session state
-    saveSessionState(hookInput.cwd, hookInput.session_id, conversationId);
+    // Claude-P can resume an existing Claude session and fire SessionStart again.
+    // Keep its cursor and foreground-known memory markers instead of resetting them.
+    initializeSessionSyncState(hookInput.cwd, hookInput.session_id, conversationId, log);
 
     // Clean up any existing <letta> section from CLAUDE.md (legacy migration)
     log('Cleaning up any legacy CLAUDE.md content...');

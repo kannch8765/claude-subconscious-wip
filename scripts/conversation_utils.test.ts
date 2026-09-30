@@ -530,6 +530,41 @@ describe('live retryable conversation recovery', () => {
     expect(calls).toBe(0);
   });
 
+  it('resumes SessionStart state without resetting cursor or foreground-known memories', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+
+    const {
+      getSessionForegroundKnownMemoryIds,
+      initializeSessionSyncState,
+      loadSyncState,
+      saveSyncState,
+    } = await import('./conversation_utils.js');
+    const cwd = '/workspace';
+    const sessionId = 'session-resumed';
+    saveSyncState(cwd, {
+      lastProcessedIndex: 664,
+      sessionId,
+      conversationId: 'conv-old',
+      deliveredMemoryIds: ['memory-delivered'],
+      sessionWrittenMemoryIds: ['memory-written'],
+      startedAt: '2026-09-25T00:00:00.000Z',
+    });
+
+    const resumed = initializeSessionSyncState(cwd, sessionId, 'conv-new');
+    expect(resumed).toMatchObject({
+      lastProcessedIndex: 664,
+      sessionId,
+      conversationId: 'conv-new',
+      deliveredMemoryIds: ['memory-delivered'],
+      sessionWrittenMemoryIds: ['memory-written'],
+      startedAt: '2026-09-25T00:00:00.000Z',
+    });
+    expect(loadSyncState(cwd, sessionId)).toMatchObject(resumed);
+    expect(getSessionForegroundKnownMemoryIds(cwd, sessionId))
+      .toEqual(['memory-delivered', 'memory-written']);
+  });
+
   it('does not let a stale state save erase session delivery markers', async () => {
     const home = tempHome();
     vi.stubEnv('LETTA_HOME', home);
