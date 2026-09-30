@@ -12,6 +12,7 @@ import {
   makeBatchId,
   MEMORY_KINDS,
   MEMORY_KIND_DEFINITIONS,
+  MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES,
   MEMORY_REMEMBER_TOOL_NAMES,
   memoryRememberKindToolSchema,
   memoryReinforceToolSchema,
@@ -445,15 +446,15 @@ describe('adopted SDK/configuration boundary', () => {
     const tools = buildRelationshipTools(rt, 'tools');
     expect(tools.map((t) => t.name)).toEqual(['memory_search', 'entity_search', 'entity_remember', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES]);
     expect(tools.some((tool) => tool.name === ('memory_remember' as any))).toBe(false);
-    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember']);
+    expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember', ...MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES]);
     expect(RELATIONSHIP_SYNC_ALLOWED_CLIENT_TOOLS).toEqual(['memory_search', 'entity_search']);
-    expect(RELATIONSHIP_MUTATION_CLIENT_TOOLS).toEqual(['memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_remember']);
+    expect(RELATIONSHIP_MUTATION_CLIENT_TOOLS).toEqual(['memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_remember', ...MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES]);
     for (const forbidden of FORBIDDEN_MARKDOWN_MEMORY_TOOLS) expect(RELATIONSHIP_ALLOWED_CLIENT_TOOLS).not.toContain(forbidden as any);
     expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).toEqual(expect.arrayContaining(['Bash', 'Read', 'Grep', 'Glob', 'Write', 'Edit', 'Task', 'Skill', 'TodoWrite']));
     for (const allowed of RELATIONSHIP_ALLOWED_CLIENT_TOOLS) expect(RELATIONSHIP_DISALLOWED_CLIENT_TOOLS).not.toContain(allowed as any);
     expect(() => assertRelationshipClientToolInventory([
       'Bash', 'TaskOutput', 'Edit', 'EnterPlanMode', 'ExitPlanMode', 'Glob', 'Grep', 'TaskStop', 'Read', 'Skill', 'Task', 'TodoWrite', 'Write',
-      'memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember',
+      'memory_search', 'memory_reinforce', ...MEMORY_REMEMBER_TOOL_NAMES, 'entity_search', 'entity_remember', ...MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES,
     ])).not.toThrow();
     expect(() => assertRelationshipClientToolInventory(['Read', 'FutureUnknownBuiltin'])).toThrow(/FutureUnknownBuiltin/);
     const remembered = await tools.find((tool) => tool.name === 'memory_remember_personal_experience')!.execute('call-1', memoryToolInput(personal()));
