@@ -12,6 +12,8 @@ import type {
   EntityIdentityRecord,
   EntityOutcome,
   MaintenanceReviewRecord,
+  MemoryResolutionRecord,
+  MemoryResolutionResolveRecord,
   ReinforcementRecord,
   RememberOutcome,
   OwnerRevisionRecord,
@@ -343,10 +345,32 @@ export class RelationshipMemoryStore {
   listBatches(): BatchRecord[] { return readJsonl<BatchRecord>(this.file('batches.jsonl')); }
   listOwnerRevisions(): OwnerRevisionRecord[] { return readJsonl<OwnerRevisionRecord>(this.file('owner-revisions.jsonl')); }
   listMaintenanceReviewRecords(): MaintenanceReviewRecord[] { return readJsonl<MaintenanceReviewRecord>(this.file('maintenance-reviews.jsonl')); }
+  listMemoryResolutionRecords(): MemoryResolutionRecord[] { return readJsonl<MemoryResolutionRecord>(this.file('memory-resolutions.jsonl')); }
+  listActiveMemoryResolutions(): MemoryResolutionResolveRecord[] {
+    const active = new Map<string, MemoryResolutionResolveRecord>();
+    for (const record of this.listMemoryResolutionRecords()) {
+      if (record.action === 'resolve') { active.set(record.review_id, record); continue; }
+      const current = active.get(record.review_id);
+      if (current?.resolution_id === record.undoes_resolution_id) active.delete(record.review_id);
+    }
+    return [...active.values()];
+  }
   listMaintenanceReviews(): MaintenanceReviewRecord[] {
     const latest = new Map<string, MaintenanceReviewRecord>();
     for (const record of this.listMaintenanceReviewRecords()) latest.set(record.review_id, record);
-    return [...latest.values()];
+    const active = new Map(this.listActiveMemoryResolutions().map((record) => [record.review_id, record] as const));
+    return [...latest.values()].map((review) => {
+      const resolution = active.get(review.review_id);
+      if (!resolution) return review;
+      return {
+        ...review,
+        status: resolution.relation === 'unrelated' ? 'dismissed' as const : 'resolved' as const,
+        resolved_relation: resolution.relation,
+        resolution_id: resolution.resolution_id,
+        resolved_at: resolution.recorded_at,
+        ...(resolution.note ? { resolution_note: resolution.note } : {}),
+      };
+    });
   }
   listAssistantIntents(): AssistantRememberIntentRecord[] { return readJsonl<AssistantRememberIntentRecord>(this.file('assistant-intents.jsonl')); }
   listAssistantIntentOutcomes(): AssistantIntentOutcome[] { return readJsonl<AssistantIntentOutcome>(this.file('assistant-intent-outcomes.jsonl')); }
@@ -367,7 +391,7 @@ export class RelationshipMemoryStore {
   }
   getMemory(memoryId: string): CanonicalMemoryRecord | undefined { return this.listMemories().find((item) => item.memory_id === memoryId); }
   getMaintenanceReview(reviewId: string): MaintenanceReviewRecord | undefined {
-    return [...this.listMaintenanceReviewRecords()].reverse().find((item) => item.review_id === reviewId);
+    return this.listMaintenanceReviews().find((item) => item.review_id === reviewId);
   }
   getMemoryBySourceKey(sourceKey: string): CanonicalMemoryRecord | undefined { return this.listMemories().find((item) => item.source_key === sourceKey); }
   getMemoryByDedupeKey(dedupeKey: string): CanonicalMemoryRecord | undefined { return this.listMemories().find((item) => item.dedupe_key === dedupeKey); }
@@ -529,6 +553,19 @@ export class RelationshipMemoryStore {
         indexReady,
       );
       return true;
+    });
+  }
+
+  appendMemoryResolution<T extends MemoryResolutionRecord>(record: T): T {
+    return this.withMutationBoundary(() => {
+      const existing = this.listMemoryResolutionRecords().find((item) => item.resolution_id === record.resolution_id);
+      if (existing) {
+        const comparable = { ...record, recorded_at: existing.recorded_at };
+        if (stableJson(existing) !== stableJson(comparable)) throw new Error(`resolution_id already used for a different owner mutation: ${record.resolution_id}`);
+        return existing as T;
+      }
+      appendJsonl(this.file('memory-resolutions.jsonl'), record);
+      return record;
     });
   }
 

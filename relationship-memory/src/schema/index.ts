@@ -517,7 +517,38 @@ export interface MaintenanceReviewRecord {
   recorded_at: string;
   batch_id?: string;
   resolution_note?: string;
+  resolved_relation?: MemoryRelationKind;
+  resolution_id?: string;
+  resolved_at?: string;
 }
+
+export interface MemoryResolutionResolveRecord {
+  schema_version: 1;
+  resolution_id: string;
+  review_id: string;
+  subject_id: string;
+  action: 'resolve';
+  relation: MemoryRelationKind;
+  memory_ids: string[];
+  recorded_at: string;
+  target_memory_id?: string;
+  owner_summary?: string;
+  contexts?: Record<string, string>;
+  note?: string;
+}
+
+export interface MemoryResolutionUndoRecord {
+  schema_version: 1;
+  resolution_id: string;
+  review_id: string;
+  subject_id: string;
+  action: 'undo';
+  undoes_resolution_id: string;
+  recorded_at: string;
+  note?: string;
+}
+
+export type MemoryResolutionRecord = MemoryResolutionResolveRecord | MemoryResolutionUndoRecord;
 
 export type OwnerRevisionAction = 'revise' | 'deactivate' | 'restore';
 
@@ -549,4 +580,9 @@ export interface EffectiveMemoryRecord extends Omit<CanonicalMemoryRecord, 'stat
   reinforcement_evidence_count?: number;
   reinforcement_evidence_ids?: string[];
   latest_reinforcement_at?: string;
+  resolution_relation?: MemoryRelationKind;
+  resolution_review_ids?: string[];
+  resolution_context?: string;
+  resolution_source_memory_ids?: string[];
+  resolution_historical_memory_ids?: string[];
 }

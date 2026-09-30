@@ -145,4 +145,59 @@ describe('owner memory review command', () => {
     expect(status.review).toEqual({ pending: 1, resolved: 0, dismissed: 0 });
     expect(status.memory.latest).toEqual(expect.objectContaining({ memory_id: memoryId }));
   });
+
+  it('resolves and undoes a pending relation through the owner review bridge', () => {
+    const { store, env, memoryId } = fixture();
+    const first = store.getMemory(memoryId)!;
+    store.appendMemory({
+      ...first,
+      memory_id: 'mem-second',
+      summary: '猫也喜欢不吵、适合久坐的咖啡店。',
+      payload: { topic: '咖啡店', preference: '不吵、适合久坐' },
+      source_key: 'source-second',
+      dedupe_key: 'dedupe-second',
+      observed_at: '2026-09-30T00:00:02.000Z',
+      created_at: '2026-09-30T00:00:02.000Z',
+    }, []);
+    store.appendMaintenanceReview({
+      schema_version: 1,
+      review_id: 'review-resolution',
+      subject_id: 'kohaku',
+      kind: 'relation',
+      suggested_relation: 'same_meaning',
+      memory_ids: [memoryId, 'mem-second'].sort(),
+      reason: 'same preference',
+      status: 'pending',
+      created_at: '2026-09-30T00:00:03.000Z',
+      recorded_at: '2026-09-30T00:00:03.000Z',
+    });
+
+    const resolved = executeOwnerMemoryReviewCommand({
+      action: 'resolve_review',
+      review_id: 'review-resolution',
+      resolution_id: 'telegram-resolution-1',
+      relation: 'same_meaning',
+      target_memory_id: 'mem-second',
+      owner_summary: '猫偏好安静、不吵、适合久坐的咖啡店。',
+    }, env) as any;
+    expect(resolved.review).toEqual(expect.objectContaining({ status: 'resolved', resolved_relation: 'same_meaning' }));
+    const current = executeOwnerMemoryReviewCommand({ action: 'search', active: true, limit: 8 }, env) as any;
+    expect(current.total).toBe(1);
+    expect(current.memories[0]).toEqual(expect.objectContaining({
+      memory_id: 'mem-second',
+      summary: '猫偏好安静、不吵、适合久坐的咖啡店。',
+      resolution_relation: 'same_meaning',
+    }));
+
+    const undone = executeOwnerMemoryReviewCommand({
+      action: 'undo_review',
+      review_id: 'review-resolution',
+      resolution_id: 'telegram-resolution-undo-1',
+    }, env) as any;
+    expect(undone.review.status).toBe('pending');
+    const restored = executeOwnerMemoryReviewCommand({ action: 'search', active: true, limit: 8 }, env) as any;
+    expect(restored.total).toBe(2);
+    expect(store.listMemoryResolutionRecords()).toHaveLength(2);
+  });
+
 });
