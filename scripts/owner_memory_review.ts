@@ -106,16 +106,25 @@ export function executeOwnerMemoryReviewCommand(
     const canonicalMemories = owner.listEffective();
     const memories = materializeCurrentMemoryView(store);
     const reviews = store.listMaintenanceReviews();
+    const resolutions = store.listActiveMemoryResolutions();
     const countsByKind = Object.fromEntries(MEMORY_KINDS.map((kind) => [kind, 0])) as Record<MemoryKind, number>;
+    const countsByRelation = Object.fromEntries(MEMORY_RELATION_KINDS.map((relation) => [relation, 0])) as Record<MemoryRelationKind, number>;
     let active = 0;
     let inactive = 0;
     let ownerCorrected = 0;
+    let sameMeaningSourceMemories = 0;
     for (const memory of memories) {
       countsByKind[memory.kind] += 1;
       if (memory.status === 'active') active += 1;
       else inactive += 1;
       if (memory.owner_corrected) ownerCorrected += 1;
     }
+    for (const resolution of resolutions) {
+      countsByRelation[resolution.relation] += 1;
+      if (resolution.relation === 'same_meaning') sameMeaningSourceMemories += resolution.memory_ids.length;
+    }
+    const canonicalActive = canonicalMemories.filter((memory) => memory.status === 'active').length;
+    const sameMeaningFamilies = countsByRelation.same_meaning;
     const latest = [...memories].sort((a, b) => b.created_at.localeCompare(a.created_at))[0];
     return {
       subject_id: subjectId,
@@ -124,7 +133,8 @@ export function executeOwnerMemoryReviewCommand(
         active,
         inactive,
         canonical_total: canonicalMemories.length,
-        canonical_active: canonicalMemories.filter((memory) => memory.status === 'active').length,
+        canonical_active: canonicalActive,
+        projected_out_active: Math.max(0, canonicalActive - active),
         owner_corrected: ownerCorrected,
         by_kind: countsByKind,
         latest: latest ? {
@@ -139,6 +149,16 @@ export function executeOwnerMemoryReviewCommand(
         pending: reviews.filter((review) => review.status === 'pending').length,
         resolved: reviews.filter((review) => review.status === 'resolved').length,
         dismissed: reviews.filter((review) => review.status === 'dismissed').length,
+      },
+      resolution: {
+        active: resolutions.length,
+        by_relation: countsByRelation,
+        same_meaning: {
+          families: sameMeaningFamilies,
+          source_memories: sameMeaningSourceMemories,
+          current_memories: sameMeaningFamilies,
+          folded_memories: sameMeaningSourceMemories - sameMeaningFamilies,
+        },
       },
     };
   }
