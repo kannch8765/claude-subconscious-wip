@@ -143,6 +143,24 @@ describe('owner memory review command', () => {
       owner_corrected: 0,
     }));
     expect(status.review).toEqual({ pending: 1, resolved: 0, dismissed: 0 });
+    expect(status.resolution).toEqual({
+      active: 0,
+      by_relation: {
+        same_meaning: 0,
+        changed_over_time: 0,
+        context_dependent: 0,
+        conflict: 0,
+        related: 0,
+        unrelated: 0,
+      },
+      same_meaning: {
+        families: 0,
+        source_memories: 0,
+        current_memories: 0,
+        folded_memories: 0,
+      },
+    });
+    expect(status.memory.projected_out_active).toBe(0);
     expect(status.memory.latest).toEqual(expect.objectContaining({ memory_id: memoryId }));
   });
 
@@ -188,6 +206,19 @@ describe('owner memory review command', () => {
       summary: '猫偏好安静、不吵、适合久坐的咖啡店。',
       resolution_relation: 'same_meaning',
     }));
+    const mergedStatus = executeOwnerMemoryReviewCommand({ action: 'status' }, env) as any;
+    expect(mergedStatus.memory).toEqual(expect.objectContaining({
+      active: 1,
+      canonical_active: 2,
+      projected_out_active: 1,
+    }));
+    expect(mergedStatus.resolution.same_meaning).toEqual({
+      families: 1,
+      source_memories: 2,
+      current_memories: 1,
+      folded_memories: 1,
+    });
+    expect(mergedStatus.resolution.by_relation.same_meaning).toBe(1);
 
     const undone = executeOwnerMemoryReviewCommand({
       action: 'undo_review',
