@@ -37,6 +37,7 @@ import {
 import {
   readTranscript,
   formatMessagesForLetta,
+  extractAllContent,
 } from './transcript_utils.js';
 import { buildCanonicalMessages, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
@@ -133,6 +134,14 @@ async function main(): Promise<void> {
     );
     log(`Persisted/verified ${assistantIntents.length} trusted assistant remember intent(s)`);
 
+    const newTranscriptMessages = messages.slice(state.lastProcessedIndex + 1);
+    const sourceUserAt = [...newTranscriptMessages].reverse().find((message) => (
+      message.type === 'user'
+      && Boolean(extractAllContent(message).text?.trim())
+      && typeof message.timestamp === 'string'
+      && Number.isFinite(Date.parse(message.timestamp))
+    ))?.timestamp;
+
     const newMessages = formatMessagesForLetta(messages, state.lastProcessedIndex, log);
     if (newMessages.length === 0) {
       log('No new messages to send after formatting');
@@ -221,6 +230,7 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
       canonicalMessages,
       assistantIntents,
       latestUserMessage,
+      ...(sourceUserAt ? { sourceUserAt } : {}),
     };
     fs.writeFileSync(payloadFile, JSON.stringify(nativePayload), 'utf-8');
     log(`Wrote native live payload to ${payloadFile}`);

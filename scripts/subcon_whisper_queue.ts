@@ -12,11 +12,17 @@ export interface PendingSubconWhisper {
   memory_id?: string;
   source?: 'async' | 'sync';
   turn_id?: string;
+  source_user_at?: string;
+  ready_latency_ms?: number;
 }
 
 export interface SubconWhisperScope {
   source: 'sync';
   turnId: string;
+}
+
+export interface SubconWhisperTiming {
+  sourceUserAt: string;
 }
 
 export interface PartitionedSubconWhispers {
@@ -85,20 +91,30 @@ export function queueSubconWhisper(
   text: string,
   scope?: SubconWhisperScope,
   memoryId?: string,
+  timing?: SubconWhisperTiming,
 ): QueueSubconWhisperResult | null {
   const cleaned = text.replace(/\r\n/g, '\n').trim();
   if (!cleaned) return null;
   const dir = queueDir(cwd, sessionId);
   fs.mkdirSync(dir, { recursive: true });
   const normalizedMemoryId = memoryId?.trim();
+  const readyAt = new Date();
+  const sourceUserAt = timing?.sourceUserAt?.trim();
+  const sourceUserAtMs = sourceUserAt ? Date.parse(sourceUserAt) : Number.NaN;
+  const readyLatencyMs = Number.isFinite(sourceUserAtMs)
+    ? Math.max(0, readyAt.getTime() - sourceUserAtMs)
+    : undefined;
   const whisper: PendingSubconWhisper = {
     whisper_id: stableWhisperId(sessionId, batchId),
     session_id: sessionId,
     batch_id: batchId,
     text: cleaned,
-    created_at: new Date().toISOString(),
+    created_at: readyAt.toISOString(),
     ...(normalizedMemoryId ? { memory_id: normalizedMemoryId } : {}),
     ...(scope ? { source: scope.source, turn_id: scope.turnId } : {}),
+    ...(sourceUserAt && readyLatencyMs !== undefined
+      ? { source_user_at: sourceUserAt, ready_latency_ms: readyLatencyMs }
+      : {}),
   };
   const file = path.join(dir, `${whisper.whisper_id}.json`);
   const deliveredMarker = path.join(dir, `${whisper.whisper_id}.delivered`);
