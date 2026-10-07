@@ -40,6 +40,25 @@ describe('Subcon foreground whisper queue', () => {
     expect(readPendingSubconWhispers(cwd, 'session-a')).toEqual([]);
   });
 
+  it('records lightweight async ready latency when a source user timestamp is supplied', () => {
+    const cwd = temp();
+    const sourceUserAt = new Date(Date.now() - 250).toISOString();
+    const result = queueSubconWhisper(
+      cwd,
+      'session-latency',
+      'batch-latency',
+      '异步 recall 纸条',
+      undefined,
+      'memory-latency',
+      { sourceUserAt },
+    );
+    expect(result?.status).toBe('queued');
+    expect(result?.whisper.source_user_at).toBe(sourceUserAt);
+    expect(result?.whisper.ready_latency_ms).toBeTypeOf('number');
+    expect(result?.whisper.ready_latency_ms).toBeGreaterThanOrEqual(0);
+    expect(result?.whisper.ready_latency_ms).toBeLessThan(5_000);
+  });
+
   it('delivers sync whispers only to their armed foreground turn while async stays unscoped', () => {
     const cwd = temp();
     queueSubconWhisper(cwd, 'session-a', 'async-a', '上一轮 async 纸条');

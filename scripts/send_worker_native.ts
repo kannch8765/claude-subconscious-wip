@@ -60,6 +60,7 @@ export interface LiveWorkerPayload {
   canonicalMessages?: CanonicalMessage[];
   assistantIntents?: AssistantRememberIntentRecord[];
   latestUserMessage: string;
+  sourceUserAt?: string;
   syncCheckpointFile?: string;
   syncTurnId?: string;
   syncAgentId?: string;
@@ -362,6 +363,7 @@ export async function sendViaNativeClient(
           payload.cwd, payload.sessionId, payload.batchId, groundedText,
           isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
           memoryId,
+          !isSync && payload.sourceUserAt ? { sourceUserAt: payload.sourceUserAt } : undefined,
         ), log, (result) => Boolean(result && result.whisper.memory_id === memoryId));
         const releaseSyncBatch = (status: 'queued' | 'already_pending' | 'already_delivered', whisperId: string): void => {
           if (!isSync) return;
