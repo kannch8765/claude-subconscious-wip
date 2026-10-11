@@ -48,6 +48,54 @@ describe('automatic async related whisper context', () => {
     expect(out.length).toBeLessThanOrEqual(35);
   });
 
+  it('uses MMR to prefer a complementary second related memory over a near-duplicate', () => {
+    const view = [
+      memory('main', '猫参加过东京 AI Meetup', ['b', 'c', 'd', 'e']),
+      memory('b', '猫喜欢参加东京 AI 社区活动'),
+      memory('c', '猫喜欢参加东京 AI 社区活动线下交流'),
+      memory('d', '猫会在 connpass 寻找东京 AI 活动'),
+      memory('e', '猫在 Meetup 拿到贴纸'),
+    ];
+    const output = renderRelatedWhisperContext('main', view, '东京 AI 活动');
+    const lines = output.split('\n').filter((line) => line.startsWith('- '));
+    expect(lines).toHaveLength(2);
+    expect(lines.join(' ')).toContain('猫喜欢参加东京 AI');
+    expect(lines.join(' ')).toContain('connpass');
+    expect(lines.filter((line) => line.includes('社区活动'))).toHaveLength(1);
+  });
+
+  it('uses diversity to break equally relevant candidates instead of choosing two near copies', () => {
+    const view = [
+      memory('main', 'notebook memory', ['b', 'c', 'd']),
+      memory('b', 'alpha beta gamma delta'),
+      memory('c', 'alpha beta gamma delta extra'),
+      memory('d', 'alpha beta coffee tourism'),
+    ];
+    const output = renderRelatedWhisperContext('main', view, 'alpha beta');
+    expect(output).toContain('alpha beta gamma delta');
+    expect(output).toContain('alpha beta coffee tourism');
+    expect(output).not.toContain('delta extra');
+  });
+
+  it('keeps at most two direct neighbors even when the graph degree is large', () => {
+    const links = Array.from({ length: 80 }, (_, i) => `related-${i}`);
+    const view = [memory('main', '猫关注 AI 线下活动', links),
+      ...links.map((id, i) => memory(id, `东京 AI 活动 ${i} 在 connpass 上发布`))];
+    const output = renderRelatedWhisperContext('main', view, '东京 AI 活动');
+    expect(output.split('\n').filter((line) => line.startsWith('- '))).toHaveLength(2);
+  });
+
+  it('matches CJK bigrams and normalizes Latin case/full-width, without embeddings', () => {
+    const view = [
+      memory('main', '東京イベント', ['japan', 'other']),
+      memory('japan', '東京のＡＩイベント情報をチェック'),
+      memory('other', '猫喜欢咖啡店'),
+    ];
+    const output = renderRelatedWhisperContext('main', view, '東京 AI イベント', new Set(), 45);
+    expect(output).toContain('東京のＡＩイベント');
+    expect(output).not.toContain('咖啡店');
+  });
+
   it('does not reintroduce a related merged family already known by its old source id', () => {
     const family = { ...memory('b', '合并后的记忆'), resolution_source_memory_ids: ['a', 'b'] };
     const main = memory('c', '本次主记忆', ['b']);

@@ -41,6 +41,7 @@ describe('owner-reviewed async recall and automatic related context', () => {
     addMemory(store, 'mem-b', '猫偏好可以久坐的咖啡店');
     addMemory(store, 'mem-c', '猫整理过咖啡店清单');
     addMemory(store, 'mem-d', '猫也整理过书店清单');
+    addMemory(store, 'mem-e', '猫报名过 AI 活动');
 
     const memoryRuntime = new RelationshipMemoryRuntime(store, new Map());
     const review = (ids: string[], relation: 'same_meaning' | 'related') => {
@@ -53,9 +54,11 @@ describe('owner-reviewed async recall and automatic related context', () => {
     const merge = review(['mem-a', 'mem-b'], 'same_meaning');
     const related = review(['mem-a', 'mem-c'], 'related');
     const distant = review(['mem-c', 'mem-d'], 'related');
+    const competing = review(['mem-a', 'mem-e'], 'related');
     const control = new RelationshipMemoryResolutionControlPlane(store);
     control.resolveReview(related, { resolution_id: 'related-a-c', relation: 'related' });
     control.resolveReview(distant, { resolution_id: 'related-c-d', relation: 'related' });
+    control.resolveReview(competing, { resolution_id: 'related-a-e', relation: 'related' });
     control.resolveReview(merge, {
       resolution_id: 'merge-a-b', relation: 'same_meaning', target_memory_id: 'mem-b',
       owner_summary: '猫喜欢安静而且可以久坐的咖啡店',
@@ -67,7 +70,9 @@ describe('owner-reviewed async recall and automatic related context', () => {
     const completed = await sendViaNativeClient({
       agentId: 'agent-test', conversationId: 'conversation-test', sessionId: 'session-reviewed',
       message: 'test', cwd: root, batchId: 'batch-reviewed-async',
-      canonicalMessages: [], assistantIntents: [], latestUserMessage: '安静的咖啡店',
+      // The model searched for coffee even though the raw latest message has AI terms.
+      // Only the selected search query should rank the associated summaries.
+      canonicalMessages: [], assistantIntents: [], latestUserMessage: 'AI 活动',
     }, {
       createClient: () => ({}),
       openStdioMcp: async () => ({ tools: [], close: async () => {} } as any),
@@ -99,8 +104,9 @@ describe('owner-reviewed async recall and automatic related context', () => {
     expect(text).toContain('关联记忆（背景，仅摘要）：');
     expect(text).toContain('猫整理过咖啡店清单');
     expect(text).not.toContain('猫也整理过书店清单');
+    expect(text).not.toContain('猫报名过 AI 活动');
     expect(text).not.toContain('原话：猫整理过咖啡店清单');
-    expect(store.listMemories()).toHaveLength(4);
-    expect(store.listMemoryResolutionRecords()).toHaveLength(3);
+    expect(store.listMemories()).toHaveLength(5);
+    expect(store.listMemoryResolutionRecords()).toHaveLength(4);
   });
 });

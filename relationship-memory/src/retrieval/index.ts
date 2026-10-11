@@ -513,6 +513,14 @@ function lexicalTerms(value: string): LexicalTerm[] {
   return terms;
 }
 
+/**
+ * Reuse the search tokenizer for local, API-free related-memory reranking.
+ * Deduplicated token sets work for Latin terms and CJK character bigrams.
+ */
+export function lexicalTokenSet(value: string): ReadonlySet<string> {
+  return new Set(lexicalTerms(value.normalize('NFKC')).map((term) => term.text));
+}
+
 export function lexicalTextScore(haystack: string, query: string | undefined): number {
   if (!query?.trim()) return 1;
   const normalized = haystack.toLowerCase();

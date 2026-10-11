@@ -100,6 +100,7 @@ type HistoricalRecallSnippet = { snippet_id?: string; source_kind: 'transcript' 
 
 interface SurfacedRecallMemory {
   summary: string;
+  searchQuery?: string;
   snippets: Map<string, HistoricalRecallSnippet & { snippet_id: string }>;
 }
 
@@ -268,6 +269,7 @@ export async function sendViaNativeClient(
               if (!memoryId || !summary) continue;
               const existing = surfacedRecallMemories.get(memoryId);
               const record: SurfacedRecallMemory = existing ?? { summary, snippets: new Map() };
+              if (query) record.searchQuery = query;
               for (const snippet of snippets) {
                 const sourceKind = snippet?.source_kind;
                 const validTranscript = sourceKind === 'transcript' && (snippet?.role === 'user' || snippet?.role === 'assistant');
@@ -366,7 +368,7 @@ export async function sendViaNativeClient(
         const related = isSync ? '' : renderRelatedWhisperContext(
           memoryId,
           materializeCurrentMemoryView(runtime.store),
-          payload.latestUserMessage,
+          surfacedMemory.searchQuery || payload.latestUserMessage,
           new Set(getSessionForegroundKnownMemoryIds(payload.cwd, payload.sessionId)),
         );
         const groundedText = composeGroundedWhisper(
