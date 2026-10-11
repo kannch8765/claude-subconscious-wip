@@ -29,6 +29,8 @@ import {
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
+import { materializeCurrentMemoryView } from '../relationship-memory/src/resolution/index.js';
+import { renderRelatedWhisperContext } from './related_whisper.js';
 import {
   advanceSyncStateCursor,
   deliverSessionMemoryOnce,
@@ -249,9 +251,11 @@ export async function sendViaNativeClient(
             log(`Model relationship memory_search: purpose=${String(purpose)}, query=${JSON.stringify(query)}, excluded=${excludeMemoryIds.length}`);
             const startedAt = Date.now();
             const search = { ...searchArgs, ...(foreground ? { excludeMemoryIds } : {}) };
-            const results = isSync
-              ? await runtime.memorySearchRecallHybridWithEvidence(search as any)
-              : await runtime.memorySearchHybridWithEvidence(search as any);
+            // Both async purposes use the owner-reviewed current view. Maintenance
+            // still refreshes semantic vectors for new memories; foreground is read-only.
+            const results = !isSync && !foreground
+              ? await runtime.memorySearchMaintenanceCurrentWithEvidence(search as any)
+              : await runtime.memorySearchRecallHybridWithEvidence(search as any);
             if (purpose === 'maintenance') {
               for (const memory of results as any[]) {
                 if (typeof memory?.memory_id === 'string' && memory.memory_id) maintenanceSearchedMemoryIds.add(memory.memory_id);
@@ -357,7 +361,18 @@ export async function sendViaNativeClient(
         }
         const snippets = snippetIds.map((snippetId) => surfacedMemory.snippets.get(snippetId)!);
         const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
-        const groundedText = composeGroundedWhisper(historicalWindow, foregroundGroundingIdentityAnchors(entitySearchObservations));
+        // Async only: once Subcon has chosen the main memory, the transport adds
+        // bounded directly related summaries without a second model/tool action.
+        const related = isSync ? '' : renderRelatedWhisperContext(
+          memoryId,
+          materializeCurrentMemoryView(runtime.store),
+          payload.latestUserMessage,
+          new Set(getSessionForegroundKnownMemoryIds(payload.cwd, payload.sessionId)),
+        );
+        const groundedText = composeGroundedWhisper(
+          historicalWindow + related,
+          foregroundGroundingIdentityAnchors(entitySearchObservations),
+        );
         if (isSync && !payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
         const delivery = deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId, () => queueSubconWhisper(
           payload.cwd, payload.sessionId, payload.batchId, groundedText,

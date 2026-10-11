@@ -87,6 +87,7 @@ export function applyMemoryResolutions(
 ): EffectiveMemoryRecord[] {
   const byId = new Map(memories.map((memory) => [memory.memory_id, { ...memory }]));
   const hidden = new Set<string>();
+  const mergedInto = new Map<string, string>();
 
   for (const resolution of resolutions) {
     const members = resolution.memory_ids.map((memoryId) => byId.get(memoryId)).filter((memory): memory is EffectiveMemoryRecord => Boolean(memory));
@@ -104,7 +105,10 @@ export function applyMemoryResolutions(
         ...(linked.length ? { linked_memory_ids: linked } : {}),
         resolution_source_memory_ids: sourceIds,
       });
-      for (const memoryId of resolution.memory_ids) if (memoryId !== targetId) hidden.add(memoryId);
+      for (const memoryId of resolution.memory_ids) if (memoryId !== targetId) {
+        hidden.add(memoryId);
+        mergedInto.set(memoryId, targetId);
+      }
       continue;
     }
 
@@ -154,9 +158,45 @@ export function applyMemoryResolutions(
     // unrelated is an owner-confirmed dismissal only; it intentionally changes no memory view.
   }
 
-  return memories
+  const current = memories
     .map((memory) => byId.get(memory.memory_id)!)
     .filter((memory) => !hidden.has(memory.memory_id));
+  const activeIds = new Set(current.filter((memory) => memory.status === 'active').map((memory) => memory.memory_id));
+  const targetId = (id: string): string => {
+    // Owner can merge a previously consolidated current memory again. Resolve
+    // the resulting family alias chain without flattening the stored history.
+    const seen = new Set<string>();
+    while (mergedInto.has(id) && !seen.has(id)) {
+      seen.add(id);
+      id = mergedInto.get(id)!;
+    }
+    return id;
+  };
+  const links = new Map(current.map((memory) => [memory.memory_id, new Set<string>()]));
+  const link = (fromId: string, toId: string): void => {
+    const from = targetId(fromId);
+    const to = targetId(toId);
+    if (from !== to && activeIds.has(from) && activeIds.has(to)) links.get(from)?.add(to);
+  };
+
+  // Reinterpret historical direct links through same-meaning targets. Keep the
+  // original edges in genesis/resolutions for audit and undo; never traverse a
+  // neighbor's neighbors or create transitive related links.
+  for (const memory of byId.values()) {
+    for (const linkedId of memory.linked_memory_ids ?? []) link(memory.memory_id, linkedId);
+  }
+  // A related review can predate or follow a merge. Resolve both cases against
+  // the final current view, not the order in which overlays were appended.
+  for (const resolution of resolutions.filter((item) => item.relation === 'related')) {
+    for (const from of resolution.memory_ids) {
+      for (const to of resolution.memory_ids) link(from, to);
+    }
+  }
+  return current.map((memory) => {
+    const { linked_memory_ids: _oldLinks, ...rest } = memory;
+    const linkedIds = [...(links.get(memory.memory_id) ?? [])].sort();
+    return { ...rest, ...(linkedIds.length ? { linked_memory_ids: linkedIds } : {}) };
+  });
 }
 
 export function materializeCurrentMemoryView(store: RelationshipMemoryStore): EffectiveMemoryRecord[] {
@@ -210,6 +250,10 @@ export class RelationshipMemoryResolutionControlPlane {
     for (const memoryId of memoryIds) {
       if (!this.store.getMemory(memoryId)) throw new Error(`Unknown canonical memory ID: ${memoryId}`);
     }
+    const currentIds = new Set(materializeCurrentMemoryView(this.store)
+      .filter((memory) => memory.status === 'active').map((memory) => memory.memory_id));
+    const staleId = memoryIds.find((memoryId) => !currentIds.has(memoryId));
+    if (staleId) throw new Error(`Review references a memory that is no longer current and active: ${staleId}`);
 
     if (relation === 'same_meaning' || relation === 'changed_over_time') {
       if (!targetMemoryId || !memoryIds.includes(targetMemoryId)) throw new Error(`${relation} resolution requires target_memory_id from the reviewed memory set`);
@@ -226,7 +270,15 @@ export class RelationshipMemoryResolutionControlPlane {
     if (STRUCTURAL_RELATIONS.has(relation)) {
       for (const active of this.store.listActiveMemoryResolutions()) {
         if (!STRUCTURAL_RELATIONS.has(active.relation)) continue;
-        if (active.memory_ids.some((memoryId) => memoryIds.includes(memoryId))) {
+        const overlaps = active.memory_ids.filter((memoryId) => memoryIds.includes(memoryId));
+        if (overlaps.length === 0) continue;
+        // A previously merged survivor is a new current memory, so it can join
+        // another same-meaning family or become historical when preferences change.
+        // Other overlapping structural decisions still require owner re-review.
+        const extendsMergedCurrent = active.relation === 'same_meaning'
+          && (relation === 'same_meaning' || relation === 'changed_over_time')
+          && overlaps.length === 1 && overlaps[0] === active.target_memory_id;
+        if (!extendsMergedCurrent) {
           throw new Error(`memory already participates in active structural resolution: ${active.review_id}`);
         }
       }

@@ -279,6 +279,12 @@ export class RelationshipMemoryRuntime {
     return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query, signal));
   }
 
+  async memorySearchMaintenanceCurrentWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
+    // Async maintenance shares the reviewed current view with foreground recall,
+    // but still refreshes vectors for new writes, as the old maintenance search did.
+    return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query, undefined, true));
+  }
+
   async memorySearchHybridWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
     return this.attachRecallEvidence(await this.memorySearchHybrid(query));
   }
@@ -337,7 +343,7 @@ export class RelationshipMemoryRuntime {
     await this.semanticRetriever.prepare(documents);
   }
 
-  async memorySearchRecallHybrid(query: SearchQuery, signal?: AbortSignal): Promise<EffectiveMemoryRecord[]> {
+  async memorySearchRecallHybrid(query: SearchQuery, signal?: AbortSignal, refreshIndex = false): Promise<EffectiveMemoryRecord[]> {
     const semanticQuery = query.query?.trim();
     const trigger = query.trigger?.trim().toLowerCase();
     const limit = boundedSearchLimit(query.limit);
@@ -389,7 +395,10 @@ export class RelationshipMemoryRuntime {
       text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, memory.resolution_context ?? '', linkedIntents),
     }));
     let semantic = new Map<string, number>();
-    if (this.semanticRetriever?.rankExisting) {
+    if (refreshIndex && this.semanticRetriever?.rank) {
+      try { semantic = await this.semanticRetriever.rank(documents, semanticQuery); }
+      catch { semantic = new Map(); }
+    } else if (this.semanticRetriever?.rankExisting) {
       try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery, signal); }
       catch { semantic = new Map(); }
     }
@@ -787,6 +796,14 @@ export class RelationshipMemoryRuntime {
     for (const memoryId of memoryIds) {
       if (!knownMemoryIds.has(memoryId)) return { outcome: 'rejected', reason: `unknown canonical memory ID: ${memoryId}` };
     }
+    // Suggestions must refer to the *current* memories the owner can review.
+    // Merged/historical/conflicted/inactive genesis remains available as evidence,
+    // but is no longer a separate maintenance comparison candidate.
+    const currentIds = new Set(this.resolvedRecallMemories()
+      .filter((memory) => memory.status === 'active')
+      .map((memory) => memory.memory_id));
+    const stale = memoryIds.find((memoryId) => !currentIds.has(memoryId));
+    if (stale) return { outcome: 'rejected', reason: `memory is not current and active: ${stale}` };
     const reviewId = stableId('maintenance_review', {
       subject_id: this.store.subjectId,
       kind,
