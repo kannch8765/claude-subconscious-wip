@@ -1,5 +1,5 @@
 import type { CanonicalMemoryRecord, EffectiveMemoryRecord, MemoryKind, OwnerRevisionRecord, OwnerSemanticContent } from '../schema/index.js';
-import { validateProposal } from '../schema/index.js';
+import { validateSemanticContent } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 
 export interface OwnerReviseCommand extends OwnerSemanticContent { revision_id: string; note?: string }
@@ -37,14 +37,15 @@ export function materializeEffectiveMemory(genesis: CanonicalMemoryRecord, revis
   };
 }
 
-function validateReplacement(input: OwnerReviseCommand, evidenceIds: string[]): OwnerSemanticContent {
+function validateReplacement(input: OwnerReviseCommand): OwnerSemanticContent {
   const allowed = new Set(['revision_id','note','kind','summary','participants','payload','linked_memory_ids']);
   for (const key of Object.keys(input as any)) if (!allowed.has(key)) throw new Error(`Owner revise cannot replace authoritative field: ${key}`);
-  const result = validateProposal({ schema_version: 1, kind: input.kind, summary: input.summary, participants: input.participants,
-    evidence_message_ids: evidenceIds, payload: input.payload, ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}) });
-  if (!result.ok || !result.proposal) throw new Error(`${result.code ?? 'invalid_revision'}: ${result.reason ?? 'Invalid owner revision'}`);
-  const p = result.proposal;
-  return { kind: p.kind, summary: p.summary, participants: p.participants, payload: p.payload, ...(p.linked_memory_ids ? { linked_memory_ids: p.linked_memory_ids } : {}) };
+  // An owner revision changes an existing memory's semantic surface. Evidence
+  // belongs to its immutable genesis and is not required for this operation.
+  const result = validateSemanticContent({ schema_version: 1, kind: input.kind, summary: input.summary, participants: input.participants,
+    payload: input.payload, ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}) });
+  if (!result.ok || !result.content) throw new Error(`${result.code ?? 'invalid_revision'}: ${result.reason ?? 'Invalid owner revision'}`);
+  return result.content;
 }
 
 export class RelationshipMemoryOwnerControlPlane {
@@ -52,7 +53,7 @@ export class RelationshipMemoryOwnerControlPlane {
 
   revise(memoryId: string, command: OwnerReviseCommand): OwnerRevisionRecord {
     const genesis = this.requireGenesis(memoryId);
-    const replacement = validateReplacement(command, this.store.listEvidence().filter((e) => e.memory_id === memoryId).map((e) => e.message_id));
+    const replacement = validateReplacement(command);
     for (const linked of replacement.linked_memory_ids ?? []) if (!this.store.getMemory(linked)) throw new Error(`Unknown canonical memory ID: ${linked}`);
     const n = note(command.note);
     return this.append({ schema_version: 1, revision_id: nonEmpty(command.revision_id, 'revision_id'), subject_id: genesis.subject_id, memory_id: memoryId,
