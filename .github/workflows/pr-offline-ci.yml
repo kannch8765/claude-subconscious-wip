@@ -1,8 +1,8 @@
 name: PR offline CI
 
 on:
+  # Run the same offline gate on normal and stacked PRs, including Drafts.
   pull_request:
-    branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
 
 permissions:
