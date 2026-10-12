@@ -61,7 +61,10 @@ describe('counts-only read-only owner review audit', () => {
       recorded_at: '2026-10-01T00:00:00.000Z',
     });
     const beforeFiles = fs.readdirSync(root).sort();
-    const beforeBytes = beforeFiles.map((name) => [name, fs.readFileSync(path.join(root, name)).toString('base64')]);
+    // The canonical store also contains indexed directories. Compare every
+    // top-level JSONL byte-for-byte while checking that no entry was created.
+    const jsonlFiles = beforeFiles.filter((name) => name.endsWith('.jsonl'));
+    const beforeBytes = jsonlFiles.map((name) => [name, fs.readFileSync(path.join(root, name)).toString('base64')]);
     const result = executeOwnerMemoryReviewCommand({action: 'audit_counts'}, env) as any;
     expect(result).toEqual({
       schema_version: 1,
@@ -79,7 +82,7 @@ describe('counts-only read-only owner review audit', () => {
       expect(output).not.toContain(forbidden);
     }
     expect(fs.readdirSync(root).sort()).toEqual(beforeFiles);
-    expect(beforeFiles.map((name) => [name, fs.readFileSync(path.join(root, name)).toString('base64')])).toEqual(beforeBytes);
+    expect(jsonlFiles.map((name) => [name, fs.readFileSync(path.join(root, name)).toString('base64')])).toEqual(beforeBytes);
   });
 
   it('fails closed on unavailable root instead of creating a fresh empty store', () => {
