@@ -1,7 +1,7 @@
 import { createRuntime, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
-import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
+import { currentReviewableMemoryIds, materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
 import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
@@ -89,8 +89,12 @@ export function executeOwnerMemoryReviewCommand(
   }
 
   if (command.action === 'list_pending_reviews') {
-    const pending = store.listMaintenanceReviews()
-      .filter((review) => review.status === 'pending')
+    // Do not present a card the owner cannot resolve anymore. The old pending
+    // record is retained, so undoing a merge naturally makes it actionable again.
+    const currentIds = currentReviewableMemoryIds(store);
+    const allPending = store.listMaintenanceReviews().filter((review) => review.status === 'pending');
+    const pending = allPending
+      .filter((review) => review.memory_ids.every((memoryId) => currentIds.has(memoryId)))
       .sort((a, b) => a.created_at.localeCompare(b.created_at));
     const memories = new Map(owner.listEffective().map((memory) => [memory.memory_id, memory]));
     return {
@@ -106,6 +110,10 @@ export function executeOwnerMemoryReviewCommand(
     const canonicalMemories = owner.listEffective();
     const memories = materializeCurrentMemoryView(store);
     const reviews = store.listMaintenanceReviews();
+    const currentIds = new Set(memories.filter((memory) => memory.status === 'active').map((memory) => memory.memory_id));
+    const pendingReviews = reviews.filter((review) => review.status === 'pending');
+    const actionablePending = pendingReviews.filter((review) =>
+      review.memory_ids.every((memoryId) => currentIds.has(memoryId)));
     const resolutions = store.listActiveMemoryResolutions();
     const countsByKind = Object.fromEntries(MEMORY_KINDS.map((kind) => [kind, 0])) as Record<MemoryKind, number>;
     const countsByRelation = Object.fromEntries(MEMORY_RELATION_KINDS.map((relation) => [relation, 0])) as Record<MemoryRelationKind, number>;
@@ -146,7 +154,8 @@ export function executeOwnerMemoryReviewCommand(
         } : null,
       },
       review: {
-        pending: reviews.filter((review) => review.status === 'pending').length,
+        pending: actionablePending.length,
+        stale: pendingReviews.length - actionablePending.length,
         resolved: reviews.filter((review) => review.status === 'resolved').length,
         dismissed: reviews.filter((review) => review.status === 'dismissed').length,
       },
