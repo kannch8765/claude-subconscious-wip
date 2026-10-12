@@ -20,7 +20,7 @@ import type {
 import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { materializeEffectiveMemory } from '../owner/index.js';
-import { applyMemoryResolutions } from '../resolution/index.js';
+import { applyMemoryResolutions, currentReviewableMemoryIds } from '../resolution/index.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
@@ -799,9 +799,7 @@ export class RelationshipMemoryRuntime {
     // Suggestions must refer to the *current* memories the owner can review.
     // Merged/historical/conflicted/inactive genesis remains available as evidence,
     // but is no longer a separate maintenance comparison candidate.
-    const currentIds = new Set(this.resolvedRecallMemories()
-      .filter((memory) => memory.status === 'active')
-      .map((memory) => memory.memory_id));
+    const currentIds = currentReviewableMemoryIds(this.store);
     const stale = memoryIds.find((memoryId) => !currentIds.has(memoryId));
     if (stale) return { outcome: 'rejected', reason: `memory is not current and active: ${stale}` };
     const reviewId = stableId('maintenance_review', {

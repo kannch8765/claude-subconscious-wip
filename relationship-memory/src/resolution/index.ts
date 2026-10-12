@@ -204,6 +204,13 @@ export function materializeCurrentMemoryView(store: RelationshipMemoryStore): Ef
   return applyMemoryResolutions(owner.listEffective(), store.listActiveMemoryResolutions());
 }
 
+/** A review can act only on current, active memories. Historical records stay on disk. */
+export function currentReviewableMemoryIds(store: RelationshipMemoryStore): Set<string> {
+  return new Set(materializeCurrentMemoryView(store)
+    .filter((memory) => memory.status === 'active')
+    .map((memory) => memory.memory_id));
+}
+
 export class RelationshipMemoryResolutionControlPlane {
   constructor(readonly store: RelationshipMemoryStore, readonly now: () => string = () => new Date().toISOString()) {}
 
@@ -250,8 +257,7 @@ export class RelationshipMemoryResolutionControlPlane {
     for (const memoryId of memoryIds) {
       if (!this.store.getMemory(memoryId)) throw new Error(`Unknown canonical memory ID: ${memoryId}`);
     }
-    const currentIds = new Set(materializeCurrentMemoryView(this.store)
-      .filter((memory) => memory.status === 'active').map((memory) => memory.memory_id));
+    const currentIds = currentReviewableMemoryIds(this.store);
     const staleId = memoryIds.find((memoryId) => !currentIds.has(memoryId));
     if (staleId) throw new Error(`Review references a memory that is no longer current and active: ${staleId}`);
 

@@ -142,7 +142,7 @@ describe('owner memory review command', () => {
       inactive: 0,
       owner_corrected: 0,
     }));
-    expect(status.review).toEqual({ pending: 1, resolved: 0, dismissed: 0 });
+    expect(status.review).toEqual({ pending: 1, stale: 0, resolved: 0, dismissed: 0 });
     expect(status.resolution).toEqual({
       active: 0,
       by_relation: {
@@ -162,6 +162,47 @@ describe('owner memory review command', () => {
     });
     expect(status.memory.projected_out_active).toBe(0);
     expect(status.memory.latest).toEqual(expect.objectContaining({ memory_id: memoryId }));
+  });
+
+  it('hides stale pending review cards after a merge and restores them after undo', () => {
+    const { store, env, memoryId } = fixture();
+    const original = store.getMemory(memoryId)!;
+    for (const id of ['mem-b', 'mem-c']) {
+      store.appendMemory({
+        ...original, memory_id: id, summary: '另一条当前记忆 ' + id,
+        source_key: 'src-' + id, dedupe_key: 'dedupe-' + id,
+      }, []);
+    }
+    const runtime = new RelationshipMemoryRuntime(store, new Map());
+    const first = runtime.suggestMaintenanceReview('batch-first', 'relation', {
+      memory_ids: [memoryId, 'mem-b'], relation: 'same_meaning', reason: '合并 A B',
+    });
+    const second = runtime.suggestMaintenanceReview('batch-second', 'relation', {
+      memory_ids: [memoryId, 'mem-c'], relation: 'related', reason: '关联 A C',
+    });
+    expect(first.outcome).toBe('accepted');
+    expect(second.outcome).toBe('accepted');
+
+    const before = executeOwnerMemoryReviewCommand({ action: 'list_pending_reviews' }, env) as any;
+    expect(before.total).toBe(2);
+    const merged = executeOwnerMemoryReviewCommand({
+      action: 'resolve_review', review_id: first.review_id!, resolution_id: 'merge-first',
+      relation: 'same_meaning', target_memory_id: 'mem-b',
+    }, env) as any;
+    expect(merged.review.status).toBe('resolved');
+    expect(store.getMaintenanceReview(second.review_id!)?.status).toBe('pending');
+    const after = executeOwnerMemoryReviewCommand({ action: 'list_pending_reviews' }, env) as any;
+    expect(after.total).toBe(0);
+    const status = executeOwnerMemoryReviewCommand({ action: 'status' }, env) as any;
+    expect(status.review).toEqual(expect.objectContaining({ pending: 0, stale: 1, resolved: 1 }));
+    expect(store.listMaintenanceReviewRecords()).toHaveLength(2);
+
+    executeOwnerMemoryReviewCommand({
+      action: 'undo_review', review_id: first.review_id!, resolution_id: 'undo-merge-first',
+    }, env);
+    const restored = executeOwnerMemoryReviewCommand({ action: 'list_pending_reviews' }, env) as any;
+    expect(restored.total).toBe(2);
+    expect(restored.reviews.map((row: any) => row.review_id)).toContain(second.review_id);
   });
 
   it('resolves and undoes a pending relation through the owner review bridge', () => {

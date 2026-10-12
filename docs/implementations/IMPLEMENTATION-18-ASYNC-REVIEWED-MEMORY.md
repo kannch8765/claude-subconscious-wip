@@ -12,6 +12,8 @@ Scope: live asynchronous Subcon only. No sync-foreground, explicit Recall MCP, U
 - Subcon continues to choose one primary memory and 1–3 primary quote snippets, calling the existing deliver_whisper tool. Only in async mode, the delivery script automatically adds summaries of directly linked current memories, without a second LLM call or an additional tool action. Neighbors have no quote snippets and are not marked as previously delivered primary memories.
 - Associated summaries are ranked lexically against the current topic, deduplicated, and fit within a short delivery character budget. There is no limit imposed on database relations or on the size of a memory's graph neighborhood. The script does not traverse neighbors of neighbors.
 
+- Pending Review cards on the asynchronous owner-control surface are filtered through the same current-active memory predicate used for suggestions and resolution. Stale cards are kept in the immutable audit history but no longer occupy the actionable queue; undo can restore their visibility. Status reports actionable pending and stale counts separately.
+
 ## Related Top-2 selection (async only)
 
 - Once Subcon selects the main memory, the existing delivery tool reuses the compact `foreground_recall` query that returned that memory. The script falls back to the most recent user message only when no search query is available.
