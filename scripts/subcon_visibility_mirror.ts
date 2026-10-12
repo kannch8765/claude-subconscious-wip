@@ -316,7 +316,7 @@ export function mirrorSubconActivity(
       payload = {
         activity: input.activity, action: input.action,
         review: { review_id: reviewId, ...(relation ? { suggested_relation: relation } : {}),
-          origin, memory_ids: memoryIds, reason },
+          ...(origin === 'remember_link' ? { origin } : {}), memory_ids: memoryIds, reason },
       };
     }
 
