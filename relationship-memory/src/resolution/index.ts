@@ -8,7 +8,7 @@ import type {
 import { MEMORY_RELATION_KINDS } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
-import { findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
+import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
 
 export interface ResolveReviewCommand {
   resolution_id: string;
@@ -270,10 +270,13 @@ export class RelationshipMemoryResolutionControlPlane {
     if (originalReview && originalReview.status !== 'pending') {
       throw new Error('Maintenance review is not pending: ' + id);
     }
-    const review = findProjectedReview(
+    const projected = findProjectedReview(
       projectRelationReviewInbox(this.store, materializeCurrentMemoryView(this.store)), id,
     );
-    if (!review) throw new Error('Review is not actionable in the current workspace: ' + id);
+    if (!projected) throw new Error('Review is not actionable in the current workspace: ' + id);
+    const observation = originalReview ?? canonicalLinkReviewObservations(this.store).find((item) => item.review_id === id);
+    const review = { ...projected, review_id: id,
+      original_memory_ids: observation?.memory_ids ?? projected.original_memory_ids };
     if (review.kind !== 'relation') throw new Error('Maintenance review is not a relation review: ' + id);
 
     if (!MEMORY_RELATION_KINDS.includes(command.relation)) throw new Error(`unsupported relation: ${command.relation}`);
@@ -340,25 +343,19 @@ export class RelationshipMemoryResolutionControlPlane {
 
   /** Dismiss a no-longer-needed candidate without falsely asserting 'unrelated'. */
   dismissReview(reviewId: string, note?: string): MaintenanceReviewRecord {
-    const original = this.store.getMaintenanceReview(reviewId);
-    if (original && original.status !== 'pending') throw new Error('Review is already closed: ' + reviewId);
-    const review = original ?? findProjectedReview(
-      projectRelationReviewInbox(this.store, materializeCurrentMemoryView(this.store)), reviewId,
-    );
-    if (!review) throw new Error('Unknown review: ' + reviewId);
-    const record: MaintenanceReviewRecord = {
-      ...review, memory_ids: [...(('original_memory_ids' in review
-        ? review.original_memory_ids : review.memory_ids) as string[])],
-      status: 'dismissed', recorded_at: this.now(),
+    const original = this.store.getMaintenanceReview(reviewId)
+      ?? canonicalLinkReviewObservations(this.store).find((item) => item.review_id === reviewId);
+    if (!original) throw new Error('Unknown review: ' + reviewId);
+    if (original.status !== 'pending'
+      || this.store.listActiveMemoryResolutions().some((item) => item.review_id === reviewId)) {
+      throw new Error('Review is already closed: ' + reviewId);
+    }
+    const dismissed: MaintenanceReviewRecord = {
+      ...original, status: 'dismissed', recorded_at: this.now(),
       ...(note ? { resolution_note: note } : {}),
     };
-    // Exclude derived UI-only fields from the append-only canonical review record.
-    const { origin: _origin, original_memory_ids: _original, origin_review_ids: _origins,
-      needs_recheck: _needs, ...stored } = record as MaintenanceReviewRecord & {
-        origin?: string; original_memory_ids?: string[]; origin_review_ids?: string[]; needs_recheck?: boolean;
-      };
-    this.store.appendMaintenanceReview(stored);
-    return stored;
+    this.store.appendMaintenanceReview(dismissed);
+    return dismissed;
   }
 
   undoReview(reviewId: string, command: UndoReviewCommand): MemoryResolutionRecord {

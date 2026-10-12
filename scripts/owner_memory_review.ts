@@ -95,7 +95,8 @@ export function executeOwnerMemoryReviewCommand(
     const current = materializeCurrentMemoryView(store);
     const review = findProjectedReview(projectRelationReviewInbox(store, current), command.review_id);
     const memories = new Map(current.map((item) => [item.memory_id, item]));
-    return { review: review ? { ...review, memories: review.memory_ids.map((id) => memories.get(id)) } : null };
+    return { review: review ? { ...review, review_id: command.review_id,
+      memories: review.memory_ids.map((id) => memories.get(id)) } : null };
   }
   if (command.action === 'list_pending_reviews') {
     // Do not present a card the owner cannot resolve anymore. The old pending

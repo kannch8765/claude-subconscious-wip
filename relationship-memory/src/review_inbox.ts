@@ -15,6 +15,27 @@ export interface ProjectedReviewInbox {
 }
 const key = (ids: readonly string[]) => [...new Set(ids)].sort().join('|');
 
+/** Stable virtual records for original Remember links, without canonical mutations. */
+export function canonicalLinkReviewObservations(store: RelationshipMemoryStore): MaintenanceReviewRecord[] {
+  const seen = new Set<string>();
+  const result: MaintenanceReviewRecord[] = [];
+  for (const memory of store.listMemories()) {
+    for (const linked of memory.linked_memory_ids ?? []) {
+      if (linked === memory.memory_id) continue;
+      const ids = [memory.memory_id, linked].sort();
+      const pair = key(ids);
+      if (seen.has(pair)) continue;
+      seen.add(pair);
+      result.push({ schema_version: 1,
+        review_id: stableId('maintenance_link_review', { subject_id: store.subjectId, memory_ids: ids }),
+        subject_id: store.subjectId, kind: 'relation', memory_ids: ids,
+        reason: 'Remember 自动 Link（尚未分类）', status: 'pending',
+        created_at: memory.created_at, recorded_at: memory.created_at });
+    }
+  }
+  return result;
+}
+
 /** Read-only owner review projection: no canonical/review history is rewritten. */
 export function projectRelationReviewInbox(
   store: RelationshipMemoryStore,
@@ -45,14 +66,8 @@ export function projectRelationReviewInbox(
         decisions.set(pair, kinds);
       }
   }
-  // A manual dismissal is not the semantic claim 'unrelated'. It only
-  // suppresses re-proposing the same owner-dismissed candidate.
-  const dismissedPairs = new Set<string>();
-  for (const review of stored) {
-    if (review.status !== 'dismissed' || resolvedIds.has(review.review_id)) continue;
-    const members = project(review.memory_ids);
-    if (members?.length === 2) dismissedPairs.add(key(members));
-  }
+  // A manual dismissal closes one observation, not a semantic edge.
+  // Only an explicit owner resolution may settle another source's suggestion.
 
   const groups = new Map<string, ProjectedRelationReview[]>();
   let suspended = 0, satisfied = 0;
@@ -76,8 +91,8 @@ export function projectRelationReviewInbox(
       for (let j = i + 1; j < members.length; j++)
         pairs.push(key([members[i], members[j]]));
     const observed = pairs.map((pair) => decisions.get(pair) ?? new Set<MemoryRelationKind>());
-    const covered = pairs.every((pair, i) => dismissedPairs.has(pair)
-      || (record.suggested_relation ? observed[i].has(record.suggested_relation) : observed[i].size > 0));
+    const covered = pairs.every((_pair, i) => record.suggested_relation
+      ? observed[i].has(record.suggested_relation) : observed[i].size > 0);
     if (covered) { satisfied++; return; }
     const needsRecheck = observed.some((relations) => relations.size > 1
       || (relations.size > 0 && record.suggested_relation && !relations.has(record.suggested_relation)));
@@ -89,20 +104,9 @@ export function projectRelationReviewInbox(
     groups.set(key(members), list);
   };
   for (const review of stored) add(review, 'maintenance_suggest');
-  const seenLinks = new Set<string>();
-  for (const memory of store.listMemories()) {
-    for (const linked of memory.linked_memory_ids ?? []) {
-      if (linked === memory.memory_id) continue;
-      const ids = [memory.memory_id, linked].sort();
-      const pair = key(ids);
-      if (seenLinks.has(pair)) continue;
-      seenLinks.add(pair);
-      const review_id = stableId('maintenance_link_review', { subject_id: store.subjectId, memory_ids: ids });
-      if (byId.has(review_id) || resolvedIds.has(review_id)) continue;
-      add({ schema_version: 1, review_id, subject_id: store.subjectId,
-        kind: 'relation', memory_ids: ids, reason: 'Remember 自动 Link（尚未分类）',
-        status: 'pending', created_at: memory.created_at, recorded_at: memory.created_at }, 'remember_link');
-    }
+  for (const observation of canonicalLinkReviewObservations(store)) {
+    if (byId.has(observation.review_id) || resolvedIds.has(observation.review_id)) continue;
+    add(observation, 'remember_link');
   }
   const reviews: ProjectedRelationReview[] = [];
   let deduplicated = 0;
