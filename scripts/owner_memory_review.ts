@@ -2,7 +2,7 @@ import { createRuntime, relationshipMemoryRoot } from '../relationship-memory/sr
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
-import { projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
+import { findProjectedReview, projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
 import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
@@ -10,6 +10,7 @@ export type OwnerMemoryReviewCommand =
   | { action: 'show'; memory_id: string }
   | { action: 'search'; query?: string; kind?: MemoryKind; active?: boolean; limit?: number }
   | { action: 'list_pending_reviews'; limit?: number }
+  | { action: 'get_review'; review_id: string }
   | { action: 'status' }
   | { action: 'resolve_review'; review_id: string; resolution_id: string; relation: MemoryRelationKind; target_memory_id?: string; owner_summary?: string; contexts?: Record<string, string>; note?: string }
   | { action: 'undo_review'; review_id: string; resolution_id: string; note?: string }
@@ -90,6 +91,12 @@ export function executeOwnerMemoryReviewCommand(
     return { memories: rows.slice(0, command.limit ?? 8), total: rows.length };
   }
 
+  if (command.action === 'get_review') {
+    const current = materializeCurrentMemoryView(store);
+    const review = findProjectedReview(projectRelationReviewInbox(store, current), command.review_id);
+    const memories = new Map(current.map((item) => [item.memory_id, item]));
+    return { review: review ? { ...review, memories: review.memory_ids.map((id) => memories.get(id)) } : null };
+  }
   if (command.action === 'list_pending_reviews') {
     // Do not present a card the owner cannot resolve anymore. The old pending
     // record is retained, so undoing a merge naturally makes it actionable again.
@@ -240,6 +247,7 @@ function parseCommand(raw: unknown): OwnerMemoryReviewCommand {
 
   if (action === 'status') return { action };
   if (action === 'list_pending_reviews') return { action, limit: limit(command.limit, 5, 20) };
+  if (action === 'get_review') return { action, review_id: requiredText(command.review_id, 'review_id') };
   if (action === 'show') return { action, memory_id: requiredText(command.memory_id, 'memory_id') };
   if (action === 'search') {
     if (command.active !== undefined && typeof command.active !== 'boolean') throw new Error('active must be boolean');

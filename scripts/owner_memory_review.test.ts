@@ -194,6 +194,9 @@ describe('owner memory review command', () => {
     const after = executeOwnerMemoryReviewCommand({ action: 'list_pending_reviews' }, env) as any;
     expect(after.total).toBe(1);
     expect(after.reviews[0].memory_ids).toEqual(['mem-b', 'mem-c']);
+    const live = executeOwnerMemoryReviewCommand({ action: 'get_review', review_id: second.review_id! }, env) as any;
+    expect(live.review.memory_ids).toEqual(['mem-b', 'mem-c']);
+    expect(live.review.memories).toHaveLength(2);
     const status = executeOwnerMemoryReviewCommand({ action: 'status' }, env) as any;
     expect(status.review).toEqual(expect.objectContaining({ pending: 1, stale: 0, resolved: 1 }));
     expect(store.listMaintenanceReviewRecords()).toHaveLength(2);
