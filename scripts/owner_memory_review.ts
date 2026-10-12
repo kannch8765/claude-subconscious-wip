@@ -4,13 +4,14 @@ import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
 import { findProjectedReview, projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
-import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../relationship-memory/src/intent/provenance.js';
+import { intentsForEffectiveMemory, linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../relationship-memory/src/intent/provenance.js';
 import { auditEffectiveReviewCounts } from '../relationship-memory/src/review_audit.js';
 import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
 export type OwnerMemoryReviewCommand =
   | { action: 'show'; memory_id: string }
+  | { action: 'sources'; memory_id: string; page?: number }
   | { action: 'search'; query?: string; kind?: MemoryKind; active?: boolean; limit?: number }
   | { action: 'list_pending_reviews'; limit?: number }
   | { action: 'get_review'; review_id: string }
@@ -87,6 +88,38 @@ export function executeOwnerMemoryReviewCommand(
       memory,
       evidence_count: store.listEvidenceForMemoryIds(evidenceMemoryIds).length,
       revision_count: owner.history(memoryId).length,
+    };
+  }
+
+  if (command.action === 'sources') {
+    const memoryId = requiredText(command.memory_id, 'memory_id');
+    const memory = materializeCurrentMemoryView(store).find((item) => item.memory_id === memoryId) ?? owner.getEffective(memoryId);
+    if (!memory) throw new Error(`Unknown canonical memory ID: ${memoryId}`);
+    const sourceIds = memory.resolution_source_memory_ids ?? [memoryId];
+    const seen = new Set<string>();
+    const evidence = store.listEvidenceForMemoryIds(sourceIds)
+      .filter((row) => {
+        // Reinforced/merged memories can cite the same message more than once.
+        const key = stableJson([row.conversation_id, row.message_id, row.role, row.quote]);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      })
+      .sort((a, b) => b.captured_at.localeCompare(a.captured_at) || a.evidence_id.localeCompare(b.evidence_id));
+    const intents = intentsForEffectiveMemory(linkedAssistantIntentIndex(store), memory);
+    const entries = [
+      ...intents.map((intent) => ({ type: 'kohaku_feel' as const, captured_at: intent.captured_at,
+        memory_text: intent.memory.text, feel_text: intent.feel.text })),
+      ...evidence.map((row) => ({ type: 'evidence' as const, captured_at: row.captured_at,
+        role: row.role, quote: row.quote })),
+    ];
+    const page = command.page ?? 0;
+    const pageSize = 3;
+    return {
+      memory_id: memoryId, page, total: entries.length,
+      evidence_total: evidence.length, feel_total: intents.length,
+      items: entries.slice(page * pageSize, (page + 1) * pageSize),
+      has_next: (page + 1) * pageSize < entries.length,
     };
   }
 
@@ -265,6 +298,13 @@ function parseCommand(raw: unknown): OwnerMemoryReviewCommand {
   if (action === 'list_pending_reviews') return { action, limit: limit(command.limit, 5, 20) };
   if (action === 'get_review') return { action, review_id: requiredText(command.review_id, 'review_id') };
   if (action === 'show') return { action, memory_id: requiredText(command.memory_id, 'memory_id') };
+  if (action === 'sources') {
+    if (command.page !== undefined && (!Number.isInteger(command.page) || Number(command.page) < 0 || Number(command.page) > 100000)) {
+      throw new Error('page must be a non-negative integer');
+    }
+    return { action, memory_id: requiredText(command.memory_id, 'memory_id'),
+      page: command.page === undefined ? 0 : Number(command.page) };
+  }
   if (action === 'search') {
     if (command.active !== undefined && typeof command.active !== 'boolean') throw new Error('active must be boolean');
     const query = optionalText(command.query);
