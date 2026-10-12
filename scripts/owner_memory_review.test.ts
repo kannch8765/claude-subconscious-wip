@@ -94,6 +94,36 @@ describe('owner memory review command', () => {
     expect(store.getMemory(memoryId)?.summary).toBe('猫喜欢安静的咖啡店。');
   });
 
+  it('marks the Kohaku-authored canonical member as the only eligible merge target in Review cards', () => {
+    const {store, env, memoryId} = fixture();
+    const original = store.getMemory(memoryId)!;
+    store.appendMemory({
+      ...original, memory_id: 'other-subcon', summary: '猫喜欢咖啡店。',
+      source_key: 'other-source', dedupe_key: 'other-dedupe',
+    }, []);
+    store.appendAssistantIntent({
+      schema_version: 1, intent_id: 'self-1', subject_id:'kohaku',
+      session_id:'old',assistant_message_id:'msg',tool_use_id:'tool',tool_name:'remember',
+      memory:{text:'琥珀决定记住这件事'},feel:{text:'当时很开心'},
+      captured_at:'2026-09-30T00:00:00.000Z',
+    });
+    store.appendAssistantIntentOutcome({
+      intent_id:'self-1',batch_id:'old',outcome:'accepted',
+      memory_id:memoryId,recorded_at:'2026-09-30T00:00:01.000Z',
+    });
+    store.appendMaintenanceReview({
+      schema_version:1,review_id:'protected-review',subject_id:'kohaku',
+      kind:'relation',suggested_relation:'same_meaning',
+      memory_ids:[memoryId,'other-subcon'],reason:'同一件事',status:'pending',
+      created_at:'2026-09-30T00:00:02.000Z',recorded_at:'2026-09-30T00:00:02.000Z',
+    });
+    const list = executeOwnerMemoryReviewCommand({action:'list_pending_reviews'},env) as any;
+    expect(list.reviews[0].protected_target_memory_ids).toEqual([memoryId]);
+    const single = executeOwnerMemoryReviewCommand({action:'get_review',review_id:'protected-review'},env) as any;
+    expect(single.review.protected_target_memory_ids).toEqual([memoryId]);
+    expect(single.review.memories).toHaveLength(2);
+  });
+
   it('lists searchable effective memories, enriches pending reviews, and reports status counts', () => {
     const { store, env, memoryId } = fixture();
     store.appendMaintenanceReview({

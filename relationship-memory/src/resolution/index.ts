@@ -9,6 +9,7 @@ import { MEMORY_RELATION_KINDS } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
+import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../intent/provenance.js';
 
 export interface ResolveReviewCommand {
   resolution_id: string;
@@ -118,7 +119,16 @@ export function applyMemoryResolutions(
       const targetId = resolution.target_memory_id!;
       const target = byId.get(targetId);
       if (!target) continue;
-      const historical = resolution.memory_ids.filter((memoryId) => memoryId !== targetId).sort();
+      // A current state can itself be the survivor of an earlier temporal
+      // transition. Preserve the older stages rather than replacing the chain.
+      const historical = [...new Set([
+        ...(target.resolution_historical_memory_ids ?? []),
+        ...resolution.memory_ids.filter((memoryId) => memoryId !== targetId)
+          .flatMap((memoryId) => {
+            const memory = byId.get(memoryId);
+            return [...(memory?.resolution_historical_memory_ids ?? []), memoryId];
+          }),
+      ])].filter((memoryId) => memoryId !== targetId).sort();
       byId.set(targetId, {
         ...withRelationMetadata(target, resolution),
         resolution_historical_memory_ids: historical,
@@ -300,6 +310,25 @@ export class RelationshipMemoryResolutionControlPlane {
       throw new Error(`${relation} resolution does not accept target_memory_id`);
     }
 
+    if (relation === 'same_meaning') {
+      const index = linkedAssistantIntentIndex(this.store);
+      const current = materializeCurrentMemoryView(this.store);
+      // An already merged-away original assistant memory needs a deliberate undo,
+      // not another round of merging that silently keeps the wrong root.
+      for (const memory of current.filter((item) => memoryIds.includes(item.memory_id))) {
+        const wrongRoot = (memory.resolution_source_memory_ids ?? [memory.memory_id])
+          .some((sourceId) => sourceId !== memory.memory_id && (index.get(sourceId)?.length ?? 0) > 0);
+        if (wrongRoot) throw new Error('Protected assistant-authored memory was already merged away; undo that earlier merge before merging again');
+      }
+      const protectedIds = protectedCurrentMemoryIds(index, current, memoryIds);
+      if (protectedIds.length > 1) {
+        throw new Error('Cannot same_meaning merge two assistant-authored memories; each original memory must remain a current target');
+      }
+      if (protectedIds.length === 1 && targetMemoryId !== protectedIds[0]) {
+        throw new Error('same_meaning must preserve the assistant-authored memory as target: ' + protectedIds[0]);
+      }
+    }
+
     if (ownerSummary && relation !== 'same_meaning') throw new Error('owner_summary is only accepted for same_meaning resolution');
     const contexts = relation === 'context_dependent'
       ? normalizedContexts(command.contexts, memoryIds)
@@ -314,10 +343,13 @@ export class RelationshipMemoryResolutionControlPlane {
         // A previously merged survivor is a new current memory, so it can join
         // another same-meaning family or become historical when preferences change.
         // Other overlapping structural decisions still require owner re-review.
-        const extendsMergedCurrent = active.relation === 'same_meaning'
-          && (relation === 'same_meaning' || relation === 'changed_over_time')
-          && overlaps.length === 1 && overlaps[0] === active.target_memory_id;
-        if (!extendsMergedCurrent) {
+        const extendsCurrentSurvivor = overlaps.length === 1
+          && overlaps[0] === active.target_memory_id
+          && (
+            (active.relation === 'same_meaning' && (relation === 'same_meaning' || relation === 'changed_over_time'))
+            || (active.relation === 'changed_over_time' && relation === 'changed_over_time')
+          );
+        if (!extendsCurrentSurvivor) {
           throw new Error(`memory already participates in active structural resolution: ${active.review_id}`);
         }
       }
