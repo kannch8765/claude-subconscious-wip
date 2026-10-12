@@ -9,6 +9,7 @@ import { MEMORY_RELATION_KINDS } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
+import { findConflictingOwnerLinks, validOwnerConflictReconciliation } from '../owner_relation_conflicts.js';
 import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../intent/provenance.js';
 
 export interface ResolveReviewCommand {
@@ -188,17 +189,37 @@ export function applyMemoryResolutions(
   const confirmed = new Map(current.map((memory) => [memory.memory_id, new Set<string>()]));
   const unrelated = new Set<string>();
   const key = (a: string, b: string): string => [a, b].sort().join('\0');
-  const pairs = (resolution: MemoryResolutionResolveRecord, action: (from: string, to: string) => void): void => {
-    for (const fromId of resolution.memory_ids) {
-      for (const toId of resolution.memory_ids) {
-        if (fromId !== toId) action(targetId(fromId), targetId(toId));
+  const ownerPairs = new Map<string, { ids: [string, string]; related: boolean; unrelated: boolean }>();
+  for (const resolution of resolutions) {
+    if (resolution.reconciles_resolution_ids?.length
+      || (resolution.relation !== 'related' && resolution.relation !== 'unrelated')) continue;
+    for (let i = 0; i < resolution.memory_ids.length; i++) {
+      for (let j = i + 1; j < resolution.memory_ids.length; j++) {
+        const from = targetId(resolution.memory_ids[i]);
+        const to = targetId(resolution.memory_ids[j]);
+        if (from === to || !activeIds.has(from) || !activeIds.has(to)) continue;
+        const pairKey = key(from, to);
+        const pair = ownerPairs.get(pairKey) ?? {
+          ids: [from, to].sort() as [string, string], related: false, unrelated: false,
+        };
+        pair[resolution.relation] = true;
+        ownerPairs.set(pairKey, pair);
       }
     }
-  };
-  // A confirmed "unrelated" is an owner rejection of a link, even if an old
-  // model-authored canonical link proposed it. Keep the raw edge for auditing.
-  for (const resolution of resolutions) {
-    if (resolution.relation === 'unrelated') pairs(resolution, (from, to) => unrelated.add(key(from, to)));
+  }
+  // Opposite owner judgments on two originally separate families must never
+  // silently become a trustworthy Related edge after those families merge.
+  const conflicts = findConflictingOwnerLinks(current, resolutions);
+  const reconciled = new Map(conflicts.map((conflict) => [
+    key(...conflict.memory_ids), validOwnerConflictReconciliation(conflict, resolutions),
+  ]));
+  const approvedRelatedPairs: Array<[string, string]> = [];
+  for (const [pairKey, pair] of ownerPairs) {
+    const decision = pair.related && pair.unrelated
+      ? reconciled.get(pairKey)?.relation
+      : pair.unrelated ? 'unrelated' : 'related';
+    if (decision === 'related') approvedRelatedPairs.push(pair.ids);
+    else unrelated.add(pairKey); // includes unreconciled conflicts
   }
   const link = (fromId: string, toId: string, ownerConfirmed = false): void => {
     const from = targetId(fromId);
@@ -208,17 +229,14 @@ export function applyMemoryResolutions(
     if (ownerConfirmed) confirmed.get(from)?.add(to);
   };
 
-  // The full projected graph retains links already present in canonical/owner
-  // content, for lookup and visualization. Those are NOT automatically
-  // owner-approved Whisper background.
+  // Raw canonical/owner link hints are retained for visualization, but never
+  // elevated to trusted Whisper context without a compatible owner decision.
   for (const memory of byId.values()) {
     for (const linkedId of memory.linked_memory_ids ?? []) link(memory.memory_id, linkedId);
   }
-  // Only explicit owner-confirmed "related" resolutions supply Whisper context.
-  // Resolve historical/merged endpoints against the final current view, so a
-  // review confirmed before a merge remains usable without copying records.
-  for (const resolution of resolutions) {
-    if (resolution.relation === 'related') pairs(resolution, (from, to) => link(from, to, true));
+  for (const [from, to] of approvedRelatedPairs) {
+    link(from, to, true);
+    link(to, from, true);
   }
   return current.map((memory) => {
     const { linked_memory_ids: _oldLinks, resolution_confirmed_related_memory_ids: _oldConfirmed, ...rest } = memory;
@@ -243,62 +261,6 @@ export function currentReviewableMemoryIds(store: RelationshipMemoryStore): Set<
   return new Set(materializeCurrentMemoryView(store)
     .filter((memory) => memory.status === 'active')
     .map((memory) => memory.memory_id));
-}
-
-export interface ConflictingOwnerLink {
-  memory_ids: [string, string];
-  related_review_ids: string[];
-  unrelated_review_ids: string[];
-}
-
-/**
- * Owner link decisions are immutable; opposite decisions cannot be silently
- * collapsed when two canonical source families are merged.
- * Optionally preview one same-meaning merge before appending its resolution.
- * Time: O(N + R * K^2), K = bounded review member count.
- */
-export function findConflictingOwnerLinks(
-  current: readonly EffectiveMemoryRecord[],
-  resolutions: readonly MemoryResolutionResolveRecord[],
-  proposedMerge?: { memory_ids: readonly string[]; target_memory_id: string },
-): ConflictingOwnerLink[] {
-  const currentIdOf = new Map<string, string>();
-  for (const memory of current) {
-    if (memory.status !== 'active') continue;
-    for (const source of memory.resolution_source_memory_ids ?? [memory.memory_id]) {
-      currentIdOf.set(source, memory.memory_id);
-    }
-  }
-  const merging = new Set(proposedMerge?.memory_ids ?? []);
-  const mapped = (id: string): string | undefined => {
-    const effective = currentIdOf.get(id);
-    if (!effective) return undefined;
-    return merging.has(effective) ? proposedMerge?.target_memory_id : effective;
-  };
-  const pairs = new Map<string, { ids: [string, string]; related: Set<string>; unrelated: Set<string> }>();
-  for (const resolution of resolutions) {
-    if (resolution.relation !== 'related' && resolution.relation !== 'unrelated') continue;
-    for (let i = 0; i < resolution.memory_ids.length; i++) {
-      for (let j = i + 1; j < resolution.memory_ids.length; j++) {
-        const left = mapped(resolution.memory_ids[i]);
-        const right = mapped(resolution.memory_ids[j]);
-        if (!left || !right || left === right) continue;
-        const ids = [left, right].sort() as [string, string];
-        const key = JSON.stringify(ids);
-        const entry = pairs.get(key) ?? { ids, related: new Set<string>(), unrelated: new Set<string>() };
-        entry[resolution.relation].add(resolution.review_id);
-        pairs.set(key, entry);
-      }
-    }
-  }
-  return [...pairs.values()]
-    .filter((pair) => pair.related.size > 0 && pair.unrelated.size > 0)
-    .map((pair) => ({
-      memory_ids: pair.ids,
-      related_review_ids: [...pair.related].sort(),
-      unrelated_review_ids: [...pair.unrelated].sort(),
-    }))
-    .sort((a, b) => JSON.stringify(a.memory_ids).localeCompare(JSON.stringify(b.memory_ids)));
 }
 
 export class RelationshipMemoryResolutionControlPlane {
@@ -347,6 +309,10 @@ export class RelationshipMemoryResolutionControlPlane {
 
     if (!MEMORY_RELATION_KINDS.includes(command.relation)) throw new Error(`unsupported relation: ${command.relation}`);
     const relation = command.relation;
+    if (review.reconciles_resolution_ids?.length
+      && relation !== 'related' && relation !== 'unrelated') {
+      throw new Error('Owner-decision conflict Review requires related or unrelated reconciliation');
+    }
     const targetMemoryId = optionalText(command.target_memory_id, 'target_memory_id');
     const ownerSummary = optionalText(command.owner_summary, 'owner_summary');
     const note = optionalText(command.note, 'note');
@@ -368,19 +334,6 @@ export class RelationshipMemoryResolutionControlPlane {
 
     if (relation === 'same_meaning') {
       const current = materializeCurrentMemoryView(this.store);
-      const activeResolutions = this.store.listActiveMemoryResolutions();
-      const alreadyConflicting = new Set(findConflictingOwnerLinks(current, activeResolutions)
-        .map((item) => JSON.stringify(item.memory_ids)));
-      const introducedConflict = findConflictingOwnerLinks(current, activeResolutions, {
-        memory_ids: memoryIds, target_memory_id: targetMemoryId!,
-      }).find((item) => !alreadyConflicting.has(JSON.stringify(item.memory_ids)));
-      if (introducedConflict) {
-        throw new Error('Cannot merge memories: previous owner related/unrelated decisions '
-          + 'would become contradictory for ' + introducedConflict.memory_ids.join(' and ')
-          + '. Re-review or undo one of the conflicting owner decisions first (related reviews: '
-          + introducedConflict.related_review_ids.join(', ') + '; unrelated reviews: '
-          + introducedConflict.unrelated_review_ids.join(', ') + ')');
-      }
       const index = linkedAssistantIntentIndex(this.store);
       // An already merged-away original assistant memory needs a deliberate undo,
       // not another round of merging that silently keeps the wrong root.
@@ -433,6 +386,8 @@ export class RelationshipMemoryResolutionControlPlane {
       relation,
       memory_ids: memoryIds,
       original_memory_ids: review.original_memory_ids,
+      ...(review.reconciles_resolution_ids?.length
+        ? { reconciles_resolution_ids: [...review.reconciles_resolution_ids] } : {}),
       recorded_at: this.now(),
       ...(targetMemoryId ? { target_memory_id: targetMemoryId } : {}),
       ...(ownerSummary ? { owner_summary: ownerSummary } : {}),
