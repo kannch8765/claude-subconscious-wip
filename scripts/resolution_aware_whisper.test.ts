@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { AssistantRememberIntentRecord } from '../relationship-memory/src/schema/index.js';
 import type { EffectiveMemoryRecord } from '../relationship-memory/src/schema/index.js';
-import { renderResolutionAwareWhisper } from './resolution_aware_whisper.js';
+import { renderResolutionAwareWhisper, renderResolutionAwareWhisperPacket } from './resolution_aware_whisper.js';
 
 function memory(id: string, summary: string): EffectiveMemoryRecord {
   return {
@@ -15,6 +15,19 @@ function memory(id: string, summary: string): EffectiveMemoryRecord {
 const selected = '记忆：猫现在喜欢轻食咖啡店。\n\n[2026-10-10]\n猫：「现在喜欢轻食咖啡店。」';
 
 describe('resolution-aware Whisper transport-only formatting', () => {
+  it('returns the included related IDs from the same formatting pass as the queued text', () => {
+    const main = { ...memory('a', '东京 meetup'), resolution_confirmed_related_memory_ids: ['b'] };
+    const related = { ...memory('b', '东京 AI 活动'), resolution_source_memory_ids: ['old-b', 'b'] };
+    const input = { memoryId: 'a', historicalWindow: '记忆：东京 meetup',
+      currentMemories: [main, related], topic: '东京 AI' };
+    const packet = renderResolutionAwareWhisperPacket(input);
+    expect(packet?.text).toContain('东京 AI 活动');
+    expect(packet?.includedRelatedMemoryIds).toEqual(['b', 'old-b']);
+    expect(renderResolutionAwareWhisperPacket({ ...input, sessionKnownIds: new Set(['old-b']) }))
+      .toEqual({ text: '记忆：东京 meetup', includedRelatedMemoryIds: [] });
+    expect(renderResolutionAwareWhisperPacket({ ...input, memoryId: 'missing' })).toBeNull();
+  });
+
   it('preserves default, same-meaning merged and unrelated content without fabricating quotes', () => {
     const merged = { ...memory('B', '猫现在喜欢轻食咖啡店。'), resolution_source_memory_ids: ['A', 'B'] };
     const unlinked = { ...merged, linked_memory_ids: ['C'] }; // unconfirmed hint

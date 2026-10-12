@@ -49,7 +49,7 @@ describe('additive synchronous Subcon mode contract', () => {
   it('checkpoints after durable queueing and transfers post-release cleanup ownership to the worker', () => {
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
     const deliveryGate = worker.indexOf('deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId');
-    const durableQueue = worker.indexOf('() => queueSubconWhisper(');
+    const durableQueue = worker.indexOf('const queued = queueSubconWhisper(');
     const releaseHelper = worker.indexOf('const releaseSyncBatch =');
     const completion = worker.indexOf('Native live turn complete: mode=${mode}');
     expect(deliveryGate).toBeGreaterThan(-1);

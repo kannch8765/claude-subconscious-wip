@@ -33,7 +33,7 @@ import { materializeCurrentMemoryView } from '../relationship-memory/src/resolut
 import { projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
 import { stableId } from '../relationship-memory/src/store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
-import { renderAssistantIntentWhisper, renderResolutionAwareWhisper } from './resolution_aware_whisper.js';
+import { renderAssistantIntentWhisper, renderResolutionAwareWhisperPacket } from './resolution_aware_whisper.js';
 import { intentsForEffectiveMemory, linkedAssistantIntentIndex } from '../relationship-memory/src/intent/provenance.js';
 import {
   advanceSyncStateCursor,
@@ -401,9 +401,10 @@ export async function sendViaNativeClient(
           return { status: 'suppressed_no_longer_current' };
         }
         const assistantIntents = intentsForEffectiveMemory(linkedAssistantIntentIndex(runtime.store), current, true);
-        const resolvedWindow = isSync
-          ? historicalWindow + renderAssistantIntentWhisper(assistantIntents)
-          : renderResolutionAwareWhisper({
+        // Keep all formatting inputs fixed for this selected foreground memory.
+        // Re-evaluate related neighbors under the durable session lock so
+        // overlapping workers cannot re-surface an already-known neighbor.
+        const whisperInput = {
           memoryId,
           historicalWindow,
           currentMemories,
@@ -415,25 +416,26 @@ export async function sendViaNativeClient(
             }
             : {}),
           topic: surfacedMemory.searchQuery || payload.latestUserMessage,
-          sessionKnownIds: new Set(getSessionForegroundKnownMemoryIds(payload.cwd, payload.sessionId)),
-        });
-        if (resolvedWindow === null) {
-          // Owner review can change after search. Never deliver a now-hidden
-          // (e.g. conflicted/merged) memory as an asserted current fact.
-          whisperResolved = true;
-          return { status: 'suppressed_no_longer_current' };
-        }
-        const groundedText = composeGroundedWhisper(
-          resolvedWindow,
-          foregroundGroundingIdentityAnchors(entitySearchObservations),
-        );
+        };
+        const groundingAnchors = foregroundGroundingIdentityAnchors(entitySearchObservations);
         if (isSync && !payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
-        const delivery = deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId, () => queueSubconWhisper(
-          payload.cwd, payload.sessionId, payload.batchId, groundedText,
-          isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
-          memoryId,
-          !isSync && payload.sourceUserAt ? { sourceUserAt: payload.sourceUserAt } : undefined,
-        ), log, (result) => Boolean(result && result.whisper.memory_id === memoryId));
+        const delivery = deliverSessionMemoryOnce(payload.cwd, payload.sessionId, memoryId, (sessionKnownIds) => {
+          const resolved = isSync
+            ? { text: historicalWindow + renderAssistantIntentWhisper(assistantIntents), includedRelatedMemoryIds: [] }
+            : renderResolutionAwareWhisperPacket({ ...whisperInput, sessionKnownIds });
+          if (resolved === null) return null;
+          const groundedText = composeGroundedWhisper(resolved.text, groundingAnchors);
+          const queued = queueSubconWhisper(
+            payload.cwd, payload.sessionId, payload.batchId, groundedText,
+            isSync ? { source: 'sync', turnId: payload.syncTurnId! } : undefined,
+            memoryId,
+            !isSync && payload.sourceUserAt ? { sourceUserAt: payload.sourceUserAt } : undefined,
+          );
+          return queued && { ...queued, includedRelatedMemoryIds: resolved.includedRelatedMemoryIds };
+        }, log, (result) => Boolean(result && result.whisper.memory_id === memoryId),
+        // An existing batch artifact might have different text: only register
+        // neighbors contained in this newly queued artifact, never guessed ones.
+        (result) => result?.status === 'queued' ? result.includedRelatedMemoryIds : []);
         const releaseSyncBatch = (status: 'queued' | 'already_pending' | 'already_delivered', whisperId: string): void => {
           if (!isSync) return;
           if (status === 'already_delivered') writeSyncCheckpoint(payload, 'no_whisper');
@@ -462,7 +464,7 @@ export async function sendViaNativeClient(
         const queued = delivery.result;
         whisperResolved = true;
         releaseSyncBatch(queued.status, queued.whisper.whisper_id);
-        log(`Foreground whisper ${queued.status}: ${queued.whisper.whisper_id} (${groundedText.length} chars)`);
+        log(`Foreground whisper ${queued.status}: ${queued.whisper.whisper_id} (${queued.whisper.text.length} chars)`);
         // Cleanup ownership transfers only after the durable foreground release
         // checkpoint exists. A queue write alone is not enough to let Kohaku go.
         return { status: 'ok', queue_status: queued.status, whisper_id: queued.whisper.whisper_id };

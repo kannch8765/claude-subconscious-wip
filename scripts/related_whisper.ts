@@ -29,22 +29,28 @@ function queryCoverage(query: ReadonlySet<string>, candidate: ReadonlySet<string
  * lexical MMR reranker: no graph traversal, model action, or embedding API call.
  * topic is the compact query from the foreground search that found the primary.
  */
-export function renderRelatedWhisperContext(
+export interface RelatedWhisperSelection {
+  text: string;
+  /** Exactly the selected current memory IDs and their same-meaning source IDs. */
+  includedMemoryIds: string[];
+}
+
+export function selectRelatedWhisperContext(
   mainMemoryId: string,
   currentMemories: readonly EffectiveMemoryRecord[],
   topic: string,
   sessionKnownIds: ReadonlySet<string> = new Set(),
   budget = RELATED_WHISPER_BUDGET_CHARS,
-): string {
+): RelatedWhisperSelection {
   const currentById = new Map(currentMemories
     .filter((memory) => memory.status === 'active')
     .map((memory) => [memory.memory_id, memory]));
   const main = currentById.get(mainMemoryId);
-  if (!main || !main.resolution_confirmed_related_memory_ids?.length || budget <= 0) return '';
+  if (!main || !main.resolution_confirmed_related_memory_ids?.length || budget <= 0) return { text: '', includedMemoryIds: [] };
 
   const heading = '\n\n关联记忆（背景，仅摘要）：';
   let remaining = budget - heading.length;
-  if (remaining <= 0) return '';
+  if (remaining <= 0) return { text: '', includedMemoryIds: [] };
 
   const mainTokens = lexicalTokenSet(main.summary);
   const topicTokens = lexicalTokenSet(topic);
@@ -98,5 +104,20 @@ export function renderRelatedWhisperContext(
     selected.push(best);
     remaining -= best.line.length;
   }
-  return selected.length ? heading + selected.map((item) => item.line).join('') : '';
+  return {
+    text: selected.length ? heading + selected.map((item) => item.line).join('') : '',
+    includedMemoryIds: [...new Set(selected.flatMap(({ memory }) =>
+      [memory.memory_id, ...(memory.resolution_source_memory_ids ?? [])]))],
+  };
+}
+
+/** Kept for callers that only need the transport text, never session markers. */
+export function renderRelatedWhisperContext(
+  mainMemoryId: string,
+  currentMemories: readonly EffectiveMemoryRecord[],
+  topic: string,
+  sessionKnownIds: ReadonlySet<string> = new Set(),
+  budget = RELATED_WHISPER_BUDGET_CHARS,
+): string {
+  return selectRelatedWhisperContext(mainMemoryId, currentMemories, topic, sessionKnownIds, budget).text;
 }

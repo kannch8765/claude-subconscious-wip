@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { EffectiveMemoryRecord } from '../relationship-memory/src/schema/index.js';
-import { renderRelatedWhisperContext } from './related_whisper.js';
+import { renderRelatedWhisperContext, selectRelatedWhisperContext } from './related_whisper.js';
 
 function memory(id: string, summary: string, links: string[] = [], status: 'active'|'inactive' = 'active'): EffectiveMemoryRecord {
   return {
@@ -108,6 +108,29 @@ describe('automatic async related whisper context', () => {
     const family = { ...memory('b', '合并后的记忆'), resolution_source_memory_ids: ['a', 'b'] };
     const main = memory('c', '本次主记忆', ['b']);
     expect(renderRelatedWhisperContext('c', [main, family], '记忆', new Set(['a']))).toBe('');
+  });
+
+  it('reports exactly the related summaries actually included and merged source identities', () => {
+    const family = { ...memory('b', '东京科技社区活动'), resolution_source_memory_ids: ['old-b', 'b'] };
+    const main = memory('a', '东京 Meetup', ['b', 'c']);
+    const other = memory('c', '完全无关的信息');
+    const result = selectRelatedWhisperContext('a', [main, family, other], '东京 Meetup');
+    expect(result.text).toContain('东京科技社区活动');
+    expect(result.text).not.toContain('完全无关');
+    expect(result.includedMemoryIds).toEqual(['b', 'old-b']);
+    expect(selectRelatedWhisperContext('a', [main, family, other], '东京 Meetup', new Set(['old-b', 'c'])))
+      .toEqual({ text: '', includedMemoryIds: [] });
+  });
+
+  it('never marks a candidate skipped by the final transport budget', () => {
+    const main = memory('a', '东京 Meetup', ['b', 'c']);
+    const view = [main, memory('b', '东京 Meetup 专场'), memory('c', '东京 Meetup 超级冗长活动说明')];
+    const selected = selectRelatedWhisperContext('a', view, '东京 Meetup', new Set(), 39);
+    expect(selected.includedMemoryIds).toHaveLength(1);
+    const included = selected.includedMemoryIds[0];
+    expect(['b', 'c']).toContain(included);
+    expect(selected.text).toContain(view.find((m) => m.memory_id === included)!.summary);
+    expect(selected.text).not.toContain(view.find((m) => m.memory_id !== included && m.memory_id !== 'a')!.summary);
   });
 
   it('returns no related block for isolated or suppressed main memories', () => {

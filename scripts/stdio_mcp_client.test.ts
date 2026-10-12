@@ -95,9 +95,9 @@ describe('stdio MCP native client-tool bridge', () => {
     expect(worker).toContain("enum: ['foreground_grounding', 'maintenance']");
     expect(worker).toContain('foregroundGroundingIdentityAnchors(entitySearchObservations)');
     expect(worker).toContain('renderHistoricalWhisperQuotes(snippets)');
-    expect(worker).toContain('renderResolutionAwareWhisper({');
-    expect(worker).toContain('resolvedWindow,');
-    expect(worker).toContain('foregroundGroundingIdentityAnchors(entitySearchObservations),');
+    expect(worker).toContain('renderResolutionAwareWhisperPacket({');
+    expect(worker).toContain('composeGroundedWhisper(resolved.text, groundingAnchors)');
+    expect(worker).toContain('foregroundGroundingIdentityAnchors(entitySearchObservations)');
     expect(worker).toContain('await stdioMcp.close()');
   });
 

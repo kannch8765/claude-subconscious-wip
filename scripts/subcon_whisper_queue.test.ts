@@ -2,7 +2,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { deliverSessionMemoryOnce, getSessionDeliveredMemoryIds } from './conversation_utils.js';
+import { deliverSessionMemoryOnce, getSessionDeliveredMemoryIds, getSessionForegroundKnownMemoryIds } from './conversation_utils.js';
+import { renderResolutionAwareWhisperPacket } from './resolution_aware_whisper.js';
+import type { EffectiveMemoryRecord } from '../relationship-memory/src/schema/index.js';
 import {
   acknowledgePendingSubconWhispers,
   formatPendingSubconWhispers,
@@ -121,6 +123,37 @@ it('retracts only the exact pending sync turn without touching async or another 
   expect(left.map((item) => item.batch_id).sort()).toEqual(['async-a', 'sync-next']);
 });
 
+
+it('delivers a primary with related context once and masks its neighbor for later same-session whispers', () => {
+  const cwd = temp();
+  const sessionId = 'same-session-related';
+  const memory = (id: string, summary: string): EffectiveMemoryRecord => ({
+    schema_version: 1, memory_id: id, subject_id: 'kohaku', kind: 'user_preference',
+    summary, participants: ['user'], payload: { topic: id }, status: 'active',
+    observed_at: '2026-10-12T00:00:00Z', created_at: '2026-10-12T00:00:00Z',
+    source_key: id, dedupe_key: id, owner_corrected: false,
+  });
+  const main = { ...memory('main', '东京 meetup'), resolution_confirmed_related_memory_ids: ['related'] };
+  const related = { ...memory('related', '东京 AI 活动'), resolution_source_memory_ids: ['historical-related', 'related'] };
+  const view = [main, related];
+  const delivery = deliverSessionMemoryOnce(cwd, sessionId, 'main', (sessionKnownIds) => {
+    const packet = renderResolutionAwareWhisperPacket({ memoryId: 'main', historicalWindow: '记忆：东京 meetup',
+      currentMemories: view, topic: '东京 AI', sessionKnownIds })!;
+    const result = queueSubconWhisper(cwd, sessionId, 'batch-one', packet.text, undefined, 'main');
+    return result && { ...result, includedRelatedMemoryIds: packet.includedRelatedMemoryIds };
+  }, undefined, (result) => Boolean(result && result.whisper.memory_id === 'main'),
+  (result) => result?.status === 'queued' ? result.includedRelatedMemoryIds : []);
+  expect(delivery.delivered).toBe(true);
+  expect(readPendingSubconWhispers(cwd, sessionId)[0].whisper.text).toContain('东京 AI 活动');
+  expect(getSessionForegroundKnownMemoryIds(cwd, sessionId)).toEqual(['main', 'related', 'historical-related']);
+  let anotherQueueCall = 0;
+  expect(deliverSessionMemoryOnce(cwd, sessionId, 'related', () => {
+    anotherQueueCall += 1;
+    return queueSubconWhisper(cwd, sessionId, 'batch-two', '重复相关记忆', undefined, 'related');
+  })).toEqual({ delivered: false });
+  expect(anotherQueueCall).toBe(0);
+  expect(readPendingSubconWhispers(cwd, sessionId)).toHaveLength(1);
+});
 
 describe('session memory delivery truth follows the batch artifact', () => {
   function deliverMemory(cwd: string, sessionId: string, batchId: string, memoryId: string, text: string) {
