@@ -1,8 +1,10 @@
 import type { EffectiveMemoryRecord, MaintenanceReviewRecord, MemoryRelationKind } from './schema/index.js';
 import { RelationshipMemoryStore, stableId } from './store/index.js';
+import { findConflictingOwnerLinks, validOwnerConflictReconciliation } from './owner_relation_conflicts.js';
 
 export interface ProjectedRelationReview extends MaintenanceReviewRecord {
-  origin: 'remember_link' | 'maintenance_suggest';
+  origin: 'remember_link' | 'maintenance_suggest' | 'owner_conflict';
+  reconciles_resolution_ids?: string[];
   original_memory_ids: string[];
   origin_review_ids: string[];
   needs_recheck?: boolean;
@@ -34,6 +36,39 @@ export function canonicalLinkReviewObservations(store: RelationshipMemoryStore):
     }
   }
   return result;
+}
+
+/**
+ * A reconciliation Review is a derived observation, not a second database.
+ * Stable identity is tied to the original, contradictory owner resolution IDs.
+ * When merge is undone or a reconciliation is accepted, the card vanishes;
+ * undoing that decision reconstructs exactly the same card.
+ */
+export function ownerConflictReviewObservations(
+  store: RelationshipMemoryStore,
+  current: readonly EffectiveMemoryRecord[],
+): ProjectedRelationReview[] {
+  const active = store.listActiveMemoryResolutions();
+  const created = new Map(active.map((item) => [item.resolution_id, item.recorded_at]));
+  return findConflictingOwnerLinks(current, active)
+    .filter((conflict) => !validOwnerConflictReconciliation(conflict, active))
+    .map((conflict) => {
+      const sourceIds = [...conflict.related_resolution_ids, ...conflict.unrelated_resolution_ids].sort();
+      const review_id = stableId('owner_relation_conflict', {
+        subject_id: store.subjectId, source_resolution_ids: sourceIds,
+      });
+      const created_at = sourceIds.map((id) => created.get(id) ?? '').sort().at(-1) || new Date(0).toISOString();
+      return {
+        schema_version: 1, review_id, subject_id: store.subjectId, kind: 'relation',
+        memory_ids: [...conflict.memory_ids], original_memory_ids: [...conflict.memory_ids],
+        origin_review_ids: [review_id], origin: 'owner_conflict',
+        reconciles_resolution_ids: sourceIds,
+        reason: '先前的 owner decisions 相互冲突：related Review '
+          + conflict.related_review_ids.join(', ') + ' / unrelated Review '
+          + conflict.unrelated_review_ids.join(', ') + '。请选择当前有效关系；旧决定仍保留。',
+        status: 'pending', needs_recheck: true, created_at, recorded_at: created_at,
+      };
+    });
 }
 
 /** Read-only owner review projection: no canonical/review history is rewritten. */
@@ -108,11 +143,19 @@ export function projectRelationReviewInbox(
     if (byId.has(observation.review_id) || resolvedIds.has(observation.review_id)) continue;
     add(observation, 'remember_link');
   }
+  // A conflict must be reviewed even when old proposals have each been
+  // individually resolved. It wins display precedence over ordinary hints.
+  for (const conflict of ownerConflictReviewObservations(store, current)) {
+    const list = groups.get(key(conflict.memory_ids)) ?? [];
+    list.push(conflict);
+    groups.set(key(conflict.memory_ids), list);
+  }
   const reviews: ProjectedRelationReview[] = [];
   let deduplicated = 0;
   for (const group of groups.values()) {
-    group.sort((a, b) => (a.origin === 'maintenance_suggest' ? 0 : 1)
-      - (b.origin === 'maintenance_suggest' ? 0 : 1)
+    const sourcePriority = (origin: ProjectedRelationReview['origin']): number =>
+      origin === 'owner_conflict' ? 0 : origin === 'maintenance_suggest' ? 1 : 2;
+    group.sort((a, b) => sourcePriority(a.origin) - sourcePriority(b.origin)
       || a.created_at.localeCompare(b.created_at) || a.review_id.localeCompare(b.review_id));
     const original = [...new Set(group.flatMap((entry) => entry.original_memory_ids))].sort();
     reviews.push({ ...group[0], original_memory_ids: original,
@@ -120,7 +163,9 @@ export function projectRelationReviewInbox(
       ...(group.some((entry) => entry.needs_recheck) ? { needs_recheck: true } : {}) });
     deduplicated += group.length - 1;
   }
-  reviews.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.review_id.localeCompare(b.review_id));
+  // Owner decision conflicts outrank the (potentially large) legacy Link backlog.
+  reviews.sort((a, b) => (a.origin === 'owner_conflict' ? 0 : 1) - (b.origin === 'owner_conflict' ? 0 : 1)
+    || a.created_at.localeCompare(b.created_at) || a.review_id.localeCompare(b.review_id));
   return { reviews, suspended, satisfied, deduplicated };
 }
 export const findProjectedReview = (inbox: ProjectedReviewInbox, id: string) =>

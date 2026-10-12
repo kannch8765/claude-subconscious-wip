@@ -214,6 +214,100 @@ describe('owner-confirmed relation resolution', () => {
     expect(current.find(m=>m.memory_id==='mem-c')?.linked_memory_ids).toEqual(['mem-b']);
   });
 
+  it('allows A+B but routes colliding owner judgments to a Review, safely hiding Related until resolved', async () => {
+    const { store, runtime, resolution } = fixture();
+    const c = memory('mem-c', '猫整理了一份咖啡店清单。', '2026-10-01T00:00:00.000Z', '证据C');
+    store.appendMemory(c.memory, [c.evidence]);
+    const ac = runtime.suggestMaintenanceReview('review-related', 'relation', {
+      memory_ids: ['mem-a','mem-c'], relation: 'related', reason: '猫确认有关联',
+    });
+    const bc = runtime.suggestMaintenanceReview('review-unrelated', 'relation', {
+      memory_ids: ['mem-b','mem-c'], relation: 'unrelated', reason: '猫确认没有关系',
+    });
+    const ab = runtime.suggestMaintenanceReview('review-merge', 'relation', {
+      memory_ids: ['mem-a','mem-b'], relation: 'same_meaning', reason: '猫确认同一件事',
+    });
+    for (const suggested of [ac, bc, ab]) expect(suggested.outcome).toBe('accepted');
+    resolution.resolveReview(ac.review_id!, { resolution_id: 'ac-related', relation: 'related' });
+    resolution.resolveReview(bc.review_id!, { resolution_id: 'bc-unrelated', relation: 'unrelated' });
+    // No artificial gate: A+B can merge, but the contradictory B-C edge is
+    // not silently trusted or silently discarded as a finished Review.
+    resolution.resolveReview(ab.review_id!, {
+      resolution_id: 'merge-safe', relation: 'same_meaning', target_memory_id: 'mem-a',
+    });
+    let current = await runtime.memorySearchRecallHybrid({});
+    expect(current.map((m)=>m.memory_id)).toEqual(['mem-a','mem-c']);
+    expect(current.find((m)=>m.memory_id==='mem-a')?.resolution_confirmed_related_memory_ids).toBeUndefined();
+    const { projectRelationReviewInbox } = await import('../src/review_inbox.js');
+    const { materializeCurrentMemoryView } = await import('../src/resolution/index.js');
+    let inbox = projectRelationReviewInbox(store, materializeCurrentMemoryView(store));
+    const conflict = inbox.reviews.find((item) => item.origin === 'owner_conflict');
+    expect(conflict).toEqual(expect.objectContaining({
+      memory_ids: ['mem-a', 'mem-c'],
+      needs_recheck: true,
+      reconciles_resolution_ids: ['ac-related','bc-unrelated'],
+    }));
+    // The owner can confirm the current pair's relation WITHOUT deleting old
+    // source decisions. This reconciliation is itself reviewable and undoable.
+    expect(() => resolution.resolveReview(conflict!.review_id, {
+      resolution_id:'invalid-conflict', relation:'same_meaning', target_memory_id:'mem-a',
+    })).toThrow(/requires related or unrelated reconciliation/);
+    resolution.resolveReview(conflict!.review_id, {
+      resolution_id:'owner-reconciles', relation:'related',
+    });
+    inbox = projectRelationReviewInbox(store, materializeCurrentMemoryView(store));
+    expect(inbox.reviews.some((r)=>r.origin === 'owner_conflict')).toBe(false);
+    current = await runtime.memorySearchRecallHybrid({});
+    expect(current.find((m)=>m.memory_id==='mem-a')?.resolution_confirmed_related_memory_ids).toEqual(['mem-c']);
+    expect(store.listMemories()).toHaveLength(3);
+    resolution.undoReview(conflict!.review_id, {resolution_id:'undo-reconciliation'});
+    inbox = projectRelationReviewInbox(store, materializeCurrentMemoryView(store));
+    expect(inbox.reviews.find((r)=>r.origin === 'owner_conflict')?.review_id).toBe(conflict!.review_id);
+    expect((await runtime.memorySearchRecallHybrid({}))
+      .find((m)=>m.memory_id==='mem-a')?.resolution_confirmed_related_memory_ids).toBeUndefined();
+    // Undo the merge: the two original owner decisions become compatible again,
+    // so the synthetic conflict disappears without changing either old record.
+    resolution.undoReview(ab.review_id!, { resolution_id: 'undo-merge' });
+    inbox = projectRelationReviewInbox(store, materializeCurrentMemoryView(store));
+    expect(inbox.reviews.some((r)=>r.origin === 'owner_conflict')).toBe(false);
+    current = await runtime.memorySearchRecallHybrid({});
+    expect(current.find((m)=>m.memory_id==='mem-a')?.resolution_confirmed_related_memory_ids).toEqual(['mem-c']);
+    expect(current.find((m)=>m.memory_id==='mem-b')?.resolution_confirmed_related_memory_ids).toBeUndefined();
+  });
+
+  it('does not apply a previous merged-family reconciliation once that merge is undone', async () => {
+    const {store,runtime,resolution}=fixture();
+    const c=memory('mem-c','第三条独立记忆','2026-10-01T00:00:00.000Z','证据C');
+    store.appendMemory(c.memory,[c.evidence]);
+    const ac=runtime.suggestMaintenanceReview('r-ac','relation',{
+      memory_ids:['mem-a','mem-c'],relation:'related',reason:'相关',
+    });
+    const bc=runtime.suggestMaintenanceReview('r-bc','relation',{
+      memory_ids:['mem-b','mem-c'],relation:'unrelated',reason:'不相关',
+    });
+    const ab=runtime.suggestMaintenanceReview('r-ab','relation',{
+      memory_ids:['mem-a','mem-b'],relation:'same_meaning',reason:'同义',
+    });
+    resolution.resolveReview(ac.review_id!,{resolution_id:'related-source',relation:'related'});
+    resolution.resolveReview(bc.review_id!,{resolution_id:'unrelated-source',relation:'unrelated'});
+    resolution.resolveReview(ab.review_id!,{resolution_id:'merged-source',relation:'same_meaning',target_memory_id:'mem-a'});
+    const {projectRelationReviewInbox}=await import('../src/review_inbox.js');
+    const {materializeCurrentMemoryView}=await import('../src/resolution/index.js');
+    const conflict=projectRelationReviewInbox(store,materializeCurrentMemoryView(store))
+      .reviews.find((item)=>item.origin==='owner_conflict')!;
+    resolution.resolveReview(conflict.review_id,{resolution_id:'merged-owner-choice',relation:'related'});
+    resolution.undoReview(ab.review_id!,{resolution_id:'undo-alias-only'});
+    expect(projectRelationReviewInbox(store,materializeCurrentMemoryView(store))
+      .reviews.some((item)=>item.origin==='owner_conflict')).toBe(false);
+    const current=await runtime.memorySearchRecallHybrid({});
+    expect(current.find((m)=>m.memory_id==='mem-a')?.resolution_confirmed_related_memory_ids).toEqual(['mem-c']);
+    expect(current.find((m)=>m.memory_id==='mem-b')?.resolution_confirmed_related_memory_ids).toBeUndefined();
+    expect(current.find((m)=>m.memory_id==='mem-b')?.linked_memory_ids).toBeUndefined();
+    expect(store.listActiveMemoryResolutions().some((r)=>r.review_id===conflict.review_id)).toBe(true);
+    // The reconciliation event is retained for Undo/audit, but is inert until
+    // its source owner judgments again project onto the same effective pair.
+  });
+
   it('an owner-confirmed unrelated decision excludes an old model-authored edge from the current view', async () => {
     const { store, runtime, resolution } = fixture();
     const old = store.getMemory('mem-a')!;
