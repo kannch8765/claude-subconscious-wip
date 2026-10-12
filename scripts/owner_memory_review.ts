@@ -1,9 +1,11 @@
+import * as fs from 'node:fs';
 import { createRuntime, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
 import { findProjectedReview, projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
 import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../relationship-memory/src/intent/provenance.js';
+import { auditEffectiveReviewCounts } from '../relationship-memory/src/review_audit.js';
 import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
@@ -13,6 +15,7 @@ export type OwnerMemoryReviewCommand =
   | { action: 'list_pending_reviews'; limit?: number }
   | { action: 'get_review'; review_id: string }
   | { action: 'status' }
+  | { action: 'audit_counts' }
   | { action: 'resolve_review'; review_id: string; resolution_id: string; relation: MemoryRelationKind; target_memory_id?: string; owner_summary?: string; contexts?: Record<string, string>; note?: string }
   | { action: 'undo_review'; review_id: string; resolution_id: string; note?: string }
   | { action: 'dismiss_review'; review_id: string; note?: string }
@@ -65,6 +68,12 @@ export function executeOwnerMemoryReviewCommand(
 ): unknown {
   const root = env.RELATIONSHIP_MEMORY_DIR?.trim() || relationshipMemoryRoot();
   const subjectId = env.RELATIONSHIP_MEMORY_SUBJECT_ID?.trim() || 'local-user';
+  if (command.action === 'audit_counts') {
+    // Fail closed if the caller cannot access the EXISTING production store.
+    // Do not create a replacement empty directory or refresh any index.
+    if (!fs.statSync(root).isDirectory()) throw new Error('relationship memory root is not a directory');
+    return auditEffectiveReviewCounts(new RelationshipMemoryStore(root, subjectId, undefined, false));
+  }
   const store = new RelationshipMemoryStore(root, subjectId);
   const owner = new RelationshipMemoryOwnerControlPlane(store);
 
@@ -252,6 +261,7 @@ function parseCommand(raw: unknown): OwnerMemoryReviewCommand {
   const action = requiredText(command.action, 'action');
 
   if (action === 'status') return { action };
+  if (action === 'audit_counts') return { action };
   if (action === 'list_pending_reviews') return { action, limit: limit(command.limit, 5, 20) };
   if (action === 'get_review') return { action, review_id: requiredText(command.review_id, 'review_id') };
   if (action === 'show') return { action, memory_id: requiredText(command.memory_id, 'memory_id') };
