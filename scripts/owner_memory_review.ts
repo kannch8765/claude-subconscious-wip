@@ -3,6 +3,7 @@ import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
 import { findProjectedReview, projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
+import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../relationship-memory/src/intent/provenance.js';
 import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
@@ -95,7 +96,9 @@ export function executeOwnerMemoryReviewCommand(
     const current = materializeCurrentMemoryView(store);
     const review = findProjectedReview(projectRelationReviewInbox(store, current), command.review_id);
     const memories = new Map(current.map((item) => [item.memory_id, item]));
+    const protectedIndex = linkedAssistantIntentIndex(store);
     return { review: review ? { ...review, review_id: command.review_id,
+      protected_target_memory_ids: protectedCurrentMemoryIds(protectedIndex, current, review.memory_ids),
       memories: review.memory_ids.map((id) => memories.get(id)) } : null };
   }
   if (command.action === 'list_pending_reviews') {
@@ -106,9 +109,11 @@ export function executeOwnerMemoryReviewCommand(
     // Original reviews and virtual link hints share the same effective inbox.
     const pending = inbox.reviews;
     const memories = new Map(current.map((memory) => [memory.memory_id, memory]));
+    const protectedIndex = linkedAssistantIntentIndex(store);
     return {
       reviews: pending.slice(0, command.limit ?? 5).map((review) => ({
         ...review,
+        protected_target_memory_ids: protectedCurrentMemoryIds(protectedIndex, current, review.memory_ids),
         memories: review.memory_ids.map((memoryId) => memories.get(memoryId) ?? { memory_id: memoryId, missing: true }),
       })),
       total: pending.length, suspended: inbox.suspended, satisfied: inbox.satisfied, deduplicated: inbox.deduplicated,

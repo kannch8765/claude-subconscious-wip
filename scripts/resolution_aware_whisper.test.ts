@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import type { AssistantRememberIntentRecord } from '../relationship-memory/src/schema/index.js';
 import type { EffectiveMemoryRecord } from '../relationship-memory/src/schema/index.js';
 import { renderResolutionAwareWhisper } from './resolution_aware_whisper.js';
 
@@ -55,6 +56,24 @@ describe('resolution-aware Whisper transport-only formatting', () => {
     expect(rendered).toContain('适用条件（已审核）：仅周末与朋友外出时');
     expect(rendered).toContain('猫：「现在喜欢轻食咖啡店。」');
     expect(rendered).not.toContain('历史阶段');
+  });
+
+  it('Whispers source-faithful original assistant Memory and Feel with historical attribution', () => {
+    const intent: AssistantRememberIntentRecord = {
+      schema_version: 1, intent_id: 'owner-1', subject_id: 'kohaku',
+      session_id: 'session', assistant_message_id: 'msg', tool_use_id: 'tool', tool_name: 'remember',
+      memory: { text: '我和猫去了 AI Meetup。' },
+      feel: { text: '那天我真的很幸福。' },
+      captured_at: '2026-10-07T21:00:00.000Z',
+    };
+    const rendered = renderResolutionAwareWhisper({
+      memoryId: 'B', historicalWindow: selected, currentMemories: [memory('B','琥珀和猫去了 Meetup')],
+      assistantIntents: [intent], topic: 'AI',
+    });
+    expect(rendered).toContain('历史记录，不代表现在的感受');
+    expect(rendered).toContain('[2026-10-07] Memory：「我和猫去了 AI Meetup。」');
+    expect(rendered).toContain('Feel：「那天我真的很幸福。」');
+    expect(rendered).toContain('猫：「现在喜欢轻食咖啡店。」');
   });
 
   it('uses a late owner correction without altering the Agent-selected original quote', () => {

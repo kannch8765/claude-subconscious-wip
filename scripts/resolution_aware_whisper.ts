@@ -1,4 +1,4 @@
-import type { EffectiveMemoryRecord, EvidenceRecord } from '../relationship-memory/src/schema/index.js';
+import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, EvidenceRecord } from '../relationship-memory/src/schema/index.js';
 import { renderRelatedWhisperContext } from './related_whisper.js';
 
 const HISTORICAL_CONTEXT_BUDGET = 420;
@@ -10,8 +10,25 @@ export interface ResolutionAwareWhisperInput {
   currentMemories: readonly EffectiveMemoryRecord[];
   historicalMemories?: readonly EffectiveMemoryRecord[];
   historicalEvidence?: readonly EvidenceRecord[];
+  assistantIntents?: readonly AssistantRememberIntentRecord[];
   topic: string;
   sessionKnownIds?: ReadonlySet<string>;
+}
+
+/** Preserve Kohaku's own historical memory and feeling verbatim, not as a current emotion. */
+export function renderAssistantIntentWhisper(
+  intents: readonly AssistantRememberIntentRecord[],
+): string {
+  const selected = [...intents]
+    .filter((intent) => intent.memory.text.trim() && intent.feel.text.trim())
+    .sort((a, b) => b.captured_at.localeCompare(a.captured_at) || a.intent_id.localeCompare(b.intent_id))
+    .slice(0, 3);
+  if (!selected.length) return '';
+  return '\n\n当时琥珀亲自 Remember 的原文（历史记录，不代表现在的感受）：'
+    + selected.map((intent) => {
+      const date = /^\d{4}-\d{2}-\d{2}/.exec(intent.captured_at)?.[0] ?? '历史';
+      return `\n[${date}] Memory：「${intent.memory.text}」\n  Feel：「${intent.feel.text}」`;
+    }).join('');
 }
 
 /**
@@ -92,5 +109,5 @@ export function renderResolutionAwareWhisper(input: ResolutionAwareWhisperInput)
     current.memory_id, input.currentMemories, input.topic,
     input.sessionKnownIds ?? new Set(),
   );
-  return qualified + related;
+  return qualified + renderAssistantIntentWhisper(input.assistantIntents ?? []) + related;
 }

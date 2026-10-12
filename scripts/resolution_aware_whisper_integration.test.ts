@@ -89,6 +89,34 @@ describe('resolution-aware async Whisper end-to-end',()=>{
     expect(queued[0]).toContain('猫：「原话：现在喜欢清淡咖啡。');
   });
 
+  it('queues an original Kohaku Memory+Feel through the merged effective memory, with no extra Agent tool call', async () => {
+    const {root,store,runtime,control}=fixture();
+    const review=runtime.suggestMaintenanceReview('review','relation',{
+      memory_ids:['a','b'],relation:'same_meaning',reason:'猫确认同一件事',
+    });
+    store.appendAssistantIntent({
+      schema_version:1,intent_id:'kohaku-feel',subject_id:'kohaku',
+      session_id:'original-session',assistant_message_id:'assistant-msg',tool_use_id:'tool-id',
+      tool_name:'remember',memory:{text:'我亲自记住了这一天。'},
+      feel:{text:'当时很感动，想一直珍藏这件事。'},
+      captured_at:'2026-10-07T20:10:00.000Z',
+    });
+    store.appendAssistantIntentOutcome({
+      intent_id:'kohaku-feel',batch_id:'original-batch',outcome:'accepted',
+      memory_id:'b',recorded_at:'2026-10-07T20:11:00.000Z',
+    });
+    // Ordinary Subcon memory a may be merged into Kohaku memory b, never reverse.
+    control.resolveReview(review.review_id!,{
+      resolution_id:'b-protected',relation:'same_meaning',target_memory_id:'b',
+    });
+    const queued=await whisper(root,'owner-feel');
+    expect(queued).toHaveLength(1);
+    expect(queued[0]).toContain('记忆：现在喜欢清淡咖啡');
+    expect(queued[0]).toContain('当时琥珀亲自 Remember 的原文（历史记录，不代表现在的感受）');
+    expect(queued[0]).toContain('Memory：「我亲自记住了这一天。」');
+    expect(queued[0]).toContain('Feel：「当时很感动，想一直珍藏这件事。」');
+  });
+
   it('limits reviewed scoped fact to its exact condition', async()=>{
     const {root,runtime,control}=fixture();
     const review=runtime.suggestMaintenanceReview('review','relation',{

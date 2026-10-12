@@ -33,7 +33,8 @@ import { materializeCurrentMemoryView } from '../relationship-memory/src/resolut
 import { projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
 import { stableId } from '../relationship-memory/src/store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
-import { renderResolutionAwareWhisper } from './resolution_aware_whisper.js';
+import { renderAssistantIntentWhisper, renderResolutionAwareWhisper } from './resolution_aware_whisper.js';
+import { intentsForEffectiveMemory, linkedAssistantIntentIndex } from '../relationship-memory/src/intent/provenance.js';
 import {
   advanceSyncStateCursor,
   deliverSessionMemoryOnce,
@@ -387,12 +388,17 @@ export async function sendViaNativeClient(
         const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
         // Transport-only Resolution formatting: the Agent still selects the
         // exact same memory_id and 1-3 source snippet_ids, with no new tool.
-        const currentMemories = isSync ? [] : materializeCurrentMemoryView(runtime.store);
+        const currentMemories = materializeCurrentMemoryView(runtime.store);
         const current = currentMemories.find((memory) => memory.memory_id === memoryId);
-        const resolvedWindow = isSync ? historicalWindow : renderResolutionAwareWhisper({
+        const assistantIntents = current
+          ? intentsForEffectiveMemory(linkedAssistantIntentIndex(runtime.store), current) : [];
+        const resolvedWindow = isSync
+          ? historicalWindow + renderAssistantIntentWhisper(assistantIntents)
+          : renderResolutionAwareWhisper({
           memoryId,
           historicalWindow,
           currentMemories,
+          assistantIntents,
           ...(current?.resolution_historical_memory_ids?.length
             ? {
               historicalMemories: new RelationshipMemoryOwnerControlPlane(runtime.store).listEffective(),

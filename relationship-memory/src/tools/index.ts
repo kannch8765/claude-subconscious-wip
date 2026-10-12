@@ -24,6 +24,7 @@ import { applyMemoryResolutions, currentReviewableMemoryIds, materializeCurrentM
 import { projectRelationReviewInbox } from '../review_inbox.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
+import { linkedAssistantIntentIndex } from '../intent/provenance.js';
 
 export interface SearchQuery {
   kind?: MemoryKind;
@@ -306,21 +307,8 @@ export class RelationshipMemoryRuntime {
   }
 
   private linkedIntentSemanticByMemory(): Map<string, Array<{ memory: string; feel: string }>> {
-    const intentsById = new Map(this.store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
-    const latestOutcomeByIntent = new Map<string, AssistantIntentOutcome>();
-    for (const outcome of this.store.listAssistantIntentOutcomes()) latestOutcomeByIntent.set(outcome.intent_id, outcome);
-    const byMemory = new Map<string, Array<{ intent_id: string; memory: string; feel: string }>>();
-    for (const [intentId, outcome] of latestOutcomeByIntent) {
-      if ((outcome.outcome !== 'accepted' && outcome.outcome !== 'duplicate') || !outcome.memory_id) continue;
-      const intent = intentsById.get(intentId);
-      if (!intent) continue;
-      const bucket = byMemory.get(outcome.memory_id) ?? [];
-      bucket.push({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text });
-      byMemory.set(outcome.memory_id, bucket);
-    }
-    return new Map([...byMemory].map(([memoryId, intents]) => [
-      memoryId,
-      [...new Map(intents.map((intent) => [intent.intent_id, intent])).values()].map(({ memory, feel }) => ({ memory, feel })),
+    return new Map([...linkedAssistantIntentIndex(this.store)].map(([memoryId, intents]) => [
+      memoryId, intents.map((intent) => ({ memory: intent.memory.text, feel: intent.feel.text })),
     ]));
   }
 
@@ -343,6 +331,10 @@ export class RelationshipMemoryRuntime {
       });
     await this.semanticRetriever.prepare(documents);
   }
+
+  // Six ranking points is intentionally small compared with a complete lexical match.
+  // This never introduces a candidate excluded by the topical lexical/semantic filter.
+  readonly ownerRememberRecallBoost = 6;
 
   async memorySearchRecallHybrid(query: SearchQuery, signal?: AbortSignal, refreshIndex = false): Promise<EffectiveMemoryRecord[]> {
     const semanticQuery = query.query?.trim();
@@ -406,7 +398,9 @@ export class RelationshipMemoryRuntime {
     const scored = candidates.map(({ memory }, index) => {
       const lexical = lexicalTextScore(documents[index].text, semanticQuery);
       const semanticScore = semantic.get(documents[index].id);
-      return { memory, lexical, semantic: semanticScore, score: hybridScore(lexical, semanticScore) };
+      const ownerRemembered = candidates[index].linkedIntents.length > 0;
+      return { memory, lexical, semantic: semanticScore,
+        score: hybridScore(lexical, semanticScore) + (ownerRemembered ? this.ownerRememberRecallBoost : 0) };
     }).filter((item) => item.semantic !== undefined || item.lexical > 0);
     return scored
       .sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))

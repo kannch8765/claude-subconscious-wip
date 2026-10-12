@@ -9,6 +9,7 @@ import { MEMORY_RELATION_KINDS } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
+import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../intent/provenance.js';
 
 export interface ResolveReviewCommand {
   resolution_id: string;
@@ -307,6 +308,25 @@ export class RelationshipMemoryResolutionControlPlane {
       if (!targetMemoryId || !memoryIds.includes(targetMemoryId)) throw new Error(`${relation} resolution requires target_memory_id from the reviewed memory set`);
     } else if (targetMemoryId) {
       throw new Error(`${relation} resolution does not accept target_memory_id`);
+    }
+
+    if (relation === 'same_meaning') {
+      const index = linkedAssistantIntentIndex(this.store);
+      const current = materializeCurrentMemoryView(this.store);
+      // An already merged-away original assistant memory needs a deliberate undo,
+      // not another round of merging that silently keeps the wrong root.
+      for (const memory of current.filter((item) => memoryIds.includes(item.memory_id))) {
+        const wrongRoot = (memory.resolution_source_memory_ids ?? [memory.memory_id])
+          .some((sourceId) => sourceId !== memory.memory_id && (index.get(sourceId)?.length ?? 0) > 0);
+        if (wrongRoot) throw new Error('Protected assistant-authored memory was already merged away; undo that earlier merge before merging again');
+      }
+      const protectedIds = protectedCurrentMemoryIds(index, current, memoryIds);
+      if (protectedIds.length > 1) {
+        throw new Error('Cannot same_meaning merge two assistant-authored memories; each original memory must remain a current target');
+      }
+      if (protectedIds.length === 1 && targetMemoryId !== protectedIds[0]) {
+        throw new Error('same_meaning must preserve the assistant-authored memory as target: ' + protectedIds[0]);
+      }
     }
 
     if (ownerSummary && relation !== 'same_meaning') throw new Error('owner_summary is only accepted for same_meaning resolution');
