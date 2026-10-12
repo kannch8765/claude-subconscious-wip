@@ -45,6 +45,52 @@ function fixture() {
   return { root, store, env, memoryId };
 }
 
+describe('counts-only read-only owner review audit', () => {
+  it('counts current, original links and pending inbox without emitting memory text or modifying JSONL', () => {
+    const {root, store, env, memoryId} = fixture();
+    const original = store.getMemory(memoryId)!;
+    store.appendMemory({
+      ...original, memory_id: 'second-memory', source_key: 'second-source',
+      dedupe_key: 'second-dedupe', linked_memory_ids: [memoryId],
+    }, []);
+    store.appendMaintenanceReview({
+      schema_version: 1, review_id: 'owner-suggest', subject_id: 'kohaku',
+      kind: 'relation', suggested_relation: 'related',
+      memory_ids: [memoryId, 'second-memory'], status: 'pending',
+      reason: '私密审核原因：请不要输出', created_at: '2026-10-01T00:00:00.000Z',
+      recorded_at: '2026-10-01T00:00:00.000Z',
+    });
+    const beforeFiles = fs.readdirSync(root).sort();
+    const beforeBytes = beforeFiles.map((name) => [name, fs.readFileSync(path.join(root, name)).toString('base64')]);
+    const result = executeOwnerMemoryReviewCommand({action: 'audit_counts'}, env) as any;
+    expect(result).toEqual({
+      schema_version: 1,
+      canonical: {total:2, active:2, inactive:0},
+      effective: {total:2, active:2, inactive:0, projected_out_active:0, merged_families:0},
+      automatic_links: {unique_original_observations:1},
+      review: {
+        actionable:1, actionable_by_origin:{remember_link:0,maintenance_suggest:1,owner_conflict:0},
+        suspended:0, satisfied:0, deduplicated:1, stored_pending:1,
+      },
+      resolution: {active:0,same_meaning:0},
+    });
+    const output = JSON.stringify(result);
+    for (const forbidden of ['猫喜欢安静', '私密审核原因', memoryId, 'second-memory', 'kohaku']) {
+      expect(output).not.toContain(forbidden);
+    }
+    expect(fs.readdirSync(root).sort()).toEqual(beforeFiles);
+    expect(beforeFiles.map((name) => [name, fs.readFileSync(path.join(root, name)).toString('base64')])).toEqual(beforeBytes);
+  });
+
+  it('fails closed on unavailable root instead of creating a fresh empty store', () => {
+    const root = path.join(os.tmpdir(), 'nonexistent-review-audit-' + process.pid + '-no-create');
+    fs.rmSync(root,{recursive:true,force:true});
+    const env = {RELATIONSHIP_MEMORY_DIR:root, RELATIONSHIP_MEMORY_SUBJECT_ID:'kohaku'} as NodeJS.ProcessEnv;
+    expect(() => executeOwnerMemoryReviewCommand({action:'audit_counts'}, env)).toThrow();
+    expect(fs.existsSync(root)).toBe(false);
+  });
+});
+
 describe('owner memory review command', () => {
   it('revises only the effective summary while preserving canonical genesis and evidence', () => {
     const { store, env, memoryId } = fixture();
