@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { RelationshipMemoryStore } from '../src/store/index.js';
 import { RelationshipMemoryRuntime } from '../src/tools/index.js';
 import { RelationshipMemoryResolutionControlPlane, materializeCurrentMemoryView } from '../src/resolution/index.js';
+import { RelationshipMemoryOwnerControlPlane } from '../src/owner/index.js';
 import { projectRelationReviewInbox, findProjectedReview } from '../src/review_inbox.js';
 
 const dirs: string[] = [];
@@ -103,6 +104,29 @@ describe('effective Review inbox',()=>{
    expect(inbox().reviews[0].review_id).toBe(explicit);
    expect(inbox().reviews[0].suggested_relation).toBe('related');
    expect(store.listActiveMemoryResolutions()).toHaveLength(0);
+ });
+ it('temporarily suspends old Link and Subcon suggestion when either side becomes inactive, then restores them',()=>{
+   const {store,add,propose,inbox}=fixture();
+   add('A',['B']);add('B');
+   const explicit=propose(['A','B'],'related');
+   const before=inbox();
+   expect(before.reviews).toHaveLength(1);
+   const reviewId=before.reviews[0].review_id;
+   expect(before.deduplicated).toBe(1);
+   const owner=new RelationshipMemoryOwnerControlPlane(store);
+   owner.deactivate('B',{revision_id:'B-off'});
+   const suspended=inbox();
+   expect(suspended.reviews).toHaveLength(0);
+   expect(suspended.suspended).toBe(2);
+   expect(store.listMaintenanceReviews().find((r)=>r.review_id===explicit)?.status).toBe('pending');
+   expect(store.listActiveMemoryResolutions()).toHaveLength(0);
+   expect(store.listMemories()).toHaveLength(2);
+   owner.restore('B',{revision_id:'B-on'});
+   const restored=inbox();
+   expect(restored.reviews).toHaveLength(1);
+   expect(restored.reviews[0].review_id).toBe(reviewId);
+   expect(restored.deduplicated).toBe(1);
+   expect(restored.suspended).toBe(0);
  });
  it('manually dismisses a virtual hint without recording unrelated',()=>{
    const {owner,add,inbox,store}=fixture();
