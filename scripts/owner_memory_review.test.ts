@@ -125,6 +125,26 @@ describe('owner memory review command', () => {
     ]);
   });
 
+  it('owner edit through CLI revises an evidence-free legacy memory and preserves original genesis', () => {
+    const {root,store,env} = fixture();
+    store.appendMemory({
+      schema_version:1,memory_id:'old-legacy',subject_id:'kohaku',kind:'user_preference',
+      summary:'猫之前喜欢热咖啡',participants:['user'],payload:{topic:'咖啡',preference:'热咖啡'},
+      status:'active',observed_at:'2026-09-01T00:00:00Z',
+      created_at:'2026-09-01T00:00:00Z',source_key:'legacy',dedupe_key:'legacy',
+    },[]);
+    const genesis=fs.readFileSync(path.join(root,'memories.jsonl'),'utf8');
+    const changed=executeOwnerMemoryReviewCommand({
+      action:'revise_summary',memory_id:'old-legacy',revision_id:'telegram-old-fix',
+      summary:'猫现在喜欢冰咖啡',
+    },env) as any;
+    expect(changed.memory.summary).toBe('猫现在喜欢冰咖啡');
+    expect((executeOwnerMemoryReviewCommand({action:'show',memory_id:'old-legacy'},env) as any).memory.summary).toBe('猫现在喜欢冰咖啡');
+    expect(fs.readFileSync(path.join(root,'memories.jsonl'),'utf8')).toBe(genesis);
+    expect(store.listEvidence().some((x)=>x.memory_id==='old-legacy')).toBe(false);
+    expect(store.listOwnerRevisions().filter((x)=>x.memory_id==='old-legacy')).toHaveLength(1);
+  });
+
   it('deactivates and restores without deleting genesis', () => {
     const { store, env, memoryId } = fixture();
     executeOwnerMemoryReviewCommand({
