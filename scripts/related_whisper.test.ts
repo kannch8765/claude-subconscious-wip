@@ -7,11 +7,19 @@ function memory(id: string, summary: string, links: string[] = [], status: 'acti
     schema_version: 1, memory_id: id, subject_id: 'kohaku', kind: 'user_preference',
     summary, participants: ['user'], payload: { topic: id, preference: summary }, status,
     observed_at: '2026-10-10T00:00:00.000Z', created_at: '2026-10-10T00:00:00.000Z',
-    source_key: id, dedupe_key: id, linked_memory_ids: links, owner_corrected: false,
+    source_key: id, dedupe_key: id, linked_memory_ids: links, resolution_confirmed_related_memory_ids: links, owner_corrected: false,
   };
 }
 
 describe('automatic async related whisper context', () => {
+  it('does not surface model-authored canonical links without owner confirmation', () => {
+    const main = { ...memory('a', '猫喜欢东京 AI 活动', ['b']), resolution_confirmed_related_memory_ids: [] };
+    const related = memory('b', '猫喜欢科技社区活动');
+    expect(renderRelatedWhisperContext('a', [main, related], '东京 AI')).toBe('');
+    expect(renderRelatedWhisperContext('a', [{ ...main, resolution_confirmed_related_memory_ids: ['b'] }, related], '东京 AI'))
+      .toContain('猫喜欢科技社区活动');
+  });
+
   it('follows only owner-projected direct links, never a neighbor of a neighbor', () => {
     const view = [
       memory('a', '东京 Meetup', ['b']),

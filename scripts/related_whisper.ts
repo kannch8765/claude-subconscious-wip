@@ -40,7 +40,7 @@ export function renderRelatedWhisperContext(
     .filter((memory) => memory.status === 'active')
     .map((memory) => [memory.memory_id, memory]));
   const main = currentById.get(mainMemoryId);
-  if (!main || !main.linked_memory_ids?.length || budget <= 0) return '';
+  if (!main || !main.resolution_confirmed_related_memory_ids?.length || budget <= 0) return '';
 
   const heading = '\n\n关联记忆（背景，仅摘要）：';
   let remaining = budget - heading.length;
@@ -49,7 +49,7 @@ export function renderRelatedWhisperContext(
   const mainTokens = lexicalTokenSet(main.summary);
   const topicTokens = lexicalTokenSet(topic);
   const seen = new Set([main.summary.normalize('NFKC').trim().toLowerCase()]);
-  const candidates = [...new Set(main.linked_memory_ids)]
+  const candidates = [...new Set(main.resolution_confirmed_related_memory_ids)]
     .filter((id) => id !== mainMemoryId && !sessionKnownIds.has(id))
     .map((id) => currentById.get(id))
     .filter((memory): memory is EffectiveMemoryRecord => Boolean(memory)

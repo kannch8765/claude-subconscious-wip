@@ -585,4 +585,6 @@ export interface EffectiveMemoryRecord extends Omit<CanonicalMemoryRecord, 'stat
   resolution_context?: string;
   resolution_source_memory_ids?: string[];
   resolution_historical_memory_ids?: string[];
+  /** Current direct neighbors explicitly confirmed as related by the owner. Computed view, not canonical storage. */
+  resolution_confirmed_related_memory_ids?: string[];
 }

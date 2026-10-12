@@ -173,30 +173,52 @@ export function applyMemoryResolutions(
     return id;
   };
   const links = new Map(current.map((memory) => [memory.memory_id, new Set<string>()]));
-  const link = (fromId: string, toId: string): void => {
+  const confirmed = new Map(current.map((memory) => [memory.memory_id, new Set<string>()]));
+  const unrelated = new Set<string>();
+  const key = (a: string, b: string): string => [a, b].sort().join('\0');
+  const pairs = (resolution: MemoryResolutionResolveRecord, action: (from: string, to: string) => void): void => {
+    for (const fromId of resolution.memory_ids) {
+      for (const toId of resolution.memory_ids) {
+        if (fromId !== toId) action(targetId(fromId), targetId(toId));
+      }
+    }
+  };
+  // A confirmed "unrelated" is an owner rejection of a link, even if an old
+  // model-authored canonical link proposed it. Keep the raw edge for auditing.
+  for (const resolution of resolutions) {
+    if (resolution.relation === 'unrelated') pairs(resolution, (from, to) => unrelated.add(key(from, to)));
+  }
+  const link = (fromId: string, toId: string, ownerConfirmed = false): void => {
     const from = targetId(fromId);
     const to = targetId(toId);
-    if (from !== to && activeIds.has(from) && activeIds.has(to)) links.get(from)?.add(to);
+    if (from === to || !activeIds.has(from) || !activeIds.has(to) || unrelated.has(key(from, to))) return;
+    links.get(from)?.add(to);
+    if (ownerConfirmed) confirmed.get(from)?.add(to);
   };
 
-  // Reinterpret historical direct links through same-meaning targets. Keep the
-  // original edges in genesis/resolutions for audit and undo; never traverse a
-  // neighbor's neighbors or create transitive related links.
+  // The full projected graph retains links already present in canonical/owner
+  // content, for lookup and visualization. Those are NOT automatically
+  // owner-approved Whisper background.
   for (const memory of byId.values()) {
     for (const linkedId of memory.linked_memory_ids ?? []) link(memory.memory_id, linkedId);
   }
-  // A related review can predate or follow a merge. Resolve both cases against
-  // the final current view, not the order in which overlays were appended.
-  for (const resolution of resolutions.filter((item) => item.relation === 'related')) {
-    for (const from of resolution.memory_ids) {
-      for (const to of resolution.memory_ids) link(from, to);
-    }
+  // Only explicit owner-confirmed "related" resolutions supply Whisper context.
+  // Resolve historical/merged endpoints against the final current view, so a
+  // review confirmed before a merge remains usable without copying records.
+  for (const resolution of resolutions) {
+    if (resolution.relation === 'related') pairs(resolution, (from, to) => link(from, to, true));
   }
   return current.map((memory) => {
-    const { linked_memory_ids: _oldLinks, ...rest } = memory;
+    const { linked_memory_ids: _oldLinks, resolution_confirmed_related_memory_ids: _oldConfirmed, ...rest } = memory;
     const linkedIds = [...(links.get(memory.memory_id) ?? [])].sort();
-    return { ...rest, ...(linkedIds.length ? { linked_memory_ids: linkedIds } : {}) };
+    const confirmedIds = [...(confirmed.get(memory.memory_id) ?? [])].sort();
+    return {
+      ...rest,
+      ...(linkedIds.length ? { linked_memory_ids: linkedIds } : {}),
+      ...(confirmedIds.length ? { resolution_confirmed_related_memory_ids: confirmedIds } : {}),
+    };
   });
+
 }
 
 export function materializeCurrentMemoryView(store: RelationshipMemoryStore): EffectiveMemoryRecord[] {

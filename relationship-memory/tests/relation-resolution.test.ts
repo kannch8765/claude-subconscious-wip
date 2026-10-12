@@ -6,6 +6,7 @@ import type { CanonicalMemoryRecord, EvidenceRecord } from '../src/schema/index.
 import { RelationshipMemoryStore } from '../src/store/index.js';
 import { RelationshipMemoryRuntime } from '../src/tools/index.js';
 import { RelationshipMemoryResolutionControlPlane } from '../src/resolution/index.js';
+import { RelationshipMemoryOwnerControlPlane } from '../src/owner/index.js';
 import { rebuildProjection } from '../src/projection/index.js';
 
 const roots: string[] = [];
@@ -143,10 +144,73 @@ describe('owner-confirmed relation resolution', () => {
 
     const current = await runtime.memorySearchRecallHybrid({});
     expect(current).toEqual(expect.arrayContaining([
-      expect.objectContaining({ memory_id: 'mem-a', linked_memory_ids: ['mem-b'], resolution_relation: 'related' }),
-      expect.objectContaining({ memory_id: 'mem-b', linked_memory_ids: ['mem-a'], resolution_relation: 'related' }),
+      expect.objectContaining({ memory_id: 'mem-a', linked_memory_ids: ['mem-b'], resolution_confirmed_related_memory_ids: ['mem-b'], resolution_relation: 'related' }),
+      expect.objectContaining({ memory_id: 'mem-b', linked_memory_ids: ['mem-a'], resolution_confirmed_related_memory_ids: ['mem-a'], resolution_relation: 'related' }),
     ]));
     expect((await runtime.memorySearchRecallHybrid({ linked_memory_id: 'mem-b' })).map((item) => item.memory_id)).toEqual(['mem-a']);
+  });
+
+  it('keeps canonical links for visual analysis but only exposes reviewed related edges to Whisper', async () => {
+    const { store, runtime, resolution } = fixture();
+    const old = store.getMemory('mem-a')!;
+    const owner = new RelationshipMemoryOwnerControlPlane(store);
+    owner.revise('mem-a', {
+      revision_id: 'link-originally-inferred',
+      kind: old.kind, summary: old.summary, participants: old.participants,
+      payload: old.payload, linked_memory_ids: ['mem-b'],
+    });
+    const before = await runtime.memorySearchRecallHybrid({});
+    expect(before.find((m) => m.memory_id === 'mem-a')?.linked_memory_ids).toEqual(['mem-b']);
+    expect(before.find((m) => m.memory_id === 'mem-a')?.resolution_confirmed_related_memory_ids).toBeUndefined();
+
+    const id = review(runtime, 'related');
+    resolution.resolveReview(id, { resolution_id: 'owner-confirmed-related', relation: 'related' });
+    const confirmed = await runtime.memorySearchRecallHybrid({});
+    expect(confirmed.find((m) => m.memory_id === 'mem-a')?.resolution_confirmed_related_memory_ids).toEqual(['mem-b']);
+
+    resolution.undoReview(id, { resolution_id: 'undo-reviewed-relation' });
+    const undone = await runtime.memorySearchRecallHybrid({});
+    expect(undone.find((m) => m.memory_id === 'mem-a')?.linked_memory_ids).toEqual(['mem-b']);
+    expect(undone.find((m) => m.memory_id === 'mem-a')?.resolution_confirmed_related_memory_ids).toBeUndefined();
+  });
+
+  it('projects reviewed related edges to merged targets, without creating transitive links', async () => {
+    const { store, runtime, resolution } = fixture();
+    const c = memory('mem-c', '猫有一份咖啡店清单', '2026-09-25T00:00:00.000Z', '证据C');
+    store.appendMemory(c.memory, [c.evidence]);
+    const related = runtime.suggestMaintenanceReview('review-1', 'relation', {
+      memory_ids: ['mem-a', 'mem-c'], relation: 'related', reason: 'owner confirmed',
+    });
+    const merged = runtime.suggestMaintenanceReview('review-2', 'relation', {
+      memory_ids: ['mem-a', 'mem-b'], relation: 'same_meaning', reason: 'owner confirmed',
+    });
+    resolution.resolveReview(related.review_id!, { resolution_id: 'rel', relation: 'related' });
+    resolution.resolveReview(merged.review_id!, { resolution_id: 'merge', relation: 'same_meaning', target_memory_id: 'mem-b' });
+    const current = await runtime.memorySearchRecallHybrid({});
+    expect(current.find(m=>m.memory_id==='mem-b')?.resolution_confirmed_related_memory_ids).toEqual(['mem-c']);
+    expect(current.find(m=>m.memory_id==='mem-c')?.resolution_confirmed_related_memory_ids).toEqual(['mem-b']);
+    expect(current.find(m=>m.memory_id==='mem-b')?.linked_memory_ids).toEqual(['mem-c']);
+    expect(current.find(m=>m.memory_id==='mem-c')?.linked_memory_ids).toEqual(['mem-b']);
+  });
+
+  it('an owner-confirmed unrelated decision excludes an old model-authored edge from the current view', async () => {
+    const { store, runtime, resolution } = fixture();
+    const old = store.getMemory('mem-a')!;
+    const owner = new RelationshipMemoryOwnerControlPlane(store);
+    owner.revise('mem-a', {
+      revision_id: 'original-inferred-link',
+      kind: old.kind, summary: old.summary, participants: old.participants,
+      payload: old.payload, linked_memory_ids: ['mem-b'],
+    });
+    const id = review(runtime, 'unrelated');
+    resolution.resolveReview(id, { resolution_id: 'dismiss-canonical-link', relation: 'unrelated' });
+    const current = await runtime.memorySearchRecallHybrid({});
+    expect(current.find((m) => m.memory_id === 'mem-a')?.linked_memory_ids).toBeUndefined();
+    expect(current.find((m) => m.memory_id === 'mem-a')?.resolution_confirmed_related_memory_ids).toBeUndefined();
+    expect(owner.getEffective('mem-a')?.linked_memory_ids).toEqual(['mem-b']);
+    resolution.undoReview(id, { resolution_id: 'undo-dismiss-canonical-link' });
+    const afterUndo = await runtime.memorySearchRecallHybrid({});
+    expect(afterUndo.find((m) => m.memory_id === 'mem-a')?.linked_memory_ids).toEqual(['mem-b']);
   });
 
   it('unrelated dismisses the review without changing the current memory view', async () => {
