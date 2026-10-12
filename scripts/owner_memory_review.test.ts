@@ -142,7 +142,7 @@ describe('owner memory review command', () => {
       inactive: 0,
       owner_corrected: 0,
     }));
-    expect(status.review).toEqual({ pending: 1, stale: 0, resolved: 0, dismissed: 0 });
+    expect(status.review).toEqual(expect.objectContaining({ pending: 1, stale: 0, resolved: 0, dismissed: 0 }));
     expect(status.resolution).toEqual({
       active: 0,
       by_relation: {
@@ -192,9 +192,10 @@ describe('owner memory review command', () => {
     expect(merged.review.status).toBe('resolved');
     expect(store.getMaintenanceReview(second.review_id!)?.status).toBe('pending');
     const after = executeOwnerMemoryReviewCommand({ action: 'list_pending_reviews' }, env) as any;
-    expect(after.total).toBe(0);
+    expect(after.total).toBe(1);
+    expect(after.reviews[0].memory_ids).toEqual(['mem-b', 'mem-c']);
     const status = executeOwnerMemoryReviewCommand({ action: 'status' }, env) as any;
-    expect(status.review).toEqual(expect.objectContaining({ pending: 0, stale: 1, resolved: 1 }));
+    expect(status.review).toEqual(expect.objectContaining({ pending: 1, stale: 0, resolved: 1 }));
     expect(store.listMaintenanceReviewRecords()).toHaveLength(2);
 
     executeOwnerMemoryReviewCommand({

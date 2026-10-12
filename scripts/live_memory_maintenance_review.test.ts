@@ -6,6 +6,8 @@ import type { CanonicalMemoryRecord } from '../relationship-memory/src/schema/in
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
 import { sendViaNativeClient } from './send_worker_native.js';
 import { readMirroredActivityEvents } from './subcon_visibility_mirror.js';
+import { projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
+import { materializeCurrentMemoryView } from '../relationship-memory/src/resolution/index.js';
 
 const roots: string[] = [];
 
@@ -125,6 +127,48 @@ describe('live memory maintenance review tools', () => {
         }),
       }),
     ]);
+  });
+
+  it('emits a classified-free Review activity when Remember links a newly written memory', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'auto-link-review-')); roots.push(root);
+    process.env.RELATIONSHIP_MEMORY_DIR = root;
+    process.env.LETTA_API_KEY = 'test-only';
+    process.env.SUBCON_VISIBILITY_DIR = root;
+    process.env.SUBCON_VISIBILITY_RUN_ID = 'new-link-review';
+    const store = new RelationshipMemoryStore(root, 'local-user');
+    store.appendMemory(memory('mem-old', '猫喜欢有阳光的咖啡店。'), []);
+    const evidence = {
+      conversation_id: 'conv-new', message_id: 'msg-new', evidence_id: 'ev-new',
+      role: 'user' as const, event_kind: 'user_text' as const,
+      quote: '猫还喜欢安静的咖啡店。', captured_at: '2026-10-12T00:00:00.000Z',
+    };
+    await sendViaNativeClient({
+      agentId: 'agent-test', conversationId: 'conv-new', sessionId: 'session-link',
+      message: 'test', cwd: root, batchId: 'batch-link', canonicalMessages: [evidence],
+      assistantIntents: [], latestUserMessage: '',
+    }, {
+      createClient: () => ({}),
+      openStdioMcp: async () => ({ tools: [], close: async () => {} } as any),
+      runConversation: async (input: any) => {
+        const remember = input.tools.find((tool: any) => tool.name === 'memory_remember_user_preference');
+        const result = await remember.execute('remember-link', {
+          summary: '猫喜欢安静的咖啡店。', participants: ['user'],
+          evidence_ids: [evidence.evidence_id],
+          payload: { topic: '咖啡店', preference: '猫喜欢安静的咖啡店。' },
+          linked_memory_ids: ['mem-old'],
+        });
+        expect(result.outcome).toBe('accepted');
+        return { response: { stop_reason: { stop_reason: 'end_turn' } }, clientToolFailure: false } as any;
+      },
+    });
+    expect(store.listMemories()[1]?.linked_memory_ids).toEqual(['mem-old']);
+    expect(projectRelationReviewInbox(store, materializeCurrentMemoryView(store)).reviews).toHaveLength(1);
+    const events = readMirroredActivityEvents(root, 'new-link-review');
+    expect(events.map((item) => item.activity)).toEqual(['memory_write', 'relation_review']);
+    expect(events[1].review).toEqual(expect.objectContaining({
+      origin: 'remember_link', memory_ids: expect.arrayContaining(['mem-old']),
+    }));
+    expect(events[1].review?.suggested_relation).toBeUndefined();
   });
 
   it('does not expose maintenance review mutation tools to sync foreground recall', async () => {

@@ -807,6 +807,12 @@ export class RelationshipMemoryRuntime {
       kind,
       memory_ids: memoryIds,
     });
+    const previous = this.store.getMaintenanceReview(reviewId);
+    if (previous) return { outcome: 'duplicate', review_id: reviewId };
+    const priorApproval = this.store.listActiveMemoryResolutions().find((item) =>
+      item.relation === relation && item.memory_ids.length === memoryIds.length
+      && item.memory_ids.every((id) => memoryIds.includes(id)));
+    if (priorApproval) return { outcome: 'duplicate', review_id: priorApproval.review_id };
     const now = this.now();
     const record: MaintenanceReviewRecord = {
       schema_version: 1,
