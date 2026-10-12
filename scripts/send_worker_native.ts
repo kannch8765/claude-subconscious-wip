@@ -30,7 +30,8 @@ import {
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
 import { materializeCurrentMemoryView } from '../relationship-memory/src/resolution/index.js';
-import { renderRelatedWhisperContext } from './related_whisper.js';
+import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
+import { renderResolutionAwareWhisper } from './resolution_aware_whisper.js';
 import {
   advanceSyncStateCursor,
   deliverSessionMemoryOnce,
@@ -363,16 +364,31 @@ export async function sendViaNativeClient(
         }
         const snippets = snippetIds.map((snippetId) => surfacedMemory.snippets.get(snippetId)!);
         const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
-        // Async only: once Subcon has chosen the main memory, the transport adds
-        // bounded directly related summaries without a second model/tool action.
-        const related = isSync ? '' : renderRelatedWhisperContext(
+        // Transport-only Resolution formatting: the Agent still selects the
+        // exact same memory_id and 1-3 source snippet_ids, with no new tool.
+        const currentMemories = isSync ? [] : materializeCurrentMemoryView(runtime.store);
+        const current = currentMemories.find((memory) => memory.memory_id === memoryId);
+        const resolvedWindow = isSync ? historicalWindow : renderResolutionAwareWhisper({
           memoryId,
-          materializeCurrentMemoryView(runtime.store),
-          surfacedMemory.searchQuery || payload.latestUserMessage,
-          new Set(getSessionForegroundKnownMemoryIds(payload.cwd, payload.sessionId)),
-        );
+          historicalWindow,
+          currentMemories,
+          ...(current?.resolution_historical_memory_ids?.length
+            ? {
+              historicalMemories: new RelationshipMemoryOwnerControlPlane(runtime.store).listEffective(),
+              historicalEvidence: runtime.store.listEvidenceForMemoryIds(current.resolution_historical_memory_ids),
+            }
+            : {}),
+          topic: surfacedMemory.searchQuery || payload.latestUserMessage,
+          sessionKnownIds: new Set(getSessionForegroundKnownMemoryIds(payload.cwd, payload.sessionId)),
+        });
+        if (resolvedWindow === null) {
+          // Owner review can change after search. Never deliver a now-hidden
+          // (e.g. conflicted/merged) memory as an asserted current fact.
+          whisperResolved = true;
+          return { status: 'suppressed_no_longer_current' };
+        }
         const groundedText = composeGroundedWhisper(
-          historicalWindow + related,
+          resolvedWindow,
           foregroundGroundingIdentityAnchors(entitySearchObservations),
         );
         if (isSync && !payload.syncTurnId) throw new Error('sync live worker requires syncTurnId');
