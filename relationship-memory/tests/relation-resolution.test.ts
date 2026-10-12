@@ -111,6 +111,27 @@ describe('owner-confirmed relation resolution', () => {
     expect(store.getMaintenanceReview(reviewId)?.status).toBe('resolved');
   });
 
+  it('preserves all earlier temporal stages across sequential changed_over_time resolutions', async () => {
+    const { store, runtime, resolution } = fixture();
+    const first = review(runtime, 'changed_over_time');
+    resolution.resolveReview(first, {
+      resolution_id: 'temporal-1', relation: 'changed_over_time', target_memory_id: 'mem-b',
+    });
+    const third = memory('mem-c', '猫现在喜欢工作日去咖啡店。', '2026-10-01T00:00:00.000Z', '证据C');
+    store.appendMemory(third.memory, [third.evidence]);
+    const next = runtime.suggestMaintenanceReview('later', 'relation', {
+      memory_ids: ['mem-b','mem-c'], relation:'changed_over_time', reason:'later evolution',
+    });
+    expect(next.outcome).toBe('accepted');
+    resolution.resolveReview(next.review_id!, {
+      resolution_id: 'temporal-2', relation: 'changed_over_time', target_memory_id: 'mem-c',
+    });
+    const current = await runtime.memorySearchRecallHybrid({});
+    expect(current.map(m=>m.memory_id)).toEqual(['mem-c']);
+    expect(current[0].resolution_historical_memory_ids).toEqual(['mem-a','mem-b']);
+    expect(store.listMemories()).toHaveLength(3);
+  });
+
   it('context_dependent keeps both memories current and makes their scopes searchable', async () => {
     const { runtime, resolution } = fixture();
     const reviewId = review(runtime, 'context_dependent');

@@ -118,7 +118,16 @@ export function applyMemoryResolutions(
       const targetId = resolution.target_memory_id!;
       const target = byId.get(targetId);
       if (!target) continue;
-      const historical = resolution.memory_ids.filter((memoryId) => memoryId !== targetId).sort();
+      // A current state can itself be the survivor of an earlier temporal
+      // transition. Preserve the older stages rather than replacing the chain.
+      const historical = [...new Set([
+        ...(target.resolution_historical_memory_ids ?? []),
+        ...resolution.memory_ids.filter((memoryId) => memoryId !== targetId)
+          .flatMap((memoryId) => {
+            const memory = byId.get(memoryId);
+            return [...(memory?.resolution_historical_memory_ids ?? []), memoryId];
+          }),
+      ])].filter((memoryId) => memoryId !== targetId).sort();
       byId.set(targetId, {
         ...withRelationMetadata(target, resolution),
         resolution_historical_memory_ids: historical,
@@ -314,10 +323,13 @@ export class RelationshipMemoryResolutionControlPlane {
         // A previously merged survivor is a new current memory, so it can join
         // another same-meaning family or become historical when preferences change.
         // Other overlapping structural decisions still require owner re-review.
-        const extendsMergedCurrent = active.relation === 'same_meaning'
-          && (relation === 'same_meaning' || relation === 'changed_over_time')
-          && overlaps.length === 1 && overlaps[0] === active.target_memory_id;
-        if (!extendsMergedCurrent) {
+        const extendsCurrentSurvivor = overlaps.length === 1
+          && overlaps[0] === active.target_memory_id
+          && (
+            (active.relation === 'same_meaning' && (relation === 'same_meaning' || relation === 'changed_over_time'))
+            || (active.relation === 'changed_over_time' && relation === 'changed_over_time')
+          );
+        if (!extendsCurrentSurvivor) {
           throw new Error(`memory already participates in active structural resolution: ${active.review_id}`);
         }
       }
