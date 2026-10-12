@@ -507,6 +507,40 @@ describe('live retryable conversation recovery', () => {
     });
   });
 
+  it('marks queued related IDs atomically, but not failed or reused batch artifacts', async () => {
+    const home = tempHome();
+    vi.stubEnv('LETTA_HOME', home);
+    const { deliverSessionMemoryOnce, getSessionForegroundKnownMemoryIds, saveSyncState } = await import('./conversation_utils.js');
+    const cwd = '/workspace';
+    const session = 'related-known';
+    saveSyncState(cwd, { lastProcessedIndex: 7, sessionId: session });
+    const main = deliverSessionMemoryOnce(cwd, session, 'main', (known) => {
+      expect(known.size).toBe(0);
+      return { status: 'queued', included: ['neighbor', 'merged-old'] };
+    }, undefined, (result) => result.status === 'queued', (result) => result.included);
+    expect(main.delivered).toBe(true);
+    expect(getSessionForegroundKnownMemoryIds(cwd, session)).toEqual(['main','neighbor','merged-old']);
+    let calls = 0;
+    expect(deliverSessionMemoryOnce(cwd, session, 'neighbor', () => { calls += 1; return 'queued'; }))
+      .toEqual({ delivered: false });
+    expect(calls).toBe(0);
+    expect(() => deliverSessionMemoryOnce(cwd, session, 'failed', () => {
+      throw new Error('queue failed');
+    }, undefined, () => true, () => ['phantom'])).toThrow('queue failed');
+    expect(deliverSessionMemoryOnce(cwd, session, 'reused', () => ({ status: 'already_pending', included: ['phantom'] }),
+      undefined, () => true, (result) => result.status === 'queued' ? result.included : []).delivered).toBe(true);
+    expect(getSessionForegroundKnownMemoryIds(cwd, session)).toEqual(['main','neighbor','merged-old','reused']);
+    expect(deliverSessionMemoryOnce(cwd, session, 'unsuccessful', () => ({ status: 'queued', included: ['phantom'] }),
+      undefined, () => false, (result) => result.included)).toEqual({ delivered: false, result: { status: 'queued', included: ['phantom'] } });
+    expect(getSessionForegroundKnownMemoryIds(cwd, session)).not.toContain('phantom');
+    let concurrent: string[] = [];
+    deliverSessionMemoryOnce(cwd, session, 'later', (known) => {
+      concurrent = [...known];
+      return { status: 'queued', included: [] as string[] };
+    }, undefined, () => true, (result) => result.included);
+    expect(concurrent).toContain('merged-old');
+  });
+
   it('treats accepted same-session writes as foreground-known without marking them delivered', async () => {
     const home = tempHome();
     vi.stubEnv('LETTA_HOME', home);

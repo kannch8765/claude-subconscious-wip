@@ -518,9 +518,10 @@ export function deliverSessionMemoryOnce<T>(
   cwd: string,
   sessionId: string,
   memoryId: string,
-  deliver: () => T,
+  deliver: (foregroundKnownMemoryIds: ReadonlySet<string>) => T,
   log: LogFn = noopLog,
   confirmsDelivery: (result: T) => boolean = () => true,
+  includedMemoryIds: (result: T) => readonly string[] = () => [],
 ): { delivered: true; result: T } | { delivered: false; result?: T } {
   const normalizedMemoryId = memoryId.trim();
   if (!normalizedMemoryId) throw new Error('Session memory delivery requires a canonical memory id');
@@ -531,9 +532,15 @@ export function deliverSessionMemoryOnce<T>(
     const foregroundKnownMemoryIds = new Set([...deliveredMemoryIds, ...uniqueMemoryIds(durable.sessionWrittenMemoryIds)]);
     if (foregroundKnownMemoryIds.has(normalizedMemoryId)) return { delivered: false };
 
-    const result = deliver();
+    const result = deliver(foregroundKnownMemoryIds);
     if (!confirmsDelivery(result)) return { delivered: false, result };
     deliveredMemoryIds.add(normalizedMemoryId);
+    // The same durable whisper can contain bounded, owner-confirmed related
+    // summaries. Only the IDs that actually entered the confirmed artifact
+    // become session-known, atomically alongside its primary memory.
+    for (const id of includedMemoryIds(result)) {
+      if (typeof id === 'string' && id.trim()) deliveredMemoryIds.add(id.trim());
+    }
     const next: SyncState = { ...durable, deliveredMemoryIds: [...deliveredMemoryIds] };
     writeSyncStateUnlocked(cwd, next, log);
     return { delivered: true, result };

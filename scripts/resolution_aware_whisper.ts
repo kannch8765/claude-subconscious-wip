@@ -1,5 +1,5 @@
 import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, EvidenceRecord } from '../relationship-memory/src/schema/index.js';
-import { renderRelatedWhisperContext } from './related_whisper.js';
+import { selectRelatedWhisperContext } from './related_whisper.js';
 
 const HISTORICAL_CONTEXT_BUDGET = 420;
 const HISTORICAL_CONTEXT_MAX_RECORDS = 3;
@@ -49,7 +49,8 @@ export function renderAssistantIntentWhisper(
  * Returns null if the selected memory is no longer current/active, e.g. an
  * owner conflict resolution was applied after search but before delivery.
  */
-export function renderResolutionAwareWhisper(input: ResolutionAwareWhisperInput): string | null {
+export function renderResolutionAwareWhisperPacket(input: ResolutionAwareWhisperInput):
+  { text: string; includedRelatedMemoryIds: string[] } | null {
   const current = input.currentMemories.find(
     (item) => item.memory_id === input.memoryId && item.status === 'active',
   );
@@ -116,9 +117,15 @@ export function renderResolutionAwareWhisper(input: ResolutionAwareWhisperInput)
     ? `${header}\n${qualifiers.join('\n')}${quotes}`
     : `${header}${quotes}`;
 
-  const related = renderRelatedWhisperContext(
+  const related = selectRelatedWhisperContext(
     current.memory_id, input.currentMemories, input.topic,
     input.sessionKnownIds ?? new Set(),
   );
-  return qualified + renderAssistantIntentWhisper(input.assistantIntents ?? []) + related;
+  return { text: qualified + renderAssistantIntentWhisper(input.assistantIntents ?? []) + related.text,
+    includedRelatedMemoryIds: related.includedMemoryIds };
+}
+
+/** Existing text-only helper remains available for display-only callers. */
+export function renderResolutionAwareWhisper(input: ResolutionAwareWhisperInput): string | null {
+  return renderResolutionAwareWhisperPacket(input)?.text ?? null;
 }
