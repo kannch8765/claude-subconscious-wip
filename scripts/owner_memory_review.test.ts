@@ -94,6 +94,87 @@ describe('counts-only read-only owner review audit', () => {
   });
 });
 
+describe('read-only memory provenance', () => {
+  it('shows linked Kohaku Remember and Feel before verbatim Evidence, without changing storage', () => {
+    const {root,store,env,memoryId}=fixture();
+    store.appendAssistantIntent({
+      schema_version:1,intent_id:'intent-1',subject_id:'kohaku',session_id:'session',
+      assistant_message_id:'a1',tool_use_id:'tool-1',tool_name:'remember',
+      memory:{text:'琥珀记得猫喜欢这家店'},feel:{text:'想到猫就很开心'},
+      captured_at:'2026-09-30T00:00:00.000Z',
+    });
+    store.appendAssistantIntentOutcome({intent_id:'intent-1',batch_id:'b',outcome:'accepted',
+      memory_id:memoryId,recorded_at:'2026-09-30T00:00:01.000Z'});
+    const before=Object.fromEntries(fs.readdirSync(root).filter((file)=>file.endsWith('.jsonl'))
+      .map((file)=>[file,fs.readFileSync(path.join(root,file),'utf8')]));
+    const first=executeOwnerMemoryReviewCommand({action:'sources',memory_id:memoryId,page:0},env) as any;
+    expect(first).toMatchObject({total:2,evidence_total:1,feel_total:1,page:0,has_next:false});
+    expect(first.items).toEqual([
+      {type:'kohaku_feel',captured_at:'2026-09-30T00:00:00.000Z',
+        memory_text:'琥珀记得猫喜欢这家店',feel_text:'想到猫就很开心'},
+      {type:'evidence',captured_at:'2026-09-30T00:00:00.000Z',
+        role:'user',quote:'猫喜欢安静的咖啡店。'},
+    ]);
+    const after=Object.fromEntries(fs.readdirSync(root).filter((file)=>file.endsWith('.jsonl'))
+      .map((file)=>[file,fs.readFileSync(path.join(root,file),'utf8')]));
+    expect(after).toEqual(before);
+    expect((executeOwnerMemoryReviewCommand({action:'sources',memory_id:memoryId,page:1},env) as any).items).toEqual([]);
+  });
+  it('does not fabricate source material for an old evidence-free memory or an unrelated intent', () => {
+    const {store,env}=fixture();
+    const old=store.listMemories()[0];
+    store.appendMemory({...old,memory_id:'legacy-blank',source_key:'legacy',dedupe_key:'legacy'},[]);
+    store.appendAssistantIntent({
+      schema_version:1,intent_id:'unrelated',subject_id:'kohaku',session_id:'s',
+      assistant_message_id:'x',tool_use_id:'y',tool_name:'remember',
+      memory:{text:'不相关'},feel:{text:'不相关心情'},captured_at:'2026-09-30T00:00:00.000Z',
+    });
+    store.appendAssistantIntentOutcome({intent_id:'unrelated',batch_id:'b',outcome:'accepted',
+      memory_id:'different-memory',recorded_at:'2026-09-30T00:00:01.000Z'});
+    const value=executeOwnerMemoryReviewCommand({action:'sources',memory_id:'legacy-blank'},env) as any;
+    expect(value).toMatchObject({total:0,evidence_total:0,feel_total:0,items:[]});
+    expect(()=>executeOwnerMemoryReviewCommand({action:'sources',memory_id:'absent'},env)).toThrow(/Unknown canonical memory/);
+  });
+  it('retrieves all contributing original excerpts for a same-meaning merged memory',()=>{
+    const {store,env,memoryId}=fixture();
+    store.appendMemory({
+      ...store.getMemory(memoryId)!,memory_id:'merged-target',summary:'合并后的版本',
+      source_key:'merged-target',dedupe_key:'merged-target',
+    },[{evidence_id:'e-merged-target',memory_id:'merged-target',conversation_id:'another-conversation',
+      message_id:'m-merged-target',role:'assistant',quote:'琥珀当时的真实原话',
+      captured_at:'2026-10-02T00:00:00Z'}]);
+    store.appendMaintenanceReview({
+      schema_version:1,review_id:'merge-sources',subject_id:'kohaku',kind:'relation',
+      suggested_relation:'same_meaning',memory_ids:[memoryId,'merged-target'].sort(),
+      reason:'重复',status:'pending',created_at:'2026-10-02T00:00:00Z',recorded_at:'2026-10-02T00:00:00Z',
+    });
+    const merged=executeOwnerMemoryReviewCommand({
+      action:'resolve_review',review_id:'merge-sources',resolution_id:'sources-resolution',
+      relation:'same_meaning',target_memory_id:'merged-target',
+    },env) as any;
+    expect(merged.review.status).toBe('resolved');
+    const sources=executeOwnerMemoryReviewCommand({action:'sources',memory_id:'merged-target'},env) as any;
+    expect(sources.evidence_total).toBe(2);
+    expect(sources.items.map((x:any)=>x.quote)).toContain('猫喜欢安静的咖啡店。');
+    expect(sources.items.map((x:any)=>x.quote)).toContain('琥珀当时的真实原话');
+  });
+  it('paginates evidence without cutting off the total',()=>{
+    const {store,env,memoryId}=fixture();
+    for(let i=1;i<=4;i++) store.appendReinforcement({
+      schema_version:1,reinforcement_id:`r-${i}`,memory_id:memoryId,batch_id:'batch-1',
+      evidence_ids:[`new-${i}`],latest_evidence_at:`2026-10-0${i}T00:00:00Z`,recorded_at:`2026-10-0${i}T00:00:00Z`,
+    },[{evidence_id:`new-${i}`,memory_id:memoryId,conversation_id:'c',message_id:`m${i}`,
+       role:'user',quote:`原话 ${i}`,captured_at:`2026-10-0${i}T00:00:00Z`}]);
+    const first=executeOwnerMemoryReviewCommand({action:'sources',memory_id:memoryId,page:0},env) as any;
+    const second=executeOwnerMemoryReviewCommand({action:'sources',memory_id:memoryId,page:1},env) as any;
+    expect(first).toMatchObject({total:5,evidence_total:5,feel_total:0,has_next:true});
+    expect(first.items).toHaveLength(3);
+    expect(first.items[0].quote).toBe('原话 4');
+    expect(second.items).toHaveLength(2);
+    expect(second.has_next).toBe(false);
+  });
+});
+
 describe('owner memory review command', () => {
   it('revises only the effective summary while preserving canonical genesis and evidence', () => {
     const { store, env, memoryId } = fixture();
