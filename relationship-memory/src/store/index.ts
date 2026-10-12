@@ -533,7 +533,7 @@ export class RelationshipMemoryStore {
     return this.withMutationBoundary(() => {
       const records = this.listMaintenanceReviewRecords();
       const latest = [...records].reverse().find((item) => item.review_id === record.review_id);
-      if (latest?.status === 'pending') return false;
+      if (latest?.status === 'pending' && record.status === 'pending') return false;
 
       const stable = stableJson(record);
       const duplicate = records.some((item) => stableJson(item) === stable);

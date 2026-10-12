@@ -1,7 +1,8 @@
 import { createRuntime, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/owner/index.js';
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
-import { currentReviewableMemoryIds, materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
+import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
+import { findProjectedReview, projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
 import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
@@ -9,9 +10,11 @@ export type OwnerMemoryReviewCommand =
   | { action: 'show'; memory_id: string }
   | { action: 'search'; query?: string; kind?: MemoryKind; active?: boolean; limit?: number }
   | { action: 'list_pending_reviews'; limit?: number }
+  | { action: 'get_review'; review_id: string }
   | { action: 'status' }
   | { action: 'resolve_review'; review_id: string; resolution_id: string; relation: MemoryRelationKind; target_memory_id?: string; owner_summary?: string; contexts?: Record<string, string>; note?: string }
   | { action: 'undo_review'; review_id: string; resolution_id: string; note?: string }
+  | { action: 'dismiss_review'; review_id: string; note?: string }
   | { action: 'revise_summary'; memory_id: string; revision_id: string; summary: string; note?: string }
   | { action: 'deactivate'; memory_id: string; revision_id: string; note?: string }
   | { action: 'restore'; memory_id: string; revision_id: string; note?: string };
@@ -88,21 +91,27 @@ export function executeOwnerMemoryReviewCommand(
     return { memories: rows.slice(0, command.limit ?? 8), total: rows.length };
   }
 
+  if (command.action === 'get_review') {
+    const current = materializeCurrentMemoryView(store);
+    const review = findProjectedReview(projectRelationReviewInbox(store, current), command.review_id);
+    const memories = new Map(current.map((item) => [item.memory_id, item]));
+    return { review: review ? { ...review, review_id: command.review_id,
+      memories: review.memory_ids.map((id) => memories.get(id)) } : null };
+  }
   if (command.action === 'list_pending_reviews') {
     // Do not present a card the owner cannot resolve anymore. The old pending
     // record is retained, so undoing a merge naturally makes it actionable again.
-    const currentIds = currentReviewableMemoryIds(store);
-    const allPending = store.listMaintenanceReviews().filter((review) => review.status === 'pending');
-    const pending = allPending
-      .filter((review) => review.memory_ids.every((memoryId) => currentIds.has(memoryId)))
-      .sort((a, b) => a.created_at.localeCompare(b.created_at));
-    const memories = new Map(owner.listEffective().map((memory) => [memory.memory_id, memory]));
+    const current = materializeCurrentMemoryView(store);
+    const inbox = projectRelationReviewInbox(store, current);
+    // Original reviews and virtual link hints share the same effective inbox.
+    const pending = inbox.reviews;
+    const memories = new Map(current.map((memory) => [memory.memory_id, memory]));
     return {
       reviews: pending.slice(0, command.limit ?? 5).map((review) => ({
         ...review,
         memories: review.memory_ids.map((memoryId) => memories.get(memoryId) ?? { memory_id: memoryId, missing: true }),
       })),
-      total: pending.length,
+      total: pending.length, suspended: inbox.suspended, satisfied: inbox.satisfied, deduplicated: inbox.deduplicated,
     };
   }
 
@@ -110,11 +119,10 @@ export function executeOwnerMemoryReviewCommand(
     const canonicalMemories = owner.listEffective();
     const memories = materializeCurrentMemoryView(store);
     const reviews = store.listMaintenanceReviews();
-    const currentIds = new Set(memories.filter((memory) => memory.status === 'active').map((memory) => memory.memory_id));
-    const pendingReviews = reviews.filter((review) => review.status === 'pending');
-    const actionablePending = pendingReviews.filter((review) =>
-      review.memory_ids.every((memoryId) => currentIds.has(memoryId)));
+    const inbox = projectRelationReviewInbox(store, memories);
     const resolutions = store.listActiveMemoryResolutions();
+    const trackedReviewIds = new Set(reviews.map((item) => item.review_id));
+    const virtualResolutions = resolutions.filter((item) => !trackedReviewIds.has(item.review_id));
     const countsByKind = Object.fromEntries(MEMORY_KINDS.map((kind) => [kind, 0])) as Record<MemoryKind, number>;
     const countsByRelation = Object.fromEntries(MEMORY_RELATION_KINDS.map((relation) => [relation, 0])) as Record<MemoryRelationKind, number>;
     let active = 0;
@@ -154,10 +162,12 @@ export function executeOwnerMemoryReviewCommand(
         } : null,
       },
       review: {
-        pending: actionablePending.length,
-        stale: pendingReviews.length - actionablePending.length,
-        resolved: reviews.filter((review) => review.status === 'resolved').length,
-        dismissed: reviews.filter((review) => review.status === 'dismissed').length,
+        pending: inbox.reviews.length,
+        stale: inbox.suspended, satisfied: inbox.satisfied, deduplicated: inbox.deduplicated,
+        resolved: reviews.filter((review) => review.status === 'resolved').length
+          + virtualResolutions.filter((item) => item.relation !== 'unrelated').length,
+        dismissed: reviews.filter((review) => review.status === 'dismissed').length
+          + virtualResolutions.filter((item) => item.relation === 'unrelated').length,
       },
       resolution: {
         active: resolutions.length,
@@ -183,6 +193,10 @@ export function executeOwnerMemoryReviewCommand(
     });
     rebuildProjection(store);
     return { resolution, review: store.getMaintenanceReview(command.review_id) };
+  }
+
+  if (command.action === 'dismiss_review') {
+    return { review: new RelationshipMemoryResolutionControlPlane(store).dismissReview(command.review_id, command.note) };
   }
 
   if (command.action === 'undo_review') {
@@ -234,6 +248,7 @@ function parseCommand(raw: unknown): OwnerMemoryReviewCommand {
 
   if (action === 'status') return { action };
   if (action === 'list_pending_reviews') return { action, limit: limit(command.limit, 5, 20) };
+  if (action === 'get_review') return { action, review_id: requiredText(command.review_id, 'review_id') };
   if (action === 'show') return { action, memory_id: requiredText(command.memory_id, 'memory_id') };
   if (action === 'search') {
     if (command.active !== undefined && typeof command.active !== 'boolean') throw new Error('active must be boolean');
@@ -259,6 +274,10 @@ function parseCommand(raw: unknown): OwnerMemoryReviewCommand {
       ...(parsedContexts ? { contexts: parsedContexts } : {}),
       ...(typeof command.note === 'string' && command.note.trim() ? { note: command.note.trim() } : {}),
     };
+  }
+  if (action === 'dismiss_review') {
+    return { action, review_id: requiredText(command.review_id, 'review_id'),
+      ...(typeof command.note === 'string' && command.note.trim() ? { note: command.note.trim() } : {}) };
   }
   if (action === 'undo_review') {
     return {
@@ -293,7 +312,7 @@ async function main(): Promise<void> {
   if (!raw) throw new Error('expected one JSON command on stdin');
   const command = parseCommand(JSON.parse(raw));
   const result = executeOwnerMemoryReviewCommand(command);
-  if (['resolve_review', 'undo_review', 'revise_summary', 'deactivate', 'restore'].includes(command.action)) {
+  if (['resolve_review', 'undo_review', 'dismiss_review', 'revise_summary', 'deactivate', 'restore'].includes(command.action)) {
     const root = process.env.RELATIONSHIP_MEMORY_DIR?.trim() || relationshipMemoryRoot();
     const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID?.trim() || 'local-user';
     try { await createRuntime([], subjectId, root).prepareCurrentMemorySemanticIndex(); }

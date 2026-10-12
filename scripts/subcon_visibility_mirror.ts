@@ -31,7 +31,8 @@ export interface SubconMemoryReceipt {
 
 export interface SubconRelationReviewReceipt {
   review_id: string;
-  suggested_relation: string;
+  suggested_relation?: string;
+  origin?: 'remember_link' | 'maintenance_suggest';
   memory_ids: string[];
   reason: string;
 }
@@ -310,10 +311,12 @@ export function mirrorSubconActivity(
       const memoryIds = Array.isArray(input.review?.memory_ids)
         ? input.review.memory_ids.map((memoryId) => memoryId.trim()).filter(Boolean)
         : [];
-      if (!reviewId || !relation || !reason || memoryIds.length < 2) return false;
+      const origin = input.review?.origin ?? 'maintenance_suggest';
+      if (!reviewId || (!relation && origin !== 'remember_link') || !reason || memoryIds.length < 2) return false;
       payload = {
         activity: input.activity, action: input.action,
-        review: { review_id: reviewId, suggested_relation: relation, memory_ids: memoryIds, reason },
+        review: { review_id: reviewId, ...(relation ? { suggested_relation: relation } : {}),
+          ...(origin === 'remember_link' ? { origin } : {}), memory_ids: memoryIds, reason },
       };
     }
 

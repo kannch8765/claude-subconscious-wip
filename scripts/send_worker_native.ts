@@ -30,6 +30,8 @@ import {
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
 import { composeGroundedWhisper, foregroundGroundingIdentityAnchors, type EntitySearchObservation } from './grounded_whisper.js';
 import { materializeCurrentMemoryView } from '../relationship-memory/src/resolution/index.js';
+import { projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
+import { stableId } from '../relationship-memory/src/store/index.js';
 import { renderRelatedWhisperContext } from './related_whisper.js';
 import {
   advanceSyncStateCursor,
@@ -311,6 +313,24 @@ export async function sendViaNativeClient(
               action: 'remembered',
               memory: { memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary },
             });
+            if (memory?.linked_memory_ids?.length) {
+              const inbox = projectRelationReviewInbox(runtime.store, materializeCurrentMemoryView(runtime.store));
+              const notified = new Set<string>();
+              for (const linked of memory.linked_memory_ids) {
+                const originalPair = [memory.memory_id, linked].sort();
+                const hintId = stableId('maintenance_link_review', {
+                  subject_id: runtime.store.subjectId, memory_ids: originalPair,
+                });
+                const candidate = inbox.reviews.find((review) => review.origin_review_ids.includes(hintId));
+                if (!candidate || notified.has(candidate.review_id)) continue;
+                notified.add(candidate.review_id);
+                mirrorSubconActivity({
+                  sessionId: payload.sessionId, activity: 'relation_review', action: 'queued',
+                  review: { review_id: candidate.review_id, origin: 'remember_link',
+                    memory_ids: candidate.memory_ids, reason: 'Remember 自动关联，等待猫猫选择关系' },
+                });
+              }
+            }
           }
           if (tool.name === 'suggest_memory_relation' && result?.outcome === 'accepted' && typeof result.review_id === 'string') {
             const review = runtime.store.getMaintenanceReview(result.review_id);
@@ -321,6 +341,7 @@ export async function sendViaNativeClient(
               review: {
                 review_id: review.review_id,
                 suggested_relation: review.suggested_relation,
+                origin: 'maintenance_suggest',
                 memory_ids: [...review.memory_ids],
                 reason: review.reason,
               },

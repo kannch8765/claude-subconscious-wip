@@ -20,7 +20,8 @@ import type {
 import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { materializeEffectiveMemory } from '../owner/index.js';
-import { applyMemoryResolutions, currentReviewableMemoryIds } from '../resolution/index.js';
+import { applyMemoryResolutions, currentReviewableMemoryIds, materializeCurrentMemoryView } from '../resolution/index.js';
+import { projectRelationReviewInbox } from '../review_inbox.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 
@@ -807,6 +808,19 @@ export class RelationshipMemoryRuntime {
       kind,
       memory_ids: memoryIds,
     });
+    const previous = this.store.getMaintenanceReview(reviewId);
+    if (previous) return { outcome: 'duplicate', review_id: reviewId };
+    const priorApproval = this.store.listActiveMemoryResolutions().find((item) =>
+      item.relation === relation && item.memory_ids.length === memoryIds.length
+      && item.memory_ids.every((id) => memoryIds.includes(id)));
+    if (priorApproval) return { outcome: 'duplicate', review_id: priorApproval.review_id };
+    // Earlier A+B+C can now be an A+C pending review after an owner merge.
+    // The Agent sees A+C in its effective workspace; do not queue it twice.
+    const pending = projectRelationReviewInbox(this.store, materializeCurrentMemoryView(this.store)).reviews;
+    const alreadyProposed = pending.find((review) => review.origin === 'maintenance_suggest'
+      && review.suggested_relation === relation && review.memory_ids.length === memoryIds.length
+      && review.memory_ids.every((id) => memoryIds.includes(id)));
+    if (alreadyProposed) return { outcome: 'duplicate', review_id: alreadyProposed.review_id };
     const now = this.now();
     const record: MaintenanceReviewRecord = {
       schema_version: 1,

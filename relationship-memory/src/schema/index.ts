@@ -532,6 +532,8 @@ export interface MemoryResolutionResolveRecord {
   memory_ids: string[];
   recorded_at: string;
   target_memory_id?: string;
+  /** Origin members of a projected review, retained for audit and alias migration. */
+  original_memory_ids?: string[];
   owner_summary?: string;
   contexts?: Record<string, string>;
   note?: string;
