@@ -163,7 +163,9 @@ export function projectRelationReviewInbox(
       ...(group.some((entry) => entry.needs_recheck) ? { needs_recheck: true } : {}) });
     deduplicated += group.length - 1;
   }
-  reviews.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.review_id.localeCompare(b.review_id));
+  // Owner decision conflicts outrank the (potentially large) legacy Link backlog.
+  reviews.sort((a, b) => (a.origin === 'owner_conflict' ? 0 : 1) - (b.origin === 'owner_conflict' ? 0 : 1)
+    || a.created_at.localeCompare(b.created_at) || a.review_id.localeCompare(b.review_id));
   return { reviews, suspended, satisfied, deduplicated };
 }
 export const findProjectedReview = (inbox: ProjectedReviewInbox, id: string) =>
