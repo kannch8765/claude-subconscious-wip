@@ -76,6 +76,23 @@ describe('resolution-aware Whisper transport-only formatting', () => {
     expect(rendered).toContain('猫：「现在喜欢轻食咖啡店。」');
   });
 
+  it('bounds oversized first-party Memory/Feel at transmission only, marking any excerpt', () => {
+    const intent: AssistantRememberIntentRecord = {
+      schema_version:1,intent_id:'large',subject_id:'kohaku',session_id:'s',
+      assistant_message_id:'m',tool_use_id:'t',tool_name:'remember',
+      memory:{text:'记'.repeat(15000)},feel:{text:'珍惜'.repeat(15000)},
+      captured_at:'2026-10-07T18:00:00.000Z',
+    };
+    const output = renderResolutionAwareWhisper({ memoryId:'B', historicalWindow:selected,
+      currentMemories:[memory('B','现在的摘要')], assistantIntents:[intent], topic:'AI' });
+    expect(output).toContain('Memory（原文节选）');
+    expect(output).toContain('Feel（原文节选）');
+    expect(output).toContain('历史记录，不代表现在的感受');
+    expect(output!.length).toBeLessThan(1300);
+    expect(intent.memory.text).toHaveLength(15000);
+    expect(intent.feel.text).toHaveLength(30000);
+  });
+
   it('uses a late owner correction without altering the Agent-selected original quote', () => {
     const corrected = memory('B', '猫确认现在喜欢低咖啡因的饮品。');
     const rendered = renderResolutionAwareWhisper({

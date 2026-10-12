@@ -3,6 +3,8 @@ import { renderRelatedWhisperContext } from './related_whisper.js';
 
 const HISTORICAL_CONTEXT_BUDGET = 420;
 const HISTORICAL_CONTEXT_MAX_RECORDS = 3;
+const FIRST_PARTY_MEMORY_CHARS = 400;
+const FIRST_PARTY_FEEL_CHARS = 650;
 
 export interface ResolutionAwareWhisperInput {
   memoryId: string;
@@ -15,7 +17,14 @@ export interface ResolutionAwareWhisperInput {
   sessionKnownIds?: ReadonlySet<string>;
 }
 
-/** Preserve Kohaku's own historical memory and feeling verbatim, not as a current emotion. */
+/** Transmission-only bound: never modify the stored Memory/Feel original. */
+function sourcedExcerpt(value: string, maxChars: number): { text: string; label: string } {
+  const characters = Array.from(value);
+  if (characters.length <= maxChars) return { text: value, label: '' };
+  return { text: characters.slice(0, maxChars).join('') + '…', label: '（原文节选）' };
+}
+
+/** Preserve Kohaku's historical words; never imply the Feeling is current. */
 export function renderAssistantIntentWhisper(
   intents: readonly AssistantRememberIntentRecord[],
 ): string {
@@ -27,7 +36,9 @@ export function renderAssistantIntentWhisper(
   return '\n\n当时琥珀亲自 Remember 的原文（历史记录，不代表现在的感受）：'
     + selected.map((intent) => {
       const date = /^\d{4}-\d{2}-\d{2}/.exec(intent.captured_at)?.[0] ?? '历史';
-      return `\n[${date}] Memory：「${intent.memory.text}」\n  Feel：「${intent.feel.text}」`;
+      const memory = sourcedExcerpt(intent.memory.text, FIRST_PARTY_MEMORY_CHARS);
+      const feel = sourcedExcerpt(intent.feel.text, FIRST_PARTY_FEEL_CHARS);
+      return `\n[${date}] Memory${memory.label}：「${memory.text}」\n  Feel${feel.label}：「${feel.text}」`;
     }).join('');
 }
 

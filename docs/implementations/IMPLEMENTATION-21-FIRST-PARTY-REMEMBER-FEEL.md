@@ -9,7 +9,7 @@ This feature integrates PR #126's formatter with PR #127's unified effective-mem
 - Only same_meaning merges are constrained; changed_over_time keeps historical states and remains usable.
 - Owner Review sends protected_target_memory_ids on current effective review cards. Telegram only offers legal same_meaning target(s), showing a protected indication.
 - Search gives linked owner-authored effective memories +6 hybrid ranking points after topical filtering, without additional embedding/model requests. This is a light preference, not absolute priority.
-- Whisper delivers original historical Memory and Feel text (up to three most recent intent pairs) with dates and explicit historical attribution. Original 1-3 model-selected source quote snippets remain unchanged. This is true for both sync and async paths, without modifying the Agent tool calls.
+- Whisper delivers original historical Memory and Feel text (up to three most recent intent pairs) with dates and explicit historical attribution. Exceptional long fields use labeled verbatim excerpts (up to 400 Unicode characters for Memory and 650 for Feel); canonical originals remain entirely unchanged. Original 1-3 model-selected source quote snippets remain unchanged. This is true for both sync and async paths, without modifying the Agent tool calls.
 - Original Feel is not paraphrased or treated as current emotion. Related Top-2 remains summary-only, so unrelated historical emotions are not attached.
 
 ## Implementation files
@@ -26,7 +26,7 @@ This feature integrates PR #126's formatter with PR #127's unified effective-mem
 - Both A and B authored: neither can disappear through same_meaning; related remains available.
 - Legacy wrong-root resolution requires owner Undo rather than quietly chaining.
 - Close ranking favors authored; large relevance gap favors more relevant candidate; missing relevance evidence is not introduced by the boost.
-- Actual queued Whisper includes original Memory+Feel after correct merge, marked as past, while selected quote text is untouched.
+- Actual queued Whisper includes original Memory+Feel after correct merge, marked as past, while selected quote text is untouched. Extremely long Feel cannot overwhelm the delivery budget and is clearly labeled as an excerpt.
 - Telegram shows only legal target and existing alternate relation choices.
 
 Do not merge/deploy production without user approval; CI and integration review are still required.
