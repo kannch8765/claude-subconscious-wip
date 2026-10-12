@@ -42,11 +42,12 @@ function fixture() {
   return {root,store,runtime,control};
 }
 
-async function whisper(root: string, sessionId: string, onSearched?: () => void) {
+async function whisper(root: string, sessionId: string, onSearched?: () => void, mode: 'async' | 'sync' = 'async') {
   let selectedCalls = 0;
   const result = await sendViaNativeClient({
     agentId: 'agent-test', conversationId: 'conv-test', sessionId, cwd: root,
     message: 'test', batchId: 'batch-'+sessionId,
+    mode, ...(mode === 'sync' ? { syncTurnId: 'turn-'+sessionId } : {}),
     canonicalMessages: [], assistantIntents: [], latestUserMessage: '咖啡',
   }, {
     createClient: () => ({}),
@@ -130,6 +131,17 @@ describe('resolution-aware async Whisper end-to-end',()=>{
     expect(queued).toHaveLength(1);
     expect(queued[0]).toContain('适用条件（已审核）：在东京学习期间');
     expect(queued[0]).not.toContain('暑假在厦门');
+  });
+
+  it('suppresses sync Whisper when an owner conflict hides a searched memory before delivery', async()=>{
+    const {root,runtime,control}=fixture();
+    const review=runtime.suggestMaintenanceReview('review','relation',{
+      memory_ids:['a','b'],relation:'conflict',reason:'猫还没决定',
+    });
+    const queued=await whisper(root,'sync-conflict',()=>{
+      control.resolveReview(review.review_id!,{resolution_id:'conflict-sync',relation:'conflict'});
+    },'sync');
+    expect(queued).toHaveLength(0);
   });
 
   it('rejects a selected quote if owner conflict resolution hides the memory before transport', async()=>{

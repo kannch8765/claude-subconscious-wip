@@ -245,6 +245,62 @@ export function currentReviewableMemoryIds(store: RelationshipMemoryStore): Set<
     .map((memory) => memory.memory_id));
 }
 
+export interface ConflictingOwnerLink {
+  memory_ids: [string, string];
+  related_review_ids: string[];
+  unrelated_review_ids: string[];
+}
+
+/**
+ * Owner link decisions are immutable; opposite decisions cannot be silently
+ * collapsed when two canonical source families are merged.
+ * Optionally preview one same-meaning merge before appending its resolution.
+ * Time: O(N + R * K^2), K = bounded review member count.
+ */
+export function findConflictingOwnerLinks(
+  current: readonly EffectiveMemoryRecord[],
+  resolutions: readonly MemoryResolutionResolveRecord[],
+  proposedMerge?: { memory_ids: readonly string[]; target_memory_id: string },
+): ConflictingOwnerLink[] {
+  const currentIdOf = new Map<string, string>();
+  for (const memory of current) {
+    if (memory.status !== 'active') continue;
+    for (const source of memory.resolution_source_memory_ids ?? [memory.memory_id]) {
+      currentIdOf.set(source, memory.memory_id);
+    }
+  }
+  const merging = new Set(proposedMerge?.memory_ids ?? []);
+  const mapped = (id: string): string | undefined => {
+    const effective = currentIdOf.get(id);
+    if (!effective) return undefined;
+    return merging.has(effective) ? proposedMerge?.target_memory_id : effective;
+  };
+  const pairs = new Map<string, { ids: [string, string]; related: Set<string>; unrelated: Set<string> }>();
+  for (const resolution of resolutions) {
+    if (resolution.relation !== 'related' && resolution.relation !== 'unrelated') continue;
+    for (let i = 0; i < resolution.memory_ids.length; i++) {
+      for (let j = i + 1; j < resolution.memory_ids.length; j++) {
+        const left = mapped(resolution.memory_ids[i]);
+        const right = mapped(resolution.memory_ids[j]);
+        if (!left || !right || left === right) continue;
+        const ids = [left, right].sort() as [string, string];
+        const key = JSON.stringify(ids);
+        const entry = pairs.get(key) ?? { ids, related: new Set<string>(), unrelated: new Set<string>() };
+        entry[resolution.relation].add(resolution.review_id);
+        pairs.set(key, entry);
+      }
+    }
+  }
+  return [...pairs.values()]
+    .filter((pair) => pair.related.size > 0 && pair.unrelated.size > 0)
+    .map((pair) => ({
+      memory_ids: pair.ids,
+      related_review_ids: [...pair.related].sort(),
+      unrelated_review_ids: [...pair.unrelated].sort(),
+    }))
+    .sort((a, b) => JSON.stringify(a.memory_ids).localeCompare(JSON.stringify(b.memory_ids)));
+}
+
 export class RelationshipMemoryResolutionControlPlane {
   constructor(readonly store: RelationshipMemoryStore, readonly now: () => string = () => new Date().toISOString()) {}
 
@@ -311,8 +367,21 @@ export class RelationshipMemoryResolutionControlPlane {
     }
 
     if (relation === 'same_meaning') {
-      const index = linkedAssistantIntentIndex(this.store);
       const current = materializeCurrentMemoryView(this.store);
+      const activeResolutions = this.store.listActiveMemoryResolutions();
+      const alreadyConflicting = new Set(findConflictingOwnerLinks(current, activeResolutions)
+        .map((item) => JSON.stringify(item.memory_ids)));
+      const introducedConflict = findConflictingOwnerLinks(current, activeResolutions, {
+        memory_ids: memoryIds, target_memory_id: targetMemoryId!,
+      }).find((item) => !alreadyConflicting.has(JSON.stringify(item.memory_ids)));
+      if (introducedConflict) {
+        throw new Error('Cannot merge memories: previous owner related/unrelated decisions '
+          + 'would become contradictory for ' + introducedConflict.memory_ids.join(' and ')
+          + '. Re-review or undo one of the conflicting owner decisions first (related reviews: '
+          + introducedConflict.related_review_ids.join(', ') + '; unrelated reviews: '
+          + introducedConflict.unrelated_review_ids.join(', ') + ')');
+      }
+      const index = linkedAssistantIntentIndex(this.store);
       // An already merged-away original assistant memory needs a deliberate undo,
       // not another round of merging that silently keeps the wrong root.
       for (const memory of current.filter((item) => memoryIds.includes(item.memory_id))) {

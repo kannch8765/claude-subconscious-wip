@@ -214,6 +214,36 @@ describe('owner-confirmed relation resolution', () => {
     expect(current.find(m=>m.memory_id==='mem-c')?.linked_memory_ids).toEqual(['mem-b']);
   });
 
+  it('refuses a merge that would collide earlier owner related and unrelated decisions', async () => {
+    const { store, runtime, resolution } = fixture();
+    const c = memory('mem-c', '猫整理了一份咖啡店清单。', '2026-10-01T00:00:00.000Z', '证据C');
+    store.appendMemory(c.memory, [c.evidence]);
+    const ac = runtime.suggestMaintenanceReview('review-related', 'relation', {
+      memory_ids: ['mem-a','mem-c'], relation: 'related', reason: '猫确认有关联',
+    });
+    const bc = runtime.suggestMaintenanceReview('review-unrelated', 'relation', {
+      memory_ids: ['mem-b','mem-c'], relation: 'unrelated', reason: '猫确认没有关系',
+    });
+    const ab = runtime.suggestMaintenanceReview('review-merge', 'relation', {
+      memory_ids: ['mem-a','mem-b'], relation: 'same_meaning', reason: '另一份合并建议',
+    });
+    for (const suggested of [ac, bc, ab]) expect(suggested.outcome).toBe('accepted');
+    resolution.resolveReview(ac.review_id!, { resolution_id: 'ac-related', relation: 'related' });
+    resolution.resolveReview(bc.review_id!, { resolution_id: 'bc-unrelated', relation: 'unrelated' });
+    expect(() => resolution.resolveReview(ab.review_id!, {
+      resolution_id: 'merge-would-contradict', relation: 'same_meaning', target_memory_id: 'mem-a',
+    })).toThrow(/previous owner related\/unrelated decisions.*contradictory/);
+    expect(store.listActiveMemoryResolutions()).toHaveLength(2);
+    expect((await runtime.memorySearchRecallHybrid({})).map((item) => item.memory_id)).toHaveLength(3);
+    // The owner can explicitly undo an obsolete judgment rather than let an
+    // algorithm silently choose which historic decision counts.
+    resolution.undoReview(bc.review_id!, { resolution_id: 'undo-bc' });
+    resolution.resolveReview(ab.review_id!, {
+      resolution_id: 'merge-safe', relation: 'same_meaning', target_memory_id: 'mem-a',
+    });
+    expect((await runtime.memorySearchRecallHybrid({})).map((item) => item.memory_id)).toHaveLength(2);
+  });
+
   it('an owner-confirmed unrelated decision excludes an old model-authored edge from the current view', async () => {
     const { store, runtime, resolution } = fixture();
     const old = store.getMemory('mem-a')!;

@@ -390,8 +390,17 @@ export async function sendViaNativeClient(
         // exact same memory_id and 1-3 source snippet_ids, with no new tool.
         const currentMemories = materializeCurrentMemoryView(runtime.store);
         const current = currentMemories.find((memory) => memory.memory_id === memoryId);
-        const assistantIntents = current
-          ? intentsForEffectiveMemory(linkedAssistantIntentIndex(runtime.store), current) : [];
+        if (!current || current.status !== 'active') {
+          // A reviewed merge, conflict or owner deactivation can happen after
+          // search but before delivery. Sync and async MUST share this gate.
+          whisperResolved = true;
+          if (isSync) {
+            writeSyncCheckpoint(payload, 'no_whisper');
+            foregroundReleased = true;
+          }
+          return { status: 'suppressed_no_longer_current' };
+        }
+        const assistantIntents = intentsForEffectiveMemory(linkedAssistantIntentIndex(runtime.store), current);
         const resolvedWindow = isSync
           ? historicalWindow + renderAssistantIntentWhisper(assistantIntents)
           : renderResolutionAwareWhisper({
