@@ -400,7 +400,7 @@ export async function sendViaNativeClient(
           }
           return { status: 'suppressed_no_longer_current' };
         }
-        const assistantIntents = intentsForEffectiveMemory(linkedAssistantIntentIndex(runtime.store), current);
+        const assistantIntents = intentsForEffectiveMemory(linkedAssistantIntentIndex(runtime.store), current, true);
         const resolvedWindow = isSync
           ? historicalWindow + renderAssistantIntentWhisper(assistantIntents)
           : renderResolutionAwareWhisper({

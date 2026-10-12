@@ -25,10 +25,17 @@ export function linkedAssistantIntentIndex(
 /** Resolve immutable assistant memory/feel texts through an effective source family. */
 export function intentsForEffectiveMemory(
   index: ReadonlyMap<string, readonly AssistantRememberIntentRecord[]>,
-  memory: Pick<EffectiveMemoryRecord, 'memory_id' | 'resolution_source_memory_ids'>,
+  memory: Pick<EffectiveMemoryRecord, 'memory_id' | 'resolution_source_memory_ids' | 'resolution_historical_memory_ids'>,
+  includeHistorical = false,
 ): AssistantRememberIntentRecord[] {
   const unique = new Map<string, AssistantRememberIntentRecord>();
-  for (const id of memory.resolution_source_memory_ids ?? [memory.memory_id]) {
+  // Retrieval ranks only CURRENT memories. Whisper alone may also cite
+  // a previous stage's self-authored Feel, clearly marked as historical.
+  const family = memory.resolution_source_memory_ids ?? [memory.memory_id];
+  const ids = includeHistorical
+    ? [...family, ...(memory.resolution_historical_memory_ids ?? [])]
+    : family;
+  for (const id of ids) {
     for (const intent of index.get(id) ?? []) unique.set(intent.intent_id, intent);
   }
   return [...unique.values()]
