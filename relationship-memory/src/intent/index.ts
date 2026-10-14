@@ -1,5 +1,5 @@
 import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
-import type { AssistantRememberIntentRecord } from '../schema/index.js';
+import type { AssistantIntentOutcome, AssistantRememberIntentRecord } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
 
 export const ASSISTANT_REMEMBER_TOOL_NAME = 'mcp__plugin_claude-subconscious_relationship-memory-intent__remember';
@@ -90,4 +90,34 @@ export function persistAssistantRememberIntents(
 ): AssistantRememberIntentRecord[] {
   for (const intent of intents) store.appendAssistantIntent(intent);
   return intents;
+}
+
+/** `deferred` outcomes per intent, counted in one pass over the outcome log. */
+export function deferredIntentCounts(outcomes: readonly AssistantIntentOutcome[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const outcome of outcomes) {
+    if (outcome.outcome === 'deferred') counts.set(outcome.intent_id, (counts.get(outcome.intent_id) ?? 0) + 1);
+  }
+  return counts;
+}
+
+export interface DeferredAssistantIntent {
+  intent: AssistantRememberIntentRecord;
+  deferrals: number;
+  last_deferred_at: string;
+}
+
+/** Intents whose latest outcome is `deferred`: released without a memory and still waiting to be resolved. */
+export function listDeferredAssistantIntents(store: RelationshipMemoryStore): DeferredAssistantIntent[] {
+  const outcomes = store.listAssistantIntentOutcomes();
+  const counts = deferredIntentCounts(outcomes);
+  const latest = new Map(outcomes.map((outcome) => [outcome.intent_id, outcome]));
+  const result: DeferredAssistantIntent[] = [];
+  for (const intent of store.listAssistantIntents()) {
+    const outcome = latest.get(intent.intent_id);
+    if (outcome?.outcome !== 'deferred') continue;
+    latest.delete(intent.intent_id); // first durable copy wins
+    result.push({ intent, deferrals: counts.get(intent.intent_id) ?? 0, last_deferred_at: outcome.recorded_at });
+  }
+  return result.sort((a, b) => a.intent.captured_at.localeCompare(b.intent.captured_at) || a.intent.intent_id.localeCompare(b.intent.intent_id));
 }

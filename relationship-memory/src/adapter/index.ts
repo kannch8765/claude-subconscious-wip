@@ -3,8 +3,9 @@ import * as path from 'path';
 import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
 import { MEMORY_KINDS, type AssistantRememberIntentRecord, type CanonicalMessage, type MemoryKind, type ParticipantRole, type TranscriptEvidenceKind } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
-import { MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES, MEMORY_REMEMBER_TOOL_NAMES, entityRememberToolSchema, entitySearchToolSchema, memoryMaintenanceReviewToolSchema, memoryRememberKindToolSchema, memoryRememberToolName, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime, type MemoryMaintenanceReviewToolName, type MemoryRememberToolName } from '../tools/index.js';
+import { MAX_UNRESOLVED_INTENT_TURNS, MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES, MEMORY_REMEMBER_TOOL_NAMES, entityRememberToolSchema, entitySearchToolSchema, memoryMaintenanceReviewToolSchema, memoryRememberKindToolSchema, memoryRememberToolName, memoryReinforceToolSchema, memorySearchToolSchema, RelationshipMemoryRuntime, type MemoryMaintenanceReviewToolName, type MemoryRememberToolName } from '../tools/index.js';
 import { rebuildProjection } from '../projection/index.js';
+import { listDeferredAssistantIntents } from '../intent/index.js';
 import { createSemanticRetrieverFromEnvironment } from '../retrieval/index.js';
 
 export interface RelationshipTool {
@@ -161,6 +162,33 @@ export function appendTrustedRelationshipCatalog(
     '  </assistant_remember_intent>',
   ].join('\n')).join('\n');
   return `${withEvidence}\n\n<assistant_remember_intent_catalog trusted="true">\n${entries}\n</assistant_remember_intent_catalog>`;
+}
+
+/** Extra observer turns a released (`deferred`) intent is re-offered in later batches of its own session. */
+export const MAX_DEFERRED_INTENT_REPLAYS = 3;
+
+/**
+ * Re-offers this session's deferred intents whose source message is already behind the cursor, together
+ * with that message as trusted evidence. Re-offered intents are past their blocking budget, so an
+ * observer that ignores them again cannot hold the batch.
+ */
+export function deferredIntentReplay(
+  store: RelationshipMemoryStore,
+  messages: TranscriptMessage[],
+  startIndex: number,
+  sessionId: string,
+  conversationId: string,
+): { intents: AssistantRememberIntentRecord[]; evidence: CanonicalMessage[] } {
+  const intents: AssistantRememberIntentRecord[] = [];
+  const evidence: CanonicalMessage[] = [];
+  for (const { intent, deferrals } of listDeferredAssistantIntents(store)) {
+    if (intent.session_id !== sessionId || deferrals >= MAX_UNRESOLVED_INTENT_TURNS + MAX_DEFERRED_INTENT_REPLAYS) continue;
+    const index = messages.findIndex((message) => message.uuid === intent.assistant_message_id);
+    if (index < 0 || index > startIndex) continue; // gone, or already inside the new range
+    intents.push(intent);
+    evidence.push(...buildCanonicalMessages([messages[index]], -1, conversationId));
+  }
+  return { intents, evidence };
 }
 
 export function makeBatchId(sessionId: string, startIndex: number, endIndex: number): string {

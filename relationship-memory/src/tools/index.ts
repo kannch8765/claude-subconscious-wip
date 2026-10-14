@@ -25,6 +25,7 @@ import { projectRelationReviewInbox } from '../review_inbox.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 import { linkedAssistantIntentIndex } from '../intent/provenance.js';
+import { deferredIntentCounts } from '../intent/index.js';
 
 export interface SearchQuery {
   kind?: MemoryKind;
@@ -1070,9 +1071,9 @@ export class RelationshipMemoryRuntime {
   /** Records a `deferred` outcome per unresolved intent and returns the ones that must still hold the batch. */
   private deferUnresolvedIntents(batchId: string, intentIds: readonly string[], now: string): string[] {
     if (intentIds.length === 0) return [];
-    const outcomes = this.store.listAssistantIntentOutcomes();
+    const deferrals = deferredIntentCounts(this.store.listAssistantIntentOutcomes());
     return intentIds.filter((intentId) => {
-      const turn = outcomes.filter((item) => item.intent_id === intentId && item.outcome === 'deferred').length + 1;
+      const turn = (deferrals.get(intentId) ?? 0) + 1;
       const released = turn >= MAX_UNRESOLVED_INTENT_TURNS;
       try {
         this.store.appendAssistantIntentOutcome({

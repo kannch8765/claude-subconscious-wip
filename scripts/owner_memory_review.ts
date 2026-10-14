@@ -4,6 +4,7 @@ import { RelationshipMemoryOwnerControlPlane } from '../relationship-memory/src/
 import { rebuildProjection } from '../relationship-memory/src/projection/index.js';
 import { materializeCurrentMemoryView, RelationshipMemoryResolutionControlPlane } from '../relationship-memory/src/resolution/index.js';
 import { findProjectedReview, projectRelationReviewInbox } from '../relationship-memory/src/review_inbox.js';
+import { listDeferredAssistantIntents } from '../relationship-memory/src/intent/index.js';
 import { intentsForEffectiveMemory, linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../relationship-memory/src/intent/provenance.js';
 import { auditEffectiveReviewCounts } from '../relationship-memory/src/review_audit.js';
 import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
@@ -14,6 +15,7 @@ export type OwnerMemoryReviewCommand =
   | { action: 'sources'; memory_id: string; page?: number }
   | { action: 'search'; query?: string; kind?: MemoryKind; active?: boolean; limit?: number }
   | { action: 'list_pending_reviews'; limit?: number }
+  | { action: 'list_deferred_intents'; limit?: number }
   | { action: 'get_review'; review_id: string }
   | { action: 'status' }
   | { action: 'audit_counts' }
@@ -162,6 +164,18 @@ export function executeOwnerMemoryReviewCommand(
     };
   }
 
+  if (command.action === 'list_deferred_intents') {
+    // Remember intents released without a memory; a later turn of the same session re-offers them.
+    const deferred = listDeferredAssistantIntents(store);
+    return {
+      intents: deferred.slice(0, command.limit ?? 5).map(({ intent, deferrals, last_deferred_at }) => ({
+        intent_id: intent.intent_id, session_id: intent.session_id, captured_at: intent.captured_at,
+        deferrals, last_deferred_at, memory: intent.memory.text, feel: intent.feel.text,
+      })),
+      total: deferred.length,
+    };
+  }
+
   if (command.action === 'status') {
     const canonicalMemories = owner.listEffective();
     const memories = materializeCurrentMemoryView(store);
@@ -296,6 +310,7 @@ function parseCommand(raw: unknown): OwnerMemoryReviewCommand {
   if (action === 'status') return { action };
   if (action === 'audit_counts') return { action };
   if (action === 'list_pending_reviews') return { action, limit: limit(command.limit, 5, 20) };
+  if (action === 'list_deferred_intents') return { action, limit: limit(command.limit, 5, 20) };
   if (action === 'get_review') return { action, review_id: requiredText(command.review_id, 'review_id') };
   if (action === 'show') return { action, memory_id: requiredText(command.memory_id, 'memory_id') };
   if (action === 'sources') {

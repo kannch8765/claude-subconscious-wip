@@ -457,3 +457,26 @@ describe('owner memory review command', () => {
   });
 
 });
+
+describe('deferred remember intents', () => {
+  it('lists intents released without a memory and skips ones resolved later', () => {
+    const { store, env, memoryId } = fixture();
+    const intent = (id: string, at: string) => ({
+      schema_version: 1 as const, intent_id: id, subject_id: 'kohaku', session_id: 'session', assistant_message_id: `a-${id}`,
+      tool_use_id: `t-${id}`, tool_name: 'remember', memory: { text: `memory ${id}` }, feel: { text: `feel ${id}` }, captured_at: at,
+    });
+    store.appendAssistantIntent(intent('waiting', '2026-09-30T00:00:00.000Z'));
+    store.appendAssistantIntent(intent('resolved', '2026-09-30T00:00:01.000Z'));
+    for (const turn of [1, 2, 3]) {
+      store.appendAssistantIntentOutcome({ intent_id: 'waiting', batch_id: `b${turn}`, outcome: 'deferred', recorded_at: `2026-09-30T00:0${turn}:00.000Z` });
+    }
+    store.appendAssistantIntentOutcome({ intent_id: 'resolved', batch_id: 'b1', outcome: 'deferred', recorded_at: '2026-09-30T00:01:00.000Z' });
+    store.appendAssistantIntentOutcome({ intent_id: 'resolved', batch_id: 'b4', outcome: 'accepted', memory_id: memoryId, recorded_at: '2026-09-30T00:04:00.000Z' });
+
+    expect(executeOwnerMemoryReviewCommand({ action: 'list_deferred_intents' }, env)).toEqual({
+      total: 1,
+      intents: [{ intent_id: 'waiting', session_id: 'session', captured_at: '2026-09-30T00:00:00.000Z', deferrals: 3,
+        last_deferred_at: '2026-09-30T00:03:00.000Z', memory: 'memory waiting', feel: 'feel waiting' }],
+    });
+  });
+});
