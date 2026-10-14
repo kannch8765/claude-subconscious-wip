@@ -75,6 +75,13 @@ export function memoryRememberToolName(kind: MemoryKind): MemoryRememberToolName
 export const MEMORY_REMEMBER_TOOL_NAMES = MEMORY_KINDS.map(memoryRememberToolName) as readonly MemoryRememberToolName[];
 
 export const MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES = ['suggest_memory_relation'] as const;
+
+/**
+ * A trusted assistant intent holds its batch (and the transcript cursor) open for at most this many
+ * completed observer turns. After that it is released as `deferred`, so one ignored intent cannot
+ * freeze a whole session; the durable intent stays queryable for a later replay.
+ */
+export const MAX_UNRESOLVED_INTENT_TURNS = 3;
 export type MemoryMaintenanceReviewToolName = (typeof MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES)[number];
 
 function boundedSearchLimit(value: number | undefined): number {
@@ -1060,6 +1067,31 @@ export class RelationshipMemoryRuntime {
     return this.persistOutcomePair(batchId, sourceKey, 'accepted', memoryId, now, assistantIntent);
   }
 
+  /** Records a `deferred` outcome per unresolved intent and returns the ones that must still hold the batch. */
+  private deferUnresolvedIntents(batchId: string, intentIds: readonly string[], now: string): string[] {
+    if (intentIds.length === 0) return [];
+    const outcomes = this.store.listAssistantIntentOutcomes();
+    return intentIds.filter((intentId) => {
+      const turn = outcomes.filter((item) => item.intent_id === intentId && item.outcome === 'deferred').length + 1;
+      const released = turn >= MAX_UNRESOLVED_INTENT_TURNS;
+      try {
+        this.store.appendAssistantIntentOutcome({
+          intent_id: intentId,
+          batch_id: batchId,
+          ...this.attemptFields(batchId),
+          outcome: 'deferred',
+          reason: released
+            ? `Unresolved after ${turn} completed observer turns; released so the transcript cursor can advance.`
+            : `Unresolved after completed observer turn ${turn} of ${MAX_UNRESOLVED_INTENT_TURNS}.`,
+          recorded_at: now,
+        });
+      } catch {
+        return true; // without a durable deferral record, keep holding the batch
+      }
+      return !released;
+    });
+  }
+
   finalizeBatch(batchId: string, sessionSucceeded: boolean): BatchCompletion {
     const now = this.now();
     const currentAttempt = this.currentAttempt(batchId);
@@ -1075,16 +1107,18 @@ export class RelationshipMemoryRuntime {
     const intentOutcomes = this.store.listAssistantIntentOutcomes().filter((item) => item.batch_id === batchId && inCurrentAttempt(item));
     const latestByIntent = new Map<string, AssistantIntentOutcome>();
     for (const outcome of intentOutcomes) latestByIntent.set(outcome.intent_id, outcome);
-    const unresolvedAssistantIntent = [...this.trustedAssistantIntents.keys()].some((intentId) => {
+    const unresolvedIntentIds = [...this.trustedAssistantIntents.keys()].filter((intentId) => {
       const latest = latestByIntent.get(intentId);
       return !latest || latest.outcome === 'retryable_failed';
     });
+    // Only a turn the observer actually completed counts against an intent's budget.
+    const blockingIntentIds = sessionSucceeded ? this.deferUnresolvedIntents(batchId, unresolvedIntentIds, now) : unresolvedIntentIds;
 
     const retryable = !sessionSucceeded
       || this.retryableAttempts.has(attemptId ?? `legacy:${batchId}`)
       || [...latestBySource.values()].some((item) => item.outcome === 'retryable_failed')
       || [...latestEntityBySource.values()].some((item) => item.outcome === 'retryable_failed')
-      || unresolvedAssistantIntent;
+      || blockingIntentIds.length > 0;
     const status: BatchCompletion = retryable ? 'retryable_failure' : 'completed';
     this.store.finalizeBatch({
       batch_id: batchId,

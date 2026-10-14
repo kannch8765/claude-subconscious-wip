@@ -7,6 +7,7 @@ import {
   appendTrustedRelationshipCatalog,
   cursorShouldAdvance,
   extractAssistantRememberIntents,
+  MAX_UNRESOLVED_INTENT_TURNS,
   memoryRememberKindToolSchema,
   persistAssistantRememberIntents,
   rebuildProjection,
@@ -258,7 +259,7 @@ describe('trusted intent processing and batch completeness', () => {
     expect(runtime(store).memorySearch({ query: 'feel-0' }).map((memory) => memory.memory_id)).toContain(memoryId);
   });
 
-  it('cannot finalize or advance the cursor while a trusted assistant intent is unresolved', () => {
+  it('holds the batch and cursor on the first turn that leaves a trusted assistant intent unresolved', () => {
     const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
     const intent = persistIntent(store, 'Needs processing.', 'Needs its feeling retained.');
     const rt = runtime(store, [intent]);
@@ -267,6 +268,51 @@ describe('trusted intent processing and batch completeness', () => {
     expect(completion).toBe('retryable_failure');
     expect(cursorShouldAdvance(completion)).toBe(false);
     expect(store.listBatches().at(-1)?.detail).toBeUndefined();
+  });
+
+  it('releases an intent the observer keeps ignoring so the session cursor can advance', () => {
+    const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+    const intent = persistIntent(store, 'Ignored by the observer.', 'Still worth keeping.');
+    const completions = Array.from({ length: MAX_UNRESOLVED_INTENT_TURNS }, (_, turn) => {
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch(`batch-turn-${turn}`, '2026-08-01T00:00:00Z');
+      return rt.finalizeBatch(`batch-turn-${turn}`, true);
+    });
+    expect(completions).toEqual([...Array(MAX_UNRESOLVED_INTENT_TURNS - 1).fill('retryable_failure'), 'completed']);
+    expect(cursorShouldAdvance(completions.at(-1)!)).toBe(true);
+    const deferrals = store.listAssistantIntentOutcomes().filter((item) => item.intent_id === intent.intent_id);
+    expect(deferrals.map((item) => item.outcome)).toEqual(Array(MAX_UNRESOLVED_INTENT_TURNS).fill('deferred'));
+    expect(deferrals.at(-1)?.reason).toContain('released');
+    expect(store.getTerminalAssistantIntentOutcome(intent.intent_id)).toBeUndefined();
+  });
+
+  it('does not spend the intent budget on turns where the observer itself failed', () => {
+    const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+    const intent = persistIntent(store, 'Waiting on a healthy observer.', 'Patient.');
+    for (let turn = 0; turn < MAX_UNRESOLVED_INTENT_TURNS + 1; turn++) {
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch(`batch-down-${turn}`, '2026-08-01T00:00:00Z');
+      expect(rt.finalizeBatch(`batch-down-${turn}`, false)).toBe('retryable_failure');
+    }
+    expect(store.listAssistantIntentOutcomes()).toEqual([]);
+  });
+
+  it('still links a released intent when a later batch resolves it', () => {
+    const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+    const intent = persistIntent(store, 'Remember the inclusion gesture.', 'It made me feel held in mind.');
+    for (let turn = 0; turn < MAX_UNRESOLVED_INTENT_TURNS; turn++) {
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch(`batch-skip-${turn}`, '2026-08-01T00:00:00Z');
+      rt.finalizeBatch(`batch-skip-${turn}`, true);
+    }
+    const replay = runtime(store, [intent]);
+    replay.store.beginBatch('batch-replay', '2026-08-03T00:00:00Z');
+    const remembered = replay.remember('batch-replay', proposal(intent.intent_id));
+    expect(remembered.outcome).toBe('accepted');
+    expect(replay.finalizeBatch('batch-replay', true)).toBe('completed');
+    expect(store.getTerminalAssistantIntentOutcome(intent.intent_id)).toEqual(expect.objectContaining({
+      outcome: 'accepted', memory_id: remembered.memory_id,
+    }));
   });
 
   it('preserves intent/link ledgers across reopen and searches through linked memory/feel text', () => {
