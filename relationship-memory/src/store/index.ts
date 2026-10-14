@@ -381,7 +381,7 @@ export class RelationshipMemoryStore {
 
   getTerminalAssistantIntentOutcome(intentId: string, batchId?: string): AssistantIntentOutcome | undefined {
     return [...this.listAssistantIntentOutcomes()].reverse().find((item) =>
-      item.intent_id === intentId && (!batchId || item.batch_id === batchId) && item.outcome !== 'retryable_failed');
+      item.intent_id === intentId && (!batchId || item.batch_id === batchId) && item.outcome !== 'retryable_failed' && item.outcome !== 'deferred');
   }
 
   getEntity(entityId: string): EntityIdentityRecord | undefined { return this.listEntities().find((item) => item.entity_id === entityId); }

@@ -11,7 +11,8 @@ export type ParticipantRole = 'user' | 'assistant';
 export type TranscriptEvidenceKind = 'user_text' | 'assistant_text' | 'assistant_tool_use' | 'tool_result';
 export type RememberOutcomeKind = 'accepted' | 'duplicate' | 'permanently_rejected' | 'retryable_failed';
 export type BatchCompletion = 'completed' | 'retryable_failure';
-export type AssistantIntentOutcomeKind = RememberOutcomeKind;
+/** `deferred`: the observer finished a turn without resolving the intent. Not terminal; see MAX_UNRESOLVED_INTENT_TURNS. */
+export type AssistantIntentOutcomeKind = RememberOutcomeKind | 'deferred';
 export const ENTITY_TYPES = ['user', 'assistant', 'other'] as const;
 export type EntityType = (typeof ENTITY_TYPES)[number];
 
