@@ -2,6 +2,7 @@ import type {
   AssistantIntentOutcome,
   AssistantRememberIntentRecord,
   BatchCompletion,
+  BatchRetryReason,
   CanonicalMessage,
   CanonicalMemoryRecord,
   EffectiveMemoryRecord,
@@ -162,6 +163,14 @@ export class RelationshipMemoryRuntime {
 
   private attemptKey(batchId: string): string {
     return this.currentAttempt(batchId)?.attempt_id ?? `legacy:${batchId}`;
+  }
+
+  /**
+   * Holds the current attempt for an owned-work failure that produced no
+   * outcome record (e.g. an exception escaping a mutation tool).
+   */
+  markAttemptRetryable(batchId: string): void {
+    this.retryableAttempts.add(this.attemptKey(batchId));
   }
 
   private ensureRetryAttempt(batchId: string, now: string): void {
@@ -1115,11 +1124,13 @@ export class RelationshipMemoryRuntime {
     // Only a turn the observer actually completed counts against an intent's budget.
     const blockingIntentIds = sessionSucceeded ? this.deferUnresolvedIntents(batchId, unresolvedIntentIds, now) : unresolvedIntentIds;
 
-    const retryable = !sessionSucceeded
-      || this.retryableAttempts.has(attemptId ?? `legacy:${batchId}`)
-      || [...latestBySource.values()].some((item) => item.outcome === 'retryable_failed')
-      || [...latestEntityBySource.values()].some((item) => item.outcome === 'retryable_failed')
-      || blockingIntentIds.length > 0;
+    const retryReasons: BatchRetryReason[] = [];
+    if (!sessionSucceeded) retryReasons.push('turn_failed');
+    if (this.retryableAttempts.has(attemptId ?? `legacy:${batchId}`)) retryReasons.push('attempt_retryable');
+    if ([...latestBySource.values()].some((item) => item.outcome === 'retryable_failed')) retryReasons.push('memory_retryable');
+    if ([...latestEntityBySource.values()].some((item) => item.outcome === 'retryable_failed')) retryReasons.push('entity_retryable');
+    if (blockingIntentIds.length > 0) retryReasons.push('intent_blocking');
+    const retryable = retryReasons.length > 0;
     const status: BatchCompletion = retryable ? 'retryable_failure' : 'completed';
     this.store.finalizeBatch({
       batch_id: batchId,
@@ -1128,6 +1139,7 @@ export class RelationshipMemoryRuntime {
       created_at: currentAttempt?.created_at ?? now,
       finalized_at: now,
       ...(!retryable && outcomes.length === 0 && entityOutcomes.length === 0 && this.trustedAssistantIntents.size === 0 ? { detail: 'no_memory_required' as const } : {}),
+      ...(retryable ? { retry_reasons: retryReasons } : {}),
     });
     return status;
   }

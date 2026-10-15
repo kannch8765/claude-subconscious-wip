@@ -59,7 +59,7 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(worker).toContain("if (status === 'already_delivered') writeSyncCheckpoint(payload, 'no_whisper')");
     expect(worker).toContain("else writeSyncCheckpoint(payload, 'whisper', whisperId)");
     expect(worker).toContain('if (isSync && !foregroundReleased)');
-    expect(worker).toContain('if (whisperResolved) throw new Error');
+    expect(worker).toContain("if (whisperResolved) return { status: 'already_resolved'");
     expect(worker).toContain('clientToolRoundGate: syncClientToolRoundGate');
     expect(worker).toContain('Post-whisper sync failure cleanup deferred');
     expect(worker).toContain('cancelAndDeferSyncResources');

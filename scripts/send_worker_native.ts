@@ -131,6 +131,13 @@ function requireMaintenanceSearchProvenance(
 }
 
 
+/** Lists what deliver_whisper may select this turn so the model can self-correct. */
+export function describeSurfacedRecall(surfaced: ReadonlyMap<string, { snippets: ReadonlyMap<string, unknown> }>): string {
+  if (surfaced.size === 0) return 'Nothing was surfaced yet; call memory_search with purpose=foreground_recall first.';
+  const entries = [...surfaced].map(([memoryId, memory]) => `${memoryId} (snippet_ids: ${[...memory.snippets.keys()].join(', ') || 'none'})`);
+  return `Surfaced this turn: ${entries.join('; ')}.`;
+}
+
 export function renderHistoricalWhisperQuotes(snippets: readonly HistoricalRecallSnippet[]): string {
   const lines: string[] = [];
   let activeDate = '';
@@ -225,9 +232,17 @@ export async function sendViaNativeClient(
             const rawArgs = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
             const purpose = rawArgs.purpose;
             const { purpose: _purpose, ...searchArgs } = rawArgs;
-            const result = isSync
-              ? { results: await runtime.entitySearchRecallHybrid(searchArgs as any) }
-              : await execute(toolCallId, searchArgs);
+            let result;
+            try {
+              result = isSync
+                ? { results: await runtime.entitySearchRecallHybrid(searchArgs as any) }
+                : await execute(toolCallId, searchArgs);
+            } catch (error) {
+              // A failed maintenance lookup can hide an owned entity write; a
+              // failed grounding lookup only degrades the optional whisper.
+              if (!isSync && purpose !== 'foreground_grounding') runtime.markAttemptRetryable(payload.batchId);
+              throw error;
+            }
             entitySearchObservations.push({ purpose, query: searchArgs.query, result });
             return result;
           },
@@ -258,9 +273,17 @@ export async function sendViaNativeClient(
             const search = { ...searchArgs, ...(foreground ? { excludeMemoryIds } : {}) };
             // Both async purposes use the owner-reviewed current view. Maintenance
             // still refreshes semantic vectors for new memories; foreground is read-only.
-            const results = !isSync && !foreground
-              ? await runtime.memorySearchMaintenanceCurrentWithEvidence(search as any)
-              : await runtime.memorySearchRecallHybridWithEvidence(search as any);
+            let results;
+            try {
+              results = !isSync && !foreground
+                ? await runtime.memorySearchMaintenanceCurrentWithEvidence(search as any)
+                : await runtime.memorySearchRecallHybridWithEvidence(search as any);
+            } catch (error) {
+              // Same ownership split as entity_search: maintenance feeds memory
+              // writes, foreground_recall only feeds deliver_whisper.
+              if (!isSync && !foreground) runtime.markAttemptRetryable(payload.batchId);
+              throw error;
+            }
             if (purpose === 'maintenance') {
               for (const memory of results as any[]) {
                 if (typeof memory?.memory_id === 'string' && memory.memory_id) maintenanceSearchedMemoryIds.add(memory.memory_id);
@@ -303,9 +326,19 @@ export async function sendViaNativeClient(
         ...tool,
         async execute(toolCallId: string, args: unknown) {
           if (MEMORY_MAINTENANCE_REVIEW_TOOL_SET.has(tool.name)) {
+            // Model-input validation: returned to the model, never a batch verdict.
             requireMaintenanceSearchProvenance(tool.name, args, maintenanceSearchedMemoryIds);
           }
-          const result = await runtime.store.withMutationBoundary(() => execute(toolCallId, args)) as any;
+          let result: any;
+          try {
+            result = await runtime.store.withMutationBoundary(() => execute(toolCallId, args));
+          } catch (error) {
+            // Business failures come back as ledger outcomes; anything thrown
+            // here is an unrecorded owned-work failure and must hold the batch.
+            runtime.markAttemptRetryable(payload.batchId);
+            log(`Owned-work tool ${tool.name} threw; holding batch ${payload.batchId}: ${error instanceof Error ? error.message : String(error)}`);
+            throw error;
+          }
           if (tool.name.startsWith('memory_remember_') && result?.outcome === 'accepted' && typeof result.memory_id === 'string') {
             markSessionWrittenMemory(payload.cwd, payload.sessionId, result.memory_id, log);
             const memory = runtime.store.getMemory(result.memory_id);
@@ -371,18 +404,18 @@ export async function sendViaNativeClient(
         },
       },
       async execute(_toolCallId: string, args: unknown) {
-        if (whisperResolved) throw new Error('deliver_whisper may be called at most once per batch');
+        if (whisperResolved) return { status: 'already_resolved', reason: 'deliver_whisper runs at most once per batch; this batch already resolved its whisper.' };
         const raw = args && typeof args === 'object' && !Array.isArray(args) ? args as Record<string, unknown> : {};
         const memoryId = typeof raw.memory_id === 'string' ? raw.memory_id.trim() : '';
         const snippetIds = Array.isArray(raw.snippet_ids)
           ? raw.snippet_ids.filter((value): value is string => typeof value === 'string').map((value) => value.trim()).filter(Boolean)
           : [];
         if (!memoryId || snippetIds.length < 1 || snippetIds.length > 3 || new Set(snippetIds).size !== snippetIds.length) {
-          throw new Error('deliver_whisper requires one searched memory_id and 1-3 unique snippet_ids');
+          throw new Error(`deliver_whisper requires one searched memory_id and 1-3 unique snippet_ids. ${describeSurfacedRecall(surfacedRecallMemories)}`);
         }
         const surfacedMemory = surfacedRecallMemories.get(memoryId);
         if (!surfacedMemory || snippetIds.some((snippetId) => !surfacedMemory.snippets.has(snippetId))) {
-          throw new Error('deliver_whisper may select only one memory and quote snippets surfaced by a prior foreground_recall memory_search in this turn');
+          throw new Error(`deliver_whisper may select only one memory and quote snippets surfaced by a prior foreground_recall memory_search in this turn. ${describeSurfacedRecall(surfacedRecallMemories)}`);
         }
         const snippets = snippetIds.map((snippetId) => surfacedMemory.snippets.get(snippetId)!);
         const historicalWindow = renderHistoricalMemoryWhisper(surfacedMemory.summary, snippets);
@@ -526,10 +559,19 @@ export async function sendViaNativeClient(
         await stdioMcp.close();
       }
     }
-    turnSucceeded = !result.clientToolFailure;
+    // The observer completed a turn over this batch. Tool errors were returned
+    // to the model as feedback; only the owned-work ledger decides the batch.
+    turnSucceeded = true;
+    const toolErrors = result.toolErrors ?? [];
+    for (const toolError of toolErrors) {
+      // An unparseable owned-work call never reached the ledger.
+      if (!isSync && toolError.kind === 'invalid_arguments' && isRelationshipMutationClientTool(toolError.name)) {
+        runtime.markAttemptRetryable(payload.batchId);
+      }
+      log(`Client tool error returned to model: tool=${toolError.name}, kind=${toolError.kind}, message=${JSON.stringify(toolError.message.slice(0, 200))}`);
+    }
     const stopReason = result.response?.stop_reason?.stop_reason ?? result.response?.stop_reason?.reason ?? 'end_turn';
-    log(`Native live turn complete: mode=${mode}, success=${turnSucceeded}, stop_reason=${stopReason}`);
-    if (result.clientToolFailure) log('Native live turn contained at least one failed client-tool execution');
+    log(`Native live turn complete: mode=${mode}, success=${turnSucceeded}, tool_errors=${toolErrors.length}, stop_reason=${stopReason}`);
     if (isSync && !foregroundReleased) {
       writeSyncCheckpoint(payload, 'no_whisper');
       foregroundReleased = true;
