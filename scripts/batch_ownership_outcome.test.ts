@@ -70,10 +70,10 @@ function setup(): { root: string } {
   return { root };
 }
 
-function seedMemory(root: string): void {
+function seedMemory(root: string, memoryId = 'mem-tea'): void {
   new RelationshipMemoryStore(root, 'kohaku').appendMemory({
     schema_version: 1,
-    memory_id: 'mem-tea',
+    memory_id: memoryId,
     subject_id: 'kohaku',
     kind: 'shared_experience',
     summary: '猫和琥珀聊到绿茶。',
@@ -82,13 +82,13 @@ function seedMemory(root: string): void {
     status: 'active',
     observed_at: '2026-08-02T10:00:00.000Z',
     created_at: '2026-08-02T10:00:00.000Z',
-    source_key: 'source-mem-tea',
-    dedupe_key: 'dedupe-mem-tea',
+    source_key: `source-${memoryId}`,
+    dedupe_key: `dedupe-${memoryId}`,
   }, [{
-    evidence_id: 'evidence-mem-tea',
-    memory_id: 'mem-tea',
+    evidence_id: `evidence-${memoryId}`,
+    memory_id: memoryId,
     conversation_id: 'conv-old',
-    message_id: 'message-mem-tea',
+    message_id: `message-${memoryId}`,
     role: 'user',
     quote: '猫以前说过绿茶。',
     captured_at: '2026-08-02T10:00:00.000Z',
@@ -208,6 +208,34 @@ describe('ownership-based batch outcome', () => {
     ]);
     expect(toolReturnsOf(bodies[2])[0].status).toBe('error');
     expect(completion).toBe('completed');
+  });
+
+  it('does not hold the batch for malformed relation-suggestion arguments after a successful memory write', async () => {
+    const { root } = setup();
+    const { completion, batch, bodies } = await runAsync(root, 'batch-suggest-bad-json', [
+      () => [search('foreground_recall')],
+      () => [{ name: 'memory_remember_user_preference', args: rememberArgs }],
+      () => [{ name: 'suggest_memory_relation', args: '{"memory_ids": ' }],
+    ]);
+    expect(parse(toolReturnsOf(bodies[2])[0]).outcome).toBe('accepted');
+    expect(toolReturnsOf(bodies[3])[0].status).toBe('error');
+    expect(completion).toBe('completed');
+    expect(batch).not.toHaveProperty('retry_reasons');
+  });
+
+  it('does not hold the batch when relation-suggestion persistence throws after a successful memory write', async () => {
+    const { root } = setup();
+    seedMemory(root, 'mem-tea-again');
+    vi.spyOn(RelationshipMemoryRuntime.prototype, 'suggestMaintenanceReview').mockImplementation(() => { throw new Error('review store unavailable'); });
+    const { completion, batch, bodies } = await runAsync(root, 'batch-suggest-throws', [
+      () => [search('maintenance')],
+      () => [{ name: 'memory_remember_user_preference', args: rememberArgs }],
+      () => [{ name: 'suggest_memory_relation', args: { memory_ids: ['mem-tea', 'mem-tea-again'], relation: 'related', reason: 'test' } }],
+    ]);
+    expect(parse(toolReturnsOf(bodies[2])[0]).outcome).toBe('accepted');
+    expect(toolReturnsOf(bodies[3])[0]).toEqual(expect.objectContaining({ status: 'error', tool_return: 'review store unavailable' }));
+    expect(completion).toBe('completed');
+    expect(batch).not.toHaveProperty('retry_reasons');
   });
 
   it('holds the batch when a maintenance search fails but not when a foreground_recall search fails', async () => {

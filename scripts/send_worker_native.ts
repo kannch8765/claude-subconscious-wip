@@ -110,6 +110,11 @@ interface SurfacedRecallMemory {
 
 const MEMORY_MAINTENANCE_REVIEW_TOOL_SET = new Set<string>(MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES);
 
+/** Mutation tools whose failure leaves batch-owned work unsettled; relation suggestions are optional. */
+function ownsBatchWork(toolName: string): boolean {
+  return isRelationshipMutationClientTool(toolName) && !MEMORY_MAINTENANCE_REVIEW_TOOL_SET.has(toolName);
+}
+
 function maintenanceReviewMemoryIds(args: unknown): string[] {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return [];
   const raw = (args as Record<string, unknown>).memory_ids;
@@ -335,8 +340,10 @@ export async function sendViaNativeClient(
           } catch (error) {
             // Business failures come back as ledger outcomes; anything thrown
             // here is an unrecorded owned-work failure and must hold the batch.
-            runtime.markAttemptRetryable(payload.batchId);
-            log(`Owned-work tool ${tool.name} threw; holding batch ${payload.batchId}: ${error instanceof Error ? error.message : String(error)}`);
+            if (ownsBatchWork(tool.name)) {
+              runtime.markAttemptRetryable(payload.batchId);
+              log(`Owned-work tool ${tool.name} threw; holding batch ${payload.batchId}: ${error instanceof Error ? error.message : String(error)}`);
+            }
             throw error;
           }
           if (tool.name.startsWith('memory_remember_') && result?.outcome === 'accepted' && typeof result.memory_id === 'string') {
@@ -565,7 +572,7 @@ export async function sendViaNativeClient(
     const toolErrors = result.toolErrors ?? [];
     for (const toolError of toolErrors) {
       // An unparseable owned-work call never reached the ledger.
-      if (!isSync && toolError.kind === 'invalid_arguments' && isRelationshipMutationClientTool(toolError.name)) {
+      if (!isSync && toolError.kind === 'invalid_arguments' && ownsBatchWork(toolError.name)) {
         runtime.markAttemptRetryable(payload.batchId);
       }
       log(`Client tool error returned to model: tool=${toolError.name}, kind=${toolError.kind}, message=${JSON.stringify(toolError.message.slice(0, 200))}`);
