@@ -98,6 +98,13 @@ export interface ClientToolRoundGateContext {
 
 export type ClientToolRoundGate = (context: ClientToolRoundGateContext) => string | undefined;
 
+/** One client tool call that was returned to the model with status=error. */
+export interface NativeClientToolError {
+  name: string;
+  kind: 'invalid_arguments' | 'execution';
+  message: string;
+}
+
 function normalizeToolCall(value: any): NativeClientToolRequest | null {
   if (!value) return null;
   const fn = value.function ?? value;
@@ -247,13 +254,13 @@ export async function runNativeClientToolConversation(input: {
   requiredClientToolNames?: readonly string[];
   continuationBusyRetry?: ContinuationBusyRetryPolicy;
   clientToolRoundGate?: ClientToolRoundGate;
-}): Promise<{ response: any; clientToolFailure: boolean; terminal?: 'completed' | 'no_memory_required' }> {
+}): Promise<{ response: any; clientToolFailure: boolean; toolErrors: NativeClientToolError[]; terminal?: 'completed' | 'no_memory_required' }> {
   const schemas = clientToolSchemas(input.tools);
   const tools = new Map(input.tools.map((tool) => [tool.name, tool]));
   const requiredClientToolNames = new Set(input.requiredClientToolNames ?? []);
   const completedRequiredClientTools = new Set<string>();
   const completedClientTools = new Set<string>();
-  let clientToolFailure = false;
+  const toolErrors: NativeClientToolError[] = [];
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
   let response = await collectLettaStream(await input.client.conversations.messages.create(input.conversationId, {
     agent_id: input.agentId,
@@ -281,7 +288,7 @@ export async function runNativeClientToolConversation(input: {
       if (missingRequired.length > 0) {
         throw new Error(`Letta native conversation ended before required client tool completion: ${missingRequired.join(', ')}`);
       }
-      return { response, clientToolFailure, terminal: terminalSeen };
+      return { response, clientToolFailure: toolErrors.length > 0, toolErrors, terminal: terminalSeen };
     }
 
     const approvals: any[] = [];
@@ -301,14 +308,17 @@ export async function runNativeClientToolConversation(input: {
       }
       let status: 'success' | 'error' = 'success';
       let result: string;
+      let kind: NativeClientToolError['kind'] = 'invalid_arguments';
       try {
-        result = toolReturn(await tool.execute(request.toolCallId, parseToolArguments(request.arguments)));
+        const args = parseToolArguments(request.arguments);
+        kind = 'execution';
+        result = toolReturn(await tool.execute(request.toolCallId, args));
         completedClientTools.add(request.name);
         if (requiredClientToolNames.has(request.name)) completedRequiredClientTools.add(request.name);
       } catch (error) {
         status = 'error';
-        clientToolFailure = true;
         result = error instanceof Error ? error.message : String(error);
+        toolErrors.push({ name: request.name, kind, message: result });
       }
       approvals.push({ type: 'tool', tool_call_id: request.toolCallId, tool_return: result, status });
     }

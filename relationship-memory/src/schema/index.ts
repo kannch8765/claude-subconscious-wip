@@ -179,7 +179,11 @@ export interface BatchRecord {
   created_at: string;
   finalized_at?: string;
   detail?: 'no_memory_required';
+  /** Why a retryable_failure attempt held the cursor. Absent on completed attempts. */
+  retry_reasons?: BatchRetryReason[];
 }
+
+export type BatchRetryReason = 'turn_failed' | 'attempt_retryable' | 'memory_retryable' | 'entity_retryable' | 'intent_blocking';
 
 export interface ValidationResult {
   ok: boolean;

@@ -127,7 +127,8 @@ describe('live async relationship-memory surfacing contract', () => {
     const worker = fs.readFileSync(path.join(process.cwd(), 'scripts/send_worker_native.ts'), 'utf8');
     expect(worker).toContain('createNativeLettaClient');
     expect(worker).toContain('runNativeClientToolConversation');
-    expect(worker).toContain('turnSucceeded = !result.clientToolFailure');
+    expect(worker).toContain('turnSucceeded = true');
+    expect(worker).not.toContain('turnSucceeded = !result.clientToolFailure');
     expect(worker).toContain('turnSucceeded = false');
     expect(worker).toContain('runtime.finalizeBatch(payload.batchId, turnSucceeded)');
     expect(worker).toContain('markConversationForRetryRotation(');
