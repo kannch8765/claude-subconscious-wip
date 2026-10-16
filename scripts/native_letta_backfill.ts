@@ -24,13 +24,9 @@ export interface NativeLettaClientLike {
     upsert(body: Record<string, unknown>): Promise<any>;
   };
   conversations: {
-    retrieve?(conversationId: string): Promise<{ in_context_message_ids?: string[] | null }>;
     messages: {
       create(conversationId: string, body: Record<string, unknown>): Promise<AsyncIterable<any>>;
     };
-  };
-  messages?: {
-    retrieve(messageId: string): Promise<any[]>;
   };
 }
 
@@ -208,20 +204,18 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * How the first send of a turn waits for the conversation, following Letta's own letta-code CLI:
- * a busy 409 is retried with exponential backoff (letta-code: 10/20/40 s), and approvals left
- * pending by an interrupted run are denied and the message resent with the denials prepended.
- * Our turns run longer than letta-code's, so the total wait is bounded by `busyMaxWaitMs`
- * (keep it under Letta's 300 s conversation lock TTL) instead of a fixed three retries.
+ * How the first send of a turn waits for the conversation. Like Letta's own letta-code CLI, a busy
+ * 409 is retried with exponential backoff (letta-code: 10/20/40 s). Our turns run longer than
+ * letta-code's, so the total wait is bounded by `busyMaxWaitMs` (keep it under Letta's 300 s
+ * conversation lock TTL) instead of a fixed three retries.
+ *
+ * "Waiting for approval" is waited out the same way and never answered here: letta-code denies
+ * pending approvals because they are its own interrupted session, but ours can belong to a sibling
+ * worker that is still executing tools, and elapsed time cannot prove that worker has exited.
  */
 export interface InitialSendBusyPolicy {
   busyMaxWaitMs: number;
   busyBaseDelayMs?: number;
-  /**
-   * A pending approval may belong to a sibling worker that is still running between tool rounds,
-   * so it is only treated as stale once the same tool calls stay pending this long.
-   */
-  staleApprovalAfterMs?: number;
   onWait?: (event: InitialSendWaitEvent) => void;
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
@@ -229,10 +223,7 @@ export interface InitialSendBusyPolicy {
 
 export type InitialSendWaitEvent =
   | { kind: 'busy' | 'approval_pending'; attempt: number; delayMs: number; waitedMs: number }
-  | { kind: 'denied_stale_approvals'; toolCallIds: string[]; waitedMs: number }
   | { kind: 'accepted'; attempts: number; waitedMs: number };
-
-const STALE_APPROVAL_DENIAL_REASON = 'Auto-denied: stale approval from interrupted session';
 
 export function classifyPreStreamConflict(error: unknown): 'busy' | 'approval_pending' | undefined {
   const message = error instanceof Error ? error.message : String(error);
@@ -242,54 +233,24 @@ export function classifyPreStreamConflict(error: unknown): 'busy' | 'approval_pe
   return undefined;
 }
 
-/** Tool calls the conversation is waiting on, found the way letta-code does (last in-context message). */
-async function pendingApprovalToolCallIds(client: NativeLettaClientLike, conversationId: string): Promise<string[]> {
-  if (!client.conversations.retrieve || !client.messages) return [];
-  const conversation = await client.conversations.retrieve(conversationId);
-  const lastId = conversation?.in_context_message_ids?.at(-1);
-  if (!lastId) return [];
-  const messages = await client.messages.retrieve(lastId);
-  return approvalRequests(Array.isArray(messages) ? messages : []).map((request) => request.toolCallId).sort();
-}
-
 async function createInitialStream(
-  client: NativeLettaClientLike,
-  conversationId: string,
-  body: Record<string, unknown> & { messages: any[] },
+  create: () => Promise<AsyncIterable<any>>,
   policy?: InitialSendBusyPolicy,
 ): Promise<AsyncIterable<any>> {
-  if (!policy) return client.conversations.messages.create(conversationId, body);
+  if (!policy) return create();
   const now = policy.now ?? Date.now;
   const sleep = policy.sleep ?? delay;
   const maxWaitMs = Math.max(0, Math.round(policy.busyMaxWaitMs));
   const baseDelayMs = Math.max(1, Math.round(policy.busyBaseDelayMs ?? 10_000));
-  const staleAfterMs = Math.max(0, Math.round(policy.staleApprovalAfterMs ?? 90_000));
   const startedAt = now();
-  let messages = body.messages;
-  let pending: { ids: string; since: number } | undefined;
-  let denied = false;
   for (let attempt = 1; ; attempt += 1) {
     try {
-      const stream = await client.conversations.messages.create(conversationId, { ...body, messages });
+      const stream = await create();
       policy.onWait?.({ kind: 'accepted', attempts: attempt, waitedMs: now() - startedAt });
       return stream;
     } catch (error) {
       const kind = classifyPreStreamConflict(error);
       if (!kind) throw error;
-      if (kind === 'approval_pending' && !denied) {
-        const ids = await pendingApprovalToolCallIds(client, conversationId);
-        const key = ids.join(',');
-        if (ids.length > 0 && pending?.ids === key && now() - pending.since >= staleAfterMs) {
-          denied = true;
-          messages = [
-            { type: 'approval', approvals: ids.map((id) => ({ type: 'approval', tool_call_id: id, approve: false, reason: STALE_APPROVAL_DENIAL_REASON })) },
-            ...body.messages,
-          ];
-          policy.onWait?.({ kind: 'denied_stale_approvals', toolCallIds: ids, waitedMs: now() - startedAt });
-          continue;
-        }
-        if (pending?.ids !== key) pending = { ids: key, since: now() };
-      }
       const waitedMs = now() - startedAt;
       if (waitedMs >= maxWaitMs) throw error;
       const delayMs = Math.min(baseDelayMs * 2 ** (attempt - 1), maxWaitMs - waitedMs);
@@ -359,12 +320,15 @@ export async function runNativeClientToolConversation(input: {
   const completedClientTools = new Set<string>();
   const toolErrors: NativeClientToolError[] = [];
   let terminalSeen: 'completed' | 'no_memory_required' | undefined;
-  let response = await collectLettaStream(await createInitialStream(input.client, input.conversationId, {
-    agent_id: input.agentId,
-    streaming: true,
-    messages: [{ role: 'user', content: input.message }],
-    client_tools: schemas,
-  }, input.initialBusyRetry));
+  let response = await collectLettaStream(await createInitialStream(
+    () => input.client.conversations.messages.create(input.conversationId, {
+      agent_id: input.agentId,
+      streaming: true,
+      messages: [{ role: 'user', content: input.message }],
+      client_tools: schemas,
+    }),
+    input.initialBusyRetry,
+  ));
 
   for (let round = 0; round < MAX_CLIENT_TOOL_ROUNDS; round += 1) {
     const stopReason = response?.stop_reason?.stop_reason ?? response?.stop_reason?.reason ?? response?.stop_reason;

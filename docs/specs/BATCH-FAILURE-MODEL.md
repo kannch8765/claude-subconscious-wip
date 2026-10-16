@@ -131,13 +131,14 @@ working around the server:
 - **Busy:** retry with letta-code's exponential backoff (10 s, 20 s, 40 s, …), bounded by a
   total wait of 240 s (below the 300 s lock TTL). letta-code stops after three retries; our
   turns are longer (p90 ≈ 100 s), hence the time budget.
-- **Waiting for approval:** letta-code denies the pending tool calls it finds on the last
-  in-context message and resends with the denials prepended (Letta 0.16.8 accepts an approval
-  followed by the user message). A pending approval may also be a live sibling worker between
-  tool rounds, so we deny only when the *same* tool call ids stay pending for 90 s, and at most once.
+- **Waiting for approval:** waited out with the same backoff, never answered. letta-code denies
+  pending approvals because they belong to its own interrupted session; ours can belong to a
+  sibling worker that is still executing tools (the ids stay unchanged throughout), and elapsed
+  time can't prove that worker has exited. If an approval outlives the budget the attempt fails
+  as retryable. Recovering a truly orphaned approval needs proof of owner exit (later, if it shows up).
 - Async lane only (`initialBusyRetry`). Sync keeps its 3 s continuation retry; its first send
   is foreground-latency bound.
 - Whisper behaviour is unchanged. A waited turn produces a later whisper; `ready_latency_ms`
   already measures that, so any staleness cut-off waits for data.
-- Each wait is logged (`Initial send busy|approval_pending|denied_stale_approvals|accepted`).
+- Each wait is logged (`Initial send busy|approval_pending|accepted`).
 - Tests: `native_letta_backfill.test.ts` › *initial send waits for a busy conversation*.

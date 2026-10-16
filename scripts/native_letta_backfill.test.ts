@@ -316,7 +316,7 @@ const BUSY_409 = '409 {"detail":"CONFLICT: Cannot send a new message: Another re
 const APPROVAL_409 = '409 {"detail":"Cannot send a new message: The agent is waiting for approval on a tool call. Please approve or deny the pending request before continuing."}';
 
 /** A fake clock and an initial send that fails with the given errors before succeeding. */
-function initialSendHarness(failures: string[], pendingIds: string[][] = []) {
+function initialSendHarness(failures: string[]) {
   const client = fakeClient([{ messages: [], stop_reason: 'end_turn' }]);
   const originalCreate = client.conversations.messages.create.bind(client.conversations.messages);
   const sent: any[][] = [];
@@ -325,16 +325,6 @@ function initialSendHarness(failures: string[], pendingIds: string[][] = []) {
     const failure = failures.shift();
     if (failure) throw new Error(failure);
     return originalCreate(conversationId, body);
-  };
-  const lookups: string[][] = [];
-  client.conversations.retrieve = async () => ({ in_context_message_ids: ['msg-first', 'msg-last'] });
-  client.messages = {
-    async retrieve(messageId) {
-      expect(messageId).toBe('msg-last');
-      const ids = pendingIds.shift() ?? [];
-      lookups.push(ids);
-      return [{ message_type: 'approval_request_message', tool_calls: ids.map((id) => ({ name: 'memory_search', arguments: '{}', tool_call_id: id })) }];
-    },
   };
   let clock = 0;
   const sleeps: number[] = [];
@@ -349,16 +339,18 @@ function initialSendHarness(failures: string[], pendingIds: string[][] = []) {
     client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source', tools: [],
     initialBusyRetry: { ...policy, ...overrides },
   });
-  return { client, sent, sleeps, events, lookups, run };
+  return { client, sent, sleeps, events, run };
 }
 
-describe('initial send waits for a busy conversation (letta-code pattern)', () => {
+const onlyTheUserTurn = (sent: any[][]) => sent.every((messages) => messages.length === 1 && messages[0].role === 'user' && messages[0].content === 'source');
+
+describe('initial send waits for a busy conversation (letta-code backoff)', () => {
   it('backs off 10/20/40 s on a busy 409 and then sends the turn once', async () => {
     const h = initialSendHarness([BUSY_409, BUSY_409, BUSY_409]);
     await h.run();
     expect(h.sleeps).toEqual([10_000, 20_000, 40_000]);
     expect(h.sent).toHaveLength(4);
-    expect(h.sent.every((messages) => messages.length === 1 && messages[0].role === 'user')).toBe(true);
+    expect(onlyTheUserTurn(h.sent)).toBe(true);
     expect(h.events.at(-1)).toEqual({ kind: 'accepted', attempts: 4, waitedMs: 70_000 });
   });
 
@@ -381,33 +373,18 @@ describe('initial send waits for a busy conversation (letta-code pattern)', () =
     expect(other.sleeps).toEqual([]);
   });
 
-  it('keeps waiting while a sibling worker is still moving through its approval rounds', async () => {
-    const h = initialSendHarness([APPROVAL_409, APPROVAL_409, BUSY_409, APPROVAL_409], [['call-a'], ['call-b'], ['call-c']]);
+  it('only waits while another worker holds a pending approval, never answering it', async () => {
+    const h = initialSendHarness([APPROVAL_409, APPROVAL_409, BUSY_409, APPROVAL_409]);
     await h.run();
-    expect(h.sent.every((messages) => messages.length === 1 && messages[0].role === 'user')).toBe(true);
-    expect(h.events.some((event) => event.kind === 'denied_stale_approvals')).toBe(false);
+    expect(onlyTheUserTurn(h.sent)).toBe(true);
+    expect(h.events.map((event) => event.kind)).toEqual(['approval_pending', 'approval_pending', 'busy', 'approval_pending', 'accepted']);
   });
 
-  it('denies approvals that stay pending past the stale window and resends the turn behind the denials', async () => {
-    const h = initialSendHarness([APPROVAL_409, APPROVAL_409, APPROVAL_409, APPROVAL_409], [['call-b', 'call-a'], ['call-a', 'call-b'], ['call-a', 'call-b'], ['call-a', 'call-b']]);
-    await h.run({ staleApprovalAfterMs: 60_000 });
-    // seen at 0 s, 10 s, 30 s (still < 60 s), then at 70 s: stale
-    expect(h.sleeps).toEqual([10_000, 20_000, 40_000]);
-    const last = h.sent.at(-1)!;
-    expect(last).toHaveLength(2);
-    expect(last[0]).toEqual({
-      type: 'approval',
-      approvals: ['call-a', 'call-b'].map((id) => ({ type: 'approval', tool_call_id: id, approve: false, reason: 'Auto-denied: stale approval from interrupted session' })),
-    });
-    expect(last[1]).toEqual({ role: 'user', content: 'source' });
-    expect(h.events.find((event) => event.kind === 'denied_stale_approvals')).toEqual({ kind: 'denied_stale_approvals', toolCallIds: ['call-a', 'call-b'], waitedMs: 70_000 });
-  });
-
-  it('denies at most once and then only waits', async () => {
-    const h = initialSendHarness(Array(10).fill(APPROVAL_409), Array(10).fill(['call-a']));
-    await expect(h.run({ staleApprovalAfterMs: 0, busyMaxWaitMs: 30_000 })).rejects.toThrow('waiting for approval');
-    expect(h.events.filter((event) => event.kind === 'denied_stale_approvals')).toHaveLength(1);
-    expect(h.lookups).toHaveLength(2);
+  it('fails the attempt (retryable) when an approval stays pending for the whole budget', async () => {
+    const h = initialSendHarness(Array(10).fill(APPROVAL_409));
+    await expect(h.run()).rejects.toThrow('waiting for approval');
+    expect(onlyTheUserTurn(h.sent)).toBe(true);
+    expect(h.sleeps.reduce((a, b) => a + b, 0)).toBe(240_000);
   });
 });
 
