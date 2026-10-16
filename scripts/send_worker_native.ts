@@ -25,6 +25,7 @@ import { cursorShouldAdvance, MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES } from '../re
 import {
   createNativeLettaClient,
   runNativeClientToolConversation,
+  type InitialSendBusyPolicy,
   type NativeClientTool,
 } from './native_letta_backfill.js';
 import { queueSubconWhisper } from './subcon_whisper_queue.js';
@@ -108,6 +109,8 @@ interface SurfacedRecallMemory {
   snippets: Map<string, HistoricalRecallSnippet & { snippet_id: string }>;
 }
 
+/** Letta holds a busy conversation for at most 300 s (CONVERSATION_LOCK_TTL_SECONDS). */
+const ASYNC_INITIAL_BUSY_MAX_WAIT_MS = 240_000;
 const MEMORY_MAINTENANCE_REVIEW_TOOL_SET = new Set<string>(MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES);
 
 /** Mutation tools whose failure leaves batch-owned work unsettled; relation suggestions are optional. */
@@ -170,6 +173,7 @@ export function renderHistoricalMemoryWhisper(summary: string, snippets: readonl
 export interface LiveWorkerDependencies {
   createClient?: (apiKey: string) => any;
   runConversation?: typeof runNativeClientToolConversation;
+  initialBusyRetry?: Partial<InitialSendBusyPolicy>;
   cancelAndDefer?: typeof cancelAndDeferSyncResources;
   cleanupCompleted?: typeof cleanupCompletedSyncResources;
   openStdioMcp?: typeof openStdioMcpToolsFromEnvironment;
@@ -561,6 +565,13 @@ export async function sendViaNativeClient(
           message: liveMessage,
           tools: liveTools,
           requiredClientToolNames: hasRealUserMessage ? ['memory_search'] : [],
+          // Overlapping Stop hooks share this conversation: wait for the earlier turn rather than
+          // failing the batch, like letta-code. Bounded under Letta's 300 s conversation lock TTL.
+          initialBusyRetry: {
+            busyMaxWaitMs: ASYNC_INITIAL_BUSY_MAX_WAIT_MS,
+            ...dependencies.initialBusyRetry,
+            onWait: (event) => log(`Initial send ${event.kind}: ${JSON.stringify(event)}`),
+          },
         });
       } finally {
         await stdioMcp.close();

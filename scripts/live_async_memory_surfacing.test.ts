@@ -56,6 +56,7 @@ describe('live async relationship-memory surfacing contract', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'live-memory-tools-')); roots.push(root);
     process.env.RELATIONSHIP_MEMORY_DIR = root; process.env.LETTA_API_KEY = 'test-only';
     let capturedTools: any[] = [];
+    let capturedInput: any;
     const completion = await sendViaNativeClient({
       agentId: 'agent-test', conversationId: 'conversation-test', sessionId: 'session-test',
       message: '<claude_code_session_update>test</claude_code_session_update>', cwd: root,
@@ -63,9 +64,13 @@ describe('live async relationship-memory surfacing contract', () => {
     }, {
       createClient: () => ({}),
       openStdioMcp: async () => ({ tools: [], close: async () => {} } as any),
-      runConversation: async (input: any) => { capturedTools = input.tools; return { response: { stop_reason: { stop_reason: 'end_turn' } }, clientToolFailure: false } as any; },
+      runConversation: async (input: any) => { capturedTools = input.tools; capturedInput = input; return { response: { stop_reason: { stop_reason: 'end_turn' } }, clientToolFailure: false } as any; },
     });
     expect(completion).toBe('completed');
+    // The async lane waits out a busy conversation on its first send (below Letta's 300 s lock TTL).
+    expect(capturedInput.initialBusyRetry.busyMaxWaitMs).toBe(240_000);
+    expect(capturedInput.initialBusyRetry.onWait).toEqual(expect.any(Function));
+    expect(capturedInput.continuationBusyRetry).toBeUndefined();
     const names = capturedTools.map((tool) => tool.name);
     expect(names).toEqual(expect.arrayContaining([...MEMORY_REMEMBER_TOOL_NAMES, 'memory_search', 'memory_reinforce', 'entity_search', 'entity_remember', 'deliver_whisper']));
     expect(names).not.toContain('memory_remember');

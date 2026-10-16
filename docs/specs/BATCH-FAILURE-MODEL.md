@@ -119,3 +119,26 @@ Letta stream. All 10 fail on the pre-change code.
 - Payload-file entrypoint advances the cursor after a rejected whisper.
 - Updated the source-string assertions in `live_async_memory_surfacing.test.ts` /
   `sync_subcon_mode.test.ts` that pin `turnSucceeded = !result.clientToolFailure`.
+
+## Busy conversation on the first send (409)
+
+Overlapping Stop hooks share one Letta conversation. The second worker's first send used to hit
+`409 Another request is currently being processed` and fail the whole batch as `turn_failed`
+(13 of the remaining failures on 2026-10-15/16). The lock is intended Letta behaviour (Redis,
+`CONVERSATION_LOCK_TTL_SECONDS = 300`), so the fix follows Letta's own client instead of
+working around the server:
+
+- **Busy:** retry with letta-code's exponential backoff (10 s, 20 s, 40 s, …), bounded by a
+  total wait of 240 s (below the 300 s lock TTL). letta-code stops after three retries; our
+  turns are longer (p90 ≈ 100 s), hence the time budget.
+- **Waiting for approval:** waited out with the same backoff, never answered. letta-code denies
+  pending approvals because they belong to its own interrupted session; ours can belong to a
+  sibling worker that is still executing tools (the ids stay unchanged throughout), and elapsed
+  time can't prove that worker has exited. If an approval outlives the budget the attempt fails
+  as retryable. Recovering a truly orphaned approval needs proof of owner exit (later, if it shows up).
+- Async lane only (`initialBusyRetry`). Sync keeps its 3 s continuation retry; its first send
+  is foreground-latency bound.
+- Whisper behaviour is unchanged. A waited turn produces a later whisper; `ready_latency_ms`
+  already measures that, so any staleness cut-off waits for data.
+- Each wait is logged (`Initial send busy|approval_pending|accepted`).
+- Tests: `native_letta_backfill.test.ts` › *initial send waits for a busy conversation*.

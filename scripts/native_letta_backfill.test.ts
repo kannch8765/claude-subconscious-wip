@@ -312,6 +312,82 @@ describe('native Letta legacy backfill harness', () => {
 
 import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
 
+const BUSY_409 = '409 {"detail":"CONFLICT: Cannot send a new message: Another request (run_id=run-1) is currently being processed for this conversation. Please wait for it to complete."}';
+const APPROVAL_409 = '409 {"detail":"Cannot send a new message: The agent is waiting for approval on a tool call. Please approve or deny the pending request before continuing."}';
+
+/** A fake clock and an initial send that fails with the given errors before succeeding. */
+function initialSendHarness(failures: string[]) {
+  const client = fakeClient([{ messages: [], stop_reason: 'end_turn' }]);
+  const originalCreate = client.conversations.messages.create.bind(client.conversations.messages);
+  const sent: any[][] = [];
+  client.conversations.messages.create = async (conversationId, body) => {
+    sent.push(body.messages as any[]);
+    const failure = failures.shift();
+    if (failure) throw new Error(failure);
+    return originalCreate(conversationId, body);
+  };
+  let clock = 0;
+  const sleeps: number[] = [];
+  const events: any[] = [];
+  const policy = {
+    busyMaxWaitMs: 240_000,
+    sleep: async (ms: number) => { sleeps.push(ms); clock += ms; },
+    now: () => clock,
+    onWait: (event: any) => events.push(event),
+  };
+  const run = (overrides: Record<string, unknown> = {}) => runNativeClientToolConversation({
+    client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source', tools: [],
+    initialBusyRetry: { ...policy, ...overrides },
+  });
+  return { client, sent, sleeps, events, run };
+}
+
+const onlyTheUserTurn = (sent: any[][]) => sent.every((messages) => messages.length === 1 && messages[0].role === 'user' && messages[0].content === 'source');
+
+describe('initial send waits for a busy conversation (letta-code backoff)', () => {
+  it('backs off 10/20/40 s on a busy 409 and then sends the turn once', async () => {
+    const h = initialSendHarness([BUSY_409, BUSY_409, BUSY_409]);
+    await h.run();
+    expect(h.sleeps).toEqual([10_000, 20_000, 40_000]);
+    expect(h.sent).toHaveLength(4);
+    expect(onlyTheUserTurn(h.sent)).toBe(true);
+    expect(h.events.at(-1)).toEqual({ kind: 'accepted', attempts: 4, waitedMs: 70_000 });
+  });
+
+  it('gives up once the total wait reaches the budget, below the lock TTL', async () => {
+    const h = initialSendHarness(Array(10).fill(BUSY_409));
+    await expect(h.run()).rejects.toThrow('currently being processed');
+    expect(h.sleeps).toEqual([10_000, 20_000, 40_000, 80_000, 90_000]);
+    expect(h.sleeps.reduce((a, b) => a + b, 0)).toBe(240_000);
+  });
+
+  it('does not retry the initial send without a policy, or on an unrelated 409', async () => {
+    const plain = initialSendHarness([BUSY_409]);
+    await expect(runNativeClientToolConversation({
+      client: plain.client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source', tools: [],
+    })).rejects.toThrow('currently being processed');
+    expect(plain.sent).toHaveLength(1);
+
+    const other = initialSendHarness(['409 {"detail":"some other conflict"}']);
+    await expect(other.run()).rejects.toThrow('some other conflict');
+    expect(other.sleeps).toEqual([]);
+  });
+
+  it('only waits while another worker holds a pending approval, never answering it', async () => {
+    const h = initialSendHarness([APPROVAL_409, APPROVAL_409, BUSY_409, APPROVAL_409]);
+    await h.run();
+    expect(onlyTheUserTurn(h.sent)).toBe(true);
+    expect(h.events.map((event) => event.kind)).toEqual(['approval_pending', 'approval_pending', 'busy', 'approval_pending', 'accepted']);
+  });
+
+  it('fails the attempt (retryable) when an approval stays pending for the whole budget', async () => {
+    const h = initialSendHarness(Array(10).fill(APPROVAL_409));
+    await expect(h.run()).rejects.toThrow('waiting for approval');
+    expect(onlyTheUserTurn(h.sent)).toBe(true);
+    expect(h.sleeps.reduce((a, b) => a + b, 0)).toBe(240_000);
+  });
+});
+
 describe('sync client-tool cross-round dependencies', () => {
   it('defers a same-round deliver_whisper until a prior round memory_search has completed', async () => {
     const client = fakeClient([
