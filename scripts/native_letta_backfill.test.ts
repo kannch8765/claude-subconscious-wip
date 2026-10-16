@@ -312,6 +312,105 @@ describe('native Letta legacy backfill harness', () => {
 
 import { syncClientToolRoundGate } from './sync_client_tool_gate.js';
 
+const BUSY_409 = '409 {"detail":"CONFLICT: Cannot send a new message: Another request (run_id=run-1) is currently being processed for this conversation. Please wait for it to complete."}';
+const APPROVAL_409 = '409 {"detail":"Cannot send a new message: The agent is waiting for approval on a tool call. Please approve or deny the pending request before continuing."}';
+
+/** A fake clock and an initial send that fails with the given errors before succeeding. */
+function initialSendHarness(failures: string[], pendingIds: string[][] = []) {
+  const client = fakeClient([{ messages: [], stop_reason: 'end_turn' }]);
+  const originalCreate = client.conversations.messages.create.bind(client.conversations.messages);
+  const sent: any[][] = [];
+  client.conversations.messages.create = async (conversationId, body) => {
+    sent.push(body.messages as any[]);
+    const failure = failures.shift();
+    if (failure) throw new Error(failure);
+    return originalCreate(conversationId, body);
+  };
+  const lookups: string[][] = [];
+  client.conversations.retrieve = async () => ({ in_context_message_ids: ['msg-first', 'msg-last'] });
+  client.messages = {
+    async retrieve(messageId) {
+      expect(messageId).toBe('msg-last');
+      const ids = pendingIds.shift() ?? [];
+      lookups.push(ids);
+      return [{ message_type: 'approval_request_message', tool_calls: ids.map((id) => ({ name: 'memory_search', arguments: '{}', tool_call_id: id })) }];
+    },
+  };
+  let clock = 0;
+  const sleeps: number[] = [];
+  const events: any[] = [];
+  const policy = {
+    busyMaxWaitMs: 240_000,
+    sleep: async (ms: number) => { sleeps.push(ms); clock += ms; },
+    now: () => clock,
+    onWait: (event: any) => events.push(event),
+  };
+  const run = (overrides: Record<string, unknown> = {}) => runNativeClientToolConversation({
+    client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source', tools: [],
+    initialBusyRetry: { ...policy, ...overrides },
+  });
+  return { client, sent, sleeps, events, lookups, run };
+}
+
+describe('initial send waits for a busy conversation (letta-code pattern)', () => {
+  it('backs off 10/20/40 s on a busy 409 and then sends the turn once', async () => {
+    const h = initialSendHarness([BUSY_409, BUSY_409, BUSY_409]);
+    await h.run();
+    expect(h.sleeps).toEqual([10_000, 20_000, 40_000]);
+    expect(h.sent).toHaveLength(4);
+    expect(h.sent.every((messages) => messages.length === 1 && messages[0].role === 'user')).toBe(true);
+    expect(h.events.at(-1)).toEqual({ kind: 'accepted', attempts: 4, waitedMs: 70_000 });
+  });
+
+  it('gives up once the total wait reaches the budget, below the lock TTL', async () => {
+    const h = initialSendHarness(Array(10).fill(BUSY_409));
+    await expect(h.run()).rejects.toThrow('currently being processed');
+    expect(h.sleeps).toEqual([10_000, 20_000, 40_000, 80_000, 90_000]);
+    expect(h.sleeps.reduce((a, b) => a + b, 0)).toBe(240_000);
+  });
+
+  it('does not retry the initial send without a policy, or on an unrelated 409', async () => {
+    const plain = initialSendHarness([BUSY_409]);
+    await expect(runNativeClientToolConversation({
+      client: plain.client, agentId: 'agent-test', conversationId: 'conv-test', message: 'source', tools: [],
+    })).rejects.toThrow('currently being processed');
+    expect(plain.sent).toHaveLength(1);
+
+    const other = initialSendHarness(['409 {"detail":"some other conflict"}']);
+    await expect(other.run()).rejects.toThrow('some other conflict');
+    expect(other.sleeps).toEqual([]);
+  });
+
+  it('keeps waiting while a sibling worker is still moving through its approval rounds', async () => {
+    const h = initialSendHarness([APPROVAL_409, APPROVAL_409, BUSY_409, APPROVAL_409], [['call-a'], ['call-b'], ['call-c']]);
+    await h.run();
+    expect(h.sent.every((messages) => messages.length === 1 && messages[0].role === 'user')).toBe(true);
+    expect(h.events.some((event) => event.kind === 'denied_stale_approvals')).toBe(false);
+  });
+
+  it('denies approvals that stay pending past the stale window and resends the turn behind the denials', async () => {
+    const h = initialSendHarness([APPROVAL_409, APPROVAL_409, APPROVAL_409, APPROVAL_409], [['call-b', 'call-a'], ['call-a', 'call-b'], ['call-a', 'call-b'], ['call-a', 'call-b']]);
+    await h.run({ staleApprovalAfterMs: 60_000 });
+    // seen at 0 s, 10 s, 30 s (still < 60 s), then at 70 s: stale
+    expect(h.sleeps).toEqual([10_000, 20_000, 40_000]);
+    const last = h.sent.at(-1)!;
+    expect(last).toHaveLength(2);
+    expect(last[0]).toEqual({
+      type: 'approval',
+      approvals: ['call-a', 'call-b'].map((id) => ({ type: 'approval', tool_call_id: id, approve: false, reason: 'Auto-denied: stale approval from interrupted session' })),
+    });
+    expect(last[1]).toEqual({ role: 'user', content: 'source' });
+    expect(h.events.find((event) => event.kind === 'denied_stale_approvals')).toEqual({ kind: 'denied_stale_approvals', toolCallIds: ['call-a', 'call-b'], waitedMs: 70_000 });
+  });
+
+  it('denies at most once and then only waits', async () => {
+    const h = initialSendHarness(Array(10).fill(APPROVAL_409), Array(10).fill(['call-a']));
+    await expect(h.run({ staleApprovalAfterMs: 0, busyMaxWaitMs: 30_000 })).rejects.toThrow('waiting for approval');
+    expect(h.events.filter((event) => event.kind === 'denied_stale_approvals')).toHaveLength(1);
+    expect(h.lookups).toHaveLength(2);
+  });
+});
+
 describe('sync client-tool cross-round dependencies', () => {
   it('defers a same-round deliver_whisper until a prior round memory_search has completed', async () => {
     const client = fakeClient([

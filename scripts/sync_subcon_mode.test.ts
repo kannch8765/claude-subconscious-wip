@@ -31,6 +31,8 @@ describe('additive synchronous Subcon mode contract', () => {
     expect(worker).toContain('stdio MCP client tools: (disabled in sync mode)');
     expect(worker).toContain('continuationBusyRetry: { maxWaitMs: 3_000, intervalMs: 100 }');
     expect(worker.match(/continuationBusyRetry/g)?.length).toBe(1);
+    // Only the async lane waits on its first send; sync stays foreground-latency bound.
+    expect(worker.match(/initialBusyRetry: \{/g)?.length).toBe(1);
     expect(worker).toContain('(dependencies.openStdioMcp ?? openStdioMcpToolsFromEnvironment)(log)');
   });
 
