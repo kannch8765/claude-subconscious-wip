@@ -18,14 +18,14 @@ After removing duplicates, about 110 distinct incidents and findings remain. Cou
   - the validation run (tests, CI, canary)
 
   A reviewer who finds no receipt for the head commit can send the PR back.
-- **Every finding needs `file:line` and a concrete failure scenario** (inputs or state, then the wrong outcome). No "might be an issue". If you can reproduce it, say so. Reproduced findings are fixed without debate.
+- **Every finding needs `file:line` and a concrete failure scenario** (inputs or state, then the wrong outcome). No "might be an issue". If you can reproduce it, say so. Reproduced findings are fixed without debate, unless tagged Pre-existing.
 - **Tag each finding:**
   - **Important**: blocks the merge.
   - **Nit**: at most 3 per review, never blocking.
   - **Pre-existing**: real, but not introduced by this PR. It goes to the board and does not block.
 - **Cap review rounds at 3.** Most PRs here pass after one fix round. One needed three (a provenance bypass, fixed one alias at a time). If round 3 still finds Important issues, stop patching and rethink the approach.
 - **Post reviews as PR comments, signed.** Agents share one GitHub account, so start every review comment with a signature line naming the reviewer and the reviewed commit, e.g. `🐱 Review by <name> @ <sha>`.
-- **Approval covers one exact commit.** Merge only the reviewed head. An agent's approval never replaces the owner's on high-risk changes.
+- **Approval covers one exact commit.** Merge only the reviewed head. An agent's approval never replaces the owner's on high-risk changes: anything touching the durable store writers, batch/cursor handling, `Subconscious.af` or deploy, systemd and install files.
 - **Merged is not deployed.** Say "not deployed" until a deploy receipt exists.
 
 ## Where the bugs actually came from
@@ -170,7 +170,7 @@ After removing duplicates, about 110 distinct incidents and findings remain. Cou
 This repo handles a person's relationship memories.
 
 - Real memory, chat, transcript and whisper text, and real ids from production, never appear in PRs, logs, test fixtures, telemetry or reviews. Use aggregates and id-free metadata only.
-- Wholly synthetic text and identifiers are fine, and encouraged, for tests and minimal repros. Pass them through the real write path, like `scripts/owner_memory_review.test.ts`.
+- Wholly synthetic text and identifiers are fine, and encouraged, for tests and minimal repros. Pass them through the real write path, like the `fixture()` helper in `scripts/owner_memory_review.test.ts`.
 - Child processes do not inherit the worker's API keys.
 - Raw stderr never goes to the model (#63).
 - Read-only audits print counts only, through a schema guard.
@@ -216,5 +216,5 @@ These are found at deploy time far more often than in review. Check them when a 
 ## Keeping this file honest
 
 - **When something reaches production that review should have caught,** ask what the reviewer didn't have in front of it. Add the case to its class here, or add a class.
-- **When the same finding shows up twice,** turn it into a test, a lint rule or a `CLAUDE.md` line instead of repeating the comment.
+- **When the same finding shows up twice,** turn it into a test, a lint rule or a line in this file (or the relevant `docs/specs/` page) instead of repeating the comment.
 - **Re-mine and update the counts** about once a month.
