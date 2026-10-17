@@ -12,6 +12,12 @@ After removing duplicates, about 110 distinct incidents and findings remain. Cou
 
 ## How to review
 
+- **Self-review first, and leave a receipt.** Before requesting review, the author runs a fresh-context self-review against this file. The author then posts a signed PR comment with:
+  - the reviewed SHA
+  - the findings and how each was resolved
+  - the validation run (tests, CI, canary)
+
+  A reviewer who finds no receipt for the head commit can send the PR back.
 - **Every finding needs `file:line` and a concrete failure scenario** (inputs or state, then the wrong outcome). No "might be an issue". If you can reproduce it, say so. Reproduced findings are fixed without debate.
 - **Tag each finding:**
   - **Important**: blocks the merge.
@@ -163,7 +169,8 @@ After removing duplicates, about 110 distinct incidents and findings remain. Cou
 
 This repo handles a person's relationship memories.
 
-- Memory, chat, transcript and whisper text never appear in PRs, logs, test fixtures, telemetry or reviews. Use aggregates and ids-free metadata only.
+- Real memory, chat, transcript and whisper text, and real ids from production, never appear in PRs, logs, test fixtures, telemetry or reviews. Use aggregates and id-free metadata only.
+- Wholly synthetic text and identifiers are fine, and encouraged, for tests and minimal repros. Pass them through the real write path, like `scripts/owner_memory_review.test.ts`.
 - Child processes do not inherit the worker's API keys.
 - Raw stderr never goes to the model (#63).
 - Read-only audits print counts only, through a schema guard.
