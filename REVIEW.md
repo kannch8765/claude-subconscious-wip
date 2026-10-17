@@ -18,6 +18,7 @@ After removing duplicates, about 110 distinct incidents and findings remain. Cou
   - **Nit**: at most 3 per review, never blocking.
   - **Pre-existing**: real, but not introduced by this PR. It goes to the board and does not block.
 - **Cap review rounds at 3.** Most PRs here pass after one fix round. One needed three (a provenance bypass, fixed one alias at a time). If round 3 still finds Important issues, stop patching and rethink the approach.
+- **Post reviews as PR comments, signed.** Agents share one GitHub account, so start every review comment with a signature line naming the reviewer and the reviewed commit, e.g. `🐱 Review by <name> @ <sha>`.
 - **Approval covers one exact commit.** Merge only the reviewed head. An agent's approval never replaces the owner's on high-risk changes.
 - **Merged is not deployed.** Say "not deployed" until a deploy receipt exists.
 
