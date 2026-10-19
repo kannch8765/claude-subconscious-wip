@@ -15,10 +15,11 @@ export type RedactionCounts = Record<string, number>;
 // regexes slow; evidence is capped far below this anyway, and a private key cut off here still redacts to the end.
 export const MAX_REDACT_CHARS = 64_000;
 
+// Key names are capped at 40 characters around the keyword so a long underscore run can't backtrack quadratically.
 // A secret value: printable ASCII with no spaces, quotes or separators. ASCII-only on purpose, so prose (and CJK text,
 // which has no spaces) after `secret:` is never swallowed.
 const VALUE = String.raw`[\x21\x23-\x26\x28-\x2b\x2d-\x3a\x3c-\x7e]`;
-const KEY = String.raw`\b[A-Z0-9_]*(?:api[_-]?key|secret|token|passw(?:or)?d|credential)[A-Z0-9_]*\b["']?`;
+const KEY = String.raw`\b[A-Z0-9_]{0,40}(?:api[_-]?key|secret|token|passw(?:or)?d|credential)[A-Z0-9_]{0,40}\b["']?`;
 
 // Order matters: specific token shapes run before the generic assignment rule.
 const PATTERNS: Array<[string, RegExp]> = [
