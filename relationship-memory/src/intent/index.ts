@@ -1,6 +1,7 @@
 import type { TranscriptMessage } from '../../../scripts/transcript_utils.js';
 import type { AssistantIntentOutcome, AssistantRememberIntentRecord } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
+import { redactText } from '../redact/index.js';
 
 export const ASSISTANT_REMEMBER_TOOL_NAME = 'mcp__plugin_claude-subconscious_relationship-memory-intent__remember';
 const ACCEPTED_TOOL_NAMES = new Set([
@@ -75,8 +76,10 @@ export function extractAssistantRememberIntents(
         assistant_message_id: message.uuid,
         tool_use_id: block.id,
         tool_name: block.name,
-        memory: { text: validation.value.memory.text },
-        feel: { text: validation.value.feel.text },
+        // the same transcript tool_use block is redacted as evidence; its intent copy must match (intent ids don't
+        // depend on the text, so retries still converge)
+        memory: { text: redactText(validation.value.memory.text) },
+        feel: { text: redactText(validation.value.feel.text) },
         captured_at: message.timestamp || new Date(0).toISOString(),
       });
     }

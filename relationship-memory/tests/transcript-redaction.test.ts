@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildCanonicalMessages } from '../src/adapter/index.js';
-import { redactText, redactFields } from '../src/redact/index.js';
+import { MAX_REDACT_CHARS, redactText, redactFields } from '../src/redact/index.js';
+import { extractAssistantRememberIntents } from '../src/intent/index.js';
 import { formatMessagesForLetta, type TranscriptMessage } from '../../scripts/transcript_utils.js';
 
 // Wholly synthetic secrets and text (REVIEW.md class 7)
@@ -55,5 +56,41 @@ describe('transcript redaction', () => {
     const counts: Record<string, number> = {};
     expect(redactFields({ token: SECRET, tokens: 12, note: 'fine' }, counts)).toEqual({ token: '[redacted:field]', tokens: 12, note: 'fine' });
     expect(counts).toEqual({ field: 1 });
+  });
+
+  it('never swallows prose or CJK text after a secret-looking word', () => {
+    for (const prose of [
+      '告诉你一个secret: 我其实很喜欢你送的那个杯子。明天见',
+      'my secret: honestly I miss you',
+      'the token: 一緒に頑張ろうね',
+      'password: please reset it tomorrow',
+    ]) expect(redactText(prose)).toBe(prose);
+    expect(redactText('password: hunter2hunter2')).toBe('password: [redacted:assignment]');
+    expect(redactText(`DEPLOY_TOKEN=abcdefgh 次に`)).toBe('DEPLOY_TOKEN=[redacted:assignment] 次に');
+  });
+
+  it('matches sensitive field names on whole words', () => {
+    const counts: Record<string, number> = {};
+    expect(redactFields({ apiKey: 'v1', access_token: 'v2', 'x-api-key': 'v3', tokenizer: 'cl100k', secretary: 'Mika', max_tokens: 'many' }, counts))
+      .toEqual({ apiKey: '[redacted:field]', access_token: '[redacted:field]', 'x-api-key': '[redacted:field]', tokenizer: 'cl100k', secretary: 'Mika', max_tokens: 'many' });
+    expect(counts).toEqual({ field: 3 });
+  });
+
+  it('redacts assistant remember intents copied from the same tool_use block', () => {
+    const messages = [{ type: 'assistant', uuid: 'a1', timestamp: '2026-10-19T00:00:00Z', message: { role: 'assistant', content: [
+      { type: 'tool_use', id: 't1', name: 'mcp__plugin_claude-subconscious_relationship-memory-intent__remember',
+        input: { memory: { text: `the deploy uses DEPLOY_TOKEN=${SECRET}` }, feel: { text: 'relieved' } } },
+    ] } }] as TranscriptMessage[];
+    const [intent] = extractAssistantRememberIntents(messages, -1, 'session-synthetic', 'subject-synthetic');
+    expect(intent.memory.text).toBe('the deploy uses DEPLOY_TOKEN=[redacted:assignment]');
+    expect(intent.feel.text).toBe('relieved');
+  });
+
+  it('bounds the text the patterns run on, and says so', () => {
+    const huge = 'my_token_'.repeat(30_000);
+    const started = Date.now();
+    const out = redactText(huge);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(out.endsWith(`[text cut at ${MAX_REDACT_CHARS} chars before redaction]`)).toBe(true);
   });
 });
