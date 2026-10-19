@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildCanonicalMessages } from '../src/adapter/index.js';
-import { MAX_REDACT_CHARS, redactText, redactFields } from '../src/redact/index.js';
+import { MAX_REDACT_CHARS, redactText, redactValue } from '../src/redact/index.js';
 import { extractAssistantRememberIntents } from '../src/intent/index.js';
 import { formatMessagesForLetta, type TranscriptMessage } from '../../scripts/transcript_utils.js';
 
@@ -54,7 +54,7 @@ describe('transcript redaction', () => {
     const prose = 'We pinned the token budget to 4096 and the password reset page moved.';
     expect(redactText(prose)).toBe(prose);
     const counts: Record<string, number> = {};
-    expect(redactFields({ token: SECRET, tokens: 12, note: 'fine' }, counts)).toEqual({ token: '[redacted:field]', tokens: 12, note: 'fine' });
+    expect(redactValue({ token: SECRET, tokens: 12, note: 'fine' }, counts)).toEqual({ token: '[redacted:field]', tokens: 12, note: 'fine' });
     expect(counts).toEqual({ field: 1 });
   });
 
@@ -71,7 +71,7 @@ describe('transcript redaction', () => {
 
   it('matches sensitive field names on whole words', () => {
     const counts: Record<string, number> = {};
-    expect(redactFields({ apiKey: 'v1', access_token: 'v2', 'x-api-key': 'v3', tokenizer: 'cl100k', secretary: 'Mika', max_tokens: 'many' }, counts))
+    expect(redactValue({ apiKey: 'v1', access_token: 'v2', 'x-api-key': 'v3', tokenizer: 'cl100k', secretary: 'Mika', max_tokens: 'many' }, counts))
       .toEqual({ apiKey: '[redacted:field]', access_token: '[redacted:field]', 'x-api-key': '[redacted:field]', tokenizer: 'cl100k', secretary: 'Mika', max_tokens: 'many' });
     expect(counts).toEqual({ field: 3 });
   });
@@ -92,5 +92,38 @@ describe('transcript redaction', () => {
     const out = redactText(huge);
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(out.endsWith(`[text cut at ${MAX_REDACT_CHARS} chars before redaction]`)).toBe(true);
+  });
+
+  // Haru review round 1 (PR #142)
+  it('redacts JSON quoted inside string values, on both paths', () => {
+    const json = `{"api_key":"${SECRET}"}`;
+    const messages = [
+      { type: 'assistant', uuid: 'a1', timestamp: '2026-10-19T00:00:00Z', message: { role: 'assistant', content: [
+        { type: 'tool_use', id: 't1', name: 'Bash', input: { command: `curl -d '${json}' https://example.test` } },
+      ] } },
+      { type: 'user', uuid: 'u1', timestamp: '2026-10-19T00:00:01Z', message: { role: 'user', content: [
+        { type: 'tool_result', tool_use_id: 't1', content: [{ type: 'text', text: json }] },
+      ] } },
+    ] as TranscriptMessage[];
+    const evidence = buildCanonicalMessages(messages, -1, 'conv-synthetic').map((e) => e.quote).join('\n');
+    const letta = formatMessagesForLetta(messages, -1).map((m) => m.text).join('\n');
+    for (const text of [evidence, letta]) expect(text).not.toContain(SECRET);
+    expect(evidence).toContain('[redacted:assignment]');
+  });
+
+  it('matches assignment names on whole words too', () => {
+    for (const prose of ['my secretary: Alice123', 'My preferred tokenizer: cl100k_base', 'max_tokens: 4096',
+      '{"tokenizer": "cl100k_base"}']) expect(redactText(prose)).toBe(prose);
+    expect(redactText('client_secret: abc123def456')).toBe('client_secret: [redacted:assignment]');
+    expect(redactText('x-api-key: abc123def456')).toBe('x-api-key: [redacted:assignment]');
+    expect(redactText('apiKey=abcdefgh')).toBe('apiKey=[redacted:assignment]');
+  });
+
+  it('stays fast on adversarial input for every pattern', () => {
+    for (const huge of ['a-'.repeat(32_000), 'my_token_'.repeat(7_000), 'ab+'.repeat(21_000)]) {
+      const started = Date.now();
+      redactText(huge);
+      expect(Date.now() - started).toBeLessThan(500);
+    }
   });
 });

@@ -7,7 +7,7 @@
 
 import * as fs from 'fs';
 import * as readline from 'readline';
-import { redactFields, redactText, redactedJson } from '../relationship-memory/src/redact/index.js';
+import { redactText, redactValue, redactedJson } from '../relationship-memory/src/redact/index.js';
 
 // Types for transcript parsing
 export interface ContentBlock {
@@ -87,18 +87,6 @@ export async function readTranscript(transcriptPath: string, log: LogFn = noopLo
   return messages;
 }
 
-/** Tool input with sensitive fields scrubbed and every string value redacted (summaries are built from it). */
-function redactInput(input: unknown): any {
-  const scrubbed = redactFields(input);
-  const walk = (value: unknown): unknown => {
-    if (typeof value === 'string') return redactText(value);
-    if (Array.isArray(value)) return value.map(walk);
-    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v)]));
-    return value;
-  };
-  return walk(scrubbed);
-}
-
 /**
  * Extract different content types from a message. Text, thinking, tool inputs and tool results come back with
  * secrets redacted (whole values, before any caller truncates them), so nothing built from them can leak one.
@@ -130,7 +118,7 @@ export function extractAllContent(msg: TranscriptMessage): ExtractedContent {
       } else if (block.type === 'tool_use' && block.name) {
         result.toolUses.push({
           name: block.name,
-          input: redactInput(block.input),
+          input: redactValue(block.input) as any,
         });
       } else if (block.type === 'tool_result') {
         const resultContent = typeof block.content === 'string'
