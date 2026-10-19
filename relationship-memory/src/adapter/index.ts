@@ -7,6 +7,7 @@ import { MAX_UNRESOLVED_INTENT_TURNS, MEMORY_MAINTENANCE_REVIEW_TOOL_NAMES, MEMO
 import { rebuildProjection } from '../projection/index.js';
 import { listDeferredAssistantIntents } from '../intent/index.js';
 import { createSemanticRetrieverFromEnvironment } from '../retrieval/index.js';
+import { redactText, redactedJson } from '../redact/index.js';
 
 export interface RelationshipTool {
   label: string;
@@ -28,12 +29,9 @@ export function relationshipMemoryRoot(): string {
 
 const MAX_TRANSCRIPT_EVIDENCE_CHARS = 12_000;
 
+// Redaction runs on the whole block, before the size cap (see redact/index.ts)
 function boundedEvidenceText(value: unknown): string | null {
-  let text: string;
-  if (typeof value === 'string') text = value;
-  else {
-    try { text = JSON.stringify(value, null, 2); } catch { text = String(value); }
-  }
+  let text = typeof value === 'string' ? redactText(value) : redactedJson(value, undefined, 2);
   text = text.trim();
   if (!text) return null;
   if (text.length <= MAX_TRANSCRIPT_EVIDENCE_CHARS) return text;

@@ -7,6 +7,7 @@
 
 import * as fs from 'fs';
 import * as readline from 'readline';
+import { redactFields, redactText, redactedJson } from '../relationship-memory/src/redact/index.js';
 
 // Types for transcript parsing
 export interface ContentBlock {
@@ -86,8 +87,21 @@ export async function readTranscript(transcriptPath: string, log: LogFn = noopLo
   return messages;
 }
 
+/** Tool input with sensitive fields scrubbed and every string value redacted (summaries are built from it). */
+function redactInput(input: unknown): any {
+  const scrubbed = redactFields(input);
+  const walk = (value: unknown): unknown => {
+    if (typeof value === 'string') return redactText(value);
+    if (Array.isArray(value)) return value.map(walk);
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, walk(v)]));
+    return value;
+  };
+  return walk(scrubbed);
+}
+
 /**
- * Extract different content types from a message
+ * Extract different content types from a message. Text, thinking, tool inputs and tool results come back with
+ * secrets redacted (whole values, before any caller truncates them), so nothing built from them can leak one.
  */
 export function extractAllContent(msg: TranscriptMessage): ExtractedContent {
   const result: ExtractedContent = {
@@ -100,7 +114,7 @@ export function extractAllContent(msg: TranscriptMessage): ExtractedContent {
   const content = msg.message?.content ?? msg.content;
 
   if (typeof content === 'string') {
-    result.text = content;
+    result.text = redactText(content);
     return result;
   }
 
@@ -110,18 +124,18 @@ export function extractAllContent(msg: TranscriptMessage): ExtractedContent {
 
     for (const block of content) {
       if (block.type === 'text' && block.text) {
-        textParts.push(block.text);
+        textParts.push(redactText(block.text));
       } else if (block.type === 'thinking' && block.thinking) {
-        thinkingParts.push(block.thinking);
+        thinkingParts.push(redactText(block.thinking));
       } else if (block.type === 'tool_use' && block.name) {
         result.toolUses.push({
           name: block.name,
-          input: block.input,
+          input: redactInput(block.input),
         });
       } else if (block.type === 'tool_result') {
         const resultContent = typeof block.content === 'string'
-          ? block.content
-          : JSON.stringify(block.content);
+          ? redactText(block.content)
+          : redactedJson(block.content);
         result.toolResults.push({
           toolName: block.tool_use_id || 'unknown',
           content: resultContent,
@@ -171,7 +185,7 @@ export function formatMessagesForLetta(
     if (msg.type === 'summary' && msg.summary) {
       formatted.push({
         role: 'system',
-        text: `[Session Summary]: ${msg.summary}`,
+        text: `[Session Summary]: ${redactText(msg.summary)}`,
       });
       log(`    -> Added summary`);
       continue;
