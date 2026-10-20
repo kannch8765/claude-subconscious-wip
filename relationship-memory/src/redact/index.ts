@@ -48,9 +48,11 @@ const PATTERNS: Array<[string, RegExp]> = [
 const VALUE = String.raw`[\x21\x23-\x26\x28-\x2b\x2d-\x3a\x3c-\x7e]`;
 // `name = value` / `name: value` / JSON `"name": "value"`. The name is captured whole and checked with
 // sensitiveName. `=` (env style) takes any value of 6+ characters; `:` only one that looks like a secret (a digit, or
-// 16+ long), so "my secret: honestly…" stays prose.
+// 16+ long), so "my secret: honestly…" stays prose. The value is matched at most 256 characters at a time so the scan
+// stays linear; VALUE_REST takes the rest of a sensitive one.
 const ASSIGNMENT = new RegExp(String.raw`(?<![A-Za-z0-9_.\-])([A-Za-z][A-Za-z0-9_.\-]{0,63})(["']?\s*(=|:)\s*["']?)`
-  + String.raw`(?!\[redacted)(${VALUE}{6,})`, 'g');
+  + String.raw`(?!\[redacted)(${VALUE}{6,256})`, 'g');
+const VALUE_REST = new RegExp(`${VALUE}*`, 'y');
 
 function count(counts: RedactionCounts | undefined, kind: string): void {
   if (counts) counts[kind] = (counts[kind] ?? 0) + 1;
@@ -68,12 +70,28 @@ export function redactText(text: string, counts?: RedactionCounts): string {
       return `${groups[0] ?? ''}[redacted:${kind}]${groups[1] ?? ''}`;
     });
   }
-  return result.replace(ASSIGNMENT, (match, name: string, sep: string, op: string, value: string) => {
-    if (!sensitiveName(name)) return match;
-    if (op === ':' && !/[0-9]/.test(value) && value.length < 16) return match;
+  return redactAssignments(result, counts);
+}
+
+function redactAssignments(text: string, counts?: RedactionCounts): string {
+  let out = '';
+  let kept = 0;
+  ASSIGNMENT.lastIndex = 0;
+  for (let m = ASSIGNMENT.exec(text); m; m = ASSIGNMENT.exec(text)) {
+    const [, name, sep, op, value] = m;
+    const valueStart = m.index + name.length + sep.length;
+    if (!sensitiveName(name) || (op === ':' && !/[0-9]/.test(value) && value.length < 16)) {
+      // Not a secret itself, but its value may hold one (`note: DEPLOY_TOKEN=…`, `https://…?token=…`): scan on inside it
+      ASSIGNMENT.lastIndex = valueStart;
+      continue;
+    }
+    VALUE_REST.lastIndex = valueStart + value.length;
+    VALUE_REST.exec(text);
     count(counts, 'assignment');
-    return `${name}${sep}[redacted:assignment]`;
-  });
+    out += `${text.slice(kept, valueStart)}[redacted:assignment]`;
+    kept = ASSIGNMENT.lastIndex = VALUE_REST.lastIndex;
+  }
+  return out + text.slice(kept);
 }
 
 /** A copy of a JSON value with every string leaf redacted, and the string values of sensitive fields replaced. */

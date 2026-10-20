@@ -119,8 +119,37 @@ describe('transcript redaction', () => {
     expect(redactText('apiKey=abcdefgh')).toBe('apiKey=[redacted:assignment]');
   });
 
+  // Haru review round 2 (PR #142): a harmless outer name must not swallow a secret inside its value
+  const NESTED = [`note: DEPLOY_TOKEN=${SECRET}`, `https://example.test?DEPLOY_TOKEN=${SECRET}`,
+    `url=https://example.test?DEPLOY_TOKEN=${SECRET}`, `see https://example.test/cb?state=abc123&access_token=${SECRET}&x=1`];
+
+  it('finds a sensitive assignment inside a non-sensitive value', () => {
+    expect(redactText(NESTED[0])).toBe('note: DEPLOY_TOKEN=[redacted:assignment]');
+    expect(redactText(NESTED[2])).toBe('url=https://example.test?DEPLOY_TOKEN=[redacted:assignment]');
+    expect(redactText(NESTED[3])).toBe('see https://example.test/cb?state=abc123&access_token=[redacted:assignment]');
+    expect(redactText(`DEPLOY_TOKEN=${'s'.repeat(1_000)} tail`)).toBe('DEPLOY_TOKEN=[redacted:assignment] tail');
+  });
+
+  it('finds nested assignments on both transcript paths and the intent path', () => {
+    const messages = NESTED.flatMap((text, i) => [
+      { type: 'user', uuid: `u${i}`, timestamp: '2026-10-20T00:00:00Z', message: { role: 'user', content: [{ type: 'text', text }] } },
+      { type: 'assistant', uuid: `a${i}`, timestamp: '2026-10-20T00:00:01Z', message: { role: 'assistant', content: [
+        { type: 'tool_use', id: `t${i}`, name: 'mcp__plugin_claude-subconscious_relationship-memory-intent__remember',
+          input: { memory: { text }, feel: { text: 'relieved' } } },
+      ] } },
+    ]) as TranscriptMessage[];
+    const evidence = buildCanonicalMessages(messages, -1, 'conv-synthetic').map((e) => e.quote).join('\n');
+    const letta = formatMessagesForLetta(messages, -1).map((m) => m.text).join('\n');
+    const intents = extractAssistantRememberIntents(messages, -1, 'session-synthetic', 'subject-synthetic').map((i) => i.memory.text).join('\n');
+    for (const text of [evidence, letta, intents]) {
+      expect(text).not.toContain(SECRET);
+      expect(text).toContain('example.test');
+    }
+  });
+
   it('stays fast on adversarial input for every pattern', () => {
-    for (const huge of ['a-'.repeat(32_000), 'my_token_'.repeat(7_000), 'ab+'.repeat(21_000)]) {
+    for (const huge of ['a-'.repeat(32_000), 'my_token_'.repeat(7_000), 'ab+'.repeat(21_000), 'a='.repeat(32_000),
+      'note: '.repeat(10_000), `token=${'x'.repeat(63_000)}`]) {
       const started = Date.now();
       redactText(huge);
       expect(Date.now() - started).toBeLessThan(500);
