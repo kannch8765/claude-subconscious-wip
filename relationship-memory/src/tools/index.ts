@@ -851,7 +851,16 @@ export class RelationshipMemoryRuntime {
     return { outcome: appended ? 'accepted' : 'duplicate', review_id: reviewId };
   }
 
+  /**
+   * The intent-link check and the writes that publish the link run under one canonical mutation boundary (reentrant;
+   * the live worker already holds it around each mutation tool), so two workers can't both see "unlinked" and link
+   * one intent to two memories.
+   */
   reinforce(batchId: string, input: ReinforceInput): RememberResult {
+    return this.store.withMutationBoundary(() => this.reinforceInBoundary(batchId, input));
+  }
+
+  private reinforceInBoundary(batchId: string, input: ReinforceInput): RememberResult {
     const now = this.now();
     this.ensureRetryAttempt(batchId, now);
     const memoryId = typeof input?.memory_id === 'string' ? input.memory_id.trim() : '';
@@ -869,11 +878,20 @@ export class RelationshipMemoryRuntime {
     // `duplicate`. Only a write or retryable failure carries the intent; a rejected reinforcement leaves it unresolved
     // (the turn budget still applies), so a wrong memory_id cannot consume it.
     const intent = this.trustedIntent(intentId);
+    // Reinforce can point at any stored memory, so it must never move an intent (and its feel and protection) off the
+    // memory it is already linked to, on a first call or on a replayed one.
+    const linked = intent ? this.store.getTerminalAssistantIntentOutcome(intent.intent_id) : undefined;
+    const linkedElsewhere = (target: string): RememberResult | undefined => (linked?.memory_id && linked.memory_id !== target
+      ? { outcome: 'permanently_rejected', rejection_code: 'intent_already_linked', reason: `Assistant intent ${intent!.intent_id} is already linked to memory ${linked.memory_id}.` }
+      : undefined);
     const previous = this.store.getTerminalOutcome(sourceKey);
     if (previous) {
       if (previous.outcome === 'accepted' || previous.outcome === 'duplicate') {
         const previousMemoryId = previous.memory_id ?? memoryId;
         if (!intent) return { outcome: 'duplicate', memory_id: previousMemoryId };
+        // The reinforcement itself already stands; only the intent link is refused, and nothing new is recorded.
+        const refused = linkedElsewhere(previousMemoryId);
+        if (refused) return refused;
         const repaired = this.persistOutcomePair(batchId, sourceKey, previous.outcome, previousMemoryId, now, intent, 'duplicate');
         return repaired.outcome === 'retryable_failed' ? repaired : { outcome: 'duplicate', memory_id: previousMemoryId };
       }
@@ -882,12 +900,8 @@ export class RelationshipMemoryRuntime {
     if (intentId && !intent) {
       return this.persistPermanent(batchId, sourceKey, 'unknown_assistant_intent', `Assistant intent is not present in the trusted current-batch catalog: ${intentId}`, now);
     }
-    // Reinforce can point at any stored memory, so it must never move an intent (and its feel and protection) off the
-    // memory it is already linked to.
-    const linked = intent ? this.store.getTerminalAssistantIntentOutcome(intent.intent_id) : undefined;
-    if (linked?.memory_id && linked.memory_id !== memoryId) {
-      return this.persistPermanent(batchId, sourceKey, 'intent_already_linked', `Assistant intent ${intent!.intent_id} is already linked to memory ${linked.memory_id}.`, now);
-    }
+    const refused = linkedElsewhere(memoryId);
+    if (refused) return this.persistPermanent(batchId, sourceKey, refused.rejection_code!, refused.reason!, now);
     if (!memoryId || ids.length === 0 || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
       return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'memory_id and unique non-empty evidence_ids are required.', now);
     }

@@ -295,6 +295,28 @@ describe('trusted intent processing and batch completeness', () => {
       expect(rt.finalizeBatch('batch-relink', true)).toBe('completed');
     });
 
+    it('does not relink through the replay path of an already-recorded reinforcement either', () => {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+      const memoryA = existingMemory(store);
+      const other = runtime(store);
+      other.store.beginBatch('batch-other', '2026-08-01T00:00:01Z');
+      const memoryB = other.remember('batch-other', { ...proposal(undefined, ['user-2', 'assistant-2']), summary: 'A different moment' }).memory_id!;
+      const intent = persistIntent(store, 'Keep the gesture.', 'Belongs to A.', 'tool-p', 'assistant-tool-p');
+      const first = runtime(store, [intent]);
+      first.store.beginBatch('batch-p1', '2026-08-02T00:00:00Z');
+      // B's reinforcement with the intent is recorded but its intent link is lost (half commit) ...
+      const input = { memory_id: memoryB, evidence_ids: ['user-1'], assistant_intent_id: intent.intent_id };
+      const failing = new RelationshipMemoryRuntime(new RelationshipMemoryStore(store.rootDir, 'subject-1', (phase) => phase === 'intent_outcome_commit'),
+        new Map(evidence.map((item) => [item.message_id, item])), () => '2026-08-02T00:00:00.000Z', new Map([[intent.intent_id, intent]]));
+      expect(failing.reinforce('batch-p1', input).outcome).toBe('retryable_failed');
+      // ... meanwhile the intent gets linked to A ...
+      first.store.beginBatch('batch-p2', '2026-08-02T00:00:01Z');
+      expect(first.reinforce('batch-p2', { memory_id: memoryA, evidence_ids: ['user-2'], assistant_intent_id: intent.intent_id }).outcome).toBe('accepted');
+      // ... so replaying B's call must not repair a link to B.
+      expect(first.reinforce('batch-p1', input)).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'intent_already_linked' }));
+      expect(store.getTerminalAssistantIntentOutcome(intent.intent_id)?.memory_id).toBe(memoryA);
+    });
+
     it('does not consume the intent when the reinforcement itself is rejected', () => {
       const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
       existingMemory(store);

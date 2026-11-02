@@ -4,6 +4,7 @@ import * as path from 'path';
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import { afterEach, describe, expect, it } from 'vitest';
 import { RelationshipMemoryStore, stableId } from '../src/store/index.js';
+import { ASSISTANT_REMEMBER_TOOL_NAME, extractAssistantRememberIntents, persistAssistantRememberIntents } from '../src/intent/index.js';
 
 const childScript = path.resolve('relationship-memory/tests/concurrent-writer-child.ts');
 const tsxCli = path.resolve('node_modules/.bin/tsx');
@@ -109,6 +110,47 @@ describe('cross-process canonical mutation boundary', () => {
     expect(results.map((r) => r.outcome).sort()).toEqual(['accepted', 'duplicate']);
     expect(store.listReinforcements()).toHaveLength(1);
   });
+
+  it('links one intent to exactly one memory when two workers reinforce different memories at once', async () => {
+    for (let round = 0; round < 3; round += 1) {
+    const dir = tempRoot(); const store = new RelationshipMemoryStore(dir, 'subject-test');
+    for (const id of ['mem-a', 'mem-b']) {
+      const summary = `用户提到了拉面（${id}）。`;
+      store.appendMemory({
+        schema_version: 1, memory_id: id, subject_id: 'subject-test', kind: 'user_preference',
+        summary, participants: ['user'], payload: { topic: '食物', preference: '喜欢拉面' },
+        status: 'active', observed_at: '2026-08-10T00:00:00.000Z', created_at: '2026-08-10T00:00:00.000Z',
+        source_key: `seed-${id}`, dedupe_key: stableId('dedupe', {
+          subject_id: 'subject-test', kind: 'user_preference', summary, participants: ['user'],
+          evidence_message_ids: [`seed-source-${id}`], payload: { topic: '食物', preference: '喜欢拉面' }, linked_memory_ids: [],
+        }),
+      } as any, [{
+        evidence_id: `seed-evidence-${id}`, memory_id: id, conversation_id: 'conversation-test', message_id: `seed-${id}`,
+        role: 'user', quote: '猫喜欢拉面', captured_at: '2026-08-10T00:00:00.000Z', source_evidence_id: `seed-source-${id}`,
+      } as any]);
+    }
+    persistAssistantRememberIntents(store, extractAssistantRememberIntents([{
+      type: 'assistant', uuid: 'assistant-remember', timestamp: '2026-08-10T00:02:00.000Z',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-remember', name: ASSISTANT_REMEMBER_TOOL_NAME, input: { memory: { text: '拉面' }, feel: { text: '开心' } } }] },
+    }] as any, -1, 'session-test', 'subject-test'));
+    const [intent] = store.listAssistantIntents();
+
+    {
+      const start = path.join(dir, 'start');
+      const a = spawnChild('reinforce-intent', dir, 'mem-a', start); const b = spawnChild('reinforce-intent', dir, 'mem-b', start);
+      fs.writeFileSync(start, 'go');
+      const [ra, rb] = await Promise.all([finish(a), finish(b)]);
+      expect([ra.code, rb.code], ra.stderr + rb.stderr).toEqual([0, 0]);
+      const results = { 'mem-a': JSON.parse(ra.stdout), 'mem-b': JSON.parse(rb.stdout) };
+      const winners = Object.entries(results).filter(([, r]) => r.outcome === 'accepted').map(([id]) => id);
+      expect(winners).toHaveLength(1);
+      const loser = winners[0] === 'mem-a' ? 'mem-b' : 'mem-a';
+      expect(results[loser]).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'intent_already_linked' }));
+      const linked = new RelationshipMemoryStore(dir, 'subject-test').listAssistantIntentOutcomes().filter((o) => o.intent_id === intent.intent_id);
+      expect(linked.map((o) => o.memory_id)).toEqual([winners[0]]);
+    }
+    }
+  }, 60_000);
 
   it('does not hold the canonical lock during simulated slow/model work before final local mutation', async () => {
     const root = tempRoot(); const marker = path.join(root, 'slow-started');
