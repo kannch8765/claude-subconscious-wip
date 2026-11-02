@@ -14,10 +14,15 @@
  *     [--max-messages 40] [--max-chars 60000] [--max-chunks N]
  *
  * --plan reads the transcript and the sync state only: no Letta calls, no store or state writes. A real run refuses
- * when LETTA_MODE=off (like the Stop hook) or when the transcript changed in the last MIN_IDLE_HOURS. It holds the
- * session's replay lease for the whole run, and the Stop hook sends nothing for a leased session, so a resumed session
- * never gets a live batch overlapping a replay chunk. The replay stops after the chunk in flight once the transcript
- * changes, and the next Stop hook takes over from the cursor.
+ * when LETTA_MODE=off (like the Stop hook) or when the transcript changed in the last MIN_IDLE_HOURS.
+ *
+ * The replay never blocks the live lane; it steps aside. If the session is resumed mid-run, its Stop hook may send a
+ * batch overlapping the chunk in flight. That is the overlap two consecutive live Stop hooks already have (a turn's
+ * hook fires while the previous turn's worker still runs), and the lane already handles it: the cursor only moves
+ * forward (max), turns on one Letta conversation are serialized by the busy retry, and an intent is keyed by its
+ * tool_use and links to one memory. After the chunk in flight the replay stops when the transcript changed, when the
+ * cursor isn't where its plan expects, or when the live lane overtook the chunk; the live lane owns the session from
+ * there.
  * Keep the same --max-* limits when rerunning after a held chunk: the limits decide the chunk end, which is part of
  * the batch id, so different limits retry a different batch.
  * Each chunk may queue a whisper for the ended session; nothing reads it.
@@ -27,7 +32,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { acquireReplayLease, getMode, getTempStateDir, loadSyncState } from './conversation_utils.js';
+import { getMode, getTempStateDir, loadSyncState } from './conversation_utils.js';
 import { buildLiveBatch } from './send_messages_to_letta.js';
 import { runNativeWorkerPayloadFile } from './send_worker_native.js';
 import { extractAllContent, formatMessagesForLetta, readTranscript, type TranscriptMessage } from './transcript_utils.js';
@@ -141,11 +146,15 @@ function emit(record: Record<string, unknown>): void {
   console.log(JSON.stringify(record));
 }
 
-export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
+export interface ReplayDependencies {
+  buildBatch?: typeof buildLiveBatch;
+  runWorker?: (payloadFile: string) => Promise<void>;
+}
+
+export async function replayStuckSession(args: ReplayArgs, dependencies: ReplayDependencies = {}): Promise<boolean> {
   const messages = await readTranscript(args.transcript);
-  const sizes = messages.map(formattedChars); // the transcript is fixed for the run; size each message once
   const cursor = loadSyncState(args.cwd, args.session).lastProcessedIndex;
-  const plan = planReplayChunks(messages, cursor, args, sizes);
+  const plan = planReplayChunks(messages, cursor, args); // the transcript is fixed for the run: plan once
   emit({
     event: 'plan', messages: messages.length, cursor, chunks: plan.length,
     chars: plan.reduce((sum, chunk) => sum + chunk.chars, 0),
@@ -160,37 +169,37 @@ export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
     emit({ event: 'refused', reason: 'mode_off' });
     return false;
   }
-  let releaseLease: () => void;
-  try { releaseLease = acquireReplayLease(args.cwd, args.session); }
-  catch { emit({ event: 'refused', reason: 'replay_in_progress' }); return false; }
-  try {
-    // Lease first, then the idle check: a Stop hook that started before the lease wrote the transcript just before.
-    const startMtime = fs.statSync(args.transcript).mtimeMs;
-    const idleHours = (Date.now() - startMtime) / 3_600_000;
-    if (idleHours < MIN_IDLE_HOURS) {
-      emit({ event: 'refused', reason: 'session_recently_active', idle_hours: Math.round(idleHours * 10) / 10 });
-      return false;
-    }
-    return await replayChunks(args, messages, sizes, startMtime);
-  } finally {
-    releaseLease();
+  const startMtime = fs.statSync(args.transcript).mtimeMs;
+  const idleHours = (Date.now() - startMtime) / 3_600_000;
+  if (idleHours < MIN_IDLE_HOURS) {
+    emit({ event: 'refused', reason: 'session_recently_active', idle_hours: Math.round(idleHours * 10) / 10 });
+    return false;
   }
-}
 
-async function replayChunks(args: ReplayArgs, messages: TranscriptMessage[], sizes: number[], startMtime: number): Promise<boolean> {
+  const buildBatch = dependencies.buildBatch ?? buildLiveBatch;
+  const runWorker = dependencies.runWorker ?? ((payloadFile: string) => runNativeWorkerPayloadFile(payloadFile));
+  const lastIndex = messages.length - 1;
+  const currentCursor = () => loadSyncState(args.cwd, args.session).lastProcessedIndex;
   const hookInput = { session_id: args.session, transcript_path: args.transcript, cwd: args.cwd };
-  for (let n = 0; n < args.maxChunks; n++) {
+  for (const [n, chunk] of plan.entries()) {
+    if (n >= args.maxChunks) {
+      emit({ event: 'stopped', reason: 'max_chunks', cursor: currentCursor() });
+      return true;
+    }
     if (fs.statSync(args.transcript).mtimeMs !== startMtime) {
-      emit({ event: 'stopped', reason: 'transcript_changed', cursor: loadSyncState(args.cwd, args.session).lastProcessedIndex });
+      emit({ event: 'stopped', reason: 'transcript_changed', cursor: currentCursor() });
       return false;
     }
-    const before = loadSyncState(args.cwd, args.session).lastProcessedIndex;
-    const [chunk] = planReplayChunks(messages, before, args, sizes);
-    if (!chunk) { emit({ event: 'done', cursor: before }); return true; }
-    const batch = await buildLiveBatch(hookInput, messages.slice(0, chunk.end + 1));
+    const before = currentCursor();
+    if (before !== chunk.start - 1) {
+      // Only the live lane moves this cursor besides us: the session is live again, so it owns the rest.
+      emit({ event: 'stopped', reason: 'cursor_moved', expected: chunk.start - 1, cursor: before });
+      return before >= lastIndex;
+    }
+    const batch = await buildBatch(hookInput, messages.slice(0, chunk.end + 1));
     if (!batch) {
       // The Stop hook sends nothing for a tail that formats to nothing; anywhere else the backlog is still there.
-      const atEnd = chunk.end === messages.length - 1;
+      const atEnd = chunk.end === lastIndex;
       emit({ event: atEnd ? 'done' : 'stopped', cursor: before, reason: atEnd ? 'nothing_to_send' : 'empty_chunk' });
       return atEnd;
     }
@@ -199,16 +208,17 @@ async function replayChunks(args: ReplayArgs, messages: TranscriptMessage[], siz
     fs.mkdirSync(path.dirname(payloadFile), { recursive: true });
     fs.writeFileSync(payloadFile, JSON.stringify(batch.payload), 'utf-8');
     const startedAt = Date.now();
-    await runNativeWorkerPayloadFile(payloadFile);
-    const after = loadSyncState(args.cwd, args.session).lastProcessedIndex;
-    const completed = after === chunk.end;
+    await runWorker(payloadFile);
+    const after = currentCursor();
+    const outcome = after === chunk.end ? 'completed' : after > chunk.end ? 'overtaken' : 'held';
     emit({
       event: 'chunk', ...chunk, batch: batch.payload.batchId.slice(0, 16), seconds: Math.round((Date.now() - startedAt) / 1000),
-      cursor_before: before, cursor_after: after, outcome: completed ? 'completed' : 'held',
+      cursor_before: before, cursor_after: after, outcome,
     });
-    if (!completed) return false;
+    if (outcome === 'held') return false;
+    if (outcome === 'overtaken') return after >= lastIndex; // the live lane moved past this chunk and owns the rest
   }
-  emit({ event: 'stopped', reason: 'max_chunks', cursor: loadSyncState(args.cwd, args.session).lastProcessedIndex });
+  emit({ event: 'done', cursor: currentCursor() });
   return true;
 }
 

@@ -33,7 +33,6 @@ import {
   spawnSilentWorker,
   getMode,
   getTempStateDir,
-  replayLeaseHolder,
 } from './conversation_utils.js';
 import {
   readTranscript,
@@ -106,14 +105,6 @@ async function main(): Promise<void> {
 
     if (hookInput.stop_hook_active) {
       log('Stop hook already active, exiting to prevent loop');
-      process.exit(0);
-    }
-
-    // A stuck-session replay owns this session's cursor while it runs. Send nothing and leave the cursor where it is:
-    // the replay stops after its current chunk once the transcript changes, and the next Stop hook picks up from there.
-    const replayHolder = replayLeaseHolder(hookInput.cwd, hookInput.session_id);
-    if (replayHolder !== null) {
-      log(`Replay in progress for this session (pid ${replayHolder}); sending nothing this turn`);
       process.exit(0);
     }
 
