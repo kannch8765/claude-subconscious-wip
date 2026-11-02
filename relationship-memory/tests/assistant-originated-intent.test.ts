@@ -277,6 +277,24 @@ describe('trusted intent processing and batch completeness', () => {
       expect(rt.finalizeBatch('batch-fabricated', true)).toBe('retryable_failure');
     });
 
+    it('never moves an intent off the memory it is already linked to', () => {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+      const memoryA = existingMemory(store);
+      const other = runtime(store);
+      other.store.beginBatch('batch-other', '2026-08-01T00:00:01Z');
+      const memoryB = other.remember('batch-other', { ...proposal(undefined, ['user-2', 'assistant-2']), summary: 'A different moment' }).memory_id!;
+      expect(memoryB).not.toBe(memoryA);
+      const intent = persistIntent(store, 'Keep the gesture.', 'Belongs to A.', 'tool-l', 'assistant-tool-l');
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch('batch-relink', '2026-08-02T00:00:00Z');
+
+      expect(rt.reinforce('batch-relink', { memory_id: memoryA, evidence_ids: ['user-2'], assistant_intent_id: intent.intent_id }).outcome).toBe('accepted');
+      expect(rt.reinforce('batch-relink', { memory_id: memoryB, evidence_ids: ['user-1'], assistant_intent_id: intent.intent_id }))
+        .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'intent_already_linked' }));
+      expect(store.getTerminalAssistantIntentOutcome(intent.intent_id)?.memory_id).toBe(memoryA);
+      expect(rt.finalizeBatch('batch-relink', true)).toBe('completed');
+    });
+
     it('does not consume the intent when the reinforcement itself is rejected', () => {
       const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
       existingMemory(store);

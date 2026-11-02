@@ -882,6 +882,12 @@ export class RelationshipMemoryRuntime {
     if (intentId && !intent) {
       return this.persistPermanent(batchId, sourceKey, 'unknown_assistant_intent', `Assistant intent is not present in the trusted current-batch catalog: ${intentId}`, now);
     }
+    // Reinforce can point at any stored memory, so it must never move an intent (and its feel and protection) off the
+    // memory it is already linked to.
+    const linked = intent ? this.store.getTerminalAssistantIntentOutcome(intent.intent_id) : undefined;
+    if (linked?.memory_id && linked.memory_id !== memoryId) {
+      return this.persistPermanent(batchId, sourceKey, 'intent_already_linked', `Assistant intent ${intent!.intent_id} is already linked to memory ${linked.memory_id}.`, now);
+    }
     if (!memoryId || ids.length === 0 || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
       return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'memory_id and unique non-empty evidence_ids are required.', now);
     }
