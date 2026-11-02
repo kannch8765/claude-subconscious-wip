@@ -230,6 +230,27 @@ describe('replay next to a live Stop hook (overlap contract)', () => {
     } finally { t.cleanup(); }
   });
 
+  it('stops after the chunk in flight once the transcript changes (the session was resumed)', async () => {
+    const fs = await import('fs');
+    const t = await session(6);
+    try {
+      t.hooks.onEvent = (event) => { if (event.event === 'chunk') fs.utimesSync(t.args.transcript, new Date(), new Date()); };
+      const ok = await replayStuckSession(t.args, { buildBatch: t.buildBatch as any, runWorker: t.runWorker((end) => advanceSyncStateCursor(t.dir, 's', end)) });
+      expect(ok).toBe(false);
+      expect(t.sent).toEqual([1]);
+      expect(t.events.at(-1)).toEqual({ event: 'stopped', reason: 'transcript_changed', cursor: 1 });
+    } finally { t.cleanup(); }
+  });
+
+  it('never reports an empty chunk before the end as done', async () => {
+    const t = await session(6);
+    try {
+      const ok = await replayStuckSession(t.args, { buildBatch: (async () => null) as any, runWorker: t.runWorker(() => {}) });
+      expect(ok).toBe(false);
+      expect(t.events.at(-1)).toEqual({ event: 'stopped', cursor: -1, reason: 'empty_chunk' });
+    } finally { t.cleanup(); }
+  });
+
   it('keeps the cursor and the intent ledger convergent whichever overlapping batch finishes first', async () => {
     const fs = await import('fs');
     const os = await import('os');
