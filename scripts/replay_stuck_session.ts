@@ -13,7 +13,8 @@
  *   npx tsx scripts/replay_stuck_session.ts --session <id> --transcript <path> --cwd <cwd> [--plan]
  *     [--max-messages 40] [--max-chars 60000] [--max-chunks N]
  *
- * --plan reads the transcript and the sync state only: no Letta calls, no store or state writes.
+ * --plan reads the transcript and the sync state only: no Letta calls, no store or state writes. A real run refuses a
+ * session whose transcript changed in the last MIN_IDLE_HOURS, so it never races a live Stop hook on the same cursor.
  * Output is metadata only (indices, counts, sizes, durations, outcomes), one JSON object per line.
  */
 
@@ -25,6 +26,9 @@ import { buildLiveBatch } from './send_messages_to_letta.js';
 import { runNativeWorkerPayloadFile } from './send_worker_native.js';
 import { extractAllContent, formatMessagesForLetta, readTranscript, type TranscriptMessage } from './transcript_utils.js';
 import { isAssistantRememberToolName } from '../relationship-memory/src/intent/index.js';
+
+/** A transcript touched more recently than this may still get Stop hooks; replaying it would race the live lane. */
+export const MIN_IDLE_HOURS = 6;
 
 export interface ReplayLimits {
   maxMessages: number;
@@ -140,6 +144,11 @@ export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
   if (args.plan) {
     for (const chunk of plan) emit({ event: 'chunk_plan', ...chunk });
     return true;
+  }
+  const idleHours = (Date.now() - fs.statSync(args.transcript).mtimeMs) / 3_600_000;
+  if (idleHours < MIN_IDLE_HOURS) {
+    emit({ event: 'refused', reason: 'session_recently_active', idle_hours: Math.round(idleHours * 10) / 10 });
+    return false;
   }
 
   const hookInput = { session_id: args.session, transcript_path: args.transcript, cwd: args.cwd };

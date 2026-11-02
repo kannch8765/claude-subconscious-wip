@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
-import { parseReplayArgs, planReplayChunks } from './replay_stuck_session.js';
+import { describe, expect, it, vi } from 'vitest';
+import { parseReplayArgs, planReplayChunks, replayStuckSession } from './replay_stuck_session.js';
 import { ASSISTANT_REMEMBER_TOOL_NAME } from '../relationship-memory/src/intent/index.js';
 import type { TranscriptMessage } from './transcript_utils.js';
 
@@ -93,4 +93,28 @@ describe('Stop hook entry point after the buildLiveBatch split', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   }, 30_000);
+});
+
+describe('replayStuckSession', () => {
+  it('refuses a session whose transcript is still being written, before any send', async () => {
+    const fs = await import('fs');
+    const os = await import('os');
+    const path = await import('path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replay-active-'));
+    const transcript = path.join(dir, 's.jsonl');
+    fs.writeFileSync(transcript, [user('u0'), assistant('a1')].map((m) => JSON.stringify(m)).join('\n'));
+    const previousHome = process.env.LETTA_HOME;
+    process.env.LETTA_HOME = dir;
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const ok = await replayStuckSession({ session: 's', transcript, cwd: dir, plan: false, maxMessages: 40, maxChars: 60_000, maxChunks: 1 });
+      expect(ok).toBe(false);
+      expect(log.mock.calls.map(([line]) => JSON.parse(line).event)).toEqual(['plan', 'refused']);
+      expect(fs.existsSync(path.join(dir, '.letta'))).toBe(false);
+    } finally {
+      log.mockRestore();
+      if (previousHome === undefined) delete process.env.LETTA_HOME; else process.env.LETTA_HOME = previousHome;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
