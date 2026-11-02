@@ -156,6 +156,11 @@ export function getSyncStateLockOwnerFile(cwd: string, sessionId: string): strin
   return path.join(getSyncStateLockFile(cwd, sessionId), 'owner.json');
 }
 
+/** Held by a stuck-session replay for its whole run; the Stop hook sends nothing for the session while it is held. */
+export function getReplayLeaseDir(cwd: string, sessionId: string): string {
+  return path.join(getDurableStateDir(cwd), `session-${encodeURIComponent(sessionId)}.replay-lease`);
+}
+
 /**
  * Get the durable retry marker used to rotate a poisoned live Letta conversation
  * without touching the transcript cursor from a detached worker.
@@ -479,6 +484,38 @@ export function advanceSyncStateCursor(
   });
 }
 
+
+/** PID of the live process holding this session's replay lease, or null (absent, unreadable or dead owner). */
+export function replayLeaseHolder(cwd: string, sessionId: string): number | null {
+  const owner = readDurableLockOwner(path.join(getReplayLeaseDir(cwd, sessionId), 'owner.json'));
+  return owner && processIsAlive(owner.pid) ? owner.pid : null;
+}
+
+/**
+ * Take the session's replay lease for a long-running replay. Throws when a live process already holds it. A lease
+ * whose owner died is replaced. Returns the release function (only removes the lease if it is still ours).
+ */
+export function acquireReplayLease(cwd: string, sessionId: string): () => void {
+  ensureDurableStateDir(cwd);
+  const leaseDir = getReplayLeaseDir(cwd, sessionId);
+  const ownerPath = path.join(leaseDir, 'owner.json');
+  const token = makeDurableLockToken();
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.mkdirSync(leaseDir, { mode: 0o700 });
+      fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }), { encoding: 'utf-8', mode: 0o600 });
+      return () => {
+        if (readDurableLockOwner(ownerPath)?.token === token) fs.rmSync(leaseDir, { recursive: true, force: true });
+      };
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') throw error;
+      const holder = replayLeaseHolder(cwd, sessionId);
+      if (holder !== null) throw new Error(`Replay lease for session ${sessionId} is held by live process ${holder}`);
+      fs.rmSync(leaseDir, { recursive: true, force: true }); // dead or unreadable owner
+    }
+  }
+  throw new Error(`Could not take the replay lease for session ${sessionId}`);
+}
 
 /** Return the canonical memory ids already surfaced to foreground in this Claude session. */
 export function getSessionDeliveredMemoryIds(cwd: string, sessionId: string): string[] {

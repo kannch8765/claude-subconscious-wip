@@ -14,8 +14,10 @@
  *     [--max-messages 40] [--max-chars 60000] [--max-chunks N]
  *
  * --plan reads the transcript and the sync state only: no Letta calls, no store or state writes. A real run refuses
- * when LETTA_MODE=off (like the Stop hook) and when the transcript changed in the last MIN_IDLE_HOURS, and stops if it
- * changes during the run, so it never races a live Stop hook on the same cursor.
+ * when LETTA_MODE=off (like the Stop hook) or when the transcript changed in the last MIN_IDLE_HOURS. It holds the
+ * session's replay lease for the whole run, and the Stop hook sends nothing for a leased session, so a resumed session
+ * never gets a live batch overlapping a replay chunk. The replay stops after the chunk in flight once the transcript
+ * changes, and the next Stop hook takes over from the cursor.
  * Keep the same --max-* limits when rerunning after a held chunk: the limits decide the chunk end, which is part of
  * the batch id, so different limits retry a different batch.
  * Each chunk may queue a whisper for the ended session; nothing reads it.
@@ -25,7 +27,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { getMode, getTempStateDir, loadSyncState } from './conversation_utils.js';
+import { acquireReplayLease, getMode, getTempStateDir, loadSyncState } from './conversation_utils.js';
 import { buildLiveBatch } from './send_messages_to_letta.js';
 import { runNativeWorkerPayloadFile } from './send_worker_native.js';
 import { extractAllContent, formatMessagesForLetta, readTranscript, type TranscriptMessage } from './transcript_utils.js';
@@ -69,8 +71,12 @@ function rememberCalls(message: TranscriptMessage): number {
  * turn when one fits, so a batch carries whole exchanges. Messages that format to nothing ride along with the next
  * chunk, because the Stop hook sends nothing (and moves no cursor) for them.
  */
-export function planReplayChunks(messages: TranscriptMessage[], lastProcessedIndex: number, limits: ReplayLimits): ReplayChunk[] {
-  const sizes = messages.map(formattedChars);
+export function planReplayChunks(
+  messages: TranscriptMessage[],
+  lastProcessedIndex: number,
+  limits: ReplayLimits,
+  sizes: readonly number[] = messages.map(formattedChars),
+): ReplayChunk[] {
   const chunks: ReplayChunk[] = [];
   let start = lastProcessedIndex + 1;
   while (start < messages.length) {
@@ -137,8 +143,9 @@ function emit(record: Record<string, unknown>): void {
 
 export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
   const messages = await readTranscript(args.transcript);
+  const sizes = messages.map(formattedChars); // the transcript is fixed for the run; size each message once
   const cursor = loadSyncState(args.cwd, args.session).lastProcessedIndex;
-  const plan = planReplayChunks(messages, cursor, args);
+  const plan = planReplayChunks(messages, cursor, args, sizes);
   emit({
     event: 'plan', messages: messages.length, cursor, chunks: plan.length,
     chars: plan.reduce((sum, chunk) => sum + chunk.chars, 0),
@@ -153,13 +160,24 @@ export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
     emit({ event: 'refused', reason: 'mode_off' });
     return false;
   }
-  const startMtime = fs.statSync(args.transcript).mtimeMs;
-  const idleHours = (Date.now() - startMtime) / 3_600_000;
-  if (idleHours < MIN_IDLE_HOURS) {
-    emit({ event: 'refused', reason: 'session_recently_active', idle_hours: Math.round(idleHours * 10) / 10 });
-    return false;
+  let releaseLease: () => void;
+  try { releaseLease = acquireReplayLease(args.cwd, args.session); }
+  catch { emit({ event: 'refused', reason: 'replay_in_progress' }); return false; }
+  try {
+    // Lease first, then the idle check: a Stop hook that started before the lease wrote the transcript just before.
+    const startMtime = fs.statSync(args.transcript).mtimeMs;
+    const idleHours = (Date.now() - startMtime) / 3_600_000;
+    if (idleHours < MIN_IDLE_HOURS) {
+      emit({ event: 'refused', reason: 'session_recently_active', idle_hours: Math.round(idleHours * 10) / 10 });
+      return false;
+    }
+    return await replayChunks(args, messages, sizes, startMtime);
+  } finally {
+    releaseLease();
   }
+}
 
+async function replayChunks(args: ReplayArgs, messages: TranscriptMessage[], sizes: number[], startMtime: number): Promise<boolean> {
   const hookInput = { session_id: args.session, transcript_path: args.transcript, cwd: args.cwd };
   for (let n = 0; n < args.maxChunks; n++) {
     if (fs.statSync(args.transcript).mtimeMs !== startMtime) {
@@ -167,7 +185,7 @@ export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
       return false;
     }
     const before = loadSyncState(args.cwd, args.session).lastProcessedIndex;
-    const [chunk] = planReplayChunks(messages, before, args);
+    const [chunk] = planReplayChunks(messages, before, args, sizes);
     if (!chunk) { emit({ event: 'done', cursor: before }); return true; }
     const batch = await buildLiveBatch(hookInput, messages.slice(0, chunk.end + 1));
     if (!batch) {
