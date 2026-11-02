@@ -159,7 +159,8 @@ export function appendTrustedRelationshipCatalog(
     `    <feel>${escapeWorkerXml(intent.feel.text)}</feel>`,
     '  </assistant_remember_intent>',
   ].join('\n')).join('\n');
-  return `${withEvidence}\n\n<assistant_remember_intent_catalog trusted="true">\n${entries}\n</assistant_remember_intent_catalog>`;
+  const guidance = 'Each intent is foreground Kohaku explicitly asking to remember a moment. Resolve every intent: search with purpose=maintenance first; if an existing memory already holds the same moment, call memory_reinforce on it with assistant_intent_id; otherwise create the matching kind-specific memory with assistant_intent_id.';
+  return `${withEvidence}\n\n<assistant_remember_intent_catalog trusted="true">\n${entries ? `<guidance>${guidance}</guidance>\n` : ''}${entries}\n</assistant_remember_intent_catalog>`;
 }
 
 /** Extra observer turns a released (`deferred`) intent is re-offered in later batches of its own session. */
@@ -261,7 +262,7 @@ export function buildRelationshipTools(
     },
     {
       label: 'memory_reinforce', name: 'memory_reinforce',
-      description: 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying episode/event or stable preference. Explicit repeated durable-preference evidence should be bound here rather than treated as no_memory_required. Do not use lexical similarity alone to decide sameness.',
+      description: 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying episode/event or stable preference. Explicit repeated durable-preference evidence should be bound here rather than treated as no_memory_required. When a trusted assistant remember intent asks to keep a moment this memory already holds, pass its assistant_intent_id here. Do not use lexical similarity alone to decide sameness.',
       parameters: memoryReinforceToolSchema(),
       async execute(_toolCallId, args) { return wrapResult(runtime.reinforce(batchId, args as never)); },
     },

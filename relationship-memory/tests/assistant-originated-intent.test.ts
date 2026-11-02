@@ -210,6 +210,87 @@ describe('trusted intent processing and batch completeness', () => {
     expect(projection).toContain('Later, the same kind of gesture felt reassuring.');
   });
 
+  describe('reinforcing an existing memory on behalf of an intent', () => {
+    function existingMemory(store: RelationshipMemoryStore) {
+      const observer = runtime(store);
+      observer.store.beginBatch('batch-existing', '2026-08-01T00:00:00Z');
+      const created = observer.remember('batch-existing', proposal());
+      expect(created.outcome).toBe('accepted');
+      expect(observer.finalizeBatch('batch-existing', true)).toBe('completed');
+      return created.memory_id!;
+    }
+
+    it('links the intent and its feel to the memory that already holds its moment, and completes the batch', () => {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+      const memoryId = existingMemory(store);
+      const intent = persistIntent(store, 'Keep the gesture.', 'Already remembered, still warm.', 'tool-r', 'assistant-tool-r');
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch('batch-reinforce', '2026-08-02T00:00:00Z');
+
+      expect(rt.reinforce('batch-reinforce', { memory_id: memoryId, evidence_ids: ['user-2', 'assistant-2'], assistant_intent_id: intent.intent_id }))
+        .toEqual({ outcome: 'accepted', memory_id: memoryId });
+      expect(store.getTerminalAssistantIntentOutcome(intent.intent_id, 'batch-reinforce')).toEqual(expect.objectContaining({
+        outcome: 'duplicate', memory_id: memoryId,
+      }));
+      expect(store.listMemories()).toHaveLength(1);
+      expect(rt.finalizeBatch('batch-reinforce', true)).toBe('completed');
+      expect(rebuildProjection(store).blocks.remembered_experiences).toContain('Already remembered, still warm.');
+    });
+
+    it('links the intent even when the cited evidence is already on the memory', () => {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+      const memoryId = existingMemory(store);
+      const intent = persistIntent(store, 'Keep the gesture.', 'Same evidence, same moment.', 'tool-s', 'assistant-tool-s');
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch('batch-same-evidence', '2026-08-02T00:00:00Z');
+
+      expect(rt.reinforce('batch-same-evidence', { memory_id: memoryId, evidence_ids: ['user-1', 'assistant-1'], assistant_intent_id: intent.intent_id }))
+        .toEqual({ outcome: 'duplicate', memory_id: memoryId });
+      expect(store.getTerminalAssistantIntentOutcome(intent.intent_id, 'batch-same-evidence')?.memory_id).toBe(memoryId);
+      expect(rt.finalizeBatch('batch-same-evidence', true)).toBe('completed');
+    });
+
+    it('is idempotent when the same reinforcement is replayed', () => {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+      const memoryId = existingMemory(store);
+      const intent = persistIntent(store, 'Keep the gesture.', 'Once is enough.', 'tool-i', 'assistant-tool-i');
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch('batch-idem', '2026-08-02T00:00:00Z');
+      const input = { memory_id: memoryId, evidence_ids: ['user-2', 'assistant-2'], assistant_intent_id: intent.intent_id };
+      rt.reinforce('batch-idem', input);
+
+      expect(rt.reinforce('batch-idem', input)).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+      expect(store.listReinforcements()).toHaveLength(1);
+      expect(rt.finalizeBatch('batch-idem', true)).toBe('completed');
+    });
+
+    it('rejects a fabricated intent id without writing, and keeps the real intent holding the batch', () => {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+      const memoryId = existingMemory(store);
+      const intent = persistIntent(store, 'Keep the gesture.', 'Real feel.', 'tool-f', 'assistant-tool-f');
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch('batch-fabricated', '2026-08-02T00:00:00Z');
+
+      expect(rt.reinforce('batch-fabricated', { memory_id: memoryId, evidence_ids: ['user-2'], assistant_intent_id: 'intent_fabricated' }))
+        .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unknown_assistant_intent' }));
+      expect(store.listReinforcements()).toHaveLength(0);
+      expect(rt.finalizeBatch('batch-fabricated', true)).toBe('retryable_failure');
+    });
+
+    it('does not consume the intent when the reinforcement itself is rejected', () => {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject-1');
+      existingMemory(store);
+      const intent = persistIntent(store, 'Keep the gesture.', 'Wrong target.', 'tool-w', 'assistant-tool-w');
+      const rt = runtime(store, [intent]);
+      rt.store.beginBatch('batch-wrong-memory', '2026-08-02T00:00:00Z');
+
+      expect(rt.reinforce('batch-wrong-memory', { memory_id: 'mem_missing', evidence_ids: ['user-2'], assistant_intent_id: intent.intent_id }))
+        .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unknown_memory' }));
+      expect(store.getTerminalAssistantIntentOutcome(intent.intent_id, 'batch-wrong-memory')).toBeUndefined();
+      expect(rt.finalizeBatch('batch-wrong-memory', true)).toBe('retryable_failure');
+    });
+  });
+
   it('recovers a half-committed canonical outcome when assistant-intent outcome journaling failed', () => {
     let failIntentOutcome = true;
     const dir = tempDir();
@@ -431,5 +512,10 @@ describe('trusted observer catalog', () => {
     expect(catalog).toContain('tool_use_id="tool-1"');
     expect(catalog).toContain('&lt;memory exact&gt;');
     expect(catalog).toContain('feel &amp; exact');
+    expect(catalog).toContain('call memory_reinforce on it with assistant_intent_id');
+  });
+
+  it('adds intent guidance only when the batch carries intents', () => {
+    expect(appendTrustedRelationshipCatalog('fixture', evidence, [])).not.toContain('<guidance>');
   });
 });
