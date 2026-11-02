@@ -67,6 +67,17 @@ async function main(): Promise<void> {
     }))));
     return;
   }
+  if (mode === 'reinforce-intent') {
+    // id = the memory this worker links the shared intent to. No outer boundary: reinforce must serialize itself.
+    waitForStart();
+    const intents = new Map(store.listAssistantIntents().map((intent) => [intent.intent_id, intent]));
+    const runtime = new RelationshipMemoryRuntime(store, new Map([[reinforceMessage.message_id, reinforceMessage as any]]), undefined, intents);
+    const [intentId] = intents.keys();
+    console.log(JSON.stringify(runtime.reinforce(`batch-${id}`, {
+      memory_id: id, evidence_ids: [reinforceMessage.evidence_id], assistant_intent_id: intentId,
+    })));
+    return;
+  }
   if (mode === 'contend') {
     // Parent writes start only after entering withMutationBoundary, so contention ordering is causal.
     waitForStart();

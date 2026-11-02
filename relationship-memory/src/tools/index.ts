@@ -40,7 +40,7 @@ export interface SearchQuery {
   excludeMemoryIds?: readonly string[];  // Runtime-only foreground context mask; never exposed in the tool schema.
 }
 
-export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[] }
+export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[]; assistant_intent_id?: string }
 export interface MaintenanceReviewInput { memory_ids: string[]; relation: MemoryRelationKind; reason: string }
 export interface MaintenanceReviewResult { outcome: 'accepted' | 'duplicate' | 'rejected'; review_id?: string; reason?: string }
 export interface EntitySearchQuery { query?: string; limit?: number }
@@ -713,6 +713,7 @@ export class RelationshipMemoryRuntime {
     memoryId: string,
     now: string,
     intent?: AssistantRememberIntentRecord,
+    intentOutcome: 'accepted' | 'duplicate' = outcome,
   ): RememberResult {
     try {
       this.store.appendOutcome({ batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome, memory_id: memoryId, recorded_at: now });
@@ -721,7 +722,7 @@ export class RelationshipMemoryRuntime {
           intent_id: intent.intent_id,
           batch_id: batchId,
           ...this.attemptFields(batchId),
-          outcome,
+          outcome: intentOutcome,
           memory_id: memoryId,
           recorded_at: now,
         });
@@ -850,7 +851,16 @@ export class RelationshipMemoryRuntime {
     return { outcome: appended ? 'accepted' : 'duplicate', review_id: reviewId };
   }
 
+  /**
+   * The intent-link check and the writes that publish the link run under one canonical mutation boundary (reentrant;
+   * the live worker already holds it around each mutation tool), so two workers can't both see "unlinked" and link
+   * one intent to two memories.
+   */
   reinforce(batchId: string, input: ReinforceInput): RememberResult {
+    return this.store.withMutationBoundary(() => this.reinforceInBoundary(batchId, input));
+  }
+
+  private reinforceInBoundary(batchId: string, input: ReinforceInput): RememberResult {
     const now = this.now();
     this.ensureRetryAttempt(batchId, now);
     const memoryId = typeof input?.memory_id === 'string' ? input.memory_id.trim() : '';
@@ -858,14 +868,40 @@ export class RelationshipMemoryRuntime {
     const ids = Array.isArray(rawIds) ? rawIds.map((id) => typeof id === 'string' ? id.trim() : '') : [];
     const normalizedIds = [...ids].sort();
     const legacyEvidenceField = input?.evidence_ids === undefined && input?.evidence_message_ids !== undefined;
+    // An intent id is part of the source only when given, so reinforcement keys without one stay as they were.
+    const intentId = rawAssistantIntentId(input);
+    const intentKey = intentId ? { assistant_intent_id: intentId } : {};
     const sourceKey = legacyEvidenceField
-      ? stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_message_ids: normalizedIds })
-      : stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_ids: normalizedIds });
+      ? stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_message_ids: normalizedIds, ...intentKey })
+      : stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_ids: normalizedIds, ...intentKey });
+    // Reinforcing with an intent says the intent's moment is already remembered: the intent links to this memory as a
+    // `duplicate`. Only a write or retryable failure carries the intent; a rejected reinforcement leaves it unresolved
+    // (the turn budget still applies), so a wrong memory_id cannot consume it.
+    const intent = this.trustedIntent(intentId);
+    // Reinforce can point at any stored memory, so it must never move an intent (and its feel and protection) off the
+    // memory it is already linked to, on a first call or on a replayed one.
+    const linked = intent ? this.store.getTerminalAssistantIntentOutcome(intent.intent_id) : undefined;
+    const linkedElsewhere = (target: string): RememberResult | undefined => (linked?.memory_id && linked.memory_id !== target
+      ? { outcome: 'permanently_rejected', rejection_code: 'intent_already_linked', reason: `Assistant intent ${intent!.intent_id} is already linked to memory ${linked.memory_id}.` }
+      : undefined);
     const previous = this.store.getTerminalOutcome(sourceKey);
     if (previous) {
-      if (previous.outcome === 'accepted' || previous.outcome === 'duplicate') return { outcome: 'duplicate', memory_id: previous.memory_id ?? memoryId };
+      if (previous.outcome === 'accepted' || previous.outcome === 'duplicate') {
+        const previousMemoryId = previous.memory_id ?? memoryId;
+        if (!intent) return { outcome: 'duplicate', memory_id: previousMemoryId };
+        // The reinforcement itself already stands; only the intent link is refused, and nothing new is recorded.
+        const refused = linkedElsewhere(previousMemoryId);
+        if (refused) return refused;
+        const repaired = this.persistOutcomePair(batchId, sourceKey, previous.outcome, previousMemoryId, now, intent, 'duplicate');
+        return repaired.outcome === 'retryable_failed' ? repaired : { outcome: 'duplicate', memory_id: previousMemoryId };
+      }
       return { outcome: previous.outcome, rejection_code: previous.rejection_code, reason: previous.reason };
     }
+    if (intentId && !intent) {
+      return this.persistPermanent(batchId, sourceKey, 'unknown_assistant_intent', `Assistant intent is not present in the trusted current-batch catalog: ${intentId}`, now);
+    }
+    const refused = linkedElsewhere(memoryId);
+    if (refused) return this.persistPermanent(batchId, sourceKey, refused.rejection_code!, refused.reason!, now);
     if (!memoryId || ids.length === 0 || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
       return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'memory_id and unique non-empty evidence_ids are required.', now);
     }
@@ -879,14 +915,14 @@ export class RelationshipMemoryRuntime {
       messages.push(resolved.message);
     }
     const originalEvidenceIds = this.originalMemoryEvidenceIds(memory);
-    if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now);
+    if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now, intent);
     const completedEvidenceIds = new Set(originalEvidenceIds);
     for (const reinforcement of this.store.listReinforcements()) {
       if (reinforcement.memory_id !== memoryId) continue;
       for (const evidenceId of reinforcement.evidence_ids) completedEvidenceIds.add(evidenceId);
     }
     const newMessages = messages.filter((message) => !completedEvidenceIds.has(memoryEvidenceId(memoryId, message)));
-    if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now);
+    if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
     const newMessageIds = newMessages.map(canonicalEvidenceId).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({
       evidence_id: memoryEvidenceId(memoryId, message), memory_id: memoryId,
@@ -902,8 +938,8 @@ export class RelationshipMemoryRuntime {
     };
     const existed = this.store.listReinforcements().some((item) => item.reinforcement_id === reinforcement.reinforcement_id);
     try { this.store.appendReinforcement(reinforcement, evidence); }
-    catch (error) { return this.markRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }
-    return this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now);
+    catch (error) { return this.markRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now, intent); }
+    return this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now, intent, 'duplicate');
   }
 
   rememberKind(batchId: string, kind: MemoryKind, rawInput: unknown): RememberResult {
@@ -1229,6 +1265,7 @@ export function memoryReinforceToolSchema(): Record<string, unknown> {
     memory_id: { type: 'string', minLength: 1, description: 'Existing canonical memory_id selected after memory_search.' },
     evidence_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Exact transcript-event evidence_id values from the trusted current-batch catalog that support the same underlying memory.' },
     evidence_message_ids: { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 }, description: 'Legacy message_id compatibility alias. A message_id is accepted only when it uniquely identifies one trusted event in the current batch; ambiguous multi-event messages are rejected and require an exact evidence_id. Do not send both fields.' },
+    assistant_intent_id: { type: 'string', minLength: 1, description: 'Optional trusted assistant remember-intent ID copied exactly from the current-batch assistant intent catalog, when this existing memory already holds that intent\'s moment. Links the intent (and its feel) to this memory instead of creating a duplicate.' },
   } };
 }
 
