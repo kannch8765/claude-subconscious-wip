@@ -118,3 +118,34 @@ describe('replayStuckSession', () => {
     }
   });
 });
+
+describe('replayStuckSession refusals', () => {
+  it('refuses a real run while Subconscious is switched off, before any send', async () => {
+    const fs = await import('fs');
+    const os = await import('os');
+    const path = await import('path');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'replay-off-'));
+    const transcript = path.join(dir, 's.jsonl');
+    fs.writeFileSync(transcript, [user('u0'), assistant('a1')].map((m) => JSON.stringify(m)).join('\n'));
+    const old = new Date(Date.now() - 48 * 3_600_000);
+    fs.utimesSync(transcript, old, old);
+    const env = { home: process.env.LETTA_HOME, mode: process.env.LETTA_MODE };
+    process.env.LETTA_HOME = dir;
+    process.env.LETTA_MODE = 'off';
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    try {
+      const ok = await replayStuckSession({ session: 's', transcript, cwd: dir, plan: false, maxMessages: 40, maxChars: 60_000, maxChunks: 1 });
+      expect(ok).toBe(false);
+      expect(log.mock.calls.map(([line]) => JSON.parse(line))).toEqual([
+        expect.objectContaining({ event: 'plan' }), { event: 'refused', reason: 'mode_off' },
+      ]);
+      expect(fs.existsSync(path.join(dir, '.letta'))).toBe(false);
+    } finally {
+      log.mockRestore();
+      for (const [key, value] of [['LETTA_HOME', env.home], ['LETTA_MODE', env.mode]] as const) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});

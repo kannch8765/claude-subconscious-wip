@@ -13,15 +13,19 @@
  *   npx tsx scripts/replay_stuck_session.ts --session <id> --transcript <path> --cwd <cwd> [--plan]
  *     [--max-messages 40] [--max-chars 60000] [--max-chunks N]
  *
- * --plan reads the transcript and the sync state only: no Letta calls, no store or state writes. A real run refuses a
- * session whose transcript changed in the last MIN_IDLE_HOURS, so it never races a live Stop hook on the same cursor.
+ * --plan reads the transcript and the sync state only: no Letta calls, no store or state writes. A real run refuses
+ * when LETTA_MODE=off (like the Stop hook) and when the transcript changed in the last MIN_IDLE_HOURS, and stops if it
+ * changes during the run, so it never races a live Stop hook on the same cursor.
+ * Keep the same --max-* limits when rerunning after a held chunk: the limits decide the chunk end, which is part of
+ * the batch id, so different limits retry a different batch.
+ * Each chunk may queue a whisper for the ended session; nothing reads it.
  * Output is metadata only (indices, counts, sizes, durations, outcomes), one JSON object per line.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import { fileURLToPath } from 'url';
-import { getTempStateDir, loadSyncState } from './conversation_utils.js';
+import { getMode, getTempStateDir, loadSyncState } from './conversation_utils.js';
 import { buildLiveBatch } from './send_messages_to_letta.js';
 import { runNativeWorkerPayloadFile } from './send_worker_native.js';
 import { extractAllContent, formatMessagesForLetta, readTranscript, type TranscriptMessage } from './transcript_utils.js';
@@ -145,7 +149,12 @@ export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
     for (const chunk of plan) emit({ event: 'chunk_plan', ...chunk });
     return true;
   }
-  const idleHours = (Date.now() - fs.statSync(args.transcript).mtimeMs) / 3_600_000;
+  if (getMode() === 'off') {
+    emit({ event: 'refused', reason: 'mode_off' });
+    return false;
+  }
+  const startMtime = fs.statSync(args.transcript).mtimeMs;
+  const idleHours = (Date.now() - startMtime) / 3_600_000;
   if (idleHours < MIN_IDLE_HOURS) {
     emit({ event: 'refused', reason: 'session_recently_active', idle_hours: Math.round(idleHours * 10) / 10 });
     return false;
@@ -153,11 +162,20 @@ export async function replayStuckSession(args: ReplayArgs): Promise<boolean> {
 
   const hookInput = { session_id: args.session, transcript_path: args.transcript, cwd: args.cwd };
   for (let n = 0; n < args.maxChunks; n++) {
+    if (fs.statSync(args.transcript).mtimeMs !== startMtime) {
+      emit({ event: 'stopped', reason: 'transcript_changed', cursor: loadSyncState(args.cwd, args.session).lastProcessedIndex });
+      return false;
+    }
     const before = loadSyncState(args.cwd, args.session).lastProcessedIndex;
     const [chunk] = planReplayChunks(messages, before, args);
     if (!chunk) { emit({ event: 'done', cursor: before }); return true; }
     const batch = await buildLiveBatch(hookInput, messages.slice(0, chunk.end + 1));
-    if (!batch) { emit({ event: 'done', cursor: before, reason: 'nothing_to_send' }); return true; }
+    if (!batch) {
+      // The Stop hook sends nothing for a tail that formats to nothing; anywhere else the backlog is still there.
+      const atEnd = chunk.end === messages.length - 1;
+      emit({ event: atEnd ? 'done' : 'stopped', cursor: before, reason: atEnd ? 'nothing_to_send' : 'empty_chunk' });
+      return atEnd;
+    }
 
     const payloadFile = path.join(getTempStateDir(), `replay-payload-${args.session}-${Date.now()}.json`);
     fs.mkdirSync(path.dirname(payloadFile), { recursive: true });
