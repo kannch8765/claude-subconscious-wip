@@ -38,6 +38,7 @@ import {
   readTranscript,
   formatMessagesForLetta,
   extractAllContent,
+  type TranscriptMessage,
 } from './transcript_utils.js';
 import { buildCanonicalMessages, deferredIntentReplay, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
@@ -48,7 +49,7 @@ const __dirname = path.dirname(__filename);
 const TEMP_STATE_DIR = getTempStateDir();
 const LOG_FILE = path.join(TEMP_STATE_DIR, 'send_messages.log');
 
-interface HookInput {
+export interface HookInput {
   session_id: string;
   transcript_path: string;
   stop_hook_active?: boolean;
@@ -110,67 +111,96 @@ async function main(): Promise<void> {
     log(`Reading transcript from: ${hookInput.transcript_path}`);
     const messages = await readTranscript(hookInput.transcript_path, log);
     log(`Found ${messages.length} messages in transcript`);
-    if (messages.length === 0) {
-      log('No messages found, exiting');
-      process.exit(0);
-    }
+    const batch = await buildLiveBatch(hookInput, messages);
+    if (!batch) process.exit(0);
 
-    const typeCounts: Record<string, number> = {};
-    for (const msg of messages) {
-      const key = msg.type || msg.role || 'unknown';
-      typeCounts[key] = (typeCounts[key] || 0) + 1;
-    }
-    log(`Message types: ${JSON.stringify(typeCounts)}`);
+    const payloadFile = path.join(TEMP_STATE_DIR, `payload-${hookInput.session_id}-${Date.now()}.json`);
+    fs.writeFileSync(payloadFile, JSON.stringify(batch.payload), 'utf-8');
+    log(`Wrote native live payload to ${payloadFile}`);
 
-    const state = loadSyncState(hookInput.cwd, hookInput.session_id, log);
+    const workerScript = path.join(__dirname, 'send_worker_native.ts');
+    const child = spawnSilentWorker(workerScript, payloadFile, hookInput.cwd);
+    log(`Spawned native live worker (PID: ${child.pid})`);
+    log('Hook completed (worker running in background)');
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    log(`ERROR: ${errorMessage}`);
+    if (error instanceof Error && error.stack) log(`Stack trace: ${error.stack}`);
+    console.error(`Error sending messages to Letta: ${errorMessage}`);
+    process.exit(1);
+  }
+}
 
-    // Persist first-party assistant remember intent before any Letta/model dependency.
-    // Replays are idempotent because identity is bound to the real transcript tool_use.
-    const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
-    const intentStore = new RelationshipMemoryStore(relationshipMemoryRoot(), subjectId);
-    const assistantIntents = persistAssistantRememberIntents(
-      intentStore,
-      extractAssistantRememberIntents(messages, state.lastProcessedIndex, hookInput.session_id, subjectId),
-    );
-    log(`Persisted/verified ${assistantIntents.length} trusted assistant remember intent(s)`);
+export interface LiveBatch {
+  payload: Record<string, unknown> & { batchId: string; newLastProcessedIndex: number };
+}
 
-    const newTranscriptMessages = messages.slice(state.lastProcessedIndex + 1);
-    const sourceUserAt = [...newTranscriptMessages].reverse().find((message) => (
-      message.type === 'user'
-      && Boolean(extractAllContent(message).text?.trim())
-      && typeof message.timestamp === 'string'
-      && Number.isFinite(Date.parse(message.timestamp))
-    ))?.timestamp;
+/**
+ * Build the async live payload for everything after the session cursor. The Stop hook passes the whole transcript;
+ * the stuck-session replay passes a prefix (`messages.slice(0, end + 1)`) so a long backlog goes through in chunks.
+ * Returns null when there is nothing to send. Persists trusted remember intents and may create the Letta conversation.
+ */
+export async function buildLiveBatch(hookInput: HookInput, messages: TranscriptMessage[]): Promise<LiveBatch | null> {
+  if (messages.length === 0) {
+    log('No messages found, exiting');
+    return null;
+  }
 
-    const newMessages = formatMessagesForLetta(messages, state.lastProcessedIndex, log);
-    if (newMessages.length === 0) {
-      log('No new messages to send after formatting');
-      process.exit(0);
-    }
+  const typeCounts: Record<string, number> = {};
+  for (const msg of messages) {
+    const key = msg.type || msg.role || 'unknown';
+    typeCounts[key] = (typeCounts[key] || 0) + 1;
+  }
+  log(`Message types: ${JSON.stringify(typeCounts)}`);
 
-    const apiKey = process.env.LETTA_API_KEY;
-    log(`LETTA_API_KEY: ${apiKey ? 'set' : 'NOT SET'}`);
-    if (!apiKey) {
-      log('ERROR: LETTA_API_KEY not set after trusted intent extraction');
-      console.error('Error: LETTA_API_KEY must be set');
-      process.exit(1);
-    }
-    const agentId = await getAgentId(apiKey, log);
-    log(`Using agent: ${agentId}`);
+  const state = loadSyncState(hookInput.cwd, hookInput.session_id, log);
 
-    const conversationId = await getOrCreateConversation(apiKey, agentId, hookInput.session_id, hookInput.cwd, state, log);
-    log(`Using conversation: ${conversationId}`);
-    saveSyncState(hookInput.cwd, state, log);
+  // Persist first-party assistant remember intent before any Letta/model dependency.
+  // Replays are idempotent because identity is bound to the real transcript tool_use.
+  const subjectId = process.env.RELATIONSHIP_MEMORY_SUBJECT_ID || 'local-user';
+  const intentStore = new RelationshipMemoryStore(relationshipMemoryRoot(), subjectId);
+  const assistantIntents = persistAssistantRememberIntents(
+    intentStore,
+    extractAssistantRememberIntents(messages, state.lastProcessedIndex, hookInput.session_id, subjectId),
+  );
+  log(`Persisted/verified ${assistantIntents.length} trusted assistant remember intent(s)`);
 
-    const transcriptEntries = newMessages.map(m => {
-      const role = m.role === 'user' ? 'user' : m.role === 'assistant' ? 'claude_code' : 'system';
-      const escaped = m.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      return `<message role="${role}">\n${escaped}\n</message>`;
-    }).join('\n');
-    const latestUserMessage = [...newMessages].reverse().find((message) => message.role === 'user')?.text.trim() || '';
-    const latestUserEscaped = latestUserMessage.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const newTranscriptMessages = messages.slice(state.lastProcessedIndex + 1);
+  const sourceUserAt = [...newTranscriptMessages].reverse().find((message) => (
+    message.type === 'user'
+    && Boolean(extractAllContent(message).text?.trim())
+    && typeof message.timestamp === 'string'
+    && Number.isFinite(Date.parse(message.timestamp))
+  ))?.timestamp;
 
-    const userMessage = `<claude_code_session_update>
+  const newMessages = formatMessagesForLetta(messages, state.lastProcessedIndex, log);
+  if (newMessages.length === 0) {
+    log('No new messages to send after formatting');
+    return null;
+  }
+
+  const apiKey = process.env.LETTA_API_KEY;
+  log(`LETTA_API_KEY: ${apiKey ? 'set' : 'NOT SET'}`);
+  if (!apiKey) {
+    log('ERROR: LETTA_API_KEY not set after trusted intent extraction');
+    throw new Error('LETTA_API_KEY must be set');
+  }
+  const agentId = await getAgentId(apiKey, log);
+  log(`Using agent: ${agentId}`);
+
+  const conversationId = await getOrCreateConversation(apiKey, agentId, hookInput.session_id, hookInput.cwd, state, log);
+  log(`Using conversation: ${conversationId}`);
+  saveSyncState(hookInput.cwd, state, log);
+
+  const transcriptEntries = newMessages.map(m => {
+    const role = m.role === 'user' ? 'user' : m.role === 'assistant' ? 'claude_code' : 'system';
+    const escaped = m.text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<message role="${role}">\n${escaped}\n</message>`;
+  }).join('\n');
+  const latestUserMessage = [...newMessages].reverse().find((message) => message.role === 'user')?.text.trim() || '';
+  const latestUserEscaped = latestUserMessage.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const userMessage = `<claude_code_session_update>
 <session_id>${hookInput.session_id}</session_id>
 
 <transcript>
@@ -211,43 +241,35 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
 </instructions>
 </claude_code_session_update>`;
 
-    const payloadFile = path.join(TEMP_STATE_DIR, `payload-${hookInput.session_id}-${Date.now()}.json`);
-    const stateFile = getSyncStateFile(hookInput.cwd, hookInput.session_id);
+  const stateFile = getSyncStateFile(hookInput.cwd, hookInput.session_id);
 
-    const batchId = makeBatchId(hookInput.session_id, state.lastProcessedIndex, messages.length - 1);
-    const replay = deferredIntentReplay(intentStore, messages, state.lastProcessedIndex, hookInput.session_id, conversationId);
-    if (replay.intents.length > 0) log(`Re-offering ${replay.intents.length} deferred assistant remember intent(s)`);
-    const canonicalMessages = [...replay.evidence, ...buildCanonicalMessages(messages, state.lastProcessedIndex, conversationId)];
-    log(`Relationship-memory batch: ${batchId} (${canonicalMessages.length} canonical evidence messages)`);
+  const batchId = makeBatchId(hookInput.session_id, state.lastProcessedIndex, messages.length - 1);
+  const replay = deferredIntentReplay(intentStore, messages, state.lastProcessedIndex, hookInput.session_id, conversationId);
+  if (replay.intents.length > 0) log(`Re-offering ${replay.intents.length} deferred assistant remember intent(s)`);
+  const canonicalMessages = [...replay.evidence, ...buildCanonicalMessages(messages, state.lastProcessedIndex, conversationId)];
+  log(`Relationship-memory batch: ${batchId} (${canonicalMessages.length} canonical evidence messages)`);
 
-    const nativePayload = {
-      agentId,
-      conversationId,
-      sessionId: hookInput.session_id,
-      message: userMessage,
-      stateFile,
-      newLastProcessedIndex: messages.length - 1,
-      cwd: hookInput.cwd,
-      batchId,
-      canonicalMessages,
-      assistantIntents: [...assistantIntents, ...replay.intents],
-      latestUserMessage,
-      ...(sourceUserAt ? { sourceUserAt } : {}),
-    };
-    fs.writeFileSync(payloadFile, JSON.stringify(nativePayload), 'utf-8');
-    log(`Wrote native live payload to ${payloadFile}`);
-
-    const workerScript = path.join(__dirname, 'send_worker_native.ts');
-    const child = spawnSilentWorker(workerScript, payloadFile, hookInput.cwd);
-    log(`Spawned native live worker (PID: ${child.pid})`);
-    log('Hook completed (worker running in background)');
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    log(`ERROR: ${errorMessage}`);
-    if (error instanceof Error && error.stack) log(`Stack trace: ${error.stack}`);
-    console.error(`Error sending messages to Letta: ${errorMessage}`);
-    process.exit(1);
-  }
+  const nativePayload = {
+    agentId,
+    conversationId,
+    sessionId: hookInput.session_id,
+    message: userMessage,
+    stateFile,
+    newLastProcessedIndex: messages.length - 1,
+    cwd: hookInput.cwd,
+    batchId,
+    canonicalMessages,
+    assistantIntents: [...assistantIntents, ...replay.intents],
+    latestUserMessage,
+    ...(sourceUserAt ? { sourceUserAt } : {}),
+  };
+  return { payload: nativePayload };
 }
 
-main();
+// Run only as the Stop hook entry point, not when the replay imports buildLiveBatch. Compare real paths: the hook
+// command names the script through the plugin root, which may be a symlink.
+function realPath(file: string): string {
+  try { return fs.realpathSync(file); } catch { return path.resolve(file); }
+}
+const invokedAsMain = Boolean(process.argv[1]) && realPath(process.argv[1]) === realPath(__filename);
+if (invokedAsMain) void main();
