@@ -378,6 +378,33 @@ session-days, n = 128; `harness/quote_sampler_metrics.ts`, numbers only):
   Moving the sampler into the core is a separate change because it also
   changes Kohaku's `recall`.
 
+### 4.3.3 Turn input: one place decides what the model sees
+
+`harness/turn_input.ts` sits between the transcript and both lanes. The lanes
+hold no special cases. They get a prepared turn and never see what was dropped.
+
+- **Turn rules** (`TURN_RULES`, one named rule per entry) drop whole turns that
+  are not conversation. A turn is one user text and everything after it up to
+  the next user text. A dropped turn never reaches the model and never becomes
+  citable evidence, so it cannot be remembered or reinforced either.
+- **`modelText()`** rewrites the text the model reads: conversation, memory
+  summaries and quotes. Live-location tags keep only the place. The store keeps
+  the original.
+- When the rules leave nothing (no user text in an async batch, or the new
+  message itself for sync), the caller skips the pass and records
+  `skip: input_empty`. Every record carries `input.dropped` per rule, so a
+  missing pass can be traced to the rule that caused it.
+
+First rule, `cache_warm`: a user text that is exactly 🫳 keeps the prompt cache
+warm. It is not a message to Kohaku. Letta still receives these turns. In the
+store, 8 memories hold such pieces (83 of 38,576 pieces), 1 memory consists
+only of them, and 1 more is mostly made of them. The owner will disable those
+by hand. The prod Stop hook is unchanged for now. If it ever filters too, it
+imports this function and does not keep a second copy of the rule.
+
+Check: on the 36 exam batches (none of them has a 🫳 turn) the model input is
+byte-identical before and after the change.
+
 ### 4.4 Recall mode
 
 Kohaku's `recall` becomes a third pass mode on the same core: read-only, small
