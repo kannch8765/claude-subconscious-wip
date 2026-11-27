@@ -7,8 +7,12 @@
  *   - an anchor: the opening unit of the original capture (for a legacy-origin
  *     memory the caller puts its legacy source into episode 0, so it has an anchor too),
  *   - the newest episode: at most one unit,
+ *   - optionally one relevant unit: the unit sharing most words with the current
+ *     message (lexical, no embeddings),
  *   - the rest: at most one unit per session-day, weighted by a forgetting curve
- *     with a floor, so old episodes come back now and then.
+ *     with a floor, so old episodes come back now and then. The curve uses
+ *     absolute age in days, or (relative mode) the position inside this memory's
+ *     own time span, so a memory spanning two years behaves like one spanning two months.
  * A unit is up to two consecutive pieces of one message, so a quote keeps some context.
  * The seed is (memory, session): stable within a session, different across sessions.
  */
@@ -44,6 +48,30 @@ export interface SamplerOptions {
   halfLifeDays?: number;
   floor?: number;
   now?: string;
+  /** 'absolute': half-life in days. 'relative': half-life as a share of the memory's span (default). */
+  timeMode?: 'absolute' | 'relative';
+  /** Relative mode: half-life as a share of the span, 0..1. */
+  halfSpan?: number;
+  /** Current message; when set, one slot goes to the most relevant unit. */
+  query?: string;
+  /** Minimum shared bigrams for the relevant slot. */
+  minOverlap?: number;
+  /** Bigrams too common to count (e.g. names and pet words that appear everywhere). */
+  ignore?: ReadonlySet<string>;
+}
+
+/** Distinct character bigrams over letters and digits only (CJK-friendly, ignores emoji and kaomoji). */
+export function bigrams(text: string): Set<string> {
+  const chars = [...text.toLowerCase()].filter((c) => /[\p{L}\p{N}]/u.test(c));
+  const out = new Set<string>();
+  for (let i = 0; i + 1 < chars.length; i++) out.add(chars[i] + chars[i + 1]);
+  return out;
+}
+
+export function overlap(query: Set<string>, text: string, ignore?: ReadonlySet<string>): number {
+  let n = 0;
+  for (const gram of bigrams(text)) if (query.has(gram) && !ignore?.has(gram)) n++;
+  return n;
 }
 
 /** Same sentence split as RelationshipMemoryRuntime.splitSourceText. */
@@ -111,6 +139,8 @@ export function samplePieces(memoryId: string, sessionId: string, episodes: Samp
   const halfLife = options.halfLifeDays ?? 30;
   const floor = options.floor ?? 0.15;
   const now = Date.parse(options.now ?? new Date().toISOString());
+  const timeMode = options.timeMode ?? 'relative';
+  const halfSpan = options.halfSpan ?? 0.25;
   const random = rng(`${memoryId}\u0000${sessionId}`);
   const units = episodes.flatMap((episode) => unitsOf(episode, unitPieces));
   if (units.reduce((n, unit) => n + unit.pieces.length, 0) <= maxPieces) return units.flatMap((unit) => unit.pieces);
@@ -124,12 +154,25 @@ export function samplePieces(memoryId: string, sessionId: string, episodes: Samp
     used.add(unit); chosen.push(unit); sessions.add(unit.session); count += unit.pieces.length;
   };
   take(units.find((unit) => unit.episode === 0));
+  if (options.query) {
+    const query = bigrams(options.query);
+    const scored = units.filter((unit) => !used.has(unit))
+      .map((unit) => ({ unit, score: overlap(query, unit.pieces.map((p) => p.text).join(''), options.ignore) }))
+      .filter((x) => x.score >= (options.minOverlap ?? 2));
+    const best = Math.max(0, ...scored.map((x) => x.score));
+    const top = scored.filter((x) => x.score === best);
+    if (top.length) take(top[Math.floor(random() * top.length)].unit);
+  }
   const newest = Math.max(...units.map((unit) => unit.episode));
   if (newest > 0) {
     const pool = units.filter((unit) => unit.episode === newest);
     take(pool[Math.floor(random() * pool.length)]);
   }
-  const weight = (unit: Unit): number => floor + Math.pow(0.5, Math.max(0, now - Date.parse(unit.at)) / 86_400_000 / halfLife);
+  const times = units.map((unit) => Date.parse(unit.at)).filter(Number.isFinite);
+  const newestAt = Math.max(...times); const span = Math.max(1, newestAt - Math.min(...times));
+  const weight = (unit: Unit): number => timeMode === 'relative'
+    ? floor + Math.pow(0.5, Math.max(0, newestAt - Date.parse(unit.at)) / span / halfSpan)
+    : floor + Math.pow(0.5, Math.max(0, now - Date.parse(unit.at)) / 86_400_000 / halfLife);
   for (let guard = 0; guard < 64 && count < maxPieces; guard++) {
     const pool = units.filter((unit) => !used.has(unit) && !sessions.has(unit.session) && count + unit.pieces.length <= maxPieces);
     const fallback = pool.length ? pool : units.filter((unit) => !used.has(unit) && count + unit.pieces.length <= maxPieces);
