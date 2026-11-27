@@ -263,6 +263,60 @@ our own code:
 With layout B the stable prefix is cache-eligible on the second step. The
 offline replay (§6) measures the real numbers, including cache hits.
 
+### 4.3.1 Payload diet (measured, what-if)
+
+**Tool schemas** (16 tools, 31.5k chars ≈ 13k tokens):
+
+| Group | Chars | In the harness |
+|---|---|---|
+| Letta built-ins: `conversation_search`, `memory`, `memory_replace`, `memory_insert`, `memory_rethink` | 10.0k | Gone (dropped / session card) |
+| Five `memory_remember_<kind>` tools | 12.9k | One `memory_remember` with a `kind` enum and kind-specific payload; shared fields written once |
+| `entity_remember`, `memory_search`, `deliver_whisper`, `suggest_memory_relation`, `memory_reinforce`, `entity_search` | 8.6k | Keep, shorten descriptions |
+
+Estimate: ~12k chars ≈ 5k tokens (×0.38).
+
+**One `memory_search` result** (p50 8 memories, 8 snippets each): by chars,
+`quote_snippets` 62 %, `payload` 20 %, `reinforcement_evidence_ids` 5.4 %,
+`summary` 3.8 %, internal keys (`source_key`, `dedupe_key`) 2.3 %. Inside
+`quote_snippets` the quote text is only 20 % (p50 22 chars per snippet); the
+rest is `snippet_id` 24 %, `captured_at` 18 %, `evidence_id` 17 %,
+`source_kind` 12 %, `role` 7 %.
+
+Diet: short per-result snippet handles mapped back by the runtime, date only,
+one-letter role, no `evidence_id` / internal keys / evidence ID lists in the
+model view. Estimate: ~55 % of today's size.
+
+**Why 2.5 searches per pass** (mean; p50 2, p90 5):
+
+- Purposes: `foreground_recall` 2,082, `maintenance` 734. Common sequences:
+  recall only 315, recall → maintenance 240, recall → recall (rephrase) 211.
+  58 passes (5 %) loop through 6 or more searches.
+- Later searches matter: of the memories acted on (whisper / reinforce), 48 %
+  first appeared in search #1, 25 % in #2, 18 % in #3 or later, 10 % outside
+  the pass (recently seen, §1). Results of a later search overlap earlier ones
+  by 29 % on average.
+
+Changes:
+
+- **One search, two views.** Return every hit once with a `known` flag
+  (delivered or written this session) instead of separate
+  `foreground_recall` / `maintenance` searches. The runtime still refuses a
+  whisper of a known memory. Removes the recall → maintenance repeat.
+- Rephrasings go out in parallel in one step instead of one per step.
+- The async pass starts from the sync lane's results (§4.3).
+- Soft cap on searches per pass, to stop the 6+ loops.
+
+**Dry run with the diet** (same script as §4.3, schemas ×0.38, tool traffic
+×0.55):
+
+| Prompt tokens per pass | p50 | p90 | Sum |
+|---|---|---|---|
+| Letta (real) | 647k | 1,330k | 858M |
+| B: 2 steps, no diet | 88k | 152k | 108M |
+| B: 2 steps, with diet | 53k | 94k | 67M |
+
+The search changes above are not in this number.
+
 ### 4.4 Recall mode
 
 Kohaku's `recall` becomes a third pass mode on the same core: read-only, small
