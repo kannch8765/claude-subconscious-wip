@@ -387,7 +387,8 @@ export class RelationshipMemoryRecallSession {
     this.recallId = options.recallId || `recall_${crypto.randomUUID()}`;
     this.deliveryPromise = new Promise<RecallResult>((resolve) => { this.resolveDelivery = resolve; });
     // ensureRoot=false is important: recall must not create or append store files.
-    this.store = new RelationshipMemoryStore(options.rootDir, options.subjectId, undefined, false);
+    // Read-only, so a last line that a writer is still appending is skipped, not fatal.
+    this.store = new RelationshipMemoryStore(options.rootDir, options.subjectId, undefined, false, 'skip-in-flight-append');
     this.transcriptRoots = options.transcriptRoots ?? transcriptRootsFromEnvironment();
     this.signal = options.signal;
     if (options.semanticRetriever) this.semanticRetriever = options.semanticRetriever;
