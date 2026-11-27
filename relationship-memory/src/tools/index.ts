@@ -333,11 +333,14 @@ export class RelationshipMemoryRuntime {
     return applyMemoryResolutions(this.effectiveMemories(), this.store.listActiveMemoryResolutions());
   }
 
-  async prepareCurrentMemorySemanticIndex(): Promise<void> {
+  /** Embeds missing document vectors. `onlyMemoryIds` limits it to those memories (an offline run embeds just the
+   * memories it created); other index entries are never removed. */
+  async prepareCurrentMemorySemanticIndex(onlyMemoryIds?: ReadonlySet<string>): Promise<void> {
     if (!this.semanticRetriever?.prepare) return;
     const intentsByMemory = this.linkedIntentSemanticByMemory();
     const documents = this.resolvedRecallMemories()
       .filter((memory) => memory.status === 'active')
+      .filter((memory) => !onlyMemoryIds || onlyMemoryIds.has(memory.memory_id))
       .map((memory) => {
         const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
         const linkedIntents = sourceIds.flatMap((memoryId) => intentsByMemory.get(memoryId) ?? []);

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { CanonicalMessage } from '../relationship-memory/src/schema/index.js';
-import { modelText, prepareTurn, ruleFor } from './turn_input.js';
+import { modelText, prepareTurn, previousTurn, ruleFor } from './turn_input.js';
 
 let n = 0;
 const msg = (role: 'user' | 'assistant', quote: string, event_kind?: string): CanonicalMessage =>
@@ -56,5 +56,21 @@ describe('modelText', () => {
   it('keeps only the place of a live-location tag', () => {
     expect(modelText('在走\n<telegram_live_location latitude="1" longitude="2" place="示例町, 某某区" />')).toBe('在走\n［位置：示例町, 某某区］');
     expect(modelText('到了 <telegram_live_location latitude="1" longitude="2" />')).toBe('到了');
+  });
+});
+
+describe('previousTurn', () => {
+  it('skips cache-warm turns and the new message already in the transcript', () => {
+    const messages = [
+      { role: 'user' as const, text: '今天去了海边' },
+      { role: 'assistant' as const, text: '好玩吗' },
+      { role: 'assistant' as const, text: '拍照了吗' },
+      { role: 'user' as const, text: '🫳' },
+      { role: 'assistant' as const, text: '🫳' },
+      { role: 'user' as const, text: '到家了' },
+    ];
+    expect(previousTurn(messages, '到家了')).toEqual({ previousUserMessage: '今天去了海边', previousKohakuReply: '好玩吗\n拍照了吗' });
+    expect(previousTurn(messages.slice(0, 5), '到家了').previousUserMessage).toBe('今天去了海边');
+    expect(previousTurn([], '早')).toEqual({ previousUserMessage: '', previousKohakuReply: '' });
   });
 });
