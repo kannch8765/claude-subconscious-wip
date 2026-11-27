@@ -142,31 +142,52 @@ function isMessageLevel(item: EvidenceSource): boolean {
   return item.block_index === undefined && item.event_kind === undefined;
 }
 
+function isTextBlock(item: EvidenceSource): boolean {
+  return item.block_index !== undefined && (item.event_kind === 'user_text' || item.event_kind === 'assistant_text');
+}
+
+/** What the old message-level adapter quoted for a message: its text blocks in block order, joined with newlines. */
+function joinedTextBlocks(batch: readonly CanonicalMessage[], messageId: string): string | undefined {
+  const blocks = new Map<number, string>();
+  for (const event of batch) {
+    if (event.message_id === messageId && isTextBlock(event) && !blocks.has(event.block_index!)) blocks.set(event.block_index!, event.quote);
+  }
+  return blocks.size ? [...blocks].sort(([a], [b]) => a - b).map(([, quote]) => quote).join('\n') : undefined;
+}
+
 /**
  * The messages a memory does not hold yet. `held` is the memory's completed evidence; a message is held when its
  * evidence id is held or held evidence has the same transcript source, from any conversation.
  *
  * A message-level quote (no block_index or event_kind: the shape from before per-block evidence, still accepted from
- * callers) holds a text block of its message only when the quote contains the block's text. The old adapter joined all
- * text blocks, but nothing guarantees that for other callers. Tool blocks are never held by a message-level quote.
- * Message-level messages in this call count as quotes too, so the result does not depend on the order of the ids.
+ * callers) holds the text blocks of its message only when it is exactly what the old adapter wrote: all of the
+ * message's text blocks in the trusted batch, joined with newlines. Any other message-level quote may hold only some
+ * blocks, or one block's text inside another, so it holds none. Coverage comes from held rows and the message-level
+ * messages this call will write, chosen before any block is filtered, so it does not depend on the order of the ids.
  */
 function unheldMessages(
   messages: readonly CanonicalMessage[],
   held: readonly EvidenceRecord[],
   heldEvidenceId: (message: CanonicalMessage) => boolean,
+  batch: readonly CanonicalMessage[],
 ): CanonicalMessage[] {
   const heldSources = new Set(held.map(evidenceSourceKey));
   const isHeld = (message: CanonicalMessage) => heldEvidenceId(message) || heldSources.has(evidenceSourceKey(message));
-  const messageQuotes = new Map<string, string[]>();
-  for (const item of [...held, ...messages.filter((message) => !isHeld(message))]) {
-    if (isMessageLevel(item)) messageQuotes.set(item.message_id, [...(messageQuotes.get(item.message_id) ?? []), item.quote]);
+  // Message-level messages are never filtered by coverage, so the ones this call writes are known up front.
+  const writtenMessageLevel = new Map<string, CanonicalMessage>();
+  for (const message of messages) {
+    const key = evidenceSourceKey(message);
+    if (isMessageLevel(message) && !isHeld(message) && !writtenMessageLevel.has(key)) writtenMessageLevel.set(key, message);
+  }
+  const textBlockMessageIds = new Set(messages.filter(isTextBlock).map((message) => message.message_id));
+  const coveredMessageIds = new Set<string>();
+  for (const item of [...held, ...writtenMessageLevel.values()]) {
+    if (!isMessageLevel(item) || !textBlockMessageIds.has(item.message_id)) continue;
+    if (item.quote === joinedTextBlocks(batch, item.message_id)) coveredMessageIds.add(item.message_id);
   }
   const result: CanonicalMessage[] = [];
   for (const message of messages) {
-    if (isHeld(message)) continue;
-    const textBlock = message.event_kind === 'user_text' || message.event_kind === 'assistant_text';
-    if (textBlock && messageQuotes.get(message.message_id)?.some((quote) => quote.includes(message.quote))) continue;
+    if (isHeld(message) || (isTextBlock(message) && coveredMessageIds.has(message.message_id))) continue;
     result.push(message);
     heldSources.add(evidenceSourceKey(message));
   }
@@ -977,6 +998,7 @@ export class RelationshipMemoryRuntime {
       messages,
       memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)),
       (message) => completedEvidenceIds.has(memoryEvidenceId(memoryId, message)),
+      [...this.messages.values()],
     );
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
     const newMessageIds = newMessages.map(canonicalEvidenceId).sort();

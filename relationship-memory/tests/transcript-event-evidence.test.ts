@@ -240,12 +240,24 @@ describe('reinforce matches evidence by transcript source, not by conversation',
     expect(evidenceOf().map((item) => item.event_kind ?? 'message')).toEqual(['message', 'assistant_tool_use']);
   });
 
-  it('lets a message-level quote hold only the text blocks it contains', () => {
+  it('does not let a partial message-level quote hold any block', () => {
     const firstBlockOnly: CanonicalMessage = { ...messageLevel, quote: 'That sounds like a calm start to the week.' };
     const { runtime, memoryId, evidenceOf } = setup({ evidence_message_ids: ['msg-3'] }, [], [firstBlockOnly]);
-    expect(runtime.reinforce('held-block', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 0)] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
-    expect(runtime.reinforce('new-block', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 1)] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
-    expect(evidenceOf().map((item) => item.quote)).toEqual([firstBlockOnly.quote, 'I will keep the tree in mind.']);
+    expect(runtime.reinforce('blocks', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 0), eventId(convB, 'msg-3', 1)] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(evidenceOf().map((item) => item.block_index ?? 'message').sort()).toEqual([0, 1, 'message']);
+  });
+
+  it('does not treat text inside another block as the block itself', () => {
+    // Block 1 is a substring of block 0 and also one of its whole lines.
+    const events = buildCanonicalMessages([{ type: 'user', uuid: 'msg-4', timestamp: '2026-08-10T00:03:00Z', message: { content: [
+      { type: 'text', text: 'This was not checked.\nverified.' },
+      { type: 'text', text: 'verified.' },
+    ] } }] as any[], -1, 'conv-b');
+    const blockZeroOnly: CanonicalMessage = { conversation_id: 'conv-old', message_id: 'msg-4', role: 'user', quote: 'This was not checked.\nverified.', captured_at: '2026-08-10T00:03:00Z' };
+    const { runtime, memoryId, evidenceOf } = setup({ evidence_message_ids: ['msg-4'] }, [], [...events, blockZeroOnly]);
+    expect(runtime.reinforce('separate-block', { memory_id: memoryId, evidence_ids: [events[1].evidence_id!] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(evidenceOf().map((item) => item.quote)).toEqual([blockZeroOnly.quote, 'verified.']);
   });
 
   it('settles a call citing a message-level message and its own blocks the same way whichever id sorts first', () => {
@@ -254,13 +266,33 @@ describe('reinforce matches evidence by transcript source, not by conversation',
         { type: 'text', text: 'The soil needs more water.' },
         { type: 'text', text: 'Maybe twice a week.' },
       ] } }] as any[], -1, 'conv-a');
-      const firstBlockOnly: CanonicalMessage = { conversation_id: 'conv-old', message_id: messageId, role: 'assistant', quote: 'The soil needs more water.', captured_at: '2026-08-10T00:04:00Z' };
-      const { runtime, memoryId, evidenceOf } = setup(undefined, [], [...events, firstBlockOnly]);
+      const joined: CanonicalMessage = { conversation_id: 'conv-old', message_id: messageId, role: 'assistant', quote: 'The soil needs more water.\nMaybe twice a week.', captured_at: '2026-08-10T00:04:00Z' };
+      const { runtime, memoryId, evidenceOf } = setup(undefined, [], [...events, joined]);
       const ids = [messageId, events[0].evidence_id!, events[1].evidence_id!];
       expect([...ids].sort()[0] === messageId).toBe(messageId === 'a-msg');
       expect(runtime.reinforce('mixed-legacy', { memory_id: memoryId, evidence_ids: ids })).toEqual({ outcome: 'accepted', memory_id: memoryId });
-      // Block 0 is inside the message-level quote; block 1 is not.
-      expect(evidenceOf().filter((item) => item.message_id === messageId).map((item) => item.block_index ?? 'message').sort()).toEqual([1, 'message']);
+      expect(evidenceOf().filter((item) => item.message_id === messageId).map((item) => item.block_index ?? 'message')).toEqual(['message']);
+    }
+  });
+
+  it('covers blocks only with a message-level quote the call actually writes', () => {
+    const events = buildCanonicalMessages([{ type: 'assistant', uuid: 'msg-5', timestamp: '2026-08-10T00:05:00Z', message: { content: [
+      { type: 'text', text: 'The pot is too small.' },
+      { type: 'text', text: 'A bigger one arrives soon.' },
+    ] } }] as any[], -1, 'conv-a');
+    const partial = 'The pot is too small.';
+    const joined = 'The pot is too small.\nA bigger one arrives soon.';
+    // Two message-level events share one source; only the first by id ('legacy-ev-a') is written.
+    for (const [first, second] of [[partial, joined], [joined, partial]]) {
+      const legacy = (evidenceId: string, quote: string): CanonicalMessage => ({
+        conversation_id: 'conv-old', message_id: 'msg-5', evidence_id: evidenceId, role: 'assistant', quote, captured_at: '2026-08-10T00:05:00Z',
+      });
+      const { runtime, memoryId, evidenceOf } = setup(undefined, [], [...events, legacy('legacy-ev-a', first), legacy('legacy-ev-b', second)]);
+      expect(runtime.reinforce('two-legacy', { memory_id: memoryId, evidence_ids: ['legacy-ev-a', 'legacy-ev-b', events[0].evidence_id!, events[1].evidence_id!] }))
+        .toEqual({ outcome: 'accepted', memory_id: memoryId });
+      const rows = evidenceOf().filter((item) => item.message_id === 'msg-5');
+      expect(rows.filter((item) => item.block_index === undefined).map((item) => item.quote)).toEqual([first]);
+      expect(rows.map((item) => item.block_index).filter((index) => index !== undefined).sort()).toEqual(first === joined ? [] : [0, 1]);
     }
   });
 
