@@ -4,11 +4,15 @@ import * as path from 'path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   appendCanonicalEvidenceCatalog,
+  ASSISTANT_REMEMBER_TOOL_NAME,
   buildCanonicalMessages,
+  extractAssistantRememberIntents,
   RELATIONSHIP_ALLOWED_BUILTIN_TOOLS,
   RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
+  type AssistantRememberIntentRecord,
+  type CanonicalMessage,
 } from '../src/index.js';
 
 const dirs: string[] = [];
@@ -113,5 +117,146 @@ describe('canonical transcript-event evidence', () => {
     expect(RELATIONSHIP_ALLOWED_BUILTIN_TOOLS).toEqual([]);
     expect(RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS).toContain('Bash');
     expect(RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS).toContain('Write');
+  });
+});
+
+describe('reinforce matches evidence by transcript source, not by conversation', () => {
+  const transcript = [
+    { type: 'user', uuid: 'msg-1', timestamp: '2026-08-10T00:00:00Z', message: { content: [{ type: 'text', text: 'We planted a small lemon tree on the balcony today.' }] } },
+    { type: 'user', uuid: 'msg-2', timestamp: '2026-08-10T00:01:00Z', message: { content: [{ type: 'text', text: 'It already has two new leaves.' }] } },
+    { type: 'assistant', uuid: 'msg-3', timestamp: '2026-08-10T00:02:00Z', message: { content: [
+      { type: 'text', text: 'That sounds like a calm start to the week.' },
+      { type: 'text', text: 'I will keep the tree in mind.' },
+      { type: 'tool_use', id: 'toolu_note', name: 'Write', input: { file_path: 'notes.txt', content: 'lemon tree, two leaves' } },
+    ] } },
+  ] as any[];
+  // Two conversations carry the same messages: same message ids and blocks, different transcript evidence ids.
+  const convA = buildCanonicalMessages(transcript, -1, 'conv-a');
+  const convB = buildCanonicalMessages(transcript, -1, 'conv-b');
+  const eventId = (events: CanonicalMessage[], messageId: string, blockIndex = 0) =>
+    events.find((event) => event.message_id === messageId && event.block_index === blockIndex)!.evidence_id!;
+  // The pre-block shape: one message-level event holding the joined text of the message's text blocks.
+  const messageLevel: CanonicalMessage = {
+    conversation_id: 'conv-old', message_id: 'msg-3', role: 'assistant',
+    quote: 'That sounds like a calm start to the week.\nI will keep the tree in mind.', captured_at: '2026-08-10T00:02:00Z',
+  };
+
+  function tree(evidence: Record<string, string[]>, summary = 'A lemon tree on the balcony') {
+    return {
+      schema_version: 1, kind: 'personal_experience', summary, participants: ['user'], ...evidence,
+      payload: { title: summary, experience: 'The user planted a small tree at home.' },
+    };
+  }
+
+  // `extra` events are added to the trusted batch; a message-level one replaces `messageLevel` for its message id.
+  function setup(
+    evidence: Record<string, string[]> = { evidence_ids: [eventId(convA, 'msg-1')] },
+    intents: AssistantRememberIntentRecord[] = [],
+    extra: CanonicalMessage[] = [],
+  ) {
+    const store = new RelationshipMemoryStore(tempDir(), 'subject');
+    for (const intent of intents) store.appendAssistantIntent(intent);
+    const messages = new Map([...convA, ...convB].map((event) => [event.evidence_id!, event]));
+    for (const event of [messageLevel, ...extra]) messages.set(event.evidence_id ?? event.message_id, event);
+    const runtime = new RelationshipMemoryRuntime(store, messages, () => '2026-08-11T00:00:00Z', new Map(intents.map((intent) => [intent.intent_id, intent])));
+    const memoryId = runtime.remember('seed', tree(evidence)).memory_id!;
+    const evidenceOf = (id = memoryId) => store.listEvidence().filter((item) => item.memory_id === id);
+    return { store, runtime, memoryId, evidenceOf };
+  }
+
+  it('does not attach a message again when another conversation carries it', () => {
+    const { store, runtime, memoryId, evidenceOf } = setup();
+    expect(runtime.reinforce('first', { memory_id: memoryId, evidence_ids: [eventId(convA, 'msg-2')] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+    const later = { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-2')] };
+    expect(runtime.reinforce('later', later)).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(runtime.reinforce('later', later)).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(evidenceOf()).toHaveLength(2);
+    expect(store.listReinforcements()).toHaveLength(1);
+  });
+
+  it("treats a message in the memory's original evidence as attached under any conversation", () => {
+    const { store, runtime, memoryId, evidenceOf } = setup();
+    expect(runtime.reinforce('later', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-1')] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(evidenceOf()).toHaveLength(1);
+    expect(store.listReinforcements()).toHaveLength(0);
+  });
+
+  it('attaches only the new message when a call mixes an attached one and a new one', () => {
+    const { store, runtime, memoryId, evidenceOf } = setup();
+    expect(runtime.reinforce('mixed', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-1'), eventId(convB, 'msg-2')] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    const [reinforcement] = store.listReinforcements();
+    expect(reinforcement.evidence_ids).toHaveLength(1);
+    expect(evidenceOf().find((item) => item.evidence_id === reinforcement.evidence_ids[0]))
+      .toEqual(expect.objectContaining({ message_id: 'msg-2', conversation_id: 'conv-b' }));
+    expect(evidenceOf()).toHaveLength(2);
+  });
+
+  it('attaches a message carried twice in one call once', () => {
+    const { runtime, memoryId, evidenceOf } = setup();
+    expect(runtime.reinforce('twice', { memory_id: memoryId, evidence_ids: [eventId(convA, 'msg-2'), eventId(convB, 'msg-2')] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(evidenceOf().filter((item) => item.message_id === 'msg-2')).toHaveLength(1);
+  });
+
+  it('keeps other blocks of the same message distinct', () => {
+    const { runtime, memoryId, evidenceOf } = setup({ evidence_ids: [eventId(convA, 'msg-3', 0)] });
+    expect(runtime.reinforce('other-blocks', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 1), eventId(convB, 'msg-3', 2)] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(evidenceOf().map((item) => item.block_index).sort()).toEqual([0, 1, 2]);
+    expect(runtime.reinforce('same-block', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 0)] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(evidenceOf()).toHaveLength(3);
+  });
+
+  it('still attaches the message to a different memory', () => {
+    const { runtime, memoryId, evidenceOf } = setup();
+    const other = runtime.remember('other', tree({ evidence_ids: [eventId(convA, 'msg-2')] }, 'New leaves on the tree')).memory_id!;
+    expect(runtime.reinforce('other-memory', { memory_id: other, evidence_ids: [eventId(convB, 'msg-1')] })).toEqual({ outcome: 'accepted', memory_id: other });
+    expect(evidenceOf(other).map((item) => item.message_id).sort()).toEqual(['msg-1', 'msg-2']);
+    expect(evidenceOf(memoryId)).toHaveLength(1);
+  });
+
+  it('links an intent on a call whose messages are all attached already', () => {
+    const intents = extractAssistantRememberIntents([{
+      type: 'assistant', uuid: 'msg-intent', timestamp: '2026-08-10T00:03:00Z',
+      message: { content: [{ type: 'tool_use', id: 'toolu_intent', name: ASSISTANT_REMEMBER_TOOL_NAME, input: { memory: { text: 'Keep the tree.' }, feel: { text: 'Small and steady.' } } }] },
+    }] as any[], -1, 'session-1', 'subject');
+    const { store, runtime, memoryId, evidenceOf } = setup(undefined, intents);
+    store.beginBatch('intent-batch', '2026-08-11T00:00:00Z');
+    expect(runtime.reinforce('intent-batch', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-1')], assistant_intent_id: intents[0].intent_id }))
+      .toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(store.getTerminalAssistantIntentOutcome(intents[0].intent_id, 'intent-batch')).toEqual(expect.objectContaining({ outcome: 'duplicate', memory_id: memoryId }));
+    expect(evidenceOf()).toHaveLength(1);
+    expect(runtime.finalizeBatch('intent-batch', true)).toBe('completed');
+  });
+
+  // Message-level evidence keeps main's behaviour: it is matched by evidence id only, never by block source.
+  it('never lets message-level evidence hold a block, even when its quote is the full old join', () => {
+    const { runtime, memoryId, evidenceOf } = setup({ evidence_message_ids: ['msg-3'] });
+    expect(evidenceOf()).toEqual([expect.not.objectContaining({ block_index: expect.anything() })]);
+    expect(runtime.reinforce('blocks', { memory_id: memoryId, evidence_ids: [0, 1, 2].map((index) => eventId(convB, 'msg-3', index)) }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(evidenceOf().map((item) => item.block_index ?? 'message').sort()).toEqual([0, 1, 2, 'message']);
+    expect(runtime.reinforce('same-legacy', { memory_id: memoryId, evidence_message_ids: ['msg-3'] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(evidenceOf()).toHaveLength(4);
+  });
+
+  it('keeps message-level events of one message apart when their evidence ids differ', () => {
+    const legacy = (evidenceId: string, quote: string): CanonicalMessage => ({ ...messageLevel, evidence_id: evidenceId, quote });
+    const { runtime, memoryId, evidenceOf } = setup(undefined, [], [
+      legacy('legacy-ev-a', 'That sounds like a calm start to the week.'),
+      legacy('legacy-ev-b', 'That sounds like a calm start to the week.\nI will keep the tree in mind.'),
+    ]);
+    expect(runtime.reinforce('two-legacy', { memory_id: memoryId, evidence_ids: ['legacy-ev-a', 'legacy-ev-b', eventId(convB, 'msg-3', 1)] }))
+      .toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(evidenceOf().filter((item) => item.message_id === 'msg-3').map((item) => item.block_index ?? item.source_evidence_id).sort())
+      .toEqual([1, 'legacy-ev-a', 'legacy-ev-b']);
+  });
+
+  it('attaches a message-level legacy message when the memory holds only some blocks of it', () => {
+    const { runtime, memoryId, evidenceOf } = setup({ evidence_ids: [eventId(convA, 'msg-3', 0)] });
+    expect(runtime.reinforce('message-level', { memory_id: memoryId, evidence_message_ids: ['msg-3'] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(runtime.reinforce('message-level-again', { memory_id: memoryId, evidence_message_ids: ['msg-3'] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(evidenceOf()).toHaveLength(2);
   });
 });
