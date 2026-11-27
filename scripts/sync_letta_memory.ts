@@ -21,6 +21,7 @@ import * as fs from 'fs';
 import * as readline from 'readline';
 import { getAgentId } from './agent_config.js';
 import { mirrorSubconVisibility } from './subcon_visibility_mirror.js';
+import { spawnShadowWorker } from './subcon_shadow.js';
 import { acknowledgePendingSubconWhispers, formatPendingSubconWhispers, partitionPendingSubconWhispersForTurn, readPendingSubconWhispers } from './subcon_whisper_queue.js';
 import {
   loadSyncState,
@@ -195,6 +196,10 @@ async function main(): Promise<void> {
     const hookInput = await readHookInput();
     const cwd = hookInput?.cwd || projectDir;
     const sessionId = hookInput?.session_id;
+    // Shadow sync lane (§6.1): spawns a detached worker and returns at once; never affects this hook.
+    if (sessionId && typeof hookInput?.prompt === 'string' && hookInput.transcript_path) {
+      spawnShadowWorker('sync', { session_id: sessionId, prompt: hookInput.prompt, transcript_path: hookInput.transcript_path, cwd, prompt_at: new Date().toISOString() }, cwd);
+    }
     const allPendingWhispers = sessionId ? readPendingSubconWhispers(cwd, sessionId) : [];
     const expectedTurnId = expectedSyncTurnId(hookInput);
     const partitioned = partitionPendingSubconWhispersForTurn(allPendingWhispers, expectedTurnId);

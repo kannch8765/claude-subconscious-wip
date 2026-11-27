@@ -43,6 +43,7 @@ import {
 import { buildCanonicalMessages, deferredIntentReplay, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
+import { spawnShadowWorker } from './subcon_shadow.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -121,6 +122,9 @@ async function main(): Promise<void> {
     const workerScript = path.join(__dirname, 'send_worker_native.ts');
     const child = spawnSilentWorker(workerScript, payloadFile, hookInput.cwd);
     log(`Spawned native live worker (PID: ${child.pid})`);
+    // Shadow async lane (§6.1), after the Letta spawn so it cannot affect it.
+    const { sessionId, cwd, batchId, conversationId, latestUserMessage, canonicalMessages, assistantIntents } = batch.payload as Record<string, unknown>;
+    spawnShadowWorker('async', { sessionId, cwd, batchId, conversationId, latestUserMessage, canonicalMessages, assistantIntents }, hookInput.cwd, log);
     log('Hook completed (worker running in background)');
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
