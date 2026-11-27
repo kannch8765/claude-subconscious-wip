@@ -122,6 +122,33 @@ function evidenceProvenance(message: CanonicalMessage) {
   };
 }
 
+type EvidenceSource = Pick<EvidenceRecord, 'message_id' | 'block_index' | 'event_kind' | 'tool_use_id'>;
+
+/**
+ * Where evidence sits in the transcript, without the conversation that carried it: a later conversation can carry the
+ * same message again under a new transcript evidence id. Uses only the fields the item has, so one block never
+ * matches another block of the same message.
+ */
+function evidenceSourceKey(item: EvidenceSource): string {
+  return stableJson({
+    message_id: item.message_id,
+    ...(item.block_index === undefined ? {} : { block_index: item.block_index }),
+    ...(item.event_kind ? { event_kind: item.event_kind } : {}),
+    ...(item.tool_use_id ? { tool_use_id: item.tool_use_id } : {}),
+  });
+}
+
+/**
+ * Source keys of stored evidence that already hold this message. Message-level evidence (no block_index or
+ * event_kind; written before per-block evidence) holds the joined text of all the message's text blocks and none of
+ * its tool blocks, so it also holds any text block of that message.
+ */
+function sourceKeysHolding(message: CanonicalMessage): string[] {
+  const keys = [evidenceSourceKey(message)];
+  if (message.event_kind === 'user_text' || message.event_kind === 'assistant_text') keys.push(evidenceSourceKey({ message_id: message.message_id }));
+  return keys;
+}
+
 export class RelationshipMemoryRuntime {
   private readonly retryableAttempts = new Set<string>();
 
@@ -761,14 +788,13 @@ export class RelationshipMemoryRuntime {
     }
   }
 
-  private originalMemoryEvidenceIds(memory: CanonicalMemoryRecord): Set<string> | undefined {
+  private originalMemoryEvidenceIds(memory: CanonicalMemoryRecord, evidence: readonly EvidenceRecord[]): Set<string> | undefined {
     const legacyStore = new LegacyMemorySourceStore(this.store.rootDir);
     const legacyCreated = legacyStore.listProvenance().some((item) =>
       item.canonical_memory_id === memory.memory_id && item.disposition === 'created'
     );
     if (legacyCreated) return new Set();
 
-    const evidence = this.store.listEvidence().filter((item) => item.memory_id === memory.memory_id);
     for (let length = 1; length <= evidence.length; length += 1) {
       const prefix = evidence.slice(0, length);
       const dedupeKey = stableId('dedupe', {
@@ -914,14 +940,24 @@ export class RelationshipMemoryRuntime {
       if (!resolved.message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
       messages.push(resolved.message);
     }
-    const originalEvidenceIds = this.originalMemoryEvidenceIds(memory);
+    const memoryEvidence = this.store.listEvidence().filter((item) => item.memory_id === memoryId);
+    const originalEvidenceIds = this.originalMemoryEvidenceIds(memory, memoryEvidence);
     if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now, intent);
     const completedEvidenceIds = new Set(originalEvidenceIds);
     for (const reinforcement of this.store.listReinforcements()) {
       if (reinforcement.memory_id !== memoryId) continue;
       for (const evidenceId of reinforcement.evidence_ids) completedEvidenceIds.add(evidenceId);
     }
-    const newMessages = messages.filter((message) => !completedEvidenceIds.has(memoryEvidenceId(memoryId, message)));
+    // A message is already attached when the memory holds its evidence id, or holds the same transcript source under
+    // another conversation's id. Only completed evidence counts, so a half-committed reinforcement is still repaired.
+    const attachedSources = new Set(memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)).map(evidenceSourceKey));
+    const newMessages: CanonicalMessage[] = [];
+    for (const message of messages) {
+      if (completedEvidenceIds.has(memoryEvidenceId(memoryId, message))) continue;
+      if (sourceKeysHolding(message).some((key) => attachedSources.has(key))) continue;
+      newMessages.push(message);
+      attachedSources.add(evidenceSourceKey(message));
+    }
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
     const newMessageIds = newMessages.map(canonicalEvidenceId).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({
