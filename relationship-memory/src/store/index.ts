@@ -18,6 +18,7 @@ import type {
   RememberOutcome,
   OwnerRevisionRecord,
 } from '../schema/index.js';
+import { readCacheEnabled, readJsonlCached, readJsonlCachedByField } from './read_cache.js';
 
 export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
 export type FailureInjector = (phase: StorePhase) => boolean;
@@ -230,6 +231,14 @@ export class RelationshipMemoryStore {
 
   private file(name: string): string { return path.join(this.rootDir, name); }
 
+  /** True while this instance holds the canonical mutation lock, so no store writer can be mid-append. */
+  get holdsMutationLock(): boolean { return this.mutationLockDepth > 0; }
+
+  private readRecords<T>(name: string): T[] {
+    const file = this.file(name);
+    return readCacheEnabled() ? readJsonlCached<T>(file, this.holdsMutationLock) : readJsonl<T>(file);
+  }
+
   private writeIndexDatasetDir(dataset: string): string { return path.join(this.rootDir, '.write-index-v1', dataset); }
   private writeIndexMarkersDir(dataset: string): string { return path.join(this.writeIndexDatasetDir(dataset), 'markers'); }
   private writeIndexManifestFile(dataset: string): string { return path.join(this.writeIndexDatasetDir(dataset), 'manifest.json'); }
@@ -332,20 +341,23 @@ export class RelationshipMemoryStore {
     }
   }
 
-  listMemories(): CanonicalMemoryRecord[] { return readJsonl<CanonicalMemoryRecord>(this.file('memories.jsonl')); }
-  listEvidence(): EvidenceRecord[] { return readJsonl<EvidenceRecord>(this.file('evidence.jsonl')); }
+  listMemories(): CanonicalMemoryRecord[] { return this.readRecords<CanonicalMemoryRecord>('memories.jsonl'); }
+  listEvidence(): EvidenceRecord[] { return this.readRecords<EvidenceRecord>('evidence.jsonl'); }
   listEvidenceForMemoryIds(memoryIds: readonly string[]): EvidenceRecord[] {
-    return readEvidenceJsonlForMemoryIds(this.file('evidence.jsonl'), memoryIds);
+    const file = this.file('evidence.jsonl');
+    return readCacheEnabled()
+      ? readJsonlCachedByField<EvidenceRecord>(file, 'memory_id', memoryIds, this.holdsMutationLock)
+      : readEvidenceJsonlForMemoryIds(file, memoryIds);
   }
-  listEntities(): EntityIdentityRecord[] { return readJsonl<EntityIdentityRecord>(this.file('entities.jsonl')); }
-  listEntityEvidence(): EntityEvidenceRecord[] { return readJsonl<EntityEvidenceRecord>(this.file('entity-evidence.jsonl')); }
-  listEntityOutcomes(): EntityOutcome[] { return readJsonl<EntityOutcome>(this.file('entity-outcomes.jsonl')); }
-  listReinforcements(): ReinforcementRecord[] { return readJsonl<ReinforcementRecord>(this.file('reinforcements.jsonl')); }
-  listOutcomes(): RememberOutcome[] { return readJsonl<RememberOutcome>(this.file('outcomes.jsonl')); }
-  listBatches(): BatchRecord[] { return readJsonl<BatchRecord>(this.file('batches.jsonl')); }
-  listOwnerRevisions(): OwnerRevisionRecord[] { return readJsonl<OwnerRevisionRecord>(this.file('owner-revisions.jsonl')); }
-  listMaintenanceReviewRecords(): MaintenanceReviewRecord[] { return readJsonl<MaintenanceReviewRecord>(this.file('maintenance-reviews.jsonl')); }
-  listMemoryResolutionRecords(): MemoryResolutionRecord[] { return readJsonl<MemoryResolutionRecord>(this.file('memory-resolutions.jsonl')); }
+  listEntities(): EntityIdentityRecord[] { return this.readRecords<EntityIdentityRecord>('entities.jsonl'); }
+  listEntityEvidence(): EntityEvidenceRecord[] { return this.readRecords<EntityEvidenceRecord>('entity-evidence.jsonl'); }
+  listEntityOutcomes(): EntityOutcome[] { return this.readRecords<EntityOutcome>('entity-outcomes.jsonl'); }
+  listReinforcements(): ReinforcementRecord[] { return this.readRecords<ReinforcementRecord>('reinforcements.jsonl'); }
+  listOutcomes(): RememberOutcome[] { return this.readRecords<RememberOutcome>('outcomes.jsonl'); }
+  listBatches(): BatchRecord[] { return this.readRecords<BatchRecord>('batches.jsonl'); }
+  listOwnerRevisions(): OwnerRevisionRecord[] { return this.readRecords<OwnerRevisionRecord>('owner-revisions.jsonl'); }
+  listMaintenanceReviewRecords(): MaintenanceReviewRecord[] { return this.readRecords<MaintenanceReviewRecord>('maintenance-reviews.jsonl'); }
+  listMemoryResolutionRecords(): MemoryResolutionRecord[] { return this.readRecords<MemoryResolutionRecord>('memory-resolutions.jsonl'); }
   listActiveMemoryResolutions(): MemoryResolutionResolveRecord[] {
     const active = new Map<string, MemoryResolutionResolveRecord>();
     for (const record of this.listMemoryResolutionRecords()) {
@@ -372,8 +384,8 @@ export class RelationshipMemoryStore {
       };
     });
   }
-  listAssistantIntents(): AssistantRememberIntentRecord[] { return readJsonl<AssistantRememberIntentRecord>(this.file('assistant-intents.jsonl')); }
-  listAssistantIntentOutcomes(): AssistantIntentOutcome[] { return readJsonl<AssistantIntentOutcome>(this.file('assistant-intent-outcomes.jsonl')); }
+  listAssistantIntents(): AssistantRememberIntentRecord[] { return this.readRecords<AssistantRememberIntentRecord>('assistant-intents.jsonl'); }
+  listAssistantIntentOutcomes(): AssistantIntentOutcome[] { return this.readRecords<AssistantIntentOutcome>('assistant-intent-outcomes.jsonl'); }
 
   getAssistantIntent(intentId: string): AssistantRememberIntentRecord | undefined {
     return this.listAssistantIntents().find((item) => item.intent_id === intentId);

@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
+import { readCacheEnabled, readJsonlCached } from '../store/read_cache.js';
 
 export const LEGACY_BUCKET_TYPES = ['permanent', 'dynamic', 'feel', 'archive'] as const;
 export type LegacyBucketType = (typeof LEGACY_BUCKET_TYPES)[number];
@@ -362,12 +363,16 @@ export class LegacyMemorySourceStore {
   }
 
   private file(name: string): string { return path.join(this.rootDir, name); }
+  private readRecords<T>(name: string): T[] {
+    const file = this.file(name);
+    return readCacheEnabled() ? readJsonlCached<T>(file, this.mutationStore.holdsMutationLock) : readJsonl<T>(file);
+  }
   withMutationBoundary<T>(operation: () => T): T { return this.mutationStore.withMutationBoundary(operation); }
   listSources(): LegacyAssistantMemorySourceRecord[] {
-    return readJsonl<unknown>(this.file('legacy-assistant-sources.jsonl')).map((source) => validateLegacyAssistantMemorySourceRecord(source));
+    return this.readRecords<unknown>('legacy-assistant-sources.jsonl').map((source) => validateLegacyAssistantMemorySourceRecord(source));
   }
-  listProvenance(): LegacyMemoryProvenanceLink[] { return readJsonl(this.file('legacy-memory-provenance.jsonl')); }
-  listReceipts(): LegacyImportReceipt[] { return readJsonl(this.file('legacy-import-receipts.jsonl')); }
+  listProvenance(): LegacyMemoryProvenanceLink[] { return this.readRecords('legacy-memory-provenance.jsonl'); }
+  listReceipts(): LegacyImportReceipt[] { return this.readRecords('legacy-import-receipts.jsonl'); }
   getSource(id: string): LegacyAssistantMemorySourceRecord | undefined { return this.listSources().find((source) => source.legacy_source_id === id); }
   appendSource(source: LegacyAssistantMemorySourceRecord): 'accepted' | 'duplicate' {
     return this.withMutationBoundary(() => {
