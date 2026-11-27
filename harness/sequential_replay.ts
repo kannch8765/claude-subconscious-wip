@@ -5,23 +5,35 @@
  * the async pass with sync's pick as session-known. Session-known and recently seen come from the harness's own
  * earlier passes in that session (picks, memories it created, last three searches).
  *
- * Layout of --out (the runner refuses any other existing directory):
- *   INIT.json      written last at initialization: seed paths, index fingerprint
- *   checkpoint/    the last committed turn: store data files, semantic index, sessions, pending embeddings, results
+ * Layout of --out:
+ *   RUN.lock       taken before anything else and held to the end; never taken over (a stale one is removed by hand)
+ *   INIT.json      written last at initialization: seed paths, index fingerprint, sha256 of the batches file
+ *   checkpoint/    the last committed state: store data files, semantic index, sessions, pending embeddings, results
  *   work/          rebuilt from checkpoint/ at every start; a turn runs here and is committed only when it is clean
- *   RUN.lock       one runner at a time
- * A turn that is interrupted, hits a provider failure (429, 5xx, transport) or a query-embedding cooldown is not
- * committed: the run pauses (exit 3) and the next start repeats that turn from the last checkpoint.
+ *   cooldown/      embedding-provider cooldowns; outside the checkpoint, so a rollback does not forget them
  *
- * Nothing live is written: --out must not resolve inside a --forbid path, seed files must be regular files, search
- * uses the existing vectors (rankExisting) and only memories the harness creates get vectors (HTTP mode). Recall
- * timing is off. In HTTP mode the OpenCode Go 5-hour and weekly meters must read below their caps before every
- * turn; an unreadable meter pauses the run.
+ * The run contract:
+ *   - Ownership: one runner per --out (RUN.lock, created exclusively). Initialization, restore and every commit
+ *     happen while it is held. An existing --out is used only if this runner initialized it (INIT.json).
+ *   - Input: a resume must use the same batches file (sha256 in INIT.json), and the committed results must be
+ *     exactly the first n batches of it, in order.
+ *   - Commit: a turn is committed (atomic rename of a full copy) only when it ran clean. Interrupted, a provider
+ *     failure (429, 5xx, transport) in sync or async, including a sync call that timed out and failed later, or a
+ *     query-embedding cooldown: nothing is committed, the run pauses (exit 3) and the next start repeats the turn.
+ *   - Vectors: memories the harness creates are embedded after their turn; failures stay pending in the checkpoint
+ *     and are retried before the next model call and before the run reports done. While any remain, it pauses.
+ *   - Cooldown: a start pauses while a saved embedding cooldown has not expired.
+ *   - Usage: in HTTP mode the OpenCode Go 5-hour and weekly meters must read below their caps before every turn;
+ *     an unreadable meter pauses the run.
+ *
+ * Nothing live is written: --out must not overlap a --forbid path, seed files must be regular files, search uses
+ * the existing vectors (rankExisting) and only memories the harness creates get vectors (HTTP mode). Recall timing
+ * is off.
  *
  * Usage: tsx harness/sequential_replay.ts --batches <chronological jsonl> --store <seed store dir> --index <index.json>
  *        --out <dir> [--forbid <path>]... [--limit n] [--model m] [--sync-model m] [--max-steps n]
  *        [--rolling-cap pct] [--weekly-cap pct]
- * Exit: 0 done (or --limit reached), 2 refused (bad paths, seed, lock, caps), 3 paused (resume by rerunning).
+ * Exit: 0 done (or --limit reached), 2 refused (paths, seed, input, lock, caps), 3 paused (resume by rerunning).
  */
 import * as crypto from 'crypto';
 import * as fs from 'fs';
@@ -33,7 +45,7 @@ import { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/inde
 import { backends as defaultBackends, type Backends } from './backends.js';
 import { commonBigrams, evidenceCoverage } from './evidence_coverage.js';
 import { runAsyncPass } from './pass.js';
-import { runSyncPass } from './sync_pass.js';
+import { runSyncPassSettled } from './sync_pass.js';
 import { prepareTurn } from './turn_input.js';
 
 export class Refused extends Error {}
@@ -51,6 +63,8 @@ export interface ReplayOptions {
   maxSteps?: number;
   rollingCap?: number;
   weeklyCap?: number;
+  /** Sync model-call deadline (phrases and gate); the default is the hook's. */
+  syncTimeoutMs?: number;
   /** Meters are required (HTTP mode); undefined meters pause the run. */
   metered: boolean;
 }
@@ -75,7 +89,7 @@ function real(p: string): string {
 
 function inside(child: string, parent: string): boolean {
   const rel = path.relative(parent, child);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
 }
 
 /** --out (and its parent, before it exists) must not be inside or contain any forbidden path. */
@@ -138,23 +152,40 @@ function checkIndex(indexFile: string, storeDir: string, b: Backends): void {
 function takeRunLock(outDir: string): () => void {
   const file = path.join(outDir, 'RUN.lock');
   const token = crypto.randomBytes(8).toString('hex');
-  const write = (): boolean => {
-    try { fs.writeFileSync(file, JSON.stringify({ pid: process.pid, token }), { flag: 'wx', mode: 0o600 }); return true; } catch { return false; }
-  };
-  if (!write()) {
-    let holder: { pid?: number } = {};
-    try { holder = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* unreadable: treat as held */ }
-    let alive = true;
-    try { if (holder.pid) process.kill(holder.pid, 0); } catch { alive = false; }
-    if (alive || !holder.pid) throw new Refused('another runner holds RUN.lock');
-    // The holder is dead: move its lock aside (only one taker can rename it), then take ours.
-    try { fs.renameSync(file, `${file}.stale-${token}`); } catch { throw new Refused('RUN.lock changed during takeover'); }
-    fs.rmSync(`${file}.stale-${token}`, { force: true });
-    if (!write()) throw new Refused('another runner took RUN.lock');
+  try {
+    fs.writeFileSync(file, JSON.stringify({ pid: process.pid, token, at: new Date().toISOString() }), { flag: 'wx', mode: 0o600 });
+  } catch {
+    throw new Refused(`RUN.lock exists in ${outDir}: another runner is active, or one died. Check, then remove it by hand.`);
   }
   return () => {
     try { if (JSON.parse(fs.readFileSync(file, 'utf8')).token === token) fs.rmSync(file, { force: true }); } catch { /* gone */ }
   };
+}
+
+function sha256File(file: string): string {
+  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+}
+
+// ---- embedding cooldowns survive rollback
+
+function saveCooldowns(outDir: string, indexDir: string): void {
+  if (!fs.existsSync(indexDir)) return;
+  const names = fs.readdirSync(indexDir).filter((name) => name.includes('.provider-cooldown.') && name.endsWith('.json'));
+  if (!names.length) return;
+  fs.mkdirSync(path.join(outDir, 'cooldown'), { recursive: true, mode: 0o700 });
+  for (const name of names) copyRegular(path.join(indexDir, name), path.join(outDir, 'cooldown', name));
+}
+
+function checkCooldowns(outDir: string, now = Date.now()): void {
+  const dir = path.join(outDir, 'cooldown');
+  if (!fs.existsSync(dir)) return;
+  for (const name of fs.readdirSync(dir)) {
+    let until = NaN;
+    try { until = Date.parse(JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')).retry_after); } catch { /* unreadable */ }
+    if (!Number.isFinite(until)) throw new Paused(`unreadable embedding cooldown ${name}; check it, then remove it`);
+    if (until > now) throw new Paused(`embedding cooldown until ${new Date(until).toISOString()}`);
+    fs.rmSync(path.join(dir, name), { force: true });
+  }
 }
 
 // ---- checkpoint
@@ -184,10 +215,12 @@ function restoreWork(outDir: string): string {
   return work;
 }
 
-function initialize(opts: ReplayOptions, out: string, b: Backends): void {
-  if (fs.existsSync(out) && fs.readdirSync(out).length) throw new Refused(`--out ${out} exists but was not initialized by this runner`);
-  fs.mkdirSync(out, { recursive: true, mode: 0o700 });
+/** Entries a crashed initialization can leave behind; anything else means the directory is not ours. */
+const INIT_LEFTOVERS = new Set(['RUN.lock', 'checkpoint.tmp-init']);
+
+function initialize(opts: ReplayOptions, out: string, b: Backends, batchesSha256: string): void {
   const seed = path.join(out, 'checkpoint.tmp-init');
+  fs.rmSync(seed, { recursive: true, force: true });
   fs.mkdirSync(path.join(seed, 'store'), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(seed, 'semantic-index'), { recursive: true, mode: 0o700 });
   for (const name of storeDataFiles(opts.seedStore)) copyRegular(path.join(opts.seedStore, name), path.join(seed, 'store', name));
@@ -196,7 +229,7 @@ function initialize(opts: ReplayOptions, out: string, b: Backends): void {
   fs.writeFileSync(path.join(seed, STATE), JSON.stringify({ sessions: {}, pending_embed: [] } satisfies State), { mode: 0o600 });
   fs.renameSync(seed, path.join(out, 'checkpoint'));
   const { fingerprint, documents } = indexFingerprint(path.join(out, 'checkpoint', 'semantic-index', 'index.json'));
-  fs.writeFileSync(path.join(out, 'INIT.json'), JSON.stringify({ created_at: new Date().toISOString(), seed_store: real(opts.seedStore), seed_index: real(opts.seedIndex), fingerprint, seed_documents: documents }), { mode: 0o600 });
+  fs.writeFileSync(path.join(out, 'INIT.json'), JSON.stringify({ created_at: new Date().toISOString(), seed_store: real(opts.seedStore), seed_index: real(opts.seedIndex), fingerprint, seed_documents: documents, batches_sha256: batchesSha256 }), { mode: 0o600 });
 }
 
 // ---- the run
@@ -218,27 +251,46 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
   const weeklyCap = validCap(opts.weeklyCap ?? 70, '--weekly-cap');
   const out = checkOutPath(opts.outDir, opts.forbid);
   const b = deps.backends;
-  if (!fs.existsSync(path.join(out, 'INIT.json'))) initialize(opts, out, b);
+  const initFile = path.join(out, 'INIT.json');
+  if (fs.existsSync(out) && !fs.existsSync(initFile) && fs.readdirSync(out).some((name) => !INIT_LEFTOVERS.has(name))) {
+    throw new Refused(`--out ${out} exists but was not initialized by this runner`);
+  }
+  fs.mkdirSync(out, { recursive: true, mode: 0o700 });
   const release = takeRunLock(out);
   let ran = 0;
+  let indexDir: string | undefined;
   try {
+    const batchesSha256 = sha256File(opts.batchesFile);
+    if (!fs.existsSync(initFile)) initialize(opts, out, b, batchesSha256);
+    else if (JSON.parse(fs.readFileSync(initFile, 'utf8')).batches_sha256 !== batchesSha256) throw new Refused('--batches differs from the file this run was initialized with');
+    checkCooldowns(out);
     const work = restoreWork(out);
     const storeDir = path.join(work, 'store');
     const indexFile = path.join(work, 'semantic-index', 'index.json');
+    indexDir = path.dirname(indexFile);
     checkIndex(indexFile, storeDir, b);
     const resultsFile = path.join(work, RESULTS);
-    const done = new Set(fs.existsSync(resultsFile) ? fs.readFileSync(resultsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).batch_id) : []);
+    const doneIds: string[] = fs.existsSync(resultsFile) ? fs.readFileSync(resultsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).batch_id) : [];
     const state: State = JSON.parse(fs.readFileSync(path.join(work, STATE), 'utf8'));
     const saveState = (): void => fs.writeFileSync(path.join(work, STATE), JSON.stringify(state), { mode: 0o600 });
 
     const batches = fs.readFileSync(opts.batchesFile, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    let queue = batches.filter((batch) => !done.has(batch.batch_id));
-    if (opts.limit && opts.limit > 0) queue = queue.slice(0, Math.max(0, opts.limit - done.size));
-    log(`sequential replay: ${queue.length} turns to run (${done.size} done)`);
+    if (doneIds.some((id, i) => batches[i]?.batch_id !== id)) throw new Refused('committed results are not a prefix of --batches');
+    let queue = batches.slice(doneIds.length);
+    if (opts.limit && opts.limit > 0) queue = queue.slice(0, Math.max(0, opts.limit - doneIds.length));
+    log(`sequential replay: ${queue.length} turns to run (${doneIds.length} done)`);
     const listing = new RelationshipMemoryStore(storeDir, 'local-user');
     const ignore = commonBigrams(listing.listEvidenceForMemoryIds(listing.listMemories().map((m) => m.memory_id)).map((e) => e.quote));
-    const cooldown = (): boolean => fs.readdirSync(path.dirname(indexFile)).some((file) => file.includes('provider-cooldown'));
-    if (cooldown()) throw new Paused('a query-embedding cooldown is active in the checkpoint');
+    const cooldown = (): boolean => fs.readdirSync(indexDir!).some((file) => file.includes('.provider-cooldown.'));
+    // Vectors still missing from an earlier turn: embed them and commit, or pause. Without them store and index disagree.
+    const drainPending = async (): Promise<void> => {
+      if (!state.pending_embed.length || !b.canEmbedDocuments) return;
+      const runtime = new RelationshipMemoryRuntime(new RelationshipMemoryStore(storeDir, 'local-user'), new Map(), () => new Date().toISOString(), new Map(), true, b.retrieverFor(indexFile, storeDir));
+      try { await runtime.prepareCurrentMemorySemanticIndex(new Set(state.pending_embed)); } catch { throw new Paused(`${state.pending_embed.length} pending memory embeddings still fail`); }
+      state.pending_embed = [];
+      saveState();
+      commit(out, work);
+    };
 
     for (const batch of queue) {
       const meters = await deps.meters();
@@ -255,12 +307,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
         true,
         b.retrieverFor(indexFile, storeDir),
       );
-      // Vectors still missing from an earlier turn come first; without them the store and index disagree.
-      if (state.pending_embed.length && b.canEmbedDocuments) {
-        try { await makeRuntime([]).prepareCurrentMemorySemanticIndex(new Set(state.pending_embed)); } catch { throw new Paused('pending memory embeddings still fail'); }
-        state.pending_embed = [];
-        saveState();
-      }
+      await drainPending();
 
       const session = (state.sessions[batch.letta_session] ??= { picked: [], written: [], passes: [] });
       const started = Date.now();
@@ -277,14 +324,18 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
       } else {
         const runtime = makeRuntime(turn.canonicalMessages!);
         const knownBefore = [...new Set([...session.picked, ...session.written])];
-        const sync = await runSyncPass(runtime, b.transport, {
+        const { result: sync, settled } = await runSyncPassSettled(runtime, b.transport, {
           batchId: batch.batch_id,
           sessionId: batch.letta_session,
           latestUserMessage: turn.latestUserMessage,
           previousUserMessage: turn.previousUserMessage!,
           previousKohakuReply: turn.previousKohakuReply!,
           sessionKnownMemoryIds: knownBefore,
-        }, { model: opts.syncModel ?? 'glm-5.3-flash', reasoningEffort: 'none' });
+        }, { model: opts.syncModel ?? 'glm-5.3-flash', reasoningEffort: 'none', ...(opts.syncTimeoutMs ? { phraseTimeoutMs: opts.syncTimeoutMs } : {}) });
+        // A sync call that missed its deadline is still running: let it finish before anything else, and pause if it
+        // failed at the provider. The record keeps the latency outcome (timeout); the provider outcome gates the commit.
+        const lateError = await settled();
+        if (lateError) throw new Paused(`late provider failure (${lateError}) in sync of ${batch.batch_id}`);
         const known = sync.whisper ? [...knownBefore, sync.whisper.memory_id] : knownBefore;
         const seen = new Map<string, string>();
         for (const pass of session.passes) for (const item of pass) seen.set(item.memory_id, item.summary);
@@ -330,8 +381,10 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
       const r = record as any;
       log(`  ${batch.batch_id}: ${r.skip ?? r.completion} sync=${r.sync?.whisper ? 'whisper' : r.sync?.skip_reason ?? '-'} async=${r.decisions?.whisper ? 'whisper' : '-'} r${r.decisions?.reinforce?.length ?? 0} m${(r.decisions?.remember ?? []).filter((x: any) => x.outcome === 'accepted').length} ${r.wall_ms ?? 0} ms`);
     }
-    return { ran, done: done.size + ran };
+    await drainPending();
+    return { ran, done: doneIds.length + ran };
   } finally {
+    if (indexDir) saveCooldowns(out, indexDir);
     await b.close();
     release();
   }

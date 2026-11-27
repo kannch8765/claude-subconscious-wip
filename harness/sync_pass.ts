@@ -13,7 +13,7 @@
  */
 import type { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import type { MemoryRecallResult } from '../relationship-memory/src/tools/index.js';
-import { chat, type ChatTransport, type ChatUsage } from './llm.js';
+import { chat, type ChatResult, type ChatTransport, type ChatUsage } from './llm.js';
 import { modelText } from './turn_input.js';
 import { isKnown } from './view.js';
 import { bigrams, overlap } from './quote_sampler.js';
@@ -126,13 +126,42 @@ export function pickQuotes(memory: MemoryRecallResult, queryTexts: string[], max
   return chosen.sort((a, b) => a.index - b.index).map((x) => x.id);
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | 'timeout'> {
+/** A call that loses the race keeps running; it goes to `late` so a caller can wait for it and see its status. */
+async function withTimeout<T>(promise: Promise<T>, ms: number, late: Promise<T>[]): Promise<T | 'timeout'> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), ms); });
-  try { return await Promise.race([promise, timeout]); } finally { if (timer) clearTimeout(timer); }
+  try {
+    const result = await Promise.race([promise, timeout]);
+    if (result === 'timeout') late.push(promise);
+    return result;
+  } finally { if (timer) clearTimeout(timer); }
 }
 
 export async function runSyncPass(runtime: RelationshipMemoryRuntime, transport: ChatTransport, input: SyncInput, config: SyncConfig): Promise<SyncResult> {
+  return syncPass(runtime, transport, input, config, []);
+}
+
+/**
+ * The same pass, plus `settled()`: it waits for model calls that timed out and returns the first provider error
+ * among them (rate limit, server, transport). The hook path does not wait; a replay must, before it commits a turn.
+ */
+export async function runSyncPassSettled(runtime: RelationshipMemoryRuntime, transport: ChatTransport, input: SyncInput, config: SyncConfig): Promise<{ result: SyncResult; settled: () => Promise<string | undefined> }> {
+  const late: Promise<ChatResult>[] = [];
+  const result = await syncPass(runtime, transport, input, config, late);
+  return {
+    result,
+    settled: async () => {
+      const replies = await Promise.allSettled(late);
+      for (const reply of replies) {
+        if (reply.status === 'rejected') return 'transport';
+        if (reply.value.errorClass !== 'none' && reply.value.errorClass !== 'malformed' && reply.value.errorClass !== 'client') return reply.value.errorClass;
+      }
+      return undefined;
+    },
+  };
+}
+
+async function syncPass(runtime: RelationshipMemoryRuntime, transport: ChatTransport, input: SyncInput, config: SyncConfig, late: Promise<ChatResult>[]): Promise<SyncResult> {
   const started = Date.now();
   const message = modelText(input.latestUserMessage);
   let phrases: string[] = [];
@@ -146,7 +175,7 @@ export async function runSyncPass(runtime: RelationshipMemoryRuntime, transport:
     temperature: 0,
     max_tokens: 400,
     ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
-  }, `${input.sessionId}:sync`, { maxAttempts: 2, backoffMs: 300 }), config.phraseTimeoutMs ?? 4_000);
+  }, `${input.sessionId}:sync`, { maxAttempts: 2, backoffMs: 300 }), config.phraseTimeoutMs ?? 4_000, late);
   const phraseMs = Date.now() - phraseStarted;
   if (reply === 'timeout') phraseStatus = 'timeout';
   else {
@@ -195,7 +224,7 @@ export async function runSyncPass(runtime: RelationshipMemoryRuntime, transport:
     temperature: 0,
     max_tokens: 200,
     ...(config.reasoningEffort ? { reasoning_effort: config.reasoningEffort } : {}),
-  }, `${input.sessionId}:sync`, { maxAttempts: 2, backoffMs: 300 }), config.phraseTimeoutMs ?? 4_000);
+  }, `${input.sessionId}:sync`, { maxAttempts: 2, backoffMs: 300 }), config.phraseTimeoutMs ?? 4_000, late);
   const gateMs = Date.now() - gateStarted;
   const after = { ...done, total_ms: Date.now() - started, gate_ms: gateMs };
   if (gate === 'timeout') return { ...after, gate_status: 'timeout', skip_reason: 'gate_failed' };

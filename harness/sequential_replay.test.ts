@@ -40,12 +40,16 @@ function setup(opts: { documents?: number } = {}) {
 }
 
 /** Sync: phrases, then the gate says none. Async: search, then skip. failOn: return 429 to async on that batch. */
-function model(failOn?: string): ChatTransport & { calls: number } {
+function model(failOn?: string, opts: { slowSyncPhrase429?: number } = {}): ChatTransport & { calls: number } {
   const t = {
     calls: 0,
     async chat(body: any): Promise<TransportReply> {
       t.calls++;
       const reply = (message: any, status = 200): TransportReply => ({ status, ms: 1, body: status === 200 ? { choices: [{ message }], usage: { prompt_tokens: 1, completion_tokens: 1 } } : { error: 'rate limited' } });
+      if (!body.tools && opts.slowSyncPhrase429 && !String(body.messages.at(-1).content).includes('Candidate memories')) {
+        await new Promise((resolve) => setTimeout(resolve, opts.slowSyncPhrase429));
+        return reply(null, 429);
+      }
       if (!body.tools) {
         const prompt = String(body.messages.at(-1).content);
         return reply({ role: 'assistant', content: prompt.includes('Candidate memories') ? '{"memory_id": null}' : '{"queries": ["累"]}' });
@@ -59,22 +63,40 @@ function model(failOn?: string): ChatTransport & { calls: number } {
   return t;
 }
 
-function provider(fingerprint = 'fp', failDocuments = false) {
+interface ProviderOptions { fingerprint?: string; failDocuments?: boolean; failQueries?: boolean; counts?: { queries: number; documents: number } }
+
+function provider(opts: ProviderOptions) {
   return {
-    model: 'm', dimensions: 2, maxBatchSize: 10, fingerprint,
-    async embedDocuments(texts: string[]): Promise<number[][]> { if (failDocuments) throw new Error('down'); return texts.map(() => [0.3, 0.4]); },
-    async embedQuery(): Promise<number[]> { return [0.1, 0.2]; },
+    model: 'm', dimensions: 2, maxBatchSize: 10, fingerprint: opts.fingerprint ?? 'fp',
+    async embedDocuments(texts: string[]): Promise<number[][]> {
+      if (opts.counts) opts.counts.documents++;
+      if (opts.failDocuments) throw new Error('down');
+      return texts.map(() => [0.3, 0.4]);
+    },
+    async embedQuery(): Promise<number[]> {
+      if (opts.counts) opts.counts.queries++;
+      if (opts.failQueries) throw new Error('down');
+      return [0.1, 0.2];
+    },
   };
 }
 
-function deps(transport: ChatTransport, opts: { fingerprint?: string; failDocuments?: boolean; meters?: () => Promise<any> } = {}) {
+function deps(transport: ChatTransport, opts: ProviderOptions & { meters?: () => Promise<any> } = {}) {
   const backends: Backends = {
     transport,
     canEmbedDocuments: true,
-    retrieverFor: (indexFile) => new FileBackedSemanticRetriever(provider(opts.fingerprint, opts.failDocuments) as any, indexFile),
+    retrieverFor: (indexFile) => new FileBackedSemanticRetriever(provider(opts) as any, indexFile),
     close: async () => {},
   };
   return { backends, meters: opts.meters ?? (async () => undefined), log: () => {} };
+}
+
+function expireCooldowns(out: string): void {
+  const dir = path.join(out, 'cooldown');
+  for (const name of fs.readdirSync(dir)) {
+    const file = path.join(dir, name);
+    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), retry_after: '2000-01-01T00:00:00Z' }));
+  }
 }
 
 const results = (out: string): any[] => fs.readFileSync(path.join(out, 'checkpoint', 'results.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -94,6 +116,7 @@ describe('sequential replay', () => {
   it('refuses an output inside a forbidden path, an uninitialized directory, and a symlinked seed file', async () => {
     const { options, live, seed, root } = setup();
     await expect(runSequentialReplay({ ...options, outDir: path.join(live, 'out') }, deps(model()))).rejects.toBeInstanceOf(Refused);
+    await expect(runSequentialReplay({ ...options, outDir: path.join(live, '..review') }, deps(model()))).rejects.toThrow(/forbidden/);
     fs.mkdirSync(options.outDir);
     fs.writeFileSync(path.join(options.outDir, 'stray'), '');
     await expect(runSequentialReplay(options, deps(model()))).rejects.toThrow(/not initialized/);
@@ -129,15 +152,20 @@ describe('sequential replay', () => {
     expect(await runSequentialReplay(options, deps(model()))).toEqual({ ran: 2, done: 3 });
   }, 30_000); // chat() backs off 1 + 2 + 4 s on a 429 before giving up
 
-  it('keeps vectors still to be embedded across a pause and retries them first', async () => {
+  it('does not report done while vectors are pending, and embeds them on the next start', async () => {
     const { options } = setup();
-    await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
+    await runSequentialReplay(options, deps(model()));
     const stateFile = path.join(options.outDir, 'checkpoint', 'state.json');
     const state = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     fs.writeFileSync(stateFile, JSON.stringify({ ...state, pending_embed: ['mem_seed'] }));
     await expect(runSequentialReplay(options, deps(model(), { failDocuments: true }))).rejects.toThrow(/pending memory embeddings/);
     expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).pending_embed).toEqual(['mem_seed']);
-    await runSequentialReplay(options, deps(model()));
+    // The failed embedding also set a provider cooldown; the next start waits for it. Let it expire.
+    await expect(runSequentialReplay(options, deps(model()))).rejects.toThrow(/embedding cooldown until/);
+    expireCooldowns(options.outDir);
+    const counts = { queries: 0, documents: 0 };
+    expect(await runSequentialReplay(options, deps(model(), { counts }))).toEqual({ ran: 0, done: 3 });
+    expect(counts.documents).toBe(1);
     expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).pending_embed).toEqual([]);
     const index = JSON.parse(fs.readFileSync(path.join(options.outDir, 'checkpoint', 'semantic-index', 'index.json'), 'utf8'));
     expect(Object.keys(index.documents)).toEqual(expect.arrayContaining(['memory:other0', 'memory:mem_seed']));
@@ -148,7 +176,43 @@ describe('sequential replay', () => {
     await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
     fs.writeFileSync(path.join(options.outDir, 'RUN.lock'), JSON.stringify({ pid: process.pid, token: 'other' }));
     await expect(runSequentialReplay(options, deps(model()))).rejects.toThrow(/RUN.lock/);
+    // A dead holder is not taken over either: two takers could both win. It is removed by hand.
     fs.writeFileSync(path.join(options.outDir, 'RUN.lock'), JSON.stringify({ pid: 999_999_999, token: 'dead' }));
+    await expect(runSequentialReplay(options, deps(model()))).rejects.toThrow(/RUN.lock/);
+    fs.rmSync(path.join(options.outDir, 'RUN.lock'));
     expect((await runSequentialReplay(options, deps(model()))).done).toBe(3);
+    expect(fs.existsSync(path.join(options.outDir, 'RUN.lock'))).toBe(false);
+  });
+
+  it('refuses to resume with a different batches file', async () => {
+    const { options } = setup();
+    await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
+    const lines = fs.readFileSync(options.batchesFile, 'utf8').split('\n').filter(Boolean);
+    fs.writeFileSync(options.batchesFile, [lines[0], lines[2]].join('\n') + '\n');
+    await expect(runSequentialReplay(options, deps(model()))).rejects.toThrow(/--batches differs/);
+    expect(results(options.outDir).map((r) => r.batch_id)).toEqual(['t1']);
+  });
+
+  it('keeps an embedding cooldown across the rollback and pauses until it expires', async () => {
+    const { options } = setup();
+    // Give the index a vector that matches the seed memory, so search embeds its query.
+    await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
+    const stateFile = path.join(options.outDir, 'checkpoint', 'state.json');
+    fs.writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(stateFile, 'utf8')), pending_embed: ['mem_seed'] }));
+    await expect(runSequentialReplay(options, deps(model(), { failQueries: true }))).rejects.toThrow(/cooldown during t2/);
+    expect(fs.readdirSync(path.join(options.outDir, 'cooldown')).length).toBe(1);
+    const counts = { queries: 0, documents: 0 };
+    await expect(runSequentialReplay(options, deps(model(), { counts }))).rejects.toThrow(/embedding cooldown until/);
+    expect(counts.queries).toBe(0);
+    expect(results(options.outDir).map((r) => r.batch_id)).toEqual(['t1']);
+    expireCooldowns(options.outDir);
+    expect(await runSequentialReplay(options, deps(model(), { counts }))).toEqual({ ran: 2, done: 3 });
+    expect(counts.queries).toBeGreaterThan(0);
+  });
+
+  it('waits for a sync call that missed its deadline and pauses when it fails at the provider', async () => {
+    const { options } = setup();
+    await expect(runSequentialReplay({ ...options, syncTimeoutMs: 20 }, deps(model(undefined, { slowSyncPhrase429: 60 })))).rejects.toThrow(/late provider failure \(rate_limited\) in sync of t1/);
+    expect(fs.existsSync(path.join(options.outDir, 'checkpoint', 'results.jsonl'))).toBe(false);
   });
 });
