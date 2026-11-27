@@ -254,6 +254,15 @@ describe('store JSONL read cache', () => {
     expect(store.listEvidenceForMemoryIds([])).toEqual([]);
   });
 
+  it('deep-freezes cached records under vitest, so a mutating caller fails the suite', () => {
+    const root = tempRoot();
+    fs.writeFileSync(path.join(root, 'memories.jsonl'), line(memory('mem-1')));
+    const [record] = readOnlyStore(root).listMemories();
+    expect(Object.isFrozen(record)).toBe(true);
+    expect(Object.isFrozen(record.payload)).toBe(true);
+    expect(() => { (record as { summary: string }).summary = 'changed'; }).toThrow(TypeError);
+  });
+
   it('turns off with RELATIONSHIP_MEMORY_READ_CACHE=off', () => {
     const root = tempRoot();
     fs.writeFileSync(path.join(root, 'memories.jsonl'), line(memory('mem-1')));

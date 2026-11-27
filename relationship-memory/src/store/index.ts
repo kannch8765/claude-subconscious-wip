@@ -18,7 +18,7 @@ import type {
   RememberOutcome,
   OwnerRevisionRecord,
 } from '../schema/index.js';
-import { readCacheEnabled, readJsonlCached, readJsonlCachedByField } from './read_cache.js';
+import { readJsonlRecords, readJsonlRecordsByField } from './read_cache.js';
 
 export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
 export type FailureInjector = (phase: StorePhase) => boolean;
@@ -68,35 +68,6 @@ function sleepSync(ms: number): void {
 
 function ensureDir(dir: string): void {
   fs.mkdirSync(dir, { recursive: true });
-}
-
-function readJsonl<T>(file: string): T[] {
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
-}
-
-function readEvidenceJsonlForMemoryIds(file: string, memoryIds: readonly string[]): EvidenceRecord[] {
-  if (!fs.existsSync(file) || memoryIds.length === 0) return [];
-  // Keep the 30MB+ append-only evidence file as bytes. Decoding the whole file
-  // to one JS UTF-16 string costs hundreds of milliseconds on production-scale
-  // stores; Buffer search lets foreground recall decode only the matching lines.
-  const raw = fs.readFileSync(file);
-  const result: EvidenceRecord[] = [];
-  for (const memoryId of new Set(memoryIds)) {
-    const needle = Buffer.from(`"memory_id":${JSON.stringify(memoryId)}`, 'utf8');
-    let cursor = 0;
-    while (cursor < raw.length) {
-      const match = raw.indexOf(needle, cursor);
-      if (match < 0) break;
-      const previousNewline = raw.lastIndexOf(0x0a, match - 1);
-      const lineStart = previousNewline < 0 ? 0 : previousNewline + 1;
-      const newline = raw.indexOf(0x0a, match);
-      const lineEnd = newline < 0 ? raw.length : newline;
-      if (lineEnd > lineStart) result.push(JSON.parse(raw.subarray(lineStart, lineEnd).toString('utf8')) as EvidenceRecord);
-      cursor = lineEnd + 1;
-    }
-  }
-  return result;
 }
 
 function appendJsonl(file: string, value: unknown): void {
@@ -234,10 +205,7 @@ export class RelationshipMemoryStore {
   /** True while this instance holds the canonical mutation lock, so no store writer can be mid-append. */
   get holdsMutationLock(): boolean { return this.mutationLockDepth > 0; }
 
-  private readRecords<T>(name: string): T[] {
-    const file = this.file(name);
-    return readCacheEnabled() ? readJsonlCached<T>(file, this.holdsMutationLock) : readJsonl<T>(file);
-  }
+  private readRecords<T>(name: string): T[] { return readJsonlRecords<T>(this.file(name), this.holdsMutationLock); }
 
   private writeIndexDatasetDir(dataset: string): string { return path.join(this.rootDir, '.write-index-v1', dataset); }
   private writeIndexMarkersDir(dataset: string): string { return path.join(this.writeIndexDatasetDir(dataset), 'markers'); }
@@ -344,10 +312,7 @@ export class RelationshipMemoryStore {
   listMemories(): CanonicalMemoryRecord[] { return this.readRecords<CanonicalMemoryRecord>('memories.jsonl'); }
   listEvidence(): EvidenceRecord[] { return this.readRecords<EvidenceRecord>('evidence.jsonl'); }
   listEvidenceForMemoryIds(memoryIds: readonly string[]): EvidenceRecord[] {
-    const file = this.file('evidence.jsonl');
-    return readCacheEnabled()
-      ? readJsonlCachedByField<EvidenceRecord>(file, 'memory_id', memoryIds, this.holdsMutationLock)
-      : readEvidenceJsonlForMemoryIds(file, memoryIds);
+    return readJsonlRecordsByField<EvidenceRecord>(this.file('evidence.jsonl'), 'memory_id', memoryIds, this.holdsMutationLock);
   }
   listEntities(): EntityIdentityRecord[] { return this.readRecords<EntityIdentityRecord>('entities.jsonl'); }
   listEntityEvidence(): EntityEvidenceRecord[] { return this.readRecords<EntityEvidenceRecord>('entity-evidence.jsonl'); }

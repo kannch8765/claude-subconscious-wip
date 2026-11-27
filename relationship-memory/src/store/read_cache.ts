@@ -10,7 +10,8 @@ import * as path from 'path';
  * memory in long-lived processes that read rarely.
  *
  * Cached records are shared between callers. Callers get a fresh array, but must
- * never mutate the records inside it.
+ * never mutate the records inside it. Under vitest the cached values are deep-frozen,
+ * so a caller that mutates one fails the test suite instead of corrupting the cache.
  */
 
 const GUARD_BYTES = 4096;
@@ -20,6 +21,16 @@ const NEWLINE = 0x0a;
 export function readCacheEnabled(): boolean {
   const raw = process.env.RELATIONSHIP_MEMORY_READ_CACHE?.trim().toLowerCase();
   return raw !== 'off' && raw !== '0' && raw !== 'false';
+}
+
+const FREEZE_CACHED_VALUES = Boolean(process.env.VITEST);
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const child of Object.values(value)) deepFreeze(child);
+  }
+  return value;
 }
 
 const clearers: Array<() => void> = [];
@@ -79,7 +90,7 @@ function openForRead(file: string): number | undefined {
   try {
     return fs.openSync(file, 'r');
   } catch (error) {
-    if (!fs.existsSync(file)) return undefined;
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || !fs.existsSync(file)) return undefined;
     throw error;
   }
 }
@@ -111,8 +122,8 @@ registerReadCache(() => jsonFileCache.clear());
 
 /**
  * Parses a JSON file that writers only ever replace by rename. The cache key is
- * (dev, ino, size, mtimeNs); every replacement gets a new inode, so it always
- * misses. Read or parse failures return { ok: false }, as the old catch-all did.
+ * (dev, ino, size, mtimeNs, ctimeNs); every replacement gets a new inode, so it
+ * always misses. Read or parse failures return { ok: false }, as the old catch-all did.
  */
 export function readJsonFileCached(file: string): JsonReadResult {
   const key = path.resolve(file);
@@ -125,12 +136,14 @@ export function readJsonFileCached(file: string): JsonReadResult {
     const identity = identityOf(fs.fstatSync(fd, { bigint: true }));
     const cached = jsonFileCache.get(key);
     noteReadCacheUse();
-    if (cached && sameInode(cached.identity, identity) && cached.identity.size === identity.size && cached.identity.mtimeNs === identity.mtimeNs) {
+    if (cached && sameInode(cached.identity, identity) && cached.identity.size === identity.size
+      && cached.identity.mtimeNs === identity.mtimeNs && cached.identity.ctimeNs === identity.ctimeNs) {
       return cached.result;
     }
     const raw = readRange(fd, 0, Number(identity.size));
     let result: JsonReadResult;
     try { result = { ok: true, value: JSON.parse(raw.toString('utf8')) }; } catch { result = { ok: false }; }
+    if (result.ok && FREEZE_CACHED_VALUES) deepFreeze(result.value);
     // A short read means the file changed under us; serve it once without caching.
     if (raw.length === Number(identity.size)) jsonFileCache.set(key, { identity, result });
     else jsonFileCache.delete(key);
@@ -290,6 +303,50 @@ function parseUnterminated(text: string, strict: boolean): { present: boolean; r
   }
 }
 
+// Uncached readers (RELATIONSHIP_MEMORY_READ_CACHE=off) ------------------------
+
+function readJsonlUncached<T>(file: string): T[] {
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
+}
+
+function readJsonlByFieldUncached<T>(file: string, field: string, values: readonly string[]): T[] {
+  if (!fs.existsSync(file) || values.length === 0) return [];
+  // Keep the 30MB+ append-only evidence file as bytes. Decoding the whole file
+  // to one JS UTF-16 string costs hundreds of milliseconds on production-scale
+  // stores; Buffer search lets foreground recall decode only the matching lines.
+  const raw = fs.readFileSync(file);
+  const result: T[] = [];
+  for (const value of new Set(values)) {
+    const needle = Buffer.from(`${JSON.stringify(field)}:${JSON.stringify(value)}`, 'utf8');
+    let cursor = 0;
+    while (cursor < raw.length) {
+      const match = raw.indexOf(needle, cursor);
+      if (match < 0) break;
+      const previousNewline = raw.lastIndexOf(0x0a, match - 1);
+      const lineStart = previousNewline < 0 ? 0 : previousNewline + 1;
+      const newline = raw.indexOf(0x0a, match);
+      const lineEnd = newline < 0 ? raw.length : newline;
+      if (lineEnd > lineStart) result.push(JSON.parse(raw.subarray(lineStart, lineEnd).toString('utf8')) as T);
+      cursor = lineEnd + 1;
+    }
+  }
+  return result;
+}
+
+/**
+ * Every non-empty line of a JSONL file, JSON-parsed. Pass strict when the caller
+ * holds the canonical mutation lock (see parseUnterminated).
+ */
+export function readJsonlRecords<T>(file: string, strict: boolean): T[] {
+  return readCacheEnabled() ? readJsonlCached<T>(file, strict) : readJsonlUncached<T>(file);
+}
+
+/** The lines containing `"<field>":<JSON value>`, per value in input order (see readJsonlCachedByField). */
+export function readJsonlRecordsByField<T>(file: string, field: string, values: readonly string[], strict: boolean): T[] {
+  return readCacheEnabled() ? readJsonlCachedByField<T>(file, field, values, strict) : readJsonlByFieldUncached<T>(file, field, values);
+}
+
 // Parsed records ------------------------------------------------------------
 
 interface ParsedLines {
@@ -306,13 +363,18 @@ const parsedLines = registerView<ParsedLines>({
     // decoding the whole file and splitting it, without one giant string.
     forEachLine(chunk, end, (start, lineEnd) => {
       const line = chunk.toString('utf8', start, lineEnd);
-      try { data.records.push(JSON.parse(line) as unknown); } catch { data.invalidLines.push(line); }
+      let record: unknown;
+      try { record = JSON.parse(line) as unknown; } catch {
+        data.invalidLines.push(line);
+        return;
+      }
+      data.records.push(FREEZE_CACHED_VALUES ? deepFreeze(record) : record);
     });
   },
 });
 
-/** Cached equivalent of reading a JSONL file and JSON.parse-ing every non-empty line. */
-export function readJsonlCached<T>(file: string, strict: boolean): T[] {
+/** Cached equivalent of readJsonlUncached. */
+function readJsonlCached<T>(file: string, strict: boolean): T[] {
   return readAppendOnly(parsedLines, file, (data, unterminated) => {
     // Re-parse to throw the same SyntaxError the old line-by-line parse hit first.
     if (data.invalidLines.length > 0) JSON.parse(data.invalidLines[0]);
@@ -377,7 +439,7 @@ function fieldLineView(field: string): AppendOnlyView<LineRangesByLiteral> {
  * a corrupt line that matches nothing is never touched). Only line offsets are
  * cached; the matching lines are re-read through the same fd and parsed fresh.
  */
-export function readJsonlCachedByField<T>(file: string, field: string, values: readonly string[], strict: boolean): T[] {
+function readJsonlCachedByField<T>(file: string, field: string, values: readonly string[], strict: boolean): T[] {
   if (values.length === 0) return [];
   return readAppendOnly(fieldLineView(field), file, (ranges, unterminated, fd) => {
     const result: T[] = [];

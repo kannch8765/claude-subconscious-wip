@@ -2,7 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
-import { readCacheEnabled, readJsonlCached } from '../store/read_cache.js';
+import { readJsonlRecords } from '../store/read_cache.js';
 
 export const LEGACY_BUCKET_TYPES = ['permanent', 'dynamic', 'feel', 'archive'] as const;
 export type LegacyBucketType = (typeof LEGACY_BUCKET_TYPES)[number];
@@ -335,11 +335,6 @@ export function parseLegacySource(
   };
 }
 
-function readJsonl<T>(file: string): T[] {
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
-}
-
 function appendJsonl(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, `${JSON.stringify(value)}\n`, 'utf8');
@@ -363,10 +358,7 @@ export class LegacyMemorySourceStore {
   }
 
   private file(name: string): string { return path.join(this.rootDir, name); }
-  private readRecords<T>(name: string): T[] {
-    const file = this.file(name);
-    return readCacheEnabled() ? readJsonlCached<T>(file, this.mutationStore.holdsMutationLock) : readJsonl<T>(file);
-  }
+  private readRecords<T>(name: string): T[] { return readJsonlRecords<T>(this.file(name), this.mutationStore.holdsMutationLock); }
   withMutationBoundary<T>(operation: () => T): T { return this.mutationStore.withMutationBoundary(operation); }
   listSources(): LegacyAssistantMemorySourceRecord[] {
     return this.readRecords<unknown>('legacy-assistant-sources.jsonl').map((source) => validateLegacyAssistantMemorySourceRecord(source));
