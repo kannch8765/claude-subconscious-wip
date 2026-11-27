@@ -248,7 +248,7 @@ describe('sequential replay', () => {
     fs.writeFileSync(options.batchesFile, lines.map((b) => JSON.stringify(b)).join('\n') + '\n');
     const prompts: string[] = [];
     const inner = model();
-    const spy = { ...inner, async chat(body: any) { if (body.tools) prompts.push(String(body.messages[1].content)); return inner.chat(body); } };
+    const spy = { ...inner, async chat(body: any, sessionId: string) { if (body.tools) prompts.push(String(body.messages[1].content)); return inner.chat(body, sessionId); } };
     await runSequentialReplay({ ...options, conversation: true, limit: 2 }, deps(spy as any));
     expect(results(options.outDir).map((r) => [r.input.conversation_messages, r.input.messages_resent])).toEqual([[2, 1], [3, 0]]);
     const t2 = prompts.find((p) => p.includes('<new_messages>t2-e</new_messages>'))!;
