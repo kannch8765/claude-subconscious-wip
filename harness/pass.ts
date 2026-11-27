@@ -53,6 +53,8 @@ export interface PassDecisions {
   entities: number;
   searches: number;
   search_queries: number;
+  /** The query texts, for offline analysis (traces stay on the private side). */
+  query_texts?: string[];
 }
 
 export interface PassResult {
@@ -217,6 +219,7 @@ export async function runAsyncPass(
         if (!queries.length) throw new Error('memory_search needs 1-3 non-empty queries');
         decisions.searches++;
         decisions.search_queries += queries.length;
+        (decisions.query_texts ??= []).push(...queries.map(String));
         const lists = await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence({ query, kind: args.kind, limit: args.limit ?? 8 } as any)));
         const seen = new Set<string>();
         const eligible = [];
