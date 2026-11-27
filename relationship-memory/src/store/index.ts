@@ -20,6 +20,14 @@ import type {
 } from '../schema/index.js';
 import { readJsonlRecords, readJsonlRecordsByField } from './read_cache.js';
 
+/**
+ * 'skip-in-flight-append' is for read-only stores (foreground recall): an unparseable
+ * last line without its newline is treated as a writer mid-append and skipped until
+ * it completes. Any store that may append reads strictly, as before, so a torn line
+ * fails the command instead of getting a new record glued onto it.
+ */
+export type StoreReadMode = 'strict' | 'skip-in-flight-append';
+
 export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
 export type FailureInjector = (phase: StorePhase) => boolean;
 
@@ -95,7 +103,7 @@ export class RelationshipMemoryStore {
   private mutationLockDepth = 0;
   private mutationWriteIndexReady?: Set<string>;
 
-  constructor(rootDir: string, subjectId: string, failureInjector?: FailureInjector, ensureRoot = true) {
+  constructor(rootDir: string, subjectId: string, failureInjector?: FailureInjector, ensureRoot = true, readonly readMode: StoreReadMode = 'strict') {
     this.rootDir = rootDir;
     this.subjectId = subjectId;
     this.failureInjector = failureInjector;
@@ -202,10 +210,10 @@ export class RelationshipMemoryStore {
 
   private file(name: string): string { return path.join(this.rootDir, name); }
 
-  /** True while this instance holds the canonical mutation lock, so no store writer can be mid-append. */
-  get holdsMutationLock(): boolean { return this.mutationLockDepth > 0; }
+  /** Under the mutation lock no store writer can be mid-append, so reads are always strict there. */
+  private get skipInFlightAppend(): boolean { return this.readMode === 'skip-in-flight-append' && this.mutationLockDepth === 0; }
 
-  private readRecords<T>(name: string): T[] { return readJsonlRecords<T>(this.file(name), this.holdsMutationLock); }
+  private readRecords<T>(name: string): T[] { return readJsonlRecords<T>(this.file(name), this.skipInFlightAppend); }
 
   private writeIndexDatasetDir(dataset: string): string { return path.join(this.rootDir, '.write-index-v1', dataset); }
   private writeIndexMarkersDir(dataset: string): string { return path.join(this.writeIndexDatasetDir(dataset), 'markers'); }
@@ -312,7 +320,7 @@ export class RelationshipMemoryStore {
   listMemories(): CanonicalMemoryRecord[] { return this.readRecords<CanonicalMemoryRecord>('memories.jsonl'); }
   listEvidence(): EvidenceRecord[] { return this.readRecords<EvidenceRecord>('evidence.jsonl'); }
   listEvidenceForMemoryIds(memoryIds: readonly string[]): EvidenceRecord[] {
-    return readJsonlRecordsByField<EvidenceRecord>(this.file('evidence.jsonl'), 'memory_id', memoryIds, this.holdsMutationLock);
+    return readJsonlRecordsByField<EvidenceRecord>(this.file('evidence.jsonl'), 'memory_id', memoryIds, this.skipInFlightAppend);
   }
   listEntities(): EntityIdentityRecord[] { return this.readRecords<EntityIdentityRecord>('entities.jsonl'); }
   listEntityEvidence(): EntityEvidenceRecord[] { return this.readRecords<EntityEvidenceRecord>('entity-evidence.jsonl'); }

@@ -9,9 +9,10 @@ import * as path from 'path';
  * decides whether a cached value is valid. The idle timer below only releases
  * memory in long-lived processes that read rarely.
  *
- * Cached records are shared between callers. Callers get a fresh array, but must
- * never mutate the records inside it. Under vitest the cached values are deep-frozen,
- * so a caller that mutates one fails the test suite instead of corrupting the cache.
+ * Cached values stay private. JSONL readers hand out independent copies, exactly
+ * like a fresh JSON.parse, so a caller that edits a result cannot change what later
+ * reads see. The parsed semantic index never leaves retrieval/index.ts; under vitest
+ * it is deep-frozen as a tripwire for that module's own code.
  */
 
 const GUARD_BYTES = 4096;
@@ -31,6 +32,24 @@ function deepFreeze<T>(value: T): T {
     for (const child of Object.values(value)) deepFreeze(child);
   }
   return value;
+}
+
+/**
+ * Independent copy of a JSON.parse result: same keys, key order and values. Strings
+ * are immutable, so only objects and arrays are copied, which is far cheaper than
+ * parsing again.
+ */
+function cloneJson<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((item) => cloneJson(item)) as T;
+  if (!value || typeof value !== 'object') return value;
+  const copy: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) {
+    const child = cloneJson((value as Record<string, unknown>)[key]);
+    // JSON.parse makes "__proto__" an own property; plain assignment would set the prototype.
+    if (key === '__proto__') Object.defineProperty(copy, key, { value: child, writable: true, enumerable: true, configurable: true });
+    else copy[key] = child;
+  }
+  return copy as T;
 }
 
 const clearers: Array<() => void> = [];
@@ -289,16 +308,16 @@ function registerView<T>(view: AppendOnlyView<T>): AppendOnlyView<T> {
 
 /**
  * Parses the unterminated tail. A complete record that lacks only its newline is
- * returned (never cached). An unparseable tail is a writer mid-append: outside
- * the mutation lock it is ignored until the line completes. Under the lock
- * (strict) no writer can be mid-append, so it throws as the old reader did.
+ * returned (never cached). An unparseable tail throws, as the old reader did,
+ * unless the caller is a read-only reader that opted in to skipInFlightAppend:
+ * then it is treated as a writer mid-append and ignored until the line completes.
  */
-function parseUnterminated(text: string, strict: boolean): { present: boolean; record?: unknown } {
+function parseUnterminated(text: string, skipInFlightAppend: boolean): { present: boolean; record?: unknown } {
   if (!text) return { present: false };
   try {
     return { present: true, record: JSON.parse(text) as unknown };
   } catch (error) {
-    if (strict) throw error;
+    if (!skipInFlightAppend) throw error;
     return { present: false };
   }
 }
@@ -335,16 +354,18 @@ function readJsonlByFieldUncached<T>(file: string, field: string, values: readon
 }
 
 /**
- * Every non-empty line of a JSONL file, JSON-parsed. Pass strict when the caller
- * holds the canonical mutation lock (see parseUnterminated).
+ * Every non-empty line of a JSONL file, JSON-parsed. skipInFlightAppend is only for
+ * read-only readers that never append afterwards (see parseUnterminated).
  */
-export function readJsonlRecords<T>(file: string, strict: boolean): T[] {
-  return readCacheEnabled() ? readJsonlCached<T>(file, strict) : readJsonlUncached<T>(file);
+export function readJsonlRecords<T>(file: string, skipInFlightAppend = false): T[] {
+  return readCacheEnabled() ? readJsonlCached<T>(file, skipInFlightAppend) : readJsonlUncached<T>(file);
 }
 
 /** The lines containing `"<field>":<JSON value>`, per value in input order (see readJsonlCachedByField). */
-export function readJsonlRecordsByField<T>(file: string, field: string, values: readonly string[], strict: boolean): T[] {
-  return readCacheEnabled() ? readJsonlCachedByField<T>(file, field, values, strict) : readJsonlByFieldUncached<T>(file, field, values);
+export function readJsonlRecordsByField<T>(file: string, field: string, values: readonly string[], skipInFlightAppend = false): T[] {
+  return readCacheEnabled()
+    ? readJsonlCachedByField<T>(file, field, values, skipInFlightAppend)
+    : readJsonlByFieldUncached<T>(file, field, values);
 }
 
 // Parsed records ------------------------------------------------------------
@@ -368,18 +389,18 @@ const parsedLines = registerView<ParsedLines>({
         data.invalidLines.push(line);
         return;
       }
-      data.records.push(FREEZE_CACHED_VALUES ? deepFreeze(record) : record);
+      data.records.push(record);
     });
   },
 });
 
 /** Cached equivalent of readJsonlUncached. */
-function readJsonlCached<T>(file: string, strict: boolean): T[] {
+function readJsonlCached<T>(file: string, skipInFlightAppend: boolean): T[] {
   return readAppendOnly(parsedLines, file, (data, unterminated) => {
     // Re-parse to throw the same SyntaxError the old line-by-line parse hit first.
     if (data.invalidLines.length > 0) JSON.parse(data.invalidLines[0]);
-    const records = data.records.slice() as T[];
-    const tail = parseUnterminated(unterminated, strict);
+    const records = data.records.map((record) => cloneJson(record)) as T[];
+    const tail = parseUnterminated(unterminated, skipInFlightAppend);
     if (tail.present) records.push(tail.record as T);
     return records;
   }) ?? [];
@@ -439,7 +460,7 @@ function fieldLineView(field: string): AppendOnlyView<LineRangesByLiteral> {
  * a corrupt line that matches nothing is never touched). Only line offsets are
  * cached; the matching lines are re-read through the same fd and parsed fresh.
  */
-function readJsonlCachedByField<T>(file: string, field: string, values: readonly string[], strict: boolean): T[] {
+function readJsonlCachedByField<T>(file: string, field: string, values: readonly string[], skipInFlightAppend: boolean): T[] {
   if (values.length === 0) return [];
   return readAppendOnly(fieldLineView(field), file, (ranges, unterminated, fd) => {
     const result: T[] = [];
@@ -450,7 +471,7 @@ function readJsonlCachedByField<T>(file: string, field: string, values: readonly
         result.push(JSON.parse(readRange(fd, list[index], list[index + 1] - list[index]).toString('utf8')) as T);
       }
       if (unterminated.includes(`${JSON.stringify(field)}:${literal}`)) {
-        const tail = parseUnterminated(unterminated, strict);
+        const tail = parseUnterminated(unterminated, skipInFlightAppend);
         if (tail.present) result.push(tail.record as T);
       }
     }

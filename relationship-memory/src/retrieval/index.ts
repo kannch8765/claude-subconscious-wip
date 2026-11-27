@@ -76,21 +76,21 @@ let contentHashGeneration = new Map<string, string>();
 registerReadCache(() => { contentHashGeneration = new Map(); });
 
 /**
- * sha256 of every document text. Recall re-hashes the whole document set on every
- * query, so the hashes of the latest set are kept for the next call: memory is
- * bounded by the corpus, and texts that left it are dropped on the next call.
+ * A sha256 function for one pass over a document set. Recall re-hashes the same
+ * texts on every query, so hashes from the previous pass are reused, and only the
+ * texts hashed in this pass are kept for the next one. Memory therefore stays
+ * bounded by the documents that actually have an index entry to compare against.
  */
-function contentHashes(documents: readonly SemanticDocument[]): string[] {
-  if (!readCacheEnabled()) return documents.map((document) => sha256(document.text));
+function contentHasher(): (text: string) => string {
+  if (!readCacheEnabled()) return sha256;
   const previous = contentHashGeneration;
   const next = new Map<string, string>();
-  const hashes = documents.map((document) => {
-    const hash = next.get(document.text) ?? previous.get(document.text) ?? sha256(document.text);
-    next.set(document.text, hash);
-    return hash;
-  });
   contentHashGeneration = next;
-  return hashes;
+  return (text) => {
+    const hash = next.get(text) ?? previous.get(text) ?? sha256(text);
+    next.set(text, hash);
+    return hash;
+  };
 }
 
 // Only vectors parsed from index.json reach this check, and the cached index never
@@ -415,12 +415,13 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     const token = await acquireSemanticLock(this.indexFile);
     try {
       const current = readIndex(this.indexFile, this.provider.fingerprint);
-      const hashes = contentHashes(documents);
+      const hashOf = contentHasher();
       const missing: Array<{ document: SemanticDocument; contentHash: string }> = [];
-      documents.forEach((document, position) => {
+      for (const document of documents) {
+        const contentHash = hashOf(document.text);
         const cached = current.documents[document.id];
-        if (!cached || cached.content_hash !== hashes[position] || !usableVector(cached.vector, this.provider.dimensions)) missing.push({ document, contentHash: hashes[position] });
-      });
+        if (!cached || cached.content_hash !== contentHash || !usableVector(cached.vector, this.provider.dimensions)) missing.push({ document, contentHash });
+      }
       // Add entries to a private copy: the shared cached index must only ever hold
       // what is on disk, even if a later embedding batch or write fails.
       const index = missing.length > 0 && readCacheEnabled() ? { ...current, documents: { ...current.documents } } : current;
@@ -456,11 +457,11 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     if (!query.trim() || documents.length === 0) return new Map();
     assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
     const index = readIndex(this.indexFile, this.provider.fingerprint);
-    const hashes = contentHashes(documents);
-    const usable = documents.flatMap((document, position) => {
+    const hashOf = contentHasher();
+    const usable = documents.flatMap((document) => {
       const cached = index.documents[document.id];
       if (!cached
-        || cached.content_hash !== hashes[position]
+        || cached.content_hash !== hashOf(document.text)
         || !usableVector(cached.vector, this.provider.dimensions)) return [];
       return [[document.id, cached.vector] as const];
     });

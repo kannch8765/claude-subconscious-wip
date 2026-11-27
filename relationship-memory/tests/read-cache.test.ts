@@ -5,7 +5,8 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CanonicalMemoryRecord, EvidenceRecord, ReinforcementRecord } from '../src/schema/index.js';
-import { RelationshipMemoryStore } from '../src/store/index.js';
+import { RelationshipMemoryOwnerControlPlane } from '../src/owner/index.js';
+import { RelationshipMemoryStore, type StoreReadMode } from '../src/store/index.js';
 import { clearReadCaches } from '../src/store/read_cache.js';
 import { FileBackedSemanticRetriever, type EmbeddingProvider, type SemanticDocument } from '../src/retrieval/index.js';
 import { RelationshipMemoryRuntime } from '../src/tools/index.js';
@@ -22,6 +23,7 @@ function tempRoot(): string {
 
 beforeEach(() => clearReadCaches());
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   clearReadCaches();
   while (roots.length) fs.rmSync(roots.pop()!, { recursive: true, force: true });
@@ -51,8 +53,19 @@ function reinforcement(id: string, memoryId: string, evidenceIds: string[]): Rei
   };
 }
 
-function readOnlyStore(root: string): RelationshipMemoryStore {
-  return new RelationshipMemoryStore(root, SUBJECT, undefined, false);
+function readOnlyStore(root: string, readMode: StoreReadMode = 'strict'): RelationshipMemoryStore {
+  return new RelationshipMemoryStore(root, SUBJECT, undefined, false, readMode);
+}
+
+/** Counts JSON.parse calls made by read(), to tell a cache hit from a re-parse. */
+function parsesDuring<T>(read: () => T): number {
+  const parse = vi.spyOn(JSON, 'parse');
+  try {
+    read();
+    return parse.mock.calls.length;
+  } finally {
+    parse.mockRestore();
+  }
 }
 
 function replaceByRename(file: string, content: string): void {
@@ -81,11 +94,10 @@ describe('store JSONL read cache', () => {
     expect(first.map((item) => item.memory_id)).toEqual(['mem-1']);
 
     fs.appendFileSync(file, line(memory('mem-2')));
-    const second = store.listMemories();
+    let second: CanonicalMemoryRecord[] = [];
+    expect(parsesDuring(() => { second = store.listMemories(); })).toBe(1);
     expect(second.map((item) => item.memory_id)).toEqual(['mem-1', 'mem-2']);
-    // The first record is reused, not re-parsed; callers still get a fresh array.
-    expect(second[0]).toBe(first[0]);
-    expect(second).not.toBe(first);
+    expect(parsesDuring(() => store.listMemories())).toBe(0);
     second.pop();
     expect(store.listMemories()).toHaveLength(2);
   });
@@ -134,9 +146,11 @@ describe('store JSONL read cache', () => {
     expect(store.listMemories().map((item) => item.memory_id)).toEqual(['mem-x']);
 
     replaceByRename(file, line(memory('mem-x')) + line(memory('mem-y')));
-    const third = store.listMemories();
+    let third: CanonicalMemoryRecord[] = [];
+    // A new inode is a full reload, even though the old bytes are a prefix.
+    expect(parsesDuring(() => { third = store.listMemories(); })).toBe(2);
     expect(third.map((item) => item.memory_id)).toEqual(['mem-x', 'mem-y']);
-    expect(third[0]).not.toBe(first[0]);
+    expect(first.map((item) => item.memory_id)).toEqual(['mem-1']);
   });
 
   it('reloads after a shrink and after a rewrite that grows the file', () => {
@@ -193,7 +207,7 @@ describe('store JSONL read cache', () => {
     expect(final).toEqual(withCacheOff(() => readOnlyStore(root).listOutcomes()));
   });
 
-  it('ignores a partial trailing line and picks it up once complete', () => {
+  it('ignores a partial trailing line in read-only recall stores and picks it up once complete', () => {
     const root = tempRoot();
     const memories = path.join(root, 'memories.jsonl');
     const evidenceFile = path.join(root, 'evidence.jsonl');
@@ -201,11 +215,17 @@ describe('store JSONL read cache', () => {
     const pendingEvidence = line(evidence('ev-2', 'mem-1'));
     fs.writeFileSync(memories, line(memory('mem-1')) + pending.slice(0, 40));
     fs.writeFileSync(evidenceFile, line(evidence('ev-1', 'mem-1')) + pendingEvidence.slice(0, pendingEvidence.indexOf('"role"')));
-    const store = new RelationshipMemoryStore(root, SUBJECT);
+    const store = new RelationshipMemoryStore(root, SUBJECT, undefined, true, 'skip-in-flight-append');
 
     expect(store.listMemories().map((item) => item.memory_id)).toEqual(['mem-1']);
     expect(store.listEvidenceForMemoryIds(['mem-1']).map((item) => item.evidence_id)).toEqual(['ev-1']);
-    // Under the mutation lock no writer can be mid-append, so the tail is corrupt.
+    // Strict stores, and any store under the mutation lock, throw exactly like the old reader.
+    const strict = new RelationshipMemoryStore(root, SUBJECT, undefined, false);
+    const strictReads: Array<() => unknown> = [() => strict.listMemories(), () => strict.listEvidenceForMemoryIds(['mem-1'])];
+    for (const read of strictReads) {
+      expect(read).toThrow(SyntaxError);
+      expect(() => withCacheOff(read)).toThrow(SyntaxError);
+    }
     expect(() => store.withMutationBoundary(() => store.listMemories())).toThrow(SyntaxError);
     expect(() => store.withMutationBoundary(() => store.listEvidenceForMemoryIds(['mem-1']))).toThrow(SyntaxError);
 
@@ -254,13 +274,47 @@ describe('store JSONL read cache', () => {
     expect(store.listEvidenceForMemoryIds([])).toEqual([]);
   });
 
-  it('deep-freezes cached records under vitest, so a mutating caller fails the suite', () => {
+  it('fails an owner command on a torn revision line instead of appending onto it', () => {
+    for (const readMode of ['strict', 'skip-in-flight-append'] as const) {
+      for (const cache of ['on', 'off']) {
+        clearReadCaches();
+        const root = tempRoot();
+        fs.writeFileSync(path.join(root, 'memories.jsonl'), line(memory('mem-1')));
+        const revisions = path.join(root, 'owner-revisions.jsonl');
+        const torn = line({ schema_version: 1, revision_id: 'rev-0', subject_id: SUBJECT, memory_id: 'mem-1', action: 'deactivate', recorded_at: '2026-03-03T00:00:00.000Z' }).slice(0, 50);
+        fs.writeFileSync(revisions, torn);
+        if (cache === 'off') vi.stubEnv('RELATIONSHIP_MEMORY_READ_CACHE', 'off');
+        const plane = new RelationshipMemoryOwnerControlPlane(new RelationshipMemoryStore(root, SUBJECT, undefined, true, readMode));
+        expect(() => plane.deactivate('mem-1', { revision_id: 'rev-1' }), `${readMode}/${cache}`).toThrow(SyntaxError);
+        expect(fs.readFileSync(revisions, 'utf8'), `${readMode}/${cache}`).toBe(torn);
+        vi.unstubAllEnvs();
+      }
+    }
+  });
+
+  it('hands out independent copies: editing a result never changes later reads', async () => {
     const root = tempRoot();
-    fs.writeFileSync(path.join(root, 'memories.jsonl'), line(memory('mem-1')));
-    const [record] = readOnlyStore(root).listMemories();
-    expect(Object.isFrozen(record)).toBe(true);
-    expect(Object.isFrozen(record.payload)).toBe(true);
-    expect(() => { (record as { summary: string }).summary = 'changed'; }).toThrow(TypeError);
+    fs.writeFileSync(path.join(root, 'memories.jsonl'), line(memory('mem-1')) + line(memory('mem-2')));
+    fs.writeFileSync(path.join(root, 'evidence.jsonl'), line(evidence('ev-1', 'mem-1')));
+    const store = readOnlyStore(root);
+    const [record] = store.listMemories();
+    record.summary = 'edited summary';
+    record.participants.push('assistant');
+    (record.payload as Record<string, unknown>).detail = 'zzinjected marker';
+    const [evidenceRecord] = store.listEvidenceForMemoryIds(['mem-1']);
+    evidenceRecord.quote = 'edited quote';
+
+    const other = readOnlyStore(root);
+    expect(other.listMemories()).toEqual(withCacheOff(() => readOnlyStore(root).listMemories()));
+    expect(other.listEvidenceForMemoryIds(['mem-1'])[0].quote).toBe(evidence('ev-1', 'mem-1').quote);
+
+    // The same through the owner read and recall, in an independent store instance.
+    const [effective] = new RelationshipMemoryOwnerControlPlane(readOnlyStore(root)).listEffective();
+    (effective.payload as Record<string, unknown>).detail = 'zzinjected marker';
+    const runtime = new RelationshipMemoryRuntime(readOnlyStore(root, 'skip-in-flight-append'), new Map());
+    expect(await runtime.memorySearchRecallHybridWithEvidence({ query: 'zzinjected', limit: 5 })).toEqual([]);
+    expect(new RelationshipMemoryOwnerControlPlane(readOnlyStore(root)).listEffective()[0].payload)
+      .toEqual(memory('mem-1').payload);
   });
 
   it('turns off with RELATIONSHIP_MEMORY_READ_CACHE=off', () => {
@@ -268,11 +322,11 @@ describe('store JSONL read cache', () => {
     fs.writeFileSync(path.join(root, 'memories.jsonl'), line(memory('mem-1')));
     const store = readOnlyStore(root);
     withCacheOff(() => {
-      const first = store.listMemories();
-      expect(store.listMemories()[0]).not.toBe(first[0]);
+      store.listMemories();
+      expect(parsesDuring(() => store.listMemories())).toBe(1);
     });
-    const cached = store.listMemories();
-    expect(store.listMemories()[0]).toBe(cached[0]);
+    store.listMemories();
+    expect(parsesDuring(() => store.listMemories())).toBe(0);
   });
 
   it('drops the cache after the idle period', async () => {
@@ -280,10 +334,10 @@ describe('store JSONL read cache', () => {
     const root = tempRoot();
     fs.writeFileSync(path.join(root, 'memories.jsonl'), line(memory('mem-1')));
     const store = readOnlyStore(root);
-    const first = store.listMemories();
-    expect(store.listMemories()[0]).toBe(first[0]);
+    store.listMemories();
+    expect(parsesDuring(() => store.listMemories())).toBe(0);
     await new Promise((resolve) => setTimeout(resolve, 150));
-    expect(store.listMemories()[0]).not.toBe(first[0]);
+    expect(parsesDuring(() => store.listMemories())).toBe(1);
   });
 });
 

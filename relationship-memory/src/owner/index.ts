@@ -96,9 +96,13 @@ export class RelationshipMemoryOwnerControlPlane {
     return this.append({ schema_version: 1, revision_id: nonEmpty(command.revision_id, 'revision_id'), subject_id: genesis.subject_id, memory_id: memoryId, action, recorded_at: this.now(), ...(n ? { note: n } : {}) });
   }
   private append(record: OwnerRevisionRecord): OwnerRevisionRecord {
-    const existing = this.store.listOwnerRevisions().find((r) => r.revision_id === record.revision_id);
-    if (existing) { const comparable = { ...record, recorded_at: existing.recorded_at }; if (stableJson(existing) !== stableJson(comparable)) throw new Error(`revision_id already used for a different owner mutation: ${record.revision_id}`); return existing; }
-    this.store.appendOwnerRevision(record); return record;
+    // Check and append inside one mutation boundary, so the duplicate check sees
+    // every committed revision and a torn last line fails before anything is appended.
+    return this.store.withMutationBoundary(() => {
+      const existing = this.store.listOwnerRevisions().find((r) => r.revision_id === record.revision_id);
+      if (existing) { const comparable = { ...record, recorded_at: existing.recorded_at }; if (stableJson(existing) !== stableJson(comparable)) throw new Error(`revision_id already used for a different owner mutation: ${record.revision_id}`); return existing; }
+      this.store.appendOwnerRevision(record); return record;
+    });
   }
   private requireGenesis(memoryId: string) { const genesis = this.store.getMemory(memoryId); if (!genesis) throw new Error(`Unknown canonical memory ID: ${memoryId}`); return genesis; }
 }

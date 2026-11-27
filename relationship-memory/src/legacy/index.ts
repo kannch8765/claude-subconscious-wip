@@ -358,7 +358,7 @@ export class LegacyMemorySourceStore {
   }
 
   private file(name: string): string { return path.join(this.rootDir, name); }
-  private readRecords<T>(name: string): T[] { return readJsonlRecords<T>(this.file(name), this.mutationStore.holdsMutationLock); }
+  private readRecords<T>(name: string): T[] { return readJsonlRecords<T>(this.file(name)); }
   withMutationBoundary<T>(operation: () => T): T { return this.mutationStore.withMutationBoundary(operation); }
   listSources(): LegacyAssistantMemorySourceRecord[] {
     return this.readRecords<unknown>('legacy-assistant-sources.jsonl').map((source) => validateLegacyAssistantMemorySourceRecord(source));
