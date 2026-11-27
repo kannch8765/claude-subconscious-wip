@@ -22,7 +22,8 @@
  *     query-embedding cooldown: nothing is committed, the run pauses (exit 3) and the next start repeats the turn.
  *   - Vectors: memories the harness creates are embedded after their turn; failures stay pending in the checkpoint
  *     and are retried before the next model call and before the run reports done. While any remain, it pauses.
- *   - Cooldown: a start pauses while a saved embedding cooldown has not expired.
+ *   - Cooldown: a saved embedding cooldown is honored before any call. One that ends within --cooldown-wait-ms
+ *     (default 5 min) is waited out in-process and the uncommitted turn repeated; a longer one pauses the run.
  *   - Usage: in HTTP mode the OpenCode Go 5-hour and weekly meters must read below their caps before every turn;
  *     an unreadable meter pauses the run.
  *
@@ -32,7 +33,7 @@
  *
  * Usage: tsx harness/sequential_replay.ts --batches <chronological jsonl> --store <seed store dir> --index <index.json>
  *        --out <dir> [--forbid <path>]... [--limit n] [--model m] [--sync-model m] [--max-steps n]
- *        [--rolling-cap pct] [--weekly-cap pct]
+ *        [--rolling-cap pct] [--weekly-cap pct] [--cooldown-wait-ms ms]
  * Exit: 0 done (or --limit reached), 2 refused (paths, seed, input, lock, caps), 3 paused (resume by rerunning).
  */
 import * as crypto from 'crypto';
@@ -49,7 +50,10 @@ import { runSyncPassSettled } from './sync_pass.js';
 import { prepareTurn } from './turn_input.js';
 
 export class Refused extends Error {}
-export class Paused extends Error {}
+export class Paused extends Error {
+  /** True when the pause is an embedding-provider cooldown, which ends on its own at retry_after. */
+  constructor(message: string, readonly cooldown = false) { super(message); }
+}
 
 export interface ReplayOptions {
   batchesFile: string;
@@ -65,6 +69,8 @@ export interface ReplayOptions {
   weeklyCap?: number;
   /** Sync model-call deadline (phrases and gate); the default is the hook's. */
   syncTimeoutMs?: number;
+  /** A cooldown that ends within this many ms is waited out in-process (the turn is repeated); longer ones pause. */
+  cooldownWaitMs?: number;
   /** Meters are required (HTTP mode); undefined meters pause the run. */
   metered: boolean;
 }
@@ -179,7 +185,7 @@ function checkCooldowns(outDir: string, now = Date.now()): void {
     let until = NaN;
     try { until = Date.parse(JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')).retry_after); } catch { /* unreadable */ }
     if (!Number.isFinite(until)) throw new Paused(`unreadable embedding cooldown ${name}; check it, then remove it`);
-    if (until > now) throw new Paused(`embedding cooldown until ${new Date(until).toISOString()}`);
+    if (until > now) throw new Paused(`embedding cooldown until ${new Date(until).toISOString()}`, true);
     fs.rmSync(path.join(dir, name), { force: true });
   }
 }
@@ -251,6 +257,30 @@ function validCap(value: number | undefined, name: string): number {
   return value;
 }
 
+/** Which call failed and how, for the pause message: fixed classes and status codes only. */
+function failureClasses(sync: { provider_error?: string }, steps: Array<{ step: number; status: number; error_class: string }>): string {
+  return [
+    ...(sync.provider_error ? [`sync ${sync.provider_error}`] : []),
+    ...steps.filter((s) => s.error_class !== 'none').map((s) => `async step ${s.step} ${s.error_class} ${s.status}`),
+  ].join(', ');
+}
+
+/** The latest retry_after among saved cooldowns, or undefined. */
+function cooldownUntil(outDir: string): number | undefined {
+  const dir = path.join(outDir, 'cooldown');
+  if (!fs.existsSync(dir)) return undefined;
+  let latest: number | undefined;
+  for (const name of fs.readdirSync(dir)) {
+    try {
+      const until = Date.parse(JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8')).retry_after);
+      if (Number.isFinite(until)) latest = Math.max(latest ?? until, until);
+    } catch { /* checkCooldowns reports it */ }
+  }
+  return latest;
+}
+
+const MAX_COOLDOWN_WAITS = 10;
+
 function providerFailed(sync: { provider_error?: string }, steps: Array<{ error_class: string }>): boolean {
   return Boolean(sync.provider_error) || steps.some((s) => s.error_class !== 'none');
 }
@@ -277,128 +307,145 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
     const batchesSha256 = crypto.createHash('sha256').update(batchesBytes).digest('hex');
     if (!fs.existsSync(initFile)) initialize(opts, out, b, batchesSha256);
     else if (JSON.parse(fs.readFileSync(initFile, 'utf8')).batches_sha256 !== batchesSha256) throw new Refused('--batches differs from the file this run was initialized with');
-    // A runner killed before its cleanup leaves the provider's cooldown only in work/: keep it before work/ is rebuilt.
-    saveCooldowns(out, path.join(out, 'work', 'semantic-index'));
-    checkCooldowns(out);
-    const work = restoreWork(out);
-    const storeDir = path.join(work, 'store');
-    const indexFile = path.join(work, 'semantic-index', 'index.json');
-    indexDir = path.dirname(indexFile);
-    checkIndex(indexFile, storeDir, b);
-    const resultsFile = path.join(work, RESULTS);
-    const doneIds: string[] = fs.existsSync(resultsFile) ? fs.readFileSync(resultsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).batch_id) : [];
-    const state: State = JSON.parse(fs.readFileSync(path.join(work, STATE), 'utf8'));
-    const saveState = (): void => fs.writeFileSync(path.join(work, STATE), JSON.stringify(state), { mode: 0o600 });
+    // A short embedding cooldown is waited out here: the uncommitted turn is rebuilt from the checkpoint and repeated.
+    let waits = 0;
+    for (;;) {
+      let ranHere = 0;
+      try {
+        // A runner killed before its cleanup leaves the provider's cooldown only in work/: keep it before work/ is rebuilt.
+        saveCooldowns(out, path.join(out, 'work', 'semantic-index'));
+        checkCooldowns(out);
+        const work = restoreWork(out);
+        const storeDir = path.join(work, 'store');
+        const indexFile = path.join(work, 'semantic-index', 'index.json');
+        indexDir = path.dirname(indexFile);
+        checkIndex(indexFile, storeDir, b);
+        const resultsFile = path.join(work, RESULTS);
+        const doneIds: string[] = fs.existsSync(resultsFile) ? fs.readFileSync(resultsFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l).batch_id) : [];
+        const state: State = JSON.parse(fs.readFileSync(path.join(work, STATE), 'utf8'));
+        const saveState = (): void => fs.writeFileSync(path.join(work, STATE), JSON.stringify(state), { mode: 0o600 });
 
-    const batches = batchesBytes.toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    if (doneIds.some((id, i) => batches[i]?.batch_id !== id)) throw new Refused('committed results are not a prefix of --batches');
-    let queue = batches.slice(doneIds.length);
-    if (opts.limit && opts.limit > 0) queue = queue.slice(0, Math.max(0, opts.limit - doneIds.length));
-    log(`sequential replay: ${queue.length} turns to run (${doneIds.length} done)`);
-    const listing = new RelationshipMemoryStore(storeDir, 'local-user');
-    const ignore = commonBigrams(listing.listEvidenceForMemoryIds(listing.listMemories().map((m) => m.memory_id)).map((e) => e.quote));
-    const cooldown = (): boolean => fs.readdirSync(indexDir!).some((file) => file.includes('.provider-cooldown.'));
-    // Vectors still missing from an earlier turn: embed them and commit, or pause. Without them store and index disagree.
-    const drainPending = async (): Promise<void> => {
-      if (!state.pending_embed.length || !b.canEmbedDocuments) return;
-      const runtime = new RelationshipMemoryRuntime(new RelationshipMemoryStore(storeDir, 'local-user'), new Map(), () => new Date().toISOString(), new Map(), true, b.retrieverFor(indexFile, storeDir));
-      try { await runtime.prepareCurrentMemorySemanticIndex(new Set(state.pending_embed)); } catch { throw new Paused(`${state.pending_embed.length} pending memory embeddings still fail`); }
-      state.pending_embed = [];
-      saveState();
-      commit(out, work);
-    };
-
-    for (const batch of queue) {
-      const meters = await deps.meters();
-      if (opts.metered) {
-        if (!meters || !Number.isFinite(meters.rolling) || !Number.isFinite(meters.weekly)) throw new Paused('usage meters unavailable');
-        if (meters.rolling >= rollingCap || meters.weekly >= weeklyCap) throw new Paused(`usage rolling ${meters.rolling}% weekly ${meters.weekly}% (caps ${rollingCap}/${weeklyCap})`);
-      }
-      const store = new RelationshipMemoryStore(storeDir, 'local-user');
-      const makeRuntime = (canonical: any[]) => new RelationshipMemoryRuntime(
-        store,
-        new Map(canonical.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: batch.letta_session }])),
-        () => new Date().toISOString(),
-        new Map(batch.assistant_intents.map((intent: any) => [intent.intent_id, intent])),
-        true,
-        b.retrieverFor(indexFile, storeDir),
-      );
-      await drainPending();
-
-      const session = (state.sessions[batch.letta_session] ??= { picked: [], written: [], passes: [] });
-      const started = Date.now();
-      const turn = prepareTurn({
-        latestUserMessage: batch.latest_user_message as string,
-        canonicalMessages: batch.canonical_messages,
-        previousUserMessage: batch.sync_context?.prev_user ?? '',
-        previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
-      });
-      const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}) };
-      let record: Record<string, unknown>;
-      if (turn.empty) {
-        record = { batch_id: batch.batch_id, session: batch.letta_session, input, skip: 'input_empty', usage_before: meters };
-      } else {
-        const runtime = makeRuntime(turn.canonicalMessages!);
-        const knownBefore = [...new Set([...session.picked, ...session.written])];
-        const { result: sync, settled } = await runSyncPassSettled(runtime, b.transport, {
-          batchId: batch.batch_id,
-          sessionId: batch.letta_session,
-          latestUserMessage: turn.latestUserMessage,
-          previousUserMessage: turn.previousUserMessage!,
-          previousKohakuReply: turn.previousKohakuReply!,
-          sessionKnownMemoryIds: knownBefore,
-        }, { model: opts.syncModel ?? 'glm-5.3-flash', reasoningEffort: 'none', ...(opts.syncTimeoutMs ? { phraseTimeoutMs: opts.syncTimeoutMs } : {}) });
-        // A sync call that missed its deadline is still running: let it finish before anything else, and pause if it
-        // failed at the provider. The record keeps the latency outcome (timeout); the provider outcome gates the commit.
-        const lateError = await settled();
-        if (lateError) throw new Paused(`late provider failure (${lateError}) in sync of ${batch.batch_id}`);
-        const known = sync.whisper ? [...knownBefore, sync.whisper.memory_id] : knownBefore;
-        const seen = new Map<string, string>();
-        for (const pass of session.passes) for (const item of pass) seen.set(item.memory_id, item.summary);
-        const asyncStarted = Date.now();
-        const result = await runAsyncPass(runtime, b.transport, {
-          batchId: batch.batch_id,
-          sessionId: batch.letta_session,
-          latestUserMessage: turn.latestUserMessage,
-          canonicalMessages: turn.canonicalMessages!,
-          assistantIntents: batch.assistant_intents,
-          sessionKnownMemoryIds: known,
-          recentSeen: [...seen].map(([memory_id, summary]) => ({ memory_id, summary })),
-        }, { model: opts.model ?? 'deepseek-v4.1-flash', maxSteps: opts.maxSteps ?? 4, reasoningEffort: 'none' });
-        const asyncMs = Date.now() - asyncStarted;
-        // Provider trouble or degraded search: the turn is not a fair sample. Leave work/ uncommitted and pause.
-        if (providerFailed(sync, result.steps)) throw new Paused(`provider failure in ${batch.batch_id}`);
-        if (cooldown()) throw new Paused(`query-embedding cooldown during ${batch.batch_id}`);
-
-        const created = result.decisions.remember.filter((r) => r.outcome === 'accepted' && r.memory_id).map((r) => r.memory_id!);
-        let embedMs: number | undefined;
-        if (created.length && b.canEmbedDocuments) {
-          const embedStarted = Date.now();
-          try { await runtime.prepareCurrentMemorySemanticIndex(new Set(created)); } catch { state.pending_embed.push(...created); }
-          embedMs = Date.now() - embedStarted;
-        }
-        if (sync.whisper) session.picked.push(sync.whisper.memory_id);
-        if (result.decisions.whisper) session.picked.push(result.decisions.whisper.memory_id);
-        session.written.push(...created);
-        session.passes = [...session.passes, result.surfaced_memory_ids.map((id) => ({ memory_id: id, summary: Array.from(store.getMemory(id)?.summary ?? '').slice(0, 150).join('') }))].slice(-3);
-        record = {
-          batch_id: batch.batch_id, session: batch.letta_session, group: batch.group, input, usage_before: meters,
-          known_count: knownBefore.length, wall_ms: Date.now() - started, async_ms: asyncMs, sync, ...result,
-          new_memory_coverage: created.map((id) => ({ memory_id: id, coverage: evidenceCoverage(store.getMemory(id)?.summary ?? '', store.listEvidenceForMemoryIds([id]).map((e) => e.quote), ignore) })),
-          ...(embedMs !== undefined ? { embed_ms: embedMs } : {}),
-          ...(created.length && !b.canEmbedDocuments ? { embed: 'unsupported' } : {}),
-          ...(state.pending_embed.length ? { pending_embed: state.pending_embed.length } : {}),
+        const batches = batchesBytes.toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+        if (doneIds.some((id, i) => batches[i]?.batch_id !== id)) throw new Refused('committed results are not a prefix of --batches');
+        let queue = batches.slice(doneIds.length);
+        if (opts.limit && opts.limit > 0) queue = queue.slice(0, Math.max(0, opts.limit - doneIds.length));
+        log(`sequential replay: ${queue.length} turns to run (${doneIds.length} done)`);
+        const listing = new RelationshipMemoryStore(storeDir, 'local-user');
+        const ignore = commonBigrams(listing.listEvidenceForMemoryIds(listing.listMemories().map((m) => m.memory_id)).map((e) => e.quote));
+        const cooldown = (): boolean => fs.readdirSync(indexDir!).some((file) => file.includes('.provider-cooldown.'));
+        // Vectors still missing from an earlier turn: embed them and commit, or pause. Without them store and index disagree.
+        const drainPending = async (): Promise<void> => {
+          if (!state.pending_embed.length || !b.canEmbedDocuments) return;
+          const runtime = new RelationshipMemoryRuntime(new RelationshipMemoryStore(storeDir, 'local-user'), new Map(), () => new Date().toISOString(), new Map(), true, b.retrieverFor(indexFile, storeDir));
+          try { await runtime.prepareCurrentMemorySemanticIndex(new Set(state.pending_embed)); } catch { throw new Paused(`${state.pending_embed.length} pending memory embeddings still fail`); }
+          state.pending_embed = [];
+          saveState();
+          commit(out, work);
         };
+
+        for (const batch of queue) {
+          const meters = await deps.meters();
+          if (opts.metered) {
+            if (!meters || !Number.isFinite(meters.rolling) || !Number.isFinite(meters.weekly)) throw new Paused('usage meters unavailable');
+            if (meters.rolling >= rollingCap || meters.weekly >= weeklyCap) throw new Paused(`usage rolling ${meters.rolling}% weekly ${meters.weekly}% (caps ${rollingCap}/${weeklyCap})`);
+          }
+          const store = new RelationshipMemoryStore(storeDir, 'local-user');
+          const makeRuntime = (canonical: any[]) => new RelationshipMemoryRuntime(
+            store,
+            new Map(canonical.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: batch.letta_session }])),
+            () => new Date().toISOString(),
+            new Map(batch.assistant_intents.map((intent: any) => [intent.intent_id, intent])),
+            true,
+            b.retrieverFor(indexFile, storeDir),
+          );
+          await drainPending();
+
+          const session = (state.sessions[batch.letta_session] ??= { picked: [], written: [], passes: [] });
+          const started = Date.now();
+          const turn = prepareTurn({
+            latestUserMessage: batch.latest_user_message as string,
+            canonicalMessages: batch.canonical_messages,
+            previousUserMessage: batch.sync_context?.prev_user ?? '',
+            previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
+          });
+          const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}) };
+          let record: Record<string, unknown>;
+          if (turn.empty) {
+            record = { batch_id: batch.batch_id, session: batch.letta_session, input, skip: 'input_empty', usage_before: meters };
+          } else {
+            const runtime = makeRuntime(turn.canonicalMessages!);
+            const knownBefore = [...new Set([...session.picked, ...session.written])];
+            const { result: sync, settled } = await runSyncPassSettled(runtime, b.transport, {
+              batchId: batch.batch_id,
+              sessionId: batch.letta_session,
+              latestUserMessage: turn.latestUserMessage,
+              previousUserMessage: turn.previousUserMessage!,
+              previousKohakuReply: turn.previousKohakuReply!,
+              sessionKnownMemoryIds: knownBefore,
+            }, { model: opts.syncModel ?? 'glm-5.3-flash', reasoningEffort: 'none', ...(opts.syncTimeoutMs ? { phraseTimeoutMs: opts.syncTimeoutMs } : {}) });
+            // A sync call that missed its deadline is still running: let it finish before anything else, and pause if it
+            // failed at the provider. The record keeps the latency outcome (timeout); the provider outcome gates the commit.
+            const lateError = await settled();
+            if (lateError) throw new Paused(`late provider failure (${lateError}) in sync of ${batch.batch_id}`);
+            const known = sync.whisper ? [...knownBefore, sync.whisper.memory_id] : knownBefore;
+            const seen = new Map<string, string>();
+            for (const pass of session.passes) for (const item of pass) seen.set(item.memory_id, item.summary);
+            const asyncStarted = Date.now();
+            const result = await runAsyncPass(runtime, b.transport, {
+              batchId: batch.batch_id,
+              sessionId: batch.letta_session,
+              latestUserMessage: turn.latestUserMessage,
+              canonicalMessages: turn.canonicalMessages!,
+              assistantIntents: batch.assistant_intents,
+              sessionKnownMemoryIds: known,
+              recentSeen: [...seen].map(([memory_id, summary]) => ({ memory_id, summary })),
+            }, { model: opts.model ?? 'deepseek-v4.1-flash', maxSteps: opts.maxSteps ?? 4, reasoningEffort: 'none' });
+            const asyncMs = Date.now() - asyncStarted;
+            // Provider trouble or degraded search: the turn is not a fair sample. Leave work/ uncommitted and pause.
+            if (providerFailed(sync, result.steps)) throw new Paused(`provider failure in ${batch.batch_id} (${failureClasses(sync, result.steps)})`);
+            if (cooldown()) throw new Paused(`query-embedding cooldown during ${batch.batch_id}`, true);
+
+            const created = result.decisions.remember.filter((r) => r.outcome === 'accepted' && r.memory_id).map((r) => r.memory_id!);
+            let embedMs: number | undefined;
+            if (created.length && b.canEmbedDocuments) {
+              const embedStarted = Date.now();
+              try { await runtime.prepareCurrentMemorySemanticIndex(new Set(created)); } catch { state.pending_embed.push(...created); }
+              embedMs = Date.now() - embedStarted;
+            }
+            if (sync.whisper) session.picked.push(sync.whisper.memory_id);
+            if (result.decisions.whisper) session.picked.push(result.decisions.whisper.memory_id);
+            session.written.push(...created);
+            session.passes = [...session.passes, result.surfaced_memory_ids.map((id) => ({ memory_id: id, summary: Array.from(store.getMemory(id)?.summary ?? '').slice(0, 150).join('') }))].slice(-3);
+            record = {
+              batch_id: batch.batch_id, session: batch.letta_session, group: batch.group, input, usage_before: meters,
+              known_count: knownBefore.length, wall_ms: Date.now() - started, async_ms: asyncMs, sync, ...result,
+              new_memory_coverage: created.map((id) => ({ memory_id: id, coverage: evidenceCoverage(store.getMemory(id)?.summary ?? '', store.listEvidenceForMemoryIds([id]).map((e) => e.quote), ignore) })),
+              ...(embedMs !== undefined ? { embed_ms: embedMs } : {}),
+              ...(created.length && !b.canEmbedDocuments ? { embed: 'unsupported' } : {}),
+              ...(state.pending_embed.length ? { pending_embed: state.pending_embed.length } : {}),
+            };
+          }
+          saveState();
+          fs.appendFileSync(resultsFile, `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`, { mode: 0o600 });
+          commit(out, work);
+          ran++;
+          ranHere++;
+          const r = record as any;
+          log(`  ${batch.batch_id}: ${r.skip ?? r.completion} sync=${r.sync?.whisper ? 'whisper' : r.sync?.skip_reason ?? '-'} async=${r.decisions?.whisper ? 'whisper' : '-'} r${r.decisions?.reinforce?.length ?? 0} m${(r.decisions?.remember ?? []).filter((x: any) => x.outcome === 'accepted').length} ${r.wall_ms ?? 0} ms`);
+        }
+        await drainPending();
+        return { ran, done: doneIds.length + ranHere };
+      } catch (error) {
+        if (!(error instanceof Paused) || !error.cooldown) throw error;
+        if (indexDir) saveCooldowns(out, indexDir);
+        const until = cooldownUntil(out);
+        const wait = until === undefined ? 0 : until - Date.now();
+        if (until === undefined || wait > (opts.cooldownWaitMs ?? 0) || waits >= MAX_COOLDOWN_WAITS) throw error;
+        waits++;
+        log(`  ${error.message}; waiting ${Math.max(0, Math.ceil(wait / 1000))} s (${waits}/${MAX_COOLDOWN_WAITS})`);
+        await new Promise((resolve) => setTimeout(resolve, Math.max(0, wait) + 1_000));
       }
-      saveState();
-      fs.appendFileSync(resultsFile, `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`, { mode: 0o600 });
-      commit(out, work);
-      ran++;
-      const r = record as any;
-      log(`  ${batch.batch_id}: ${r.skip ?? r.completion} sync=${r.sync?.whisper ? 'whisper' : r.sync?.skip_reason ?? '-'} async=${r.decisions?.whisper ? 'whisper' : '-'} r${r.decisions?.reinforce?.length ?? 0} m${(r.decisions?.remember ?? []).filter((x: any) => x.outcome === 'accepted').length} ${r.wall_ms ?? 0} ms`);
     }
-    await drainPending();
-    return { ran, done: doneIds.length + ran };
   } finally {
     if (indexDir) saveCooldowns(out, indexDir);
     await b.close();
@@ -439,6 +486,7 @@ function args(): ReplayOptions {
   return {
     batchesFile: get('batches'), seedStore: get('store'), seedIndex: get('index'), outDir: get('out'), forbid,
     limit: Number(get('limit', '0')), model: get('model', 'deepseek-v4.1-flash'), syncModel: get('sync-model', 'glm-5.3-flash'),
+    cooldownWaitMs: Number(get('cooldown-wait-ms', '300000')),
     maxSteps: Number(get('max-steps', '4')), rollingCap: Number(get('rolling-cap', '60')), weeklyCap: Number(get('weekly-cap', '70')),
     metered: !process.env.HARNESS_RELAY_HOST,
   };

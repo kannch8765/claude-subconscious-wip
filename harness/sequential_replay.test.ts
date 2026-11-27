@@ -63,7 +63,7 @@ function model(failOn?: string, opts: { slowSyncPhrase429?: number } = {}): Chat
   return t;
 }
 
-interface ProviderOptions { fingerprint?: string; failDocuments?: boolean; failQueries?: boolean; counts?: { queries: number; documents: number } }
+interface ProviderOptions { fingerprint?: string; failDocuments?: boolean; failQueries?: boolean; failQueriesOnce?: { done: boolean }; counts?: { queries: number; documents: number } }
 
 function provider(opts: ProviderOptions) {
   return {
@@ -76,6 +76,7 @@ function provider(opts: ProviderOptions) {
     async embedQuery(): Promise<number[]> {
       if (opts.counts) opts.counts.queries++;
       if (opts.failQueries) throw new Error('down');
+      if (opts.failQueriesOnce && !opts.failQueriesOnce.done) { opts.failQueriesOnce.done = true; throw new Error('blip'); }
       return [0.1, 0.2];
     },
   };
@@ -233,6 +234,30 @@ describe('sequential replay', () => {
     expect(await runSequentialReplay(options, deps(model(), { counts }))).toEqual({ ran: 2, done: 3 });
     expect(counts.queries).toBeGreaterThan(0);
   });
+
+  it('waits out a short cooldown in-process and repeats the turn', async () => {
+    const { options } = setup();
+    await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
+    const stateFile = path.join(options.outDir, 'checkpoint', 'state.json');
+    fs.writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(stateFile, 'utf8')), pending_embed: ['mem_seed'] }));
+    const previous = process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS;
+    process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS = '50';
+    try {
+      const lines: string[] = [];
+      const d = { ...deps(model(), { failQueriesOnce: { done: false } }), log: (line: string) => lines.push(line) };
+      expect(await runSequentialReplay({ ...options, cooldownWaitMs: 5_000 }, d)).toEqual({ ran: 2, done: 3 });
+      expect(lines.some((line) => /cooldown during t2; waiting/.test(line))).toBe(true);
+      expect(results(options.outDir).map((r) => r.batch_id)).toEqual(['t1', 't2', 't3']);
+    } finally {
+      if (previous === undefined) delete process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS;
+      else process.env.RELATIONSHIP_MEMORY_EMBEDDING_PROVIDER_COOLDOWN_MS = previous;
+    }
+  }, 15_000);
+
+  it('names the failing call in a provider-failure pause', async () => {
+    const { options } = setup();
+    await expect(runSequentialReplay(options, deps(model('到家了')))).rejects.toThrow(/provider failure in t2 \(async step 1 rate_limited 429\)/);
+  }, 30_000);
 
   it('waits for a sync call that missed its deadline and pauses when it fails at the provider', async () => {
     const { options } = setup();
