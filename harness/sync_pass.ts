@@ -55,6 +55,8 @@ export interface SyncResult {
   candidates: SyncCandidate[];
   whisper?: { memory_id: string; snippet_ids: string[] };
   skip_reason?: 'model_none' | 'no_candidate' | 'weak_support' | 'gate_none' | 'gate_failed';
+  /** A model call failed at the provider (rate limit, server, transport). Timeouts are normal outcomes, not this. */
+  provider_error?: string;
 }
 
 export const SYNC_SYSTEM_PROMPT = [
@@ -136,6 +138,7 @@ export async function runSyncPass(runtime: RelationshipMemoryRuntime, transport:
   let phrases: string[] = [];
   let phraseStatus: SyncResult['phrase_status'] = 'ok';
   let usage: ChatUsage = {};
+  let providerError: string | undefined;
   const phraseStarted = Date.now();
   const reply = await withTimeout(chat(transport, {
     model: config.model,
@@ -148,13 +151,14 @@ export async function runSyncPass(runtime: RelationshipMemoryRuntime, transport:
   if (reply === 'timeout') phraseStatus = 'timeout';
   else {
     usage = reply.usage;
+    if (reply.errorClass !== 'none') providerError = reply.errorClass;
     const parsed = reply.errorClass === 'none' ? parsePhrases(String(reply.message?.content ?? '')) : undefined;
     if (parsed === undefined) phraseStatus = 'error';
     else if (!parsed.length) phraseStatus = 'none';
     else phrases = parsed;
   }
 
-  const base = { phrases, phrase_status: phraseStatus, phrase_ms: phraseMs, usage };
+  const base = { phrases, phrase_status: phraseStatus, phrase_ms: phraseMs, usage, ...(providerError ? { provider_error: providerError } : {}) };
   // The model looked and found nothing worth recalling: stay quiet. On timeout or error, fall back to the message.
   if (phraseStatus === 'none') {
     return { ...base, search_ms: 0, total_ms: Date.now() - started, candidates: [], skip_reason: 'model_none' };
@@ -200,7 +204,8 @@ export async function runSyncPass(runtime: RelationshipMemoryRuntime, transport:
   const match = /\{[\s\S]*\}/.exec(text);
   let picked: string | null | undefined;
   try { picked = match ? JSON.parse(match[0]).memory_id : undefined; } catch { picked = undefined; }
-  if (gate.errorClass !== 'none' || picked === undefined) return { ...after, usage, gate_status: 'error', skip_reason: 'gate_failed' };
+  if (gate.errorClass !== 'none') return { ...after, usage, gate_status: 'error', skip_reason: 'gate_failed', provider_error: gate.errorClass };
+  if (picked === undefined) return { ...after, usage, gate_status: 'error', skip_reason: 'gate_failed' };
   if (picked === null || !shown.some((c) => c.memory_id === picked)) return { ...after, usage, gate_status: 'ok', skip_reason: 'gate_none' };
   return { ...after, usage, gate_status: 'ok', whisper: whisperOf(String(picked)) };
 }

@@ -11,6 +11,8 @@ export const DEFAULT_LLM_ENDPOINT = 'https://opencode.ai/zen/go/v1/chat/completi
 
 export interface Backends {
   transport: ChatTransport;
+  /** False for the relay: it embeds queries only, so new memories stay lexical-only. */
+  canEmbedDocuments: boolean;
   /** Search over an existing index file (rankExisting); undefined when the file is missing. */
   retrieverFor(indexFile: string, storeDir: string): SemanticRetriever | undefined;
   close(): Promise<void>;
@@ -27,6 +29,7 @@ export function backends(env: NodeJS.ProcessEnv = process.env): Backends {
     const relay = new RelayProcess('ssh', [host, `python3 -u -c ${shellQuote(fs.readFileSync(env.HARNESS_RELAY_SCRIPT!, 'utf8'))}`]);
     return {
       transport: new RelayChatTransport(relay),
+      canEmbedDocuments: false,
       retrieverFor: (indexFile) => {
         if (!fs.existsSync(indexFile)) return undefined;
         const fingerprint = JSON.parse(fs.readFileSync(indexFile, 'utf8')).provider_fingerprint as string;
@@ -38,6 +41,7 @@ export function backends(env: NodeJS.ProcessEnv = process.env): Backends {
   const keyFile = env.HARNESS_LLM_KEY_FILE?.trim();
   if (!keyFile) throw new Error('HARNESS_LLM_KEY_FILE is required');
   return {
+    canEmbedDocuments: true,
     transport: new HttpChatTransport(env.HARNESS_LLM_ENDPOINT?.trim() || DEFAULT_LLM_ENDPOINT, fs.readFileSync(keyFile, 'utf8').trim(), 'subcon-harness/0.1'),
     retrieverFor: (indexFile, storeDir) => {
       if (!fs.existsSync(indexFile)) return undefined;
