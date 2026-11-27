@@ -6,6 +6,7 @@
  * maps the numbers back, so deliver_whisper still references real snippet_ids.
  */
 import type { MemoryRecallResult, RecallQuoteSnippet } from '../relationship-memory/src/tools/index.js';
+import { modelText } from './turn_input.js';
 
 export interface SlimQuote { n: number; r: 'u' | 'a' | 'legacy'; d: string; q: string }
 
@@ -41,20 +42,6 @@ export class SnippetHandles {
   resolve(memoryId: string, quoteNumber: number): string | undefined {
     return this.byMemory.get(memoryId)?.[quoteNumber - 1];
   }
-}
-
-/**
- * Text as the model sees it. Live-location tags carry coordinates, accuracy and
- * heading the model cannot use, and in a short message they are most of the
- * text, so searches drift to other memories that also hold such a tag. Keep only
- * the reverse-geocoded place; drop the tag when there is none. The store keeps the original.
- */
-export function modelText(text: string): string {
-  return text
-    .replace(/<telegram_live_location\b[^>]*?\bplace="([^"]*)"[^>]*\/?>/g, (_m, place: string) => `［位置：${place}］`)
-    .replace(/<telegram_live_location\b[^>]*\/?>/g, '')
-    .replace(/[ \t]+\n/g, '\n')
-    .trim();
 }
 
 function day(value: string | undefined): string {

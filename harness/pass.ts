@@ -10,7 +10,8 @@ import type { AssistantRememberIntentRecord, BatchCompletion, CanonicalMessage, 
 import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS } from '../relationship-memory/src/schema/index.js';
 import type { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import { chat, type ChatMessage, type ChatResult, type ChatTool, type ChatTransport } from './llm.js';
-import { isKnown, modelText, slimMemory, SnippetHandles } from './view.js';
+import { modelText } from './turn_input.js';
+import { isKnown, slimMemory, SnippetHandles } from './view.js';
 
 export interface PassInput {
   batchId: string;

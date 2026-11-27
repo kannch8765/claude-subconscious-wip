@@ -21,6 +21,7 @@ import { FileBackedSemanticRetriever, type EmbeddingProvider } from '../relation
 import { RelayChatTransport, RelayProcess } from './llm.js';
 import { runSyncPass } from './sync_pass.js';
 import { runAsyncPass } from './pass.js';
+import { prepareTurn } from './turn_input.js';
 
 function arg(name: string, fallback?: string): string {
   const index = process.argv.indexOf(`--${name}`);
@@ -88,13 +89,26 @@ async function main(): Promise<void> {
   process.stderr.write(`replay: ${queue.length} batches (${done.size} already done), model=${model}, max_steps=${maxSteps}\n`);
 
   const runOne = async (batch: any): Promise<void> => {
+    const turn = prepareTurn({
+      latestUserMessage: batch.latest_user_message as string,
+      canonicalMessages: batch.canonical_messages,
+      previousUserMessage: batch.sync_context?.prev_user ?? '',
+      previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
+    });
+    const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}) };
+    if (turn.empty) {
+      const record = { batch_id: batch.batch_id, group: batch.group, wall_ms: 0, lane, input, skip: 'input_empty' };
+      fs.appendFileSync(resultsFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+      process.stderr.write(`  ${batch.batch_id} ${batch.group}: skipped (input_empty ${JSON.stringify(turn.dropped)})\n`);
+      return;
+    }
     const storeDir = path.join(outDir, 'stores', batch.batch_id);
     fs.rmSync(storeDir, { recursive: true, force: true });
     fs.cpSync(batch.store_dir, storeDir, { recursive: true });
     const store = new RelationshipMemoryStore(storeDir, 'local-user');
     const runtime = new RelationshipMemoryRuntime(
       store,
-      new Map(batch.canonical_messages.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: batch.letta_session }])),
+      new Map(turn.canonicalMessages!.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: batch.letta_session }])),
       () => new Date().toISOString(),
       new Map(batch.assistant_intents.map((intent: any) => [intent.intent_id, intent])),
       true,
@@ -108,9 +122,9 @@ async function main(): Promise<void> {
         sync = await runSyncPass(runtime, transport, {
           batchId: batch.batch_id,
           sessionId: batch.letta_session,
-          latestUserMessage: batch.latest_user_message,
-          previousUserMessage: batch.sync_context?.prev_user ?? '',
-          previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
+          latestUserMessage: turn.latestUserMessage,
+          previousUserMessage: turn.previousUserMessage!,
+          previousKohakuReply: turn.previousKohakuReply!,
           sessionKnownMemoryIds: batch.session_known,
         }, { model: syncModel, reasoningEffort: 'none', minLists, gate });
       }
@@ -120,14 +134,14 @@ async function main(): Promise<void> {
         result = await runAsyncPass(runtime, transport, {
           batchId: batch.batch_id,
           sessionId: batch.letta_session,
-          latestUserMessage: batch.latest_user_message,
-          canonicalMessages: batch.canonical_messages,
+          latestUserMessage: turn.latestUserMessage,
+          canonicalMessages: turn.canonicalMessages!,
           assistantIntents: batch.assistant_intents,
           sessionKnownMemoryIds: known,
           recentSeen: batch.recent_seen,
         }, { model, maxSteps, reasoningEffort: 'none' }) as unknown as Record<string, unknown>;
       }
-      record = { batch_id: batch.batch_id, group: batch.group, wall_ms: Date.now() - started, lane, ...result, ...(sync ? { sync } : {}) };
+      record = { batch_id: batch.batch_id, group: batch.group, wall_ms: Date.now() - started, lane, input, ...result, ...(sync ? { sync } : {}) };
     } catch (error) {
       record = { batch_id: batch.batch_id, group: batch.group, wall_ms: Date.now() - started, crashed: error instanceof Error ? `${error.name}: ${error.message.slice(0, 200)}` : 'unknown' };
     }

@@ -14,7 +14,8 @@
 import type { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import type { MemoryRecallResult } from '../relationship-memory/src/tools/index.js';
 import { chat, type ChatTransport, type ChatUsage } from './llm.js';
-import { isKnown, modelText } from './view.js';
+import { modelText } from './turn_input.js';
+import { isKnown } from './view.js';
 import { bigrams, overlap } from './quote_sampler.js';
 
 export interface SyncInput {
