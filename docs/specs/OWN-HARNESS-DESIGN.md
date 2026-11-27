@@ -332,7 +332,51 @@ Changes:
 | B: 2 steps, no diet | 88k | 152k | 108M |
 | B: 2 steps, with diet | 53k | 94k | 67M |
 
-The search changes above are not in this number.
+The search changes above are not in this number. Measured with the prototype:
+§6.1.
+
+### 4.3.2 Resurfacing view: quote sampler (experimental)
+
+Today a memory shows at most 8 sentence pieces: the first 4 and the last 4 by
+time. One piece is about one sentence (p50 22 chars). 80 % of reinforces add 4
+or more pieces alone, so one reinforcement fills the "latest" half. The same
+selection feeds the Subcon agent, the whisper and Kohaku's `recall`.
+
+Idea (owner, 2026-11-27): change only the **view layer**, not the store or
+reinforce. Like a forgetting curve: recent sessions must not fill every slot,
+old moments come back now and then, and the **original moment always stays**.
+Variation across sessions is wanted.
+
+Sampler (`harness/quote_sampler.ts`, not wired in yet):
+
+- **Episodes:** the original capture (episode 0) and each reinforcement. For a
+  legacy-origin memory, its legacy source is episode 0.
+- **Anchor:** the opening unit of episode 0. A unit is up to 2 consecutive
+  pieces of one message, so a quote keeps some context.
+- **Newest episode:** at most one unit.
+- **The rest:** at most one unit per session-day, weighted by
+  `0.15 + 0.5^(age_days / 30)`.
+- **Seed:** (memory, session): stable within a session, different across
+  sessions.
+
+Measured on the full store (2026-11-27 snapshot, memories with ≥ 5
+session-days, n = 128; `harness/quote_sampler_metrics.ts`, numbers only):
+
+| | Session-days shown (mean) | Anchor pieces (mean) | Same pieces in two sessions |
+|---|---|---|---|
+| Today (first 4 + last 4) | 2.5 | 1.5 | 100 % |
+| Sampler, unit 1 | 6.3 | 1.3 | 15 % |
+| Sampler, unit 2 | 4.7 | 1.8 | 22 % |
+| Sampler, unit 3 | 4.0 | 2.3 | 31 % |
+
+- 476 of the 1,156 reinforced memories are legacy-origin. Without the legacy
+  source as episode 0 they had no anchor.
+- Half-life (14–60 days) and floor (0.05–0.4) barely change anything: over
+  90 % of the non-anchor pieces are older than 45 days, so the weights are
+  nearly flat. The rule "one unit per session-day" does the real work.
+- Open (owner's call): unit size (context per quote vs number of days shown).
+  Moving the sampler into the core is a separate change because it also
+  changes Kohaku's `recall`.
 
 ### 4.4 Recall mode
 
@@ -441,6 +485,49 @@ known pitfalls are covered there.
    Letta stays the owner of writes.
 3. **Switch** lane by lane (sync first, then recall, then async), with Letta kept as fallback
    until the shadow numbers hold.
+
+### 6.1 Offline replay results (prototype, 2026-11-27)
+
+Prototype on branch `task/own-harness-prototype` (`harness/`): one async pass
+(whisper + upkeep in one context), the slim search view (§4.3.1), one search
+with 1–3 queries, OpenCode Go with `deepseek-v4.1-flash`, `reasoning_effort:
+none`, temperature 0, max 4 steps. Exam: 36 historical passes from the DS V4.1
+period (6 groups × 6: whisper+reinforce, whisper, remember, reinforce, silent,
+intent), each on a copy of the store sliced to that moment.
+
+| Per pass | Letta (real) | Harness (run v7) |
+|---|---|---|
+| Prompt tokens p50 | 728k | 27k (p90 55k) |
+| Prompt tokens, sum of 36 | 29.6M | 1.18M (≈ 25×) |
+| Cached share of prompt | – | 78 % |
+| Steps p50 | 4 | 2 (2: 28, 3: 7, 4: 1) |
+| Searches | 2.44 | 1.00 (3 queries) |
+| Wall time p50 | – | 11 s |
+| Completed | 36 | 36, 0 crashes |
+
+Decisions (same 36 passes):
+
+| | Letta | Harness |
+|---|---|---|
+| Whisper passes | 23 | 16 (both 12, same memory 3) |
+| Reinforced memories | 15 | 40 (same 9) |
+| Remember accepted | 9 | 13 |
+
+- **Noise.** Two identical runs (v6, v6b) differ: whisper yes/no flips in 8 of
+  36 passes, the same memory in 6 of 10 shared whispers. Reinforce is stable
+  (44 vs 47, overlap 40). Small whisper differences are noise; quality needs
+  blind judging (in progress, owner-judged, outside the repo).
+- **Reinforce excess is structural:** 42 of 48 harness reinforces hit memories
+  already known this session (one search returns them in full, §4.3.1).
+  Removing the "fine targets" hint from the prompt changed it little (48 → 44).
+  Whether the extra reinforces attach correctly is part of the judging.
+- **Tool errors:** all 10 in v7 are `deliver_whisper` on a known memory,
+  refused by the runtime as designed; each costs one extra step.
+- **Bugs found on the way:** intent records must come from the durable store,
+  not the transcript XML; the evidence lookup matches compact JSON only
+  (`"memory_id":"…"`), so sliced stores must be written compact (runs v1–v3
+  were affected); an intent already linked must be shown as such, else the
+  model re-offers it.
 
 ## 7. Open questions
 
