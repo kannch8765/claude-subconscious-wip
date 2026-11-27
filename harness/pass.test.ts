@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
 import { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import type { ChatTransport, TransportReply } from './llm.js';
-import { harnessTools, runAsyncPass } from './pass.js';
+import { buildUserMessage, harnessTools, runAsyncPass } from './pass.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -78,5 +78,24 @@ describe('intent field', () => {
       expect(props(false, name)).not.toHaveProperty('assistant_intent_id');
       expect(props(true, name)).toHaveProperty('assistant_intent_id');
     }
+  });
+});
+
+describe('conversation prompt', () => {
+  const message = (id: string, quote: string) => ({ message_id: id, evidence_id: `${id}-e`, role: 'user', quote, event_kind: 'user_text', captured_at: '2026-10-10T00:00:00Z' }) as any;
+  const input = (conversation: any[], fresh: any[]) => ({
+    batchId: 'b', sessionId: 's', latestUserMessage: fresh.at(-1).quote, canonicalMessages: fresh, conversation, assistantIntents: [],
+    sessionKnownMemoryIds: [], recentSeen: [{ memory_id: 'mem_x', summary: '编的摘要' }],
+  });
+
+  it('opens with the conversation, names the new messages, and keeps the earlier prompt as a prefix', () => {
+    const one = [message('m1', '早'), message('m2', '去上班')];
+    const first = buildUserMessage(input(one, [one[1]]));
+    const second = buildUserMessage(input([...one, message('m3', '到了')], [message('m3', '到了')]));
+    expect(first.startsWith('<conversation>')).toBe(true);
+    expect(second).toContain('<new_messages>m3-e</new_messages>');
+    expect(second).not.toContain('<evidence_catalog>');
+    const stable = first.slice(0, first.indexOf('\n</conversation>'));
+    expect(second.startsWith(stable)).toBe(true);
   });
 });

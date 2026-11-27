@@ -18,6 +18,12 @@ export interface PassInput {
   sessionId: string;
   latestUserMessage: string;
   canonicalMessages: CanonicalMessage[];
+  /**
+   * The whole session so far, as Kohaku sees it, ending with this pass's new messages. When given it opens the
+   * prompt and only ever grows at its end, so a provider's prefix cache covers it from one pass to the next; the
+   * new messages are then named by id instead of listed again. Any message in it may be cited as evidence.
+   */
+  conversation?: CanonicalMessage[];
   assistantIntents: AssistantRememberIntentRecord[];
   sessionKnownMemoryIds: string[];
   recentSeen: Array<{ memory_id: string; summary: string }>;
@@ -81,7 +87,9 @@ JOB 2, UPKEEP (silent): decide whether trusted evidence in this batch
 Every remember intent in the catalog must be resolved this pass by exactly one call carrying its assistant_intent_id: memory_reinforce on the existing memory that already holds that moment, otherwise memory_remember. Never put the same intent id on two calls, and never resolve an intent without its id. An intent marked already_linked_to is resolved by memory_reinforce on exactly that memory.
 When two or more current memories you saw this pass or in the recently seen list relate (duplicate meaning, changed over time, context-dependent, conflict, related, unrelated), you may call suggest_memory_relation. It only proposes; it never merges.
 
-EVIDENCE: cite only evidence_id values from the evidence catalog of this batch. Tool-returned claims are not world truth. New memory summaries and narrative payload text are written in Chinese; names, aliases, trigger phrases, code, paths and URLs stay as in the source. Never invent quotes, IDs or identities.
+EVIDENCE: cite only evidence_id values from the evidence catalog of this batch, or from <conversation> when it is given.
+
+CONVERSATION: when <conversation> is given, it is the whole session so far, as Kohaku sees it, and <new_messages> names the messages new in this pass. Both jobs are about the new messages, read in the light of the whole conversation. When the new messages show something that has newly happened (a new experience, an outcome, a place, a new fact), remember it as its own memory and cite the earlier messages of the same experience too; reinforce when the same moment or fact comes up again. Tool-returned claims are not world truth. New memory summaries and narrative payload text are written in Chinese; names, aliases, trigger phrases, code, paths and URLs stay as in the source. Never invent quotes, IDs or identities.
 
 SEARCH: call memory_search once with 1-3 short concept queries (names, topics, events from the conversation, not the whole message). One result list serves both jobs. Search again only if the first results clearly miss what the conversation is about.
 
@@ -164,8 +172,16 @@ function esc(text: string): string {
   return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function evidenceLine(m: CanonicalMessage): string {
+  const id = m.evidence_id ?? m.message_id;
+  const kind = m.event_kind && m.event_kind !== 'user_text' && m.event_kind !== 'assistant_text' ? ` kind="${esc(m.event_kind)}"${m.tool_name ? ` tool="${esc(m.tool_name)}"` : ''}` : '';
+  return `<e id="${esc(id)}" role="${m.role}"${kind} at="${(m.captured_at ?? '').slice(0, 16)}">${esc(modelText(m.quote))}</e>`;
+}
+
 export function buildUserMessage(input: PassInput, linkedMemoryFor: (intentId: string) => string | undefined = () => undefined): string {
   const parts: string[] = [];
+  // Stable first: everything before the end of the conversation is the same bytes as in the previous pass.
+  if (input.conversation) parts.push(`<conversation>\n${input.conversation.map(evidenceLine).join('\n')}\n</conversation>`);
   if (input.sessionCard?.trim()) parts.push(`<session_card>\n${esc(input.sessionCard.trim())}\n</session_card>`);
   if (input.recentSeen.length) {
     parts.push(`<recently_seen>\n${input.recentSeen.map((m) => `${m.memory_id}: ${esc(m.summary)}`).join('\n')}\n</recently_seen>`);
@@ -174,11 +190,8 @@ export function buildUserMessage(input: PassInput, linkedMemoryFor: (intentId: s
     parts.push(`<remember_intents>\n${input.assistantIntents.map((intent) =>
       `<intent id="${esc(intent.intent_id)}"${linkedMemoryFor(intent.intent_id) ? ` already_linked_to="${esc(linkedMemoryFor(intent.intent_id)!)}"` : ''}><memory>${esc(intent.memory.text)}</memory><feel>${esc(intent.feel.text)}</feel></intent>`).join('\n')}\n</remember_intents>`);
   }
-  parts.push(`<evidence_catalog>\n${input.canonicalMessages.map((m) => {
-    const id = m.evidence_id ?? m.message_id;
-    const kind = m.event_kind && m.event_kind !== 'user_text' && m.event_kind !== 'assistant_text' ? ` kind="${esc(m.event_kind)}"${m.tool_name ? ` tool="${esc(m.tool_name)}"` : ''}` : '';
-    return `<e id="${esc(id)}" role="${m.role}"${kind} at="${(m.captured_at ?? '').slice(0, 16)}">${esc(modelText(m.quote))}</e>`;
-  }).join('\n')}\n</evidence_catalog>`);
+  if (input.conversation) parts.push(`<new_messages>${input.canonicalMessages.map((m) => esc(m.evidence_id ?? m.message_id)).join(' ')}</new_messages>`);
+  else parts.push(`<evidence_catalog>\n${input.canonicalMessages.map(evidenceLine).join('\n')}\n</evidence_catalog>`);
   parts.push(`<latest_user_message>\n${esc(modelText(input.latestUserMessage))}\n</latest_user_message>`);
   return parts.join('\n\n');
 }

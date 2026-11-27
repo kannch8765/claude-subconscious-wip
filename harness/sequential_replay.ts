@@ -33,7 +33,10 @@
  *
  * Usage: tsx harness/sequential_replay.ts --batches <chronological jsonl> --store <seed store dir> --index <index.json>
  *        --out <dir> [--forbid <path>]... [--limit n] [--model m] [--sync-model m] [--max-steps n]
- *        [--rolling-cap pct] [--weekly-cap pct] [--cooldown-wait-ms ms]
+ *        [--rolling-cap pct] [--weekly-cap pct] [--cooldown-wait-ms ms] [--conversation]
+ * --conversation gives the async pass the whole session so far (see PassInput.conversation): every message the
+ * batches carried for that session, in first-seen order, after the first batch's optional `session_history`
+ * (messages from before the replayed range, which also count as handled).
  * Exit: 0 done (or --limit reached), 2 refused (paths, seed, input, lock, caps), 3 paused (resume by rerunning).
  */
 import * as crypto from 'crypto';
@@ -73,6 +76,36 @@ export interface ReplayOptions {
   cooldownWaitMs?: number;
   /** Meters are required (HTTP mode); undefined meters pause the run. */
   metered: boolean;
+  /** Give the async pass the whole session so far, not only the new messages. */
+  conversation?: boolean;
+}
+
+/**
+ * Each session's messages in first-seen order, and how many of them each batch can see. Built from the batches
+ * file alone, so a resumed run sees the same conversation; it only grows, which keeps the prompt prefix stable.
+ */
+function sessionConversations(batches: any[]): { messages: Map<string, any[]>; history: Map<string, Set<string>>; visible: number[] } {
+  const messages = new Map<string, any[]>();
+  const history = new Map<string, Set<string>>();
+  const seen = new Map<string, Set<string>>();
+  const visible: number[] = [];
+  for (const batch of batches) {
+    const key: string = batch.session_id ?? batch.letta_session;
+    if (!messages.has(key)) {
+      messages.set(key, []);
+      seen.set(key, new Set());
+      history.set(key, new Set((batch.session_history ?? []).map(messageKey)));
+    }
+    const list = messages.get(key)!;
+    const keys = seen.get(key)!;
+    for (const m of [...(batch.session_history ?? []), ...batch.canonical_messages]) {
+      if (keys.has(messageKey(m))) continue;
+      keys.add(messageKey(m));
+      list.push(m);
+    }
+    visible.push(list.length);
+  }
+  return { messages, history, visible };
 }
 
 export interface ReplayDeps {
@@ -331,6 +364,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
 
         const batches = batchesBytes.toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
         if (doneIds.some((id, i) => batches[i]?.batch_id !== id)) throw new Refused('committed results are not a prefix of --batches');
+        const conversations = sessionConversations(batches);
         let queue = batches.slice(doneIds.length);
         if (opts.limit && opts.limit > 0) queue = queue.slice(0, Math.max(0, opts.limit - doneIds.length));
         log(`sequential replay: ${queue.length} turns to run (${doneIds.length} done)`);
@@ -347,7 +381,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
           commit(out, work);
         };
 
-        for (const batch of queue) {
+        for (const [position, batch] of queue.entries()) {
           const meters = await deps.meters();
           if (opts.metered) {
             if (!meters || !Number.isFinite(meters.rolling) || !Number.isFinite(meters.weekly)) throw new Paused('usage meters unavailable');
@@ -363,11 +397,16 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
           const sessionKey: string = batch.session_id ?? batch.letta_session;
           // Live, the hook's cursor moves on once a pass completes, so the harness never gets a message twice. The recorded
           // batches re-send Letta's backlog (held cursor, retry rotation): keep only what this run has not handled yet.
-          const handled = new Set((state.handled ??= {})[sessionKey] ?? []);
+          const handled = new Set([...(conversations.history.get(sessionKey) ?? []), ...((state.handled ??= {})[sessionKey] ?? [])]);
           const fresh = batch.canonical_messages.filter((m: any) => !handled.has(messageKey(m)));
+          // The same filtering as the turn's own messages, applied to the whole list: it only depends on what came before,
+          // so the conversation still only grows.
+          const conversation = opts.conversation
+            ? prepareTurn({ latestUserMessage: '', canonicalMessages: conversations.messages.get(sessionKey)!.slice(0, conversations.visible[doneIds.length + position]) }).canonicalMessages!
+            : undefined;
           const makeRuntime = (canonical: any[]) => new RelationshipMemoryRuntime(
             store,
-            new Map(canonical.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: sessionKey }])),
+            new Map([...(conversation ?? []), ...canonical].map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: sessionKey }])),
             () => new Date().toISOString(),
             new Map(intents.map((intent: any) => [intent.intent_id, intent])),
             true,
@@ -383,7 +422,8 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
             previousUserMessage: batch.sync_context?.prev_user ?? '',
             previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
           });
-          const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}), intents_listed: batch.assistant_intents.length, intents_open: intents.length, messages_resent: batch.canonical_messages.length - fresh.length };
+          const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}), intents_listed: batch.assistant_intents.length, intents_open: intents.length, messages_resent: batch.canonical_messages.length - fresh.length,
+            ...(conversation ? { conversation_messages: conversation.length, conversation_chars: conversation.reduce((n: number, m: any) => n + m.quote.length, 0) } : {}) };
           let record: Record<string, unknown>;
           if (turn.empty) {
             record = { batch_id: batch.batch_id, session: sessionKey, input, skip: 'input_empty', usage_before: meters };
@@ -411,6 +451,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
               sessionId: sessionKey,
               latestUserMessage: turn.latestUserMessage,
               canonicalMessages: turn.canonicalMessages!,
+              ...(conversation ? { conversation } : {}),
               assistantIntents: intents,
               sessionKnownMemoryIds: known,
               recentSeen: [...seen].map(([memory_id, summary]) => ({ memory_id, summary })),
@@ -506,6 +547,7 @@ function args(): ReplayOptions {
     cooldownWaitMs: Number(get('cooldown-wait-ms', '300000')),
     maxSteps: Number(get('max-steps', '4')), rollingCap: Number(get('rolling-cap', '60')), weeklyCap: Number(get('weekly-cap', '70')),
     metered: !process.env.HARNESS_RELAY_HOST,
+    conversation: process.argv.includes('--conversation'),
   };
 }
 

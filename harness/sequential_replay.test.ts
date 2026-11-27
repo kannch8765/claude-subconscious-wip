@@ -239,6 +239,23 @@ describe('sequential replay', () => {
     expect(results(options.outDir).map((r) => [r.session, r.input.messages_resent])).toEqual([['s-1', 0], ['s-1', 1], ['s-2', 0]]);
   });
 
+  it('gives the async pass the session so far, after the history from before the replayed range', async () => {
+    const { options } = setup();
+    const lines = fs.readFileSync(options.batchesFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const earlier = { message_id: 'h-u', evidence_id: 'h-e', role: 'user', quote: '昨天的事', event_kind: 'user_text', captured_at: '2026-10-09T00:00:00Z' };
+    // t1 re-sends the history message: it counts as handled, and the conversation holds it once.
+    lines[0] = { ...lines[0], session_history: [earlier], canonical_messages: [earlier, ...lines[0].canonical_messages] };
+    fs.writeFileSync(options.batchesFile, lines.map((b) => JSON.stringify(b)).join('\n') + '\n');
+    const prompts: string[] = [];
+    const inner = model();
+    const spy = { ...inner, async chat(body: any) { if (body.tools) prompts.push(String(body.messages[1].content)); return inner.chat(body); } };
+    await runSequentialReplay({ ...options, conversation: true, limit: 2 }, deps(spy as any));
+    expect(results(options.outDir).map((r) => [r.input.conversation_messages, r.input.messages_resent])).toEqual([[2, 1], [3, 0]]);
+    const t2 = prompts.find((p) => p.includes('<new_messages>t2-e</new_messages>'))!;
+    expect(t2.indexOf('h-e')).toBeLessThan(t2.indexOf('t1-e'));
+    expect(t2).toContain('t1-e');
+  });
+
   it('refuses to resume with a different batches file', async () => {
     const { options } = setup();
     await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
