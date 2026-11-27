@@ -230,70 +230,27 @@ describe('reinforce matches evidence by transcript source, not by conversation',
     expect(runtime.finalizeBatch('intent-batch', true)).toBe('completed');
   });
 
-  it('lets message-level legacy evidence hold the text blocks of its message but not its tool blocks', () => {
+  // Message-level evidence keeps main's behaviour: it is matched by evidence id only, never by block source.
+  it('never lets message-level evidence hold a block, even when its quote is the full old join', () => {
     const { runtime, memoryId, evidenceOf } = setup({ evidence_message_ids: ['msg-3'] });
     expect(evidenceOf()).toEqual([expect.not.objectContaining({ block_index: expect.anything() })]);
-    expect(runtime.reinforce('text-blocks', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 0), eventId(convB, 'msg-3', 1)] }))
-      .toEqual({ outcome: 'duplicate', memory_id: memoryId });
-    expect(runtime.reinforce('tool-block', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 1), eventId(convB, 'msg-3', 2)] }))
+    expect(runtime.reinforce('blocks', { memory_id: memoryId, evidence_ids: [0, 1, 2].map((index) => eventId(convB, 'msg-3', index)) }))
       .toEqual({ outcome: 'accepted', memory_id: memoryId });
-    expect(evidenceOf().map((item) => item.event_kind ?? 'message')).toEqual(['message', 'assistant_tool_use']);
+    expect(evidenceOf().map((item) => item.block_index ?? 'message').sort()).toEqual([0, 1, 2, 'message']);
+    expect(runtime.reinforce('same-legacy', { memory_id: memoryId, evidence_message_ids: ['msg-3'] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(evidenceOf()).toHaveLength(4);
   });
 
-  it('does not let a partial message-level quote hold any block', () => {
-    const firstBlockOnly: CanonicalMessage = { ...messageLevel, quote: 'That sounds like a calm start to the week.' };
-    const { runtime, memoryId, evidenceOf } = setup({ evidence_message_ids: ['msg-3'] }, [], [firstBlockOnly]);
-    expect(runtime.reinforce('blocks', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 0), eventId(convB, 'msg-3', 1)] }))
+  it('keeps message-level events of one message apart when their evidence ids differ', () => {
+    const legacy = (evidenceId: string, quote: string): CanonicalMessage => ({ ...messageLevel, evidence_id: evidenceId, quote });
+    const { runtime, memoryId, evidenceOf } = setup(undefined, [], [
+      legacy('legacy-ev-a', 'That sounds like a calm start to the week.'),
+      legacy('legacy-ev-b', 'That sounds like a calm start to the week.\nI will keep the tree in mind.'),
+    ]);
+    expect(runtime.reinforce('two-legacy', { memory_id: memoryId, evidence_ids: ['legacy-ev-a', 'legacy-ev-b', eventId(convB, 'msg-3', 1)] }))
       .toEqual({ outcome: 'accepted', memory_id: memoryId });
-    expect(evidenceOf().map((item) => item.block_index ?? 'message').sort()).toEqual([0, 1, 'message']);
-  });
-
-  it('does not treat text inside another block as the block itself', () => {
-    // Block 1 is a substring of block 0 and also one of its whole lines.
-    const events = buildCanonicalMessages([{ type: 'user', uuid: 'msg-4', timestamp: '2026-08-10T00:03:00Z', message: { content: [
-      { type: 'text', text: 'This was not checked.\nverified.' },
-      { type: 'text', text: 'verified.' },
-    ] } }] as any[], -1, 'conv-b');
-    const blockZeroOnly: CanonicalMessage = { conversation_id: 'conv-old', message_id: 'msg-4', role: 'user', quote: 'This was not checked.\nverified.', captured_at: '2026-08-10T00:03:00Z' };
-    const { runtime, memoryId, evidenceOf } = setup({ evidence_message_ids: ['msg-4'] }, [], [...events, blockZeroOnly]);
-    expect(runtime.reinforce('separate-block', { memory_id: memoryId, evidence_ids: [events[1].evidence_id!] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
-    expect(evidenceOf().map((item) => item.quote)).toEqual([blockZeroOnly.quote, 'verified.']);
-  });
-
-  it('settles a call citing a message-level message and its own blocks the same way whichever id sorts first', () => {
-    for (const messageId of ['a-msg', 'z-msg']) {
-      const events = buildCanonicalMessages([{ type: 'assistant', uuid: messageId, timestamp: '2026-08-10T00:04:00Z', message: { content: [
-        { type: 'text', text: 'The soil needs more water.' },
-        { type: 'text', text: 'Maybe twice a week.' },
-      ] } }] as any[], -1, 'conv-a');
-      const joined: CanonicalMessage = { conversation_id: 'conv-old', message_id: messageId, role: 'assistant', quote: 'The soil needs more water.\nMaybe twice a week.', captured_at: '2026-08-10T00:04:00Z' };
-      const { runtime, memoryId, evidenceOf } = setup(undefined, [], [...events, joined]);
-      const ids = [messageId, events[0].evidence_id!, events[1].evidence_id!];
-      expect([...ids].sort()[0] === messageId).toBe(messageId === 'a-msg');
-      expect(runtime.reinforce('mixed-legacy', { memory_id: memoryId, evidence_ids: ids })).toEqual({ outcome: 'accepted', memory_id: memoryId });
-      expect(evidenceOf().filter((item) => item.message_id === messageId).map((item) => item.block_index ?? 'message')).toEqual(['message']);
-    }
-  });
-
-  it('covers blocks only with a message-level quote the call actually writes', () => {
-    const events = buildCanonicalMessages([{ type: 'assistant', uuid: 'msg-5', timestamp: '2026-08-10T00:05:00Z', message: { content: [
-      { type: 'text', text: 'The pot is too small.' },
-      { type: 'text', text: 'A bigger one arrives soon.' },
-    ] } }] as any[], -1, 'conv-a');
-    const partial = 'The pot is too small.';
-    const joined = 'The pot is too small.\nA bigger one arrives soon.';
-    // Two message-level events share one source; only the first by id ('legacy-ev-a') is written.
-    for (const [first, second] of [[partial, joined], [joined, partial]]) {
-      const legacy = (evidenceId: string, quote: string): CanonicalMessage => ({
-        conversation_id: 'conv-old', message_id: 'msg-5', evidence_id: evidenceId, role: 'assistant', quote, captured_at: '2026-08-10T00:05:00Z',
-      });
-      const { runtime, memoryId, evidenceOf } = setup(undefined, [], [...events, legacy('legacy-ev-a', first), legacy('legacy-ev-b', second)]);
-      expect(runtime.reinforce('two-legacy', { memory_id: memoryId, evidence_ids: ['legacy-ev-a', 'legacy-ev-b', events[0].evidence_id!, events[1].evidence_id!] }))
-        .toEqual({ outcome: 'accepted', memory_id: memoryId });
-      const rows = evidenceOf().filter((item) => item.message_id === 'msg-5');
-      expect(rows.filter((item) => item.block_index === undefined).map((item) => item.quote)).toEqual([first]);
-      expect(rows.map((item) => item.block_index).filter((index) => index !== undefined).sort()).toEqual(first === joined ? [] : [0, 1]);
-    }
+    expect(evidenceOf().filter((item) => item.message_id === 'msg-3').map((item) => item.block_index ?? item.source_evidence_id).sort())
+      .toEqual([1, 'legacy-ev-a', 'legacy-ev-b']);
   });
 
   it('attaches a message-level legacy message when the memory holds only some blocks of it', () => {
