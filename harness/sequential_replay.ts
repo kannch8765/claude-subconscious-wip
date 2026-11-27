@@ -212,22 +212,34 @@ function restoreWork(outDir: string): string {
 }
 
 /**
- * Entries a crashed initialization can leave behind; anything else means the directory is not ours. Without
- * INIT.json no turn has run, so an unmarked checkpoint/ is only the seed copy and is rebuilt.
+ * Entries a crashed initialization can leave behind; anything else means the directory is not ours. A checkpoint/
+ * without INIT.json is replaced only if it is provably the seed (see isSeedCheckpoint); otherwise it is refused.
  */
 const INIT_LEFTOVERS = new Set(['RUN.lock', 'checkpoint.tmp-init', 'checkpoint']);
+const SEED_MARK = 'SEED.json';
+
+/** The seed carries SEED.json and has no results. A commit copies data files only, so it never carries the mark. */
+function isSeedCheckpoint(dir: string): boolean {
+  return fs.existsSync(path.join(dir, SEED_MARK)) && !fs.existsSync(path.join(dir, RESULTS));
+}
 
 function initialize(opts: ReplayOptions, out: string, b: Backends, batchesSha256: string): void {
+  const checkpoint = path.join(out, 'checkpoint');
+  if (fs.existsSync(checkpoint) && !isSeedCheckpoint(checkpoint)) {
+    throw new Refused(`--out ${out} has a checkpoint/ without INIT.json that is not a seed; it may hold committed turns`);
+  }
   const seed = path.join(out, 'checkpoint.tmp-init');
   fs.rmSync(seed, { recursive: true, force: true });
-  fs.rmSync(path.join(out, 'checkpoint'), { recursive: true, force: true });
   fs.mkdirSync(path.join(seed, 'store'), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(seed, 'semantic-index'), { recursive: true, mode: 0o700 });
   for (const name of storeDataFiles(opts.seedStore)) copyRegular(path.join(opts.seedStore, name), path.join(seed, 'store', name));
   copyRegular(opts.seedIndex, path.join(seed, 'semantic-index', 'index.json'));
   checkIndex(path.join(seed, 'semantic-index', 'index.json'), path.join(seed, 'store'), b);
   fs.writeFileSync(path.join(seed, STATE), JSON.stringify({ sessions: {}, pending_embed: [] } satisfies State), { mode: 0o600 });
-  fs.renameSync(seed, path.join(out, 'checkpoint'));
+  fs.writeFileSync(path.join(seed, SEED_MARK), '{}', { mode: 0o600 });
+  // The new seed is complete and checked; only now replace an interrupted one.
+  fs.rmSync(checkpoint, { recursive: true, force: true });
+  fs.renameSync(seed, checkpoint);
   const { fingerprint, documents } = indexFingerprint(path.join(out, 'checkpoint', 'semantic-index', 'index.json'));
   fs.writeFileSync(path.join(out, 'INIT.json'), JSON.stringify({ created_at: new Date().toISOString(), seed_store: real(opts.seedStore), seed_index: real(opts.seedIndex), fingerprint, seed_documents: documents, batches_sha256: batchesSha256 }), { mode: 0o600 });
 }

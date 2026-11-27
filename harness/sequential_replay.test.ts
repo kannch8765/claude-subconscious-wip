@@ -187,10 +187,23 @@ describe('sequential replay', () => {
     expect(fs.existsSync(path.join(options.outDir, 'RUN.lock'))).toBe(false);
   });
 
-  it('rebuilds an initialization that stopped before INIT.json', async () => {
-    const { options } = setup();
+  it('rebuilds a seed that stopped before INIT.json, but never an unmarked checkpoint with progress', async () => {
+    const { options, root } = setup();
     fs.mkdirSync(path.join(options.outDir, 'checkpoint', 'store'), { recursive: true });
+    fs.writeFileSync(path.join(options.outDir, 'checkpoint', 'SEED.json'), '{}');
     expect(await runSequentialReplay(options, deps(model()))).toEqual({ ran: 3, done: 3 });
+
+    // A copy of a committed checkpoint without its INIT.json (say, a recovery copy) is refused and left untouched.
+    const copy = path.join(root, 'recovery');
+    fs.mkdirSync(copy);
+    fs.cpSync(path.join(options.outDir, 'checkpoint'), path.join(copy, 'checkpoint'), { recursive: true });
+    const before = fs.readFileSync(path.join(copy, 'checkpoint', 'results.jsonl'));
+    await expect(runSequentialReplay({ ...options, outDir: copy }, deps(model()))).rejects.toThrow(/not a seed/);
+    expect(fs.readFileSync(path.join(copy, 'checkpoint', 'results.jsonl')).equals(before)).toBe(true);
+    // Without a seed mark it is refused too, even with no results yet.
+    const bare = path.join(root, 'bare');
+    fs.mkdirSync(path.join(bare, 'checkpoint'), { recursive: true });
+    await expect(runSequentialReplay({ ...options, outDir: bare }, deps(model()))).rejects.toThrow(/not a seed/);
   });
 
   it('refuses to resume with a different batches file', async () => {
