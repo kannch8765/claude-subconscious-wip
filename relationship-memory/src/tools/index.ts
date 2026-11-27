@@ -138,15 +138,39 @@ function evidenceSourceKey(item: EvidenceSource): string {
   });
 }
 
+function isMessageLevel(item: EvidenceSource): boolean {
+  return item.block_index === undefined && item.event_kind === undefined;
+}
+
 /**
- * Source keys of stored evidence that already hold this message. Message-level evidence (no block_index or
- * event_kind; written before per-block evidence) holds the joined text of all the message's text blocks and none of
- * its tool blocks, so it also holds any text block of that message.
+ * The messages a memory does not hold yet. `held` is the memory's completed evidence; a message is held when its
+ * evidence id is held or held evidence has the same transcript source, from any conversation.
+ *
+ * A message-level quote (no block_index or event_kind: the shape from before per-block evidence, still accepted from
+ * callers) holds a text block of its message only when the quote contains the block's text. The old adapter joined all
+ * text blocks, but nothing guarantees that for other callers. Tool blocks are never held by a message-level quote.
+ * Message-level messages in this call count as quotes too, so the result does not depend on the order of the ids.
  */
-function sourceKeysHolding(message: CanonicalMessage): string[] {
-  const keys = [evidenceSourceKey(message)];
-  if (message.event_kind === 'user_text' || message.event_kind === 'assistant_text') keys.push(evidenceSourceKey({ message_id: message.message_id }));
-  return keys;
+function unheldMessages(
+  messages: readonly CanonicalMessage[],
+  held: readonly EvidenceRecord[],
+  heldEvidenceId: (message: CanonicalMessage) => boolean,
+): CanonicalMessage[] {
+  const heldSources = new Set(held.map(evidenceSourceKey));
+  const isHeld = (message: CanonicalMessage) => heldEvidenceId(message) || heldSources.has(evidenceSourceKey(message));
+  const messageQuotes = new Map<string, string[]>();
+  for (const item of [...held, ...messages.filter((message) => !isHeld(message))]) {
+    if (isMessageLevel(item)) messageQuotes.set(item.message_id, [...(messageQuotes.get(item.message_id) ?? []), item.quote]);
+  }
+  const result: CanonicalMessage[] = [];
+  for (const message of messages) {
+    if (isHeld(message)) continue;
+    const textBlock = message.event_kind === 'user_text' || message.event_kind === 'assistant_text';
+    if (textBlock && messageQuotes.get(message.message_id)?.some((quote) => quote.includes(message.quote))) continue;
+    result.push(message);
+    heldSources.add(evidenceSourceKey(message));
+  }
+  return result;
 }
 
 export class RelationshipMemoryRuntime {
@@ -948,16 +972,12 @@ export class RelationshipMemoryRuntime {
       if (reinforcement.memory_id !== memoryId) continue;
       for (const evidenceId of reinforcement.evidence_ids) completedEvidenceIds.add(evidenceId);
     }
-    // A message is already attached when the memory holds its evidence id, or holds the same transcript source under
-    // another conversation's id. Only completed evidence counts, so a half-committed reinforcement is still repaired.
-    const attachedSources = new Set(memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)).map(evidenceSourceKey));
-    const newMessages: CanonicalMessage[] = [];
-    for (const message of messages) {
-      if (completedEvidenceIds.has(memoryEvidenceId(memoryId, message))) continue;
-      if (sourceKeysHolding(message).some((key) => attachedSources.has(key))) continue;
-      newMessages.push(message);
-      attachedSources.add(evidenceSourceKey(message));
-    }
+    // Only completed evidence counts as held, so a half-committed reinforcement is still repaired.
+    const newMessages = unheldMessages(
+      messages,
+      memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)),
+      (message) => completedEvidenceIds.has(memoryEvidenceId(memoryId, message)),
+    );
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
     const newMessageIds = newMessages.map(canonicalEvidenceId).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({

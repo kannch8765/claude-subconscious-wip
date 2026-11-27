@@ -148,11 +148,16 @@ describe('reinforce matches evidence by transcript source, not by conversation',
     };
   }
 
-  function setup(evidence: Record<string, string[]> = { evidence_ids: [eventId(convA, 'msg-1')] }, intents: AssistantRememberIntentRecord[] = []) {
+  // `extra` events are added to the trusted batch; a message-level one replaces `messageLevel` for its message id.
+  function setup(
+    evidence: Record<string, string[]> = { evidence_ids: [eventId(convA, 'msg-1')] },
+    intents: AssistantRememberIntentRecord[] = [],
+    extra: CanonicalMessage[] = [],
+  ) {
     const store = new RelationshipMemoryStore(tempDir(), 'subject');
     for (const intent of intents) store.appendAssistantIntent(intent);
     const messages = new Map([...convA, ...convB].map((event) => [event.evidence_id!, event]));
-    messages.set(messageLevel.message_id, messageLevel);
+    for (const event of [messageLevel, ...extra]) messages.set(event.evidence_id ?? event.message_id, event);
     const runtime = new RelationshipMemoryRuntime(store, messages, () => '2026-08-11T00:00:00Z', new Map(intents.map((intent) => [intent.intent_id, intent])));
     const memoryId = runtime.remember('seed', tree(evidence)).memory_id!;
     const evidenceOf = (id = memoryId) => store.listEvidence().filter((item) => item.memory_id === id);
@@ -233,6 +238,30 @@ describe('reinforce matches evidence by transcript source, not by conversation',
     expect(runtime.reinforce('tool-block', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 1), eventId(convB, 'msg-3', 2)] }))
       .toEqual({ outcome: 'accepted', memory_id: memoryId });
     expect(evidenceOf().map((item) => item.event_kind ?? 'message')).toEqual(['message', 'assistant_tool_use']);
+  });
+
+  it('lets a message-level quote hold only the text blocks it contains', () => {
+    const firstBlockOnly: CanonicalMessage = { ...messageLevel, quote: 'That sounds like a calm start to the week.' };
+    const { runtime, memoryId, evidenceOf } = setup({ evidence_message_ids: ['msg-3'] }, [], [firstBlockOnly]);
+    expect(runtime.reinforce('held-block', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 0)] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
+    expect(runtime.reinforce('new-block', { memory_id: memoryId, evidence_ids: [eventId(convB, 'msg-3', 1)] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(evidenceOf().map((item) => item.quote)).toEqual([firstBlockOnly.quote, 'I will keep the tree in mind.']);
+  });
+
+  it('settles a call citing a message-level message and its own blocks the same way whichever id sorts first', () => {
+    for (const messageId of ['a-msg', 'z-msg']) {
+      const events = buildCanonicalMessages([{ type: 'assistant', uuid: messageId, timestamp: '2026-08-10T00:04:00Z', message: { content: [
+        { type: 'text', text: 'The soil needs more water.' },
+        { type: 'text', text: 'Maybe twice a week.' },
+      ] } }] as any[], -1, 'conv-a');
+      const firstBlockOnly: CanonicalMessage = { conversation_id: 'conv-old', message_id: messageId, role: 'assistant', quote: 'The soil needs more water.', captured_at: '2026-08-10T00:04:00Z' };
+      const { runtime, memoryId, evidenceOf } = setup(undefined, [], [...events, firstBlockOnly]);
+      const ids = [messageId, events[0].evidence_id!, events[1].evidence_id!];
+      expect([...ids].sort()[0] === messageId).toBe(messageId === 'a-msg');
+      expect(runtime.reinforce('mixed-legacy', { memory_id: memoryId, evidence_ids: ids })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+      // Block 0 is inside the message-level quote; block 1 is not.
+      expect(evidenceOf().filter((item) => item.message_id === messageId).map((item) => item.block_index ?? 'message').sort()).toEqual([1, 'message']);
+    }
   });
 
   it('attaches a message-level legacy message when the memory holds only some blocks of it', () => {
