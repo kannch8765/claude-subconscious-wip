@@ -2,7 +2,7 @@
 /**
  * Offline comparison of quote selection: today's first/last-half baseline vs samplePieces.
  * Reads a store directory; prints numbers only.
- * Usage: tsx harness/quote_sampler_metrics.ts <store dir> [--now ISO] [--half-life days] [--floor f] [--unit n]
+ * Usage: tsx harness/quote_sampler_metrics.ts <store dir> [--now ISO] [--half-life days] [--floor f] [--unit n] [--min-sessions n]
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -30,12 +30,26 @@ for (const r of jsonl('reinforcements.jsonl')) {
   reinforcementsByMemory.set(r.memory_id, list);
 }
 
+// Legacy-origin memories keep their original capture in a legacy source, not in evidence.
+// It becomes part of episode 0 so the anchor exists for them too (the live view already shows legacy snippets).
+const legacySources = new Map(jsonl('legacy-assistant-sources.jsonl').map((s) => [s.legacy_source_id, s]));
+const legacyByMemory = new Map<string, SamplerEvidence[]>();
+for (const p of jsonl('legacy-memory-provenance.jsonl')) {
+  const source = legacySources.get(p.legacy_source_id);
+  const text = source?.body_text?.trim() || source?.frontmatter?.name || '';
+  if (!source || !text) continue;
+  const list = legacyByMemory.get(p.canonical_memory_id) ?? [];
+  list.push({ evidence_id: source.legacy_source_id, quote: text, captured_at: source.created_at_utc ?? p.recorded_at, conversation_id: `legacy:${source.legacy_source_id}` });
+  legacyByMemory.set(p.canonical_memory_id, list);
+}
+
 function episodesOf(memoryId: string): SamplerEpisode[] {
   const evidence = evidenceByMemory.get(memoryId) ?? [];
   const byId = new Map(evidence.map((e) => [e.evidence_id, e]));
   const reinforcements = (reinforcementsByMemory.get(memoryId) ?? []).sort((a, b) => a.recorded_at.localeCompare(b.recorded_at));
   const inReinforcement = new Set(reinforcements.flatMap((r) => r.evidence_ids));
-  const episodes: SamplerEpisode[] = [{ index: 0, at: '', evidence: evidence.filter((e) => !inReinforcement.has(e.evidence_id)) }];
+  const original = evidence.filter((e) => !inReinforcement.has(e.evidence_id));
+  const episodes: SamplerEpisode[] = [{ index: 0, at: '', evidence: [...(legacyByMemory.get(memoryId) ?? []), ...original] }];
   reinforcements.forEach((r, i) => episodes.push({ index: i + 1, at: r.recorded_at, evidence: r.evidence_ids.map((id: string) => byId.get(id)).filter(Boolean) }));
   return episodes.filter((episode) => episode.evidence.length > 0 || episode.index === 0);
 }
@@ -43,8 +57,10 @@ function episodesOf(memoryId: string): SamplerEpisode[] {
 const q = (v: number[], p: number): number => { const s = [...v].sort((a, b) => a - b); return s.length ? s[Math.min(s.length - 1, Math.floor(p * s.length))] : 0; };
 const mean = (v: number[]): number => v.reduce((a, b) => a + b, 0) / Math.max(1, v.length);
 
-interface Stats { episodes: number[]; sessions: number[]; newestShare: number[]; original: number[]; olderReinf: number[]; chars: number[] }
-const empty = (): Stats => ({ episodes: [], sessions: [], newestShare: [], original: [], olderReinf: [], chars: [] });
+interface Stats { episodes: number[]; sessions: number[]; newestShare: number[]; original: number[]; olderReinf: number[]; chars: number[]; age: number[]; old: number[] }
+const empty = (): Stats => ({ episodes: [], sessions: [], newestShare: [], original: [], olderReinf: [], chars: [], age: [], old: [] });
+const nowMs = Date.parse(now);
+const ageDays = (p: SampledPiece): number => (nowMs - Date.parse(p.captured_at)) / 86_400_000;
 const base = empty(); const samp = empty(); const overlap: number[] = [];
 let reinforced = 0;
 
@@ -56,6 +72,9 @@ function record(stats: Stats, pieces: SampledPiece[], newestEpisode: number, tot
   stats.original.push(pieces.filter((p) => p.episode === 0).length);
   stats.olderReinf.push(totalEpisodes > 2 ? pieces.filter((p) => p.episode > 0 && p.episode < newestEpisode).length : 0);
   stats.chars.push(mean(pieces.map((p) => [...p.text].length)));
+  // age of the pieces other than the anchor (episode 0), and the share older than 45 days
+  const rest = pieces.filter((p) => p.episode > 0);
+  if (rest.length) { stats.age.push(mean(rest.map(ageDays))); stats.old.push(rest.filter((p) => ageDays(p) > 45).length / rest.length); }
 }
 
 for (const memory of jsonl('memories.jsonl')) {
@@ -79,6 +98,7 @@ for (const memory of jsonl('memories.jsonl')) {
 
 console.log(`reinforced memories: ${reinforced}; options ${JSON.stringify(options)}`);
 const line = (label: string, s: Stats): string => `${label.padEnd(9)} episodes covered p50 ${q(s.episodes, .5)} mean ${mean(s.episodes).toFixed(2)} | session-days p50 ${q(s.sessions, .5)} mean ${mean(s.sessions).toFixed(2)}`
+  + ` | non-anchor age mean ${mean(s.age).toFixed(0)}d, >45d ${(mean(s.old) * 100).toFixed(0)}%`
   + ` | newest-session share mean ${(mean(s.newestShare) * 100).toFixed(0)}% | original pieces mean ${mean(s.original).toFixed(2)} | older reinforcements pieces mean ${mean(s.olderReinf).toFixed(2)} | piece chars mean ${mean(s.chars).toFixed(0)}`;
 console.log(line('baseline', base));
 console.log(line('sampler', samp));

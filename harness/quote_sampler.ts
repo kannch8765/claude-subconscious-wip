@@ -4,7 +4,8 @@
  * Today a memory shows its first 4 and last 4 sentence pieces by time, so one
  * reinforcement fills the "latest" half. This sampler groups evidence into
  * episodes (the original capture and each reinforcement) and picks:
- *   - an anchor: the opening unit of the original capture,
+ *   - an anchor: the opening unit of the original capture (for a legacy-origin
+ *     memory the caller puts its legacy source into episode 0, so it has an anchor too),
  *   - the newest episode: at most one unit,
  *   - the rest: at most one unit per session-day, weighted by a forgetting curve
  *     with a floor, so old episodes come back now and then.
