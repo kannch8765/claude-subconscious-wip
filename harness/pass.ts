@@ -81,15 +81,15 @@ IDENTITY: You and foreground Kohaku are two layers of the same Kohaku. Think fro
 JOB 1, WHISPER (decide every pass): surface an old memory only when it would add something Kohaku would not bring up on her own: a shared moment, a running joke, a promise, a person or place with history, a past feeling about the same thing. Skip routine work, logistics, code, tool output, and memories that merely restate what is being said right now. When one fits, call deliver_whisper once with one memory_id from the eligible list and 1-3 of its quote numbers (n). Memories under known_do_not_whisper are never whispered (Kohaku already has them). The runtime renders the whisper from the stored summary and quotes; you write no whisper prose and never explain why it matters, what it means now, or how anyone should feel. Otherwise call skip_whisper. Every pass ends with exactly one of deliver_whisper or skip_whisper.
 
 JOB 2, UPKEEP (silent): decide whether trusted evidence in this batch
-- supports an existing memory -> memory_reinforce,
+- is for the same underlying episode/event or stable preference as an existing memory -> memory_reinforce (lexical similarity alone does not make it the same),
 - is a genuinely new durable memory -> memory_remember with the matching kind,
 - or needs nothing (routine work, code, tool noise, small talk) -> do nothing.
 Every remember intent in the catalog must be resolved this pass by exactly one call carrying its assistant_intent_id: memory_reinforce on the existing memory that already holds that moment, otherwise memory_remember. Never put the same intent id on two calls, and never resolve an intent without its id. An intent marked already_linked_to is resolved by memory_reinforce on exactly that memory.
 When two or more current memories you saw this pass or in the recently seen list relate (duplicate meaning, changed over time, context-dependent, conflict, related, unrelated), you may call suggest_memory_relation. It only proposes; it never merges.
 
-EVIDENCE: cite only evidence_id values from the evidence catalog of this batch, or from <conversation> when it is given.
+EVIDENCE: cite only evidence_id values from the evidence catalog of this batch, or from <conversation> when it is given. Tool-returned claims are not world truth. New memory summaries and narrative payload text are written in Chinese; names, aliases, trigger phrases, code, paths and URLs stay as in the source. Never invent quotes, IDs or identities.
 
-CONVERSATION: when <conversation> is given, it is the whole session so far, as Kohaku sees it, and <new_messages> names the messages new in this pass. Both jobs are about the new messages, read in the light of the whole conversation. When the new messages show something that has newly happened (a new experience, an outcome, a place, a new fact), remember it as its own memory and cite the earlier messages of the same experience too; reinforce when the same moment or fact comes up again. Tool-returned claims are not world truth. New memory summaries and narrative payload text are written in Chinese; names, aliases, trigger phrases, code, paths and URLs stay as in the source. Never invent quotes, IDs or identities.
+CONVERSATION: when <conversation> is given, it is the whole session so far, as Kohaku sees it, and <new_messages> names the messages new in this pass. Both jobs are about the new messages, read in the light of the whole conversation.
 
 SEARCH: call memory_search once with 1-3 short concept queries (names, topics, events from the conversation, not the whole message). One result list serves both jobs. Search again only if the first results clearly miss what the conversation is about.
 
@@ -128,7 +128,7 @@ export function harnessTools(withIntents = true): ChatTool[] {
       properties: { memory_id: { type: 'string', minLength: 1 }, quotes: { type: 'array', minItems: 1, maxItems: 3, uniqueItems: true, items: { type: 'integer', minimum: 1 } } },
     }),
     fn('skip_whisper', 'Record that no memory is worth surfacing this pass.', { type: 'object', additionalProperties: false, properties: {} }),
-    fn('memory_reinforce', 'Add evidence from this batch to an existing memory that holds the same moment or fact.', {
+    fn('memory_reinforce', 'Reinforce one existing canonical memory with trusted current-batch evidence for the same underlying episode/event or stable preference. Explicit repeated durable-preference evidence should be bound here rather than treated as nothing to store. When a trusted assistant remember intent asks to keep a moment this memory already holds, pass its assistant_intent_id here. Do not use lexical similarity alone to decide sameness.', {
       type: 'object', additionalProperties: false, required: ['memory_id', 'evidence_ids'],
       properties: { memory_id: { type: 'string', minLength: 1 }, evidence_ids: stringList, ...intent },
     }),
