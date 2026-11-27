@@ -211,6 +211,9 @@ export async function runAsyncPass(
   let succeeded = false;
   let nudged = false;
   const hasSearchedOrSilent = (): boolean => !hasUser || decisions.searches > 0;
+  // One completion rule for every exit: the pass searched (when there is a user message) and its last step had no
+  // failed tool call.
+  const complete = (lastStepFailed: boolean): boolean => hasSearchedOrSilent() && !lastStepFailed;
 
   const execute = async (name: string, args: Record<string, any>): Promise<unknown> => {
     switch (name) {
@@ -218,10 +221,11 @@ export async function runAsyncPass(
         const queries: string[] = (Array.isArray(args.queries) ? args.queries : [args.query])
           .filter((q: unknown): q is string => typeof q === 'string' && q.trim().length > 0).slice(0, config.maxSearchQueries ?? 3);
         if (!queries.length) throw new Error('memory_search needs 1-3 non-empty queries');
+        const lists = await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence({ query, kind: args.kind, limit: args.limit ?? 8 } as any)));
+        // Counted only once the search has run.
         decisions.searches++;
         decisions.search_queries += queries.length;
         (decisions.query_texts ??= []).push(...queries.map(String));
-        const lists = await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence({ query, kind: args.kind, limit: args.limit ?? 8 } as any)));
         const seen = new Set<string>();
         const eligible = [];
         const knownHits = [];
@@ -299,7 +303,7 @@ export async function runAsyncPass(
       step, ms: result.ms, attempts: result.attempts, status: result.status, error_class: result.errorClass,
       prompt_tokens: result.usage.prompt_tokens, cached_tokens: result.usage.cached_tokens,
       completion_tokens: result.usage.completion_tokens, reasoning_tokens: result.usage.reasoning_tokens,
-      prompt_chars: promptChars, tool_calls: calls.map((call) => call.function?.name ?? '?'),
+      prompt_chars: promptChars, tool_calls: calls.map((call) => (toolNames.has(call.function?.name ?? '') ? call.function!.name : 'unknown')),
     });
     if (!result.message) break; // transport / quota / malformed: the pass fails, cursor held
     const message: ChatMessage = { role: 'assistant', content: result.message.content ?? null, ...(calls.length ? { tool_calls: calls } : {}) };
@@ -310,7 +314,7 @@ export async function runAsyncPass(
         messages.push({ role: 'user', content: 'Run memory_search at least once before ending this pass.' });
         continue;
       }
-      succeeded = true;
+      succeeded = complete(false);
       break;
     }
     const outputs = await Promise.all(calls.map(async (call) => {
@@ -330,8 +334,9 @@ export async function runAsyncPass(
     // A step of decisions only (nothing new to read) that all went through ends the pass without another call.
     const errorsBefore = toolErrors.length - outputs.filter((output) => output.startsWith('{"error"')).length;
     const decisionsOnly = calls.every((call) => DECISION_TOOLS.has(call.function?.name ?? ''));
-    if (step === config.maxSteps || (decisionsOnly && toolErrors.length === errorsBefore && hasSearchedOrSilent())) {
-      succeeded = true;
+    const stepFailed = toolErrors.length !== errorsBefore;
+    if (step === config.maxSteps || (decisionsOnly && !stepFailed && hasSearchedOrSilent())) {
+      succeeded = complete(stepFailed);
       break;
     }
   }
