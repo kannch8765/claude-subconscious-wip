@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import { emitRecallTimingSegment, monotonicNow } from '../recall/instrumentation.js';
+import { readCacheEnabled, readJsonFileCached, registerReadCache } from '../store/read_cache.js';
 
 export interface SemanticDocument {
   id: string;
@@ -69,6 +70,34 @@ interface SemanticIndexLockOwner {
 
 function sha256(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
+}
+
+const CONTENT_HASH_MEMO_LIMIT = 50_000;
+const contentHashMemo = new Map<string, string>();
+registerReadCache(() => contentHashMemo.clear());
+
+/** sha256 of a document text, memoized because recall re-hashes every document per query. */
+function contentHash(text: string): string {
+  if (!readCacheEnabled()) return sha256(text);
+  let hash = contentHashMemo.get(text);
+  if (hash === undefined) {
+    if (contentHashMemo.size >= CONTENT_HASH_MEMO_LIMIT) contentHashMemo.clear();
+    hash = sha256(text);
+    contentHashMemo.set(text, hash);
+  }
+  return hash;
+}
+
+// Cached index vectors are shared and never mutated, so a vector checked once stays valid.
+const finiteVectors = new WeakSet<object>();
+
+function usableVector(vector: number[], dimensions: number): boolean {
+  if (vector.length !== dimensions) return false;
+  const cache = readCacheEnabled();
+  if (cache && finiteVectors.has(vector)) return true;
+  if (vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) return false;
+  if (cache) finiteVectors.add(vector);
+  return true;
 }
 
 function boundedDimensions(value: string | undefined): number {
@@ -207,11 +236,27 @@ function cosine(a: number[], b: number[]): number {
   return dot / Math.sqrt(aa * bb);
 }
 
-function readIndex(file: string, fingerprint: string): SemanticIndexFileV1 {
+function readIndexUncached(file: string, fingerprint: string): SemanticIndexFileV1 {
   try {
     const raw = JSON.parse(fs.readFileSync(file, 'utf8')) as SemanticIndexFileV1;
     if (raw?.schema_version === 1 && raw.provider_fingerprint === fingerprint && raw.documents && typeof raw.documents === 'object') return raw;
   } catch { /* derivative cache is rebuilt on any parse/version mismatch */ }
+  return { schema_version: 1, provider_fingerprint: fingerprint, documents: {} };
+}
+
+/**
+ * Pass forUpdate when the caller adds entries: it gets its own documents map, so
+ * the shared cached index never holds vectors that were not written to disk.
+ */
+function readIndex(file: string, fingerprint: string, forUpdate = false): SemanticIndexFileV1 {
+  if (!readCacheEnabled()) return readIndexUncached(file, fingerprint);
+  const result = readJsonFileCached(file);
+  const raw = result.ok ? result.value as SemanticIndexFileV1 : undefined;
+  if (raw?.schema_version === 1 && raw.provider_fingerprint === fingerprint && raw.documents && typeof raw.documents === 'object') {
+    if (!forUpdate) return raw;
+    const documents = Array.isArray(raw.documents) ? Object.assign([], raw.documents) : { ...raw.documents };
+    return { ...raw, documents };
+  }
   return { schema_version: 1, provider_fingerprint: fingerprint, documents: {} };
 }
 
@@ -370,12 +415,11 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
   private async ensureDocuments(documents: SemanticDocument[]): Promise<SemanticIndexFileV1> {
     const token = await acquireSemanticLock(this.indexFile);
     try {
-      const index = readIndex(this.indexFile, this.provider.fingerprint);
+      const index = readIndex(this.indexFile, this.provider.fingerprint, true);
       const missing: SemanticDocument[] = [];
       for (const document of documents) {
-        const contentHash = sha256(document.text);
         const cached = index.documents[document.id];
-        if (!cached || cached.content_hash !== contentHash || cached.vector.length !== this.provider.dimensions || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) missing.push(document);
+        if (!cached || cached.content_hash !== contentHash(document.text) || !usableVector(cached.vector, this.provider.dimensions)) missing.push(document);
       }
       for (let offset = 0; offset < missing.length; offset += this.provider.maxBatchSize) {
         assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
@@ -388,7 +432,7 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
           throw error;
         }
         batch.forEach((document, indexInBatch) => {
-          index.documents[document.id] = { content_hash: sha256(document.text), vector: vectors[indexInBatch] };
+          index.documents[document.id] = { content_hash: contentHash(document.text), vector: vectors[indexInBatch] };
         });
         // Checkpoint every successful provider batch. If a later batch fails, the next
         // search resumes from this durable boundary instead of re-billing prior texts.
@@ -412,9 +456,8 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     const usable = documents.flatMap((document) => {
       const cached = index.documents[document.id];
       if (!cached
-        || cached.content_hash !== sha256(document.text)
-        || cached.vector.length !== this.provider.dimensions
-        || cached.vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))) return [];
+        || cached.content_hash !== contentHash(document.text)
+        || !usableVector(cached.vector, this.provider.dimensions)) return [];
       return [[document.id, cached.vector] as const];
     });
     // Missing vectors and content-hash mismatches are lexical fallback signals,
