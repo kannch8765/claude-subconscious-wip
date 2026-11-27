@@ -10,7 +10,7 @@ import type { AssistantRememberIntentRecord, BatchCompletion, CanonicalMessage, 
 import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS } from '../relationship-memory/src/schema/index.js';
 import type { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import { chat, type ChatMessage, type ChatResult, type ChatTool, type ChatTransport } from './llm.js';
-import { isKnown, slimMemory, SnippetHandles } from './view.js';
+import { isKnown, modelText, slimMemory, SnippetHandles } from './view.js';
 
 export interface PassInput {
   batchId: string;
@@ -169,9 +169,9 @@ export function buildUserMessage(input: PassInput, linkedMemoryFor: (intentId: s
   parts.push(`<evidence_catalog>\n${input.canonicalMessages.map((m) => {
     const id = m.evidence_id ?? m.message_id;
     const kind = m.event_kind && m.event_kind !== 'user_text' && m.event_kind !== 'assistant_text' ? ` kind="${esc(m.event_kind)}"${m.tool_name ? ` tool="${esc(m.tool_name)}"` : ''}` : '';
-    return `<e id="${esc(id)}" role="${m.role}"${kind} at="${(m.captured_at ?? '').slice(0, 16)}">${esc(m.quote)}</e>`;
+    return `<e id="${esc(id)}" role="${m.role}"${kind} at="${(m.captured_at ?? '').slice(0, 16)}">${esc(modelText(m.quote))}</e>`;
   }).join('\n')}\n</evidence_catalog>`);
-  parts.push(`<latest_user_message>\n${esc(input.latestUserMessage)}\n</latest_user_message>`);
+  parts.push(`<latest_user_message>\n${esc(modelText(input.latestUserMessage))}\n</latest_user_message>`);
   return parts.join('\n\n');
 }
 

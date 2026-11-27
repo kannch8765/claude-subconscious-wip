@@ -43,13 +43,27 @@ export class SnippetHandles {
   }
 }
 
+/**
+ * Text as the model sees it. Live-location tags carry coordinates, accuracy and
+ * heading the model cannot use, and in a short message they are most of the
+ * text, so searches drift to other memories that also hold such a tag. Keep only
+ * the reverse-geocoded place; drop the tag when there is none. The store keeps the original.
+ */
+export function modelText(text: string): string {
+  return text
+    .replace(/<telegram_live_location\b[^>]*?\bplace="([^"]*)"[^>]*\/?>/g, (_m, place: string) => `［位置：${place}］`)
+    .replace(/<telegram_live_location\b[^>]*\/?>/g, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim();
+}
+
 function day(value: string | undefined): string {
   return typeof value === 'string' ? value.slice(0, 10) : '';
 }
 
 function slimQuote(memoryId: string, snippet: RecallQuoteSnippet, handles: SnippetHandles): SlimQuote {
   const role = snippet.source_kind === 'legacy_memory' ? 'legacy' : snippet.role === 'user' ? 'u' : 'a';
-  return { n: handles.numberFor(memoryId, snippet.snippet_id), r: role, d: day(snippet.captured_at), q: snippet.quote };
+  return { n: handles.numberFor(memoryId, snippet.snippet_id), r: role, d: day(snippet.captured_at), q: modelText(snippet.quote) };
 }
 
 export function isKnown(memory: MemoryRecallResult, known: ReadonlySet<string>): boolean {
