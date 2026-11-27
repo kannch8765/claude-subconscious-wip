@@ -207,6 +207,25 @@ describe('sequential replay', () => {
     await expect(runSequentialReplay({ ...options, outDir: bare }, deps(model()))).rejects.toThrow(/not a seed/);
   });
 
+  it('writes listed intents to the store copy and drops resolved ones from the catalog', async () => {
+    const { options } = setup();
+    const intent = {
+      schema_version: 1, intent_id: 'intent_made_up', subject_id: 'local-user', session_id: 'conv-1', assistant_message_id: 'a1',
+      tool_use_id: 'tu1', tool_name: 'remember', memory: { text: '编出来的一件事' }, feel: { text: '开心' }, captured_at: '2026-10-10T00:00:00Z',
+    };
+    const lines = fs.readFileSync(options.batchesFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    fs.writeFileSync(options.batchesFile, lines.map((b) => JSON.stringify(b.batch_id === 't3' ? b : { ...b, assistant_intents: [intent] })).join('\n') + '\n');
+    await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
+    const intentsFile = path.join(options.outDir, 'checkpoint', 'store', 'assistant-intents.jsonl');
+    expect(fs.readFileSync(intentsFile, 'utf8')).toContain('intent_made_up');
+    expect(results(options.outDir)[0].input).toMatchObject({ intents_listed: 1, intents_open: 1 });
+    // Resolved in between (as a pass would record it): the next turn no longer offers it.
+    fs.appendFileSync(path.join(options.outDir, 'checkpoint', 'store', 'assistant-intent-outcomes.jsonl'), `${JSON.stringify({ intent_id: 'intent_made_up', batch_id: 't1', outcome: 'accepted', memory_id: 'mem_seed', recorded_at: '2026-10-10T00:00:01Z' })}\n`);
+    await runSequentialReplay({ ...options, limit: 2 }, deps(model()));
+    expect(results(options.outDir)[1].input).toMatchObject({ intents_listed: 1, intents_open: 0 });
+    expect(fs.readFileSync(intentsFile, 'utf8').split('\n').filter(Boolean)).toHaveLength(1);
+  });
+
   it('refuses to resume with a different batches file', async () => {
     const { options } = setup();
     await runSequentialReplay({ ...options, limit: 1 }, deps(model()));

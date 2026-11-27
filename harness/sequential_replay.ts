@@ -350,11 +350,16 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
             if (meters.rolling >= rollingCap || meters.weekly >= weeklyCap) throw new Paused(`usage rolling ${meters.rolling}% weekly ${meters.weekly}% (caps ${rollingCap}/${weeklyCap})`);
           }
           const store = new RelationshipMemoryStore(storeDir, 'local-user');
+          // Live, the capture hook writes an intent to the store when Kohaku calls remember; the archive only lists it.
+          // The archive's catalog also keeps the backlog of the agent that ran then: an intent the harness has already
+          // resolved leaves the catalog here, as it would live.
+          for (const intent of batch.assistant_intents) store.appendAssistantIntent(intent);
+          const intents = batch.assistant_intents.filter((intent: any) => !store.getTerminalAssistantIntentOutcome(intent.intent_id));
           const makeRuntime = (canonical: any[]) => new RelationshipMemoryRuntime(
             store,
             new Map(canonical.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: batch.letta_session }])),
             () => new Date().toISOString(),
-            new Map(batch.assistant_intents.map((intent: any) => [intent.intent_id, intent])),
+            new Map(intents.map((intent: any) => [intent.intent_id, intent])),
             true,
             b.retrieverFor(indexFile, storeDir),
           );
@@ -368,7 +373,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
             previousUserMessage: batch.sync_context?.prev_user ?? '',
             previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
           });
-          const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}) };
+          const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}), intents_listed: batch.assistant_intents.length, intents_open: intents.length };
           let record: Record<string, unknown>;
           if (turn.empty) {
             record = { batch_id: batch.batch_id, session: batch.letta_session, input, skip: 'input_empty', usage_before: meters };
@@ -396,7 +401,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
               sessionId: batch.letta_session,
               latestUserMessage: turn.latestUserMessage,
               canonicalMessages: turn.canonicalMessages!,
-              assistantIntents: batch.assistant_intents,
+              assistantIntents: intents,
               sessionKnownMemoryIds: known,
               recentSeen: [...seen].map(([memory_id, summary]) => ({ memory_id, summary })),
             }, { model: opts.model ?? 'deepseek-v4.1-flash', maxSteps: opts.maxSteps ?? 4, reasoningEffort: 'none' });
