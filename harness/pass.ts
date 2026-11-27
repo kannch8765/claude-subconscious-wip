@@ -63,7 +63,7 @@ export interface PassResult {
   completion: BatchCompletion;
   steps: StepTrace[];
   decisions: PassDecisions;
-  /** `message` goes back to the model and may hold its arguments; `code` and `exception` are fixed names. */
+  /** `message` goes back to the model and may hold its arguments. `code` is fixed; `exception` is the class of an unexpected error. */
   tool_errors: Array<{ name: string; code: ToolErrorCode; exception?: string; message: string }>;
   surfaced_memory_ids: string[];
 }

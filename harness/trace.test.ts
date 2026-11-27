@@ -9,7 +9,7 @@ import { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/inde
 import type { ChatTransport, TransportReply } from './llm.js';
 import { harnessTools, runAsyncPass, type PassInput } from './pass.js';
 import { runSyncPass, runSyncPassSettled, type SyncInput } from './sync_pass.js';
-import { asyncTrust, REJECTION_CODES, syncTrust, toAsyncTrace, toCrashTrace, toSyncTrace, TRACE_TOOL_NAMES } from './trace.js';
+import { asyncTrust, syncTrust, toAsyncTrace, toCrashTrace, toSyncTrace, TRACE_TOOL_NAMES } from './trace.js';
 
 /** Made up; it goes everywhere content can enter and must never come out in a trace. */
 const S = 'ZZ_SENTINEL_7f3';
@@ -172,7 +172,7 @@ describe('async trace', () => {
         calls: [
           { name: S, args: { [S]: S } },
           { name: 'memory_search', args: `{"queries": ["${S}"` },
-          { name: 'memory_search', args: { queries: [] , [S]: S } },
+          { name: 'memory_search', args: { queries: [], [S]: S } },
           { name: 'memory_remember', args: { kind: S, summary: S } },
           { name: 'deliver_whisper', args: { memory_id: S, quotes: [1] } },
         ],
@@ -288,7 +288,7 @@ describe('async trace', () => {
     expectClean(trace, result);
   });
 
-  it('an unknown rejection code from an older store record becomes other', () => {
+  it('values outside the allowlists become other, unknown or a count', () => {
     const trust = { batchId: 'b', sessionId: 's', memoryIds: new Set<string>(), evidenceIds: new Set<string>(), intentIds: new Set<string>() };
     const trace = toAsyncTrace({
       succeeded: false, completion: S as any, steps: [], tool_errors: [{ name: S, code: S as any, exception: S, message: S }], surfaced_memory_ids: [S],
@@ -374,7 +374,6 @@ describe('sync trace', () => {
 describe('trace allowlists', () => {
   it('know every harness tool and drop a timestamp that is not one', () => {
     expect([...TRACE_TOOL_NAMES].sort()).toEqual(harnessTools().map((tool) => tool.function.name).sort());
-    expect(REJECTION_CODES.length).toBe(new Set(REJECTION_CODES).size);
     const trace = toCrashTrace('sync', new Error(S), { batchId: 'b', sessionId: 's', at: S, wallMs: S as any, memoryIds: new Set() });
     expect(trace).toEqual({ schema_version: 1, lane: 'sync', batch_id: 'b', session_id: 's', crashed: true, error_class: 'exception', exception: 'Error' });
   });
