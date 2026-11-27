@@ -72,7 +72,7 @@ function sha256(value: string): string {
   return crypto.createHash('sha256').update(value).digest('hex');
 }
 
-const CONTENT_HASH_MEMO_LIMIT = 50_000;
+const CONTENT_HASH_MEMO_LIMIT = 10_000;
 const contentHashMemo = new Map<string, string>();
 registerReadCache(() => contentHashMemo.clear());
 
