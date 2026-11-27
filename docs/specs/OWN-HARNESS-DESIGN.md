@@ -282,9 +282,23 @@ Estimate: ~12k chars ≈ 5k tokens (×0.38).
 rest is `snippet_id` 24 %, `captured_at` 18 %, `evidence_id` 17 %,
 `source_kind` 12 %, `role` 7 %.
 
-Diet: short per-result snippet handles mapped back by the runtime, date only,
-one-letter role, no `evidence_id` / internal keys / evidence ID lists in the
-model view. Estimate: ~55 % of today's size.
+Diet (decided 2026-11-27): **content stays untouched** (summary, payload, every
+quote, known memories included in full; reinforce logic unchanged). Only
+fields the model never needs are dropped from the model view; the runtime keeps
+them. `memory_search` is 97 % of all tool-result chars, so the diet targets it.
+
+| Field | Share of a result | Model view |
+|---|---|---|
+| `source_key`, `dedupe_key` (internal hashes) | 3.0 % | drop |
+| `subject_id`, `schema_version`, `status` (one value each across 20,579 results) | 1.9 % | drop |
+| `reinforcement_evidence_ids` (up to 20 IDs) | 5.5 % | drop (runtime dedupes evidence) |
+| `created_at`, `latest_reinforcement_at`, empty `resolution_*` / `latest_revision_*` | ~2.4 % | drop (`observed_at` kept) |
+| `quote_snippets` metadata: `snippet_id`, `evidence_id`, `legacy_source_id`, full `captured_at`, `source_kind`, `role` | ~38 % | short per-result handle mapped back by the runtime, date only, one-letter role, legacy flag only when legacy |
+| `memory_id`, `kind`, `summary`, `participants`, `payload`, `linked_memory_ids`, quotes | rest | keep (`memory_id` stays full: the recently-seen list refers to it across passes) |
+
+Estimate: ~50 % of today's size, without touching content. Separately, the
+traces hold one tool call whose name is garbled by leaked model markup; the
+harness should reject unknown tool names cleanly.
 
 **Why 2.5 searches per pass** (mean; p50 2, p90 5):
 
@@ -298,10 +312,13 @@ model view. Estimate: ~55 % of today's size.
 
 Changes:
 
-- **One search, two views.** Return every hit once with a `known` flag
-  (delivered or written this session) instead of separate
-  `foreground_recall` / `maintenance` searches. The runtime still refuses a
-  whisper of a known memory. Removes the recall → maintenance repeat.
+- **One search, two views** (decided 2026-11-27). Return every hit once, in
+  full, with a `known` flag (delivered or written this session) instead of
+  separate `foreground_recall` / `maintenance` searches. Whisper and reinforce /
+  remember use the same results; the runtime still refuses a whisper of a known
+  memory. Removes the recall → maintenance repeat. Known memories are not
+  compressed: 43 % of reinforces (122 of 284) target a memory already known
+  this session, median 2 passes after it became known.
 - Rephrasings go out in parallel in one step instead of one per step.
 - The async pass starts from the sync lane's results (§4.3).
 - Soft cap on searches per pass, to stop the 6+ loops.
