@@ -6,7 +6,8 @@
  * PRNG, random vectors, generated text; nothing is copied from a real store),
  * then times hybrid recall with a fake query embedder, so there is no network.
  * Every scenario runs in its own child process, so "cold" is a fresh process.
- * Memory columns are taken after a forced GC, so they show what stays resident.
+ * max_rss_mb is the process peak; rss_mb and heap_used_mb are taken after a
+ * forced GC, so heap_used_mb shows what the cache keeps resident.
  *
  *   npx tsx scripts/bench_recall_read_cache.ts [--dir <path>] [--runs 15]
  *
@@ -269,7 +270,7 @@ async function runChild(scenario: Scenario, dir: string, runs: number): Promise<
     const memory = process.memoryUsage();
     process.stdout.write(`${JSON.stringify({
       scenario, cold_ms: cold, warm_p50_ms: median(warm), warm_p95_ms: percentile(warm, 0.95),
-      rss_mb: memory.rss / 1048576, heap_used_mb: memory.heapUsed / 1048576, external_mb: memory.external / 1048576,
+      max_rss_mb: process.resourceUsage().maxRSS / 1024, rss_mb: memory.rss / 1048576, heap_used_mb: memory.heapUsed / 1048576,
     })}\n`);
   } finally {
     if (workDir) fs.rmSync(workDir, { recursive: true, force: true });
@@ -292,14 +293,14 @@ async function main(): Promise<void> {
     .reduce((sum, name) => sum + fs.statSync(path.join(datasetPaths(dir).storeDir, name)).size, 0);
   console.log(`dataset ${dir}: store ${(sizes / 1048576).toFixed(1)} MB, index ${(fs.statSync(datasetPaths(dir).indexFile).size / 1048576).toFixed(1)} MB`);
   console.log(`read cache: ${process.env.RELATIONSHIP_MEMORY_READ_CACHE ?? '(default)'}; runs per scenario: ${runs}`);
-  console.log('scenario  cold_ms  warm_p50_ms  warm_p95_ms  rss_mb  heap_used_mb  external_mb');
+  console.log('scenario  cold_ms  warm_p50_ms  warm_p95_ms  max_rss_mb  rss_mb  heap_used_mb');
   const self = fileURLToPath(import.meta.url);
   for (const scenario of SCENARIOS) {
     const result = spawnSync(process.execPath, [...process.execArgv, '--expose-gc', self, '--child', scenario, '--dir', dir, '--runs', String(runs)], { encoding: 'utf8', env: process.env });
     if (result.status !== 0) throw new Error(`scenario ${scenario} failed: ${result.stderr}`);
     const row = JSON.parse(result.stdout.trim().split('\n').at(-1)!) as Record<string, number | string>;
     const fmt = (key: string) => (row[key] as number).toFixed(1).padStart(key.length);
-    console.log(`${String(row.scenario).padEnd(8)}  ${fmt('cold_ms')}  ${fmt('warm_p50_ms')}  ${fmt('warm_p95_ms')}  ${fmt('rss_mb')}  ${fmt('heap_used_mb')}  ${fmt('external_mb')}`);
+    console.log(`${String(row.scenario).padEnd(8)}  ${fmt('cold_ms')}  ${fmt('warm_p50_ms')}  ${fmt('warm_p95_ms')}  ${fmt('max_rss_mb')}  ${fmt('rss_mb')}  ${fmt('heap_used_mb')}`);
   }
 }
 
