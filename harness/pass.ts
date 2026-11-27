@@ -63,7 +63,8 @@ export interface PassResult {
   completion: BatchCompletion;
   steps: StepTrace[];
   decisions: PassDecisions;
-  tool_errors: Array<{ name: string; message: string }>;
+  /** `message` goes back to the model and may hold its arguments; `code` and `exception` are fixed names. */
+  tool_errors: Array<{ name: string; code: ToolErrorCode; exception?: string; message: string }>;
   surfaced_memory_ids: string[];
 }
 
@@ -178,6 +179,14 @@ export function buildUserMessage(input: PassInput, linkedMemoryFor: (intentId: s
   return parts.join('\n\n');
 }
 
+export const TOOL_ERROR_CODES = ['unknown_tool', 'invalid_arguments', 'invalid_queries', 'not_surfaced', 'known_memory', 'invalid_quotes', 'invalid_kind', 'unseen_memory', 'exception'] as const;
+export type ToolErrorCode = (typeof TOOL_ERROR_CODES)[number];
+
+/** A tool call the harness refuses, with a fixed code next to the message for the model. */
+class ToolCallError extends Error {
+  constructor(readonly code: ToolErrorCode, message: string) { super(message); }
+}
+
 const DECISION_TOOLS = new Set(['deliver_whisper', 'skip_whisper', 'memory_reinforce', 'memory_remember', 'suggest_memory_relation', 'entity_remember']);
 
 function parseArgs(raw: string): Record<string, any> | undefined {
@@ -220,7 +229,7 @@ export async function runAsyncPass(
       case 'memory_search': {
         const queries: string[] = (Array.isArray(args.queries) ? args.queries : [args.query])
           .filter((q: unknown): q is string => typeof q === 'string' && q.trim().length > 0).slice(0, config.maxSearchQueries ?? 3);
-        if (!queries.length) throw new Error('memory_search needs 1-3 non-empty queries');
+        if (!queries.length) throw new ToolCallError('invalid_queries', 'memory_search needs 1-3 non-empty queries');
         const lists = await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence({ query, kind: args.kind, limit: args.limit ?? 8 } as any)));
         // Counted only once the search has run.
         decisions.searches++;
@@ -241,11 +250,11 @@ export async function runAsyncPass(
         if (decisions.whisper) return { status: 'already_resolved', reason: 'deliver_whisper runs at most once per pass.' };
         const memoryId = String(args.memory_id ?? '').trim();
         const numbers: number[] = Array.isArray(args.quotes) ? args.quotes.map(Number) : [];
-        if (!surfaced.has(memoryId)) throw new Error('deliver_whisper may select only a memory returned by memory_search in this pass.');
-        if (known.has(memoryId)) throw new Error('This memory is under known_do_not_whisper; pick one from eligible, or call skip_whisper.');
+        if (!surfaced.has(memoryId)) throw new ToolCallError('not_surfaced', 'deliver_whisper may select only a memory returned by memory_search in this pass.');
+        if (known.has(memoryId)) throw new ToolCallError('known_memory', 'This memory is under known_do_not_whisper; pick one from eligible, or call skip_whisper.');
         const resolved = numbers.map((n) => handles.resolve(memoryId, n));
         if (!numbers.length || numbers.length > 3 || resolved.some((r) => !r)) {
-          throw new Error(`quotes must be 1-3 quote numbers (n) listed under this memory (asked ${JSON.stringify(args.quotes)}; this memory has ${handles.count(memoryId)} quotes).`);
+          throw new ToolCallError('invalid_quotes', `quotes must be 1-3 quote numbers (n) listed under this memory (asked ${JSON.stringify(args.quotes)}; this memory has ${handles.count(memoryId)} quotes).`);
         }
         decisions.whisper = { memory_id: memoryId, snippet_ids: resolved as string[] };
         known.add(memoryId);
@@ -261,7 +270,7 @@ export async function runAsyncPass(
       }
       case 'memory_remember': {
         const { kind, ...rest } = args;
-        if (!MEMORY_KINDS.includes(kind)) throw new Error(`kind must be one of ${MEMORY_KINDS.join(', ')}`);
+        if (!MEMORY_KINDS.includes(kind)) throw new ToolCallError('invalid_kind', `kind must be one of ${MEMORY_KINDS.join(', ')}`);
         const result = runtime.store.withMutationBoundary(() => runtime.rememberKind(input.batchId, kind as MemoryKind, rest));
         decisions.remember.push({ kind, outcome: result.outcome, memory_id: result.memory_id, rejection_code: (result as any).rejection_code, ...(args.assistant_intent_id ? { assistant_intent_id: args.assistant_intent_id } : {}) });
         if (result.outcome === 'accepted' && result.memory_id) known.add(result.memory_id);
@@ -270,7 +279,7 @@ export async function runAsyncPass(
       case 'suggest_memory_relation': {
         const ids: string[] = Array.isArray(args.memory_ids) ? args.memory_ids.map(String) : [];
         const unseen = ids.filter((id) => !surfaced.has(id) && !recent.has(id));
-        if (unseen.length) throw new Error(`suggest_memory_relation may use only memories seen this pass or recently: ${unseen.join(', ')}`);
+        if (unseen.length) throw new ToolCallError('unseen_memory', `suggest_memory_relation may use only memories seen this pass or recently: ${unseen.join(', ')}`);
         const result = runtime.store.withMutationBoundary(() => runtime.suggestMaintenanceReview(input.batchId, 'relation', args as any));
         decisions.relations.push({ outcome: result.outcome });
         return result;
@@ -282,7 +291,7 @@ export async function runAsyncPass(
         return runtime.store.withMutationBoundary(() => runtime.rememberEntity(input.batchId, { schema_version: 1, ...args }));
       }
       default:
-        throw new Error(`unknown tool: ${name}`);
+        throw new ToolCallError('unknown_tool', `unknown tool: ${name}`);
     }
   };
 
@@ -321,12 +330,14 @@ export async function runAsyncPass(
       const name = call.function?.name ?? '';
       const args = parseArgs(call.function?.arguments ?? '');
       try {
-        if (!toolNames.has(name)) throw new Error(`unknown tool: ${name.slice(0, 60)}`);
-        if (!args) throw new Error('arguments must be a JSON object');
+        if (!toolNames.has(name)) throw new ToolCallError('unknown_tool', `unknown tool: ${name.slice(0, 60)}`);
+        if (!args) throw new ToolCallError('invalid_arguments', 'arguments must be a JSON object');
         return JSON.stringify(await execute(name, args));
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error);
-        toolErrors.push({ name: toolNames.has(name) ? name : 'unknown', message: text.slice(0, 200) });
+        const code = error instanceof ToolCallError ? error.code : 'exception';
+        const exception = code === 'exception' ? (error instanceof Error ? error.constructor?.name : typeof error) : undefined;
+        toolErrors.push({ name: toolNames.has(name) ? name : 'unknown', code, ...(exception ? { exception } : {}), message: text.slice(0, 200) });
         return JSON.stringify({ error: text });
       }
     }));
