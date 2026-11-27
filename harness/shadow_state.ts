@@ -2,7 +2,7 @@
  * Shadow state (docs/specs/OWN-HARNESS-DESIGN.md §6.1): everything the shadow lanes keep, under one directory
  * that Letta, the live hooks and Kohaku never read.
  *
- *   snapshots/<gen>/store/          copy of the live store; shadow writes land here and die with the snapshot
+ *   snapshots/<gen>/store/          copy of the live store's data files; shadow writes land here and die with it
  *   snapshots/<gen>/semantic-index/ copy of the live index (hard link when unchanged); never rebuilt
  *   snapshots/CURRENT               name of the snapshot new passes use
  *   locks/<lane>.lock               at most one worker per lane
@@ -56,9 +56,18 @@ export async function withLaneLock<T>(paths: ShadowPaths, lane: string, fn: () =
 export interface Snapshot { gen: string; storeDir: string; indexFile: string }
 export interface RefreshResult extends Snapshot { copy_ms: number; live_changed_during_copy: boolean; index: 'copied' | 'linked' | 'missing' }
 
+/** The store's data files. Dot entries are derived caches or locks (`.write-index-v1` holds ~45k marker files and is
+ * rebuilt on demand; `.canonical-mutation.lock` would make the snapshot look locked), so they are not copied. */
+export function storeDataFiles(dir: string): string[] {
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && !entry.name.startsWith('.') && /\.jsonl?$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort();
+}
+
 function signature(dir: string): string {
-  if (!fs.existsSync(dir)) return '';
-  return fs.readdirSync(dir).sort().map((name) => { const s = fs.statSync(path.join(dir, name)); return `${name}:${s.size}:${s.mtimeMs}`; }).join('|');
+  return storeDataFiles(dir).map((name) => { const s = fs.statSync(path.join(dir, name)); return `${name}:${s.size}:${s.mtimeMs}`; }).join('|');
 }
 
 function fileSignature(file: string): string {
@@ -88,7 +97,8 @@ export function refreshSnapshot(paths: ShadowPaths, keepMs = 15 * 60_000): Refre
   const gen = `${new Date().toISOString().replace(/[-:.]/g, '')}-${crypto.randomBytes(3).toString('hex')}`;
   const dir = path.join(snapshots, gen);
   const before = signature(paths.liveStore);
-  fs.cpSync(paths.liveStore, path.join(dir, 'store'), { recursive: true });
+  const storeDir = ensureDir(path.join(dir, 'store'));
+  for (const name of storeDataFiles(paths.liveStore)) fs.copyFileSync(path.join(paths.liveStore, name), path.join(storeDir, name));
   const liveChanged = signature(paths.liveStore) !== before;
 
   const indexDir = ensureDir(path.join(dir, 'semantic-index'));

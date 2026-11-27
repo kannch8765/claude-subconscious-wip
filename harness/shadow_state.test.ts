@@ -12,6 +12,10 @@ function setup() {
   const live = path.join(root, 'store');
   fs.mkdirSync(live);
   fs.writeFileSync(path.join(live, 'memories.jsonl'), '{"memory_id":"m1"}\n');
+  fs.writeFileSync(path.join(live, 'legacy-semantic-migration-state.json'), '{}\n');
+  fs.mkdirSync(path.join(live, '.write-index-v1', 'memories'), { recursive: true });
+  fs.writeFileSync(path.join(live, '.write-index-v1', 'memories', 'manifest.json'), '{}');
+  fs.mkdirSync(path.join(live, '.canonical-mutation.lock'));
   fs.mkdirSync(`${live}-semantic-index`);
   fs.writeFileSync(path.join(`${live}-semantic-index`, 'index.json'), '{"documents":{}}\n');
   return { live, paths: shadowPaths(live, {}) };
@@ -24,6 +28,7 @@ describe('snapshots', () => {
     expect(currentSnapshot(paths)).toBeUndefined();
     const first = refreshSnapshot(paths);
     expect(first.index).toBe('copied');
+    expect(fs.readdirSync(first.storeDir).sort()).toEqual(['legacy-semantic-migration-state.json', 'memories.jsonl']);
     fs.appendFileSync(path.join(first.storeDir, 'memories.jsonl'), '{"memory_id":"shadow"}\n');
     expect(fs.readFileSync(path.join(live, 'memories.jsonl'), 'utf8')).not.toContain('shadow');
 
