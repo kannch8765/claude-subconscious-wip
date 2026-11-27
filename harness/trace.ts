@@ -44,14 +44,18 @@ type Other<T extends readonly string[]> = T[number] | 'other';
 export type TraceToolName = (typeof TRACE_TOOL_NAMES)[number] | 'unknown';
 export type ExceptionName = Other<typeof EXCEPTION_NAMES>;
 
-/** What the hook knows without the model: its own ids, its clock, and the sources an id must resolve through. */
-export interface SyncTrust {
+/** The hook's own facts about a pass: its ids and its clock. It reads no store, so it can be built before the pass. */
+export interface TraceHeader {
   batchId: string;
   sessionId: string;
   /** When the hook started the pass. */
   at?: string;
   /** Wall time the hook measured around the pass. */
   wallMs?: number;
+}
+
+/** The sources an id must resolve through, next to the header. */
+export interface SyncTrust extends TraceHeader {
   /** Memory ids in the store after the pass. */
   memoryIds: ReadonlySet<string>;
 }
@@ -66,9 +70,14 @@ export interface AsyncTrust extends SyncTrust {
 export interface TraceContext { at?: string; wallMs?: number }
 type MemoryList = { listMemories(): Array<Pick<CanonicalMemoryRecord, 'memory_id'>> };
 
+/** The ids come from the hook's input only; the context adds its clock and nothing else. */
+export function traceHeader(input: Pick<SyncInput, 'batchId' | 'sessionId'>, context: TraceContext = {}): TraceHeader {
+  return { batchId: input.batchId, sessionId: input.sessionId, at: context.at, wallMs: context.wallMs };
+}
+
 /** Build it after the pass, so the memories the pass created resolve. */
 export function syncTrust(store: MemoryList, input: Pick<SyncInput, 'batchId' | 'sessionId'>, context: TraceContext = {}): SyncTrust {
-  return { batchId: input.batchId, sessionId: input.sessionId, ...context, memoryIds: new Set(store.listMemories().map((m) => m.memory_id)) };
+  return { ...traceHeader(input, context), memoryIds: new Set(store.listMemories().map((m) => m.memory_id)) };
 }
 
 /** Build it after the pass, so the memories the pass created resolve. */
@@ -127,7 +136,8 @@ export interface AsyncPassTrace extends TraceHead {
   completion: Other<typeof COMPLETIONS>;
   succeeded: boolean;
   steps: AsyncStepTrace[];
-  whisper: 'delivered' | 'skipped' | 'none';
+  /** What the pass selected. Delivery is a receipt from the hook or the queue, not part of a pass trace. */
+  whisper: 'selected' | 'skipped' | 'none';
   whisper_memory_id?: string;
   whisper_quotes?: number;
   reinforce: ReinforceTrace[];
@@ -156,7 +166,8 @@ export interface SyncPassTrace extends TraceHead {
   gate_status?: Other<typeof GATE_STATUSES>;
   usage: TokenUsage;
   candidates: number;
-  whispered: boolean;
+  /** The pass selected a whisper; delivery is a receipt from the hook, not part of a pass trace. */
+  whisper_selected: boolean;
   whisper_memory_id?: string;
   whisper_quotes?: number;
   skip_reason?: Other<typeof SKIP_REASONS>;
@@ -206,15 +217,20 @@ function usage(value: unknown): TokenUsage {
   return compact({ prompt_tokens: num(u.prompt_tokens), cached_tokens: num(u.cached_tokens), completion_tokens: num(u.completion_tokens), reasoning_tokens: num(u.reasoning_tokens) });
 }
 
-function head(trust: SyncTrust): Pick<TraceHead, 'schema_version' | 'batch_id' | 'session_id' | 'at' | 'wall_ms'> {
+function head(trust: TraceHeader): Pick<TraceHead, 'schema_version' | 'batch_id' | 'session_id' | 'at' | 'wall_ms'> {
   const at = typeof trust.at === 'string' && Number.isFinite(Date.parse(trust.at)) ? new Date(trust.at).toISOString() : undefined;
   return compact({ schema_version: TRACE_SCHEMA_VERSION, batch_id: trust.batchId, session_id: trust.sessionId, at, wall_ms: num(trust.wallMs) });
 }
 
-/** Resolves ids against trusted sets; whatever does not resolve is only counted. */
+/**
+ * Resolves ids against trusted sets; whatever does not resolve is only counted. Ids are trimmed first, as the
+ * runtime does before it resolves them (reinforce and rawAssistantIntentId in relationship-memory/src/tools), so the
+ * trace keeps exactly the trusted key the runtime used.
+ */
 class Resolver {
   unresolved = 0;
-  one(set: ReadonlySet<string>, value: unknown): string | undefined {
+  one(set: ReadonlySet<string>, raw: unknown): string | undefined {
+    const value = typeof raw === 'string' ? raw.trim() : raw;
     if (value === undefined || value === null || value === '') return undefined;
     if (typeof value === 'string' && set.has(value)) return value;
     this.unresolved++;
@@ -227,7 +243,11 @@ class Resolver {
 }
 
 function exceptionName(error: unknown): ExceptionName {
-  return error instanceof Error ? oneOf(EXCEPTION_NAMES, error.constructor?.name) : 'other';
+  try {
+    return error instanceof Error ? oneOf(EXCEPTION_NAMES, error.constructor?.name) : 'other';
+  } catch {
+    return 'other';
+  }
 }
 
 // ---- projections
@@ -291,7 +311,7 @@ export function toAsyncTrace(result: PassResult, trust: AsyncTrust): AsyncPassTr
     completion: oneOf(COMPLETIONS, result.completion),
     succeeded: result.succeeded === true,
     steps,
-    whisper: decisions.whisper ? 'delivered' as const : decisions.whisper_skipped === true ? 'skipped' as const : 'none' as const,
+    whisper: decisions.whisper ? 'selected' as const : decisions.whisper_skipped === true ? 'skipped' as const : 'none' as const,
     whisper_memory_id: whisperMemoryId,
     whisper_quotes: decisions.whisper ? list(decisions.whisper.snippet_ids).length : undefined,
     reinforce,
@@ -327,7 +347,7 @@ export function toSyncTrace(result: SyncResult, trust: SyncTrust): SyncPassTrace
     gate_status: optionalOneOf(GATE_STATUSES, result.gate_status),
     usage: usage(result.usage),
     candidates: list(result.candidates).length,
-    whispered: Boolean(result.whisper),
+    whisper_selected: Boolean(result.whisper),
     whisper_memory_id: whisperMemoryId,
     whisper_quotes: result.whisper ? list(result.whisper.snippet_ids).length : undefined,
     skip_reason: optionalOneOf(SKIP_REASONS, result.skip_reason),
@@ -336,8 +356,11 @@ export function toSyncTrace(result: SyncResult, trust: SyncTrust): SyncPassTrace
   });
 }
 
-/** For a pass that threw: the class name, if allowlisted, and nothing of the message. */
-export function toCrashTrace(lane: 'async' | 'sync', error: unknown, trust: SyncTrust): CrashTrace {
-  return { ...head(trust), lane, crashed: true, error_class: 'exception', exception: exceptionName(error) };
+/**
+ * For a pass that threw: the class name, if allowlisted, and nothing of the message. It takes the header only, so a
+ * crash the store caused (an unreadable line, say) still gets its record.
+ */
+export function toCrashTrace(lane: 'async' | 'sync', error: unknown, header: TraceHeader): CrashTrace {
+  return { ...head(header), lane, crashed: true, error_class: 'exception', exception: exceptionName(error) };
 }
 

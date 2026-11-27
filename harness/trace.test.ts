@@ -9,7 +9,7 @@ import { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/inde
 import type { ChatTransport, TransportReply } from './llm.js';
 import { harnessTools, runAsyncPass, type PassInput } from './pass.js';
 import { runSyncPass, runSyncPassSettled, type SyncInput } from './sync_pass.js';
-import { asyncTrust, syncTrust, toAsyncTrace, toCrashTrace, toSyncTrace, TRACE_TOOL_NAMES } from './trace.js';
+import { asyncTrust, syncTrust, toAsyncTrace, toCrashTrace, toSyncTrace, traceHeader, TRACE_TOOL_NAMES } from './trace.js';
 
 /** Made up; it goes everywhere content can enter and must never come out in a trace. */
 const S = 'ZZ_SENTINEL_7f3';
@@ -155,7 +155,7 @@ describe('async trace', () => {
     const created = result.decisions.remember[0].memory_id!;
     expect(trace).toMatchObject({
       schema_version: 1, lane: 'async', crashed: false, batch_id: 'batch-1', session_id: 'conv-1', at: NOW, wall_ms: 12,
-      completion: 'completed', succeeded: true, whisper: 'delivered', whisper_memory_id: seedId, whisper_quotes: 1,
+      completion: 'completed', succeeded: true, whisper: 'selected', whisper_memory_id: seedId, whisper_quotes: 1,
       reinforce: [{ outcome: 'accepted', memory_id: seedId, evidence_ids: ['ev-1'], assistant_intent_id: 'intent-1', unresolved_ids: 0 }],
       remember: [{ kind: 'shared_experience', outcome: 'accepted', memory_id: created, unresolved_ids: 0 }],
       intents: { catalog: 1, resolved: 1 }, entities: 1, searches: 1, search_queries: 2, surfaced: 1, tool_errors: [], unresolved_ids: 0,
@@ -246,11 +246,14 @@ describe('async trace', () => {
   });
 
   it('a pass that throws: a crash trace with the class name only', async () => {
-    const { store, input, runtime } = await setup();
-    for (const [error, name] of [[new SentinelError(S), 'other'], [new TypeError(S), 'TypeError'], [S, 'other']] as const) {
+    const { input, runtime } = await setup();
+    // An error class whose constructor cannot even be read still gets a record.
+    const hostile = new Error(S);
+    Object.defineProperty(hostile, 'constructor', { get() { throw new Error(S); } });
+    for (const [error, name] of [[new SentinelError(S), 'other'], [new TypeError(S), 'TypeError'], [S, 'other'], [hostile, 'other']] as const) {
       const thrown = await runAsyncPass(runtime, scripted([{ throws: error }]), input, { model: 'm', maxSteps: 4 }).then(() => undefined, (e: unknown) => e);
       expect(thrown).toBe(error);
-      const trace = toCrashTrace('async', thrown, asyncTrust(store, input, { wallMs: 3 }));
+      const trace = toCrashTrace('async', thrown, traceHeader(input, { wallMs: 3 }));
       expect(trace).toEqual({ schema_version: 1, lane: 'async', batch_id: 'batch-1', session_id: 'conv-1', wall_ms: 3, crashed: true, error_class: 'exception', exception: name });
       expectClean(trace);
     }
@@ -288,6 +291,50 @@ describe('async trace', () => {
     expectClean(trace, result);
   });
 
+  it('a whisper selected before a failed step is a selection, not a delivery', async () => {
+    const { store, runtime, input, seedId } = await setup();
+    const result = await withoutBackoff(() => runAsyncPass(runtime, scripted([
+      { calls: [search] },
+      { calls: [{ name: 'deliver_whisper', args: { memory_id: seedId, quotes: [1] } }, search] },
+      { status: 429 },
+    ]), input, { model: 'm', maxSteps: 4 }));
+    const trace = toAsyncTrace(result, asyncTrust(store, input));
+    expect(trace).toMatchObject({ completion: 'retryable_failure', succeeded: false, whisper: 'selected', whisper_memory_id: seedId });
+    expectClean(trace, result);
+  });
+
+  it('ids padded with whitespace resolve as the runtime resolves them', async () => {
+    const { store, runtime, input, seedId } = await setup();
+    const result = await runAsyncPass(runtime, scripted([
+      { calls: [search] },
+      { calls: [
+        { name: 'memory_reinforce', args: { memory_id: ` ${seedId} `, evidence_ids: [' ev-1 '], assistant_intent_id: ' intent-1 ' } },
+        { name: 'skip_whisper', args: {} },
+      ] },
+    ]), input, { model: 'm', maxSteps: 4 });
+    expect(store.getTerminalAssistantIntentOutcome('intent-1')?.memory_id).toBe(seedId);
+    const trace = toAsyncTrace(result, asyncTrust(store, input));
+    expect(trace.reinforce).toEqual([{ outcome: 'accepted', memory_id: seedId, evidence_ids: ['ev-1'], assistant_intent_id: 'intent-1', unresolved_ids: 0 }]);
+    expect(trace).toMatchObject({ intents: { catalog: 1, resolved: 1 }, unresolved_ids: 0 });
+    expectClean(trace);
+  });
+
+  it('the header takes ids from the hook input only, never from the context', async () => {
+    const { store, input, syncInput } = await setup();
+    // Structurally a valid context: extra properties pass the type check when they come in a variable.
+    const context = { at: NOW, wallMs: 5, batchId: S, sessionId: S };
+    expect(traceHeader(input, context)).toEqual({ batchId: 'batch-1', sessionId: 'conv-1', at: NOW, wallMs: 5 });
+    const traces = [
+      toCrashTrace('async', new Error(S), asyncTrust(store, input, context)),
+      toCrashTrace('sync', new Error(S), syncTrust(store, syncInput, context)),
+      toCrashTrace('sync', new Error(S), traceHeader(syncInput, context)),
+    ];
+    for (const trace of traces) {
+      expect(trace).toMatchObject({ batch_id: 'batch-1', session_id: 'conv-1', at: NOW, wall_ms: 5 });
+      expectClean(trace);
+    }
+  });
+
   it('values outside the allowlists become other, unknown or a count', () => {
     const trust = { batchId: 'b', sessionId: 's', memoryIds: new Set<string>(), evidenceIds: new Set<string>(), intentIds: new Set<string>() };
     const trace = toAsyncTrace({
@@ -305,7 +352,7 @@ describe('async trace', () => {
 });
 
 describe('sync trace', () => {
-  it('normal pass: keeps the whispered memory id, counts the phrases', async () => {
+  it('normal pass: keeps the selected memory id, counts the phrases', async () => {
     const { store, runtime, syncInput, seedId } = await setup();
     const result = await runSyncPass(runtime, syncModel(
       { content: JSON.stringify({ queries: [S, '测试笑话'] }) },
@@ -314,7 +361,7 @@ describe('sync trace', () => {
     const trace = toSyncTrace(result, syncTrust(store, syncInput, { at: NOW }));
     expect(trace).toMatchObject({
       schema_version: 1, lane: 'sync', crashed: false, batch_id: 'batch-1', session_id: 'conv-1', at: NOW,
-      phrase_status: 'ok', phrases: 2, gate_status: 'ok', whispered: true, whisper_memory_id: seedId, whisper_quotes: 1, candidates: 1,
+      phrase_status: 'ok', phrases: 2, gate_status: 'ok', whisper_selected: true, whisper_memory_id: seedId, whisper_quotes: 1, candidates: 1,
       usage: { prompt_tokens: 20, completion_tokens: 2 }, unresolved_ids: 0,
     });
     expect(trace.skip_reason).toBeUndefined();
@@ -329,7 +376,7 @@ describe('sync trace', () => {
       { content: JSON.stringify({ memory_id: S }), usage },
     ), syncInput, { model: 'm' });
     const trace = toSyncTrace(result, syncTrust(store, syncInput));
-    expect(trace).toMatchObject({ phrase_status: 'ok', phrases: 1, gate_status: 'ok', whispered: false, skip_reason: 'gate_none', usage: {} });
+    expect(trace).toMatchObject({ phrase_status: 'ok', phrases: 1, gate_status: 'ok', whisper_selected: false, skip_reason: 'gate_none', usage: {} });
     expectClean(trace, result);
 
     const broken = await runSyncPass(runtime, syncModel({ content: S }, { content: S }), syncInput, { model: 'm' });
@@ -352,21 +399,36 @@ describe('sync trace', () => {
     const { result, settled } = await runSyncPassSettled(runtime, syncModel(late, late), syncInput, { model: 'm', phraseTimeoutMs: 20 });
     expect(await settled()).toBeUndefined();
     const trace = toSyncTrace(result, syncTrust(store, syncInput));
-    expect(trace).toMatchObject({ phrase_status: 'timeout', phrases: 0, gate_status: 'timeout', skip_reason: 'gate_failed', whispered: false, usage: {} });
+    expect(trace).toMatchObject({ phrase_status: 'timeout', phrases: 0, gate_status: 'timeout', skip_reason: 'gate_failed', whisper_selected: false, usage: {} });
     expect(trace.gate_ms).toBeGreaterThanOrEqual(15);
     expectClean(trace);
   });
 
   it('a pass that throws: a crash trace with the class name only', async () => {
-    const { store, runtime, syncInput } = await setup();
+    const { runtime, syncInput } = await setup();
+    const header = traceHeader(syncInput);
     const thrown = await runSyncPass(runtime, syncModel({ throws: new SentinelError(S) }, {}), syncInput, { model: 'm' }).then(() => undefined, (e: unknown) => e);
     expect(thrown).toBeInstanceOf(SentinelError);
-    expectClean(toCrashTrace('sync', thrown, syncTrust(store, syncInput)));
+    expectClean(toCrashTrace('sync', thrown, header));
 
     vi.spyOn(runtime, 'memorySearchRecallHybridWithEvidence').mockRejectedValue(new RangeError(S));
     const thrownBySearch = await runSyncPass(runtime, syncModel({ content: S }, {}), syncInput, { model: 'm' }).then(() => undefined, (e: unknown) => e);
-    const trace = toCrashTrace('sync', thrownBySearch, syncTrust(store, syncInput));
+    const trace = toCrashTrace('sync', thrownBySearch, header);
     expect(trace).toMatchObject({ lane: 'sync', crashed: true, error_class: 'exception', exception: 'RangeError' });
+    expectClean(trace);
+  });
+
+  it('a crash the store caused still gets its record: the header reads no store', async () => {
+    const { store, runtime, syncInput } = await setup();
+    const header = traceHeader(syncInput, { at: NOW });
+    fs.appendFileSync(path.join(store.rootDir, 'memories.jsonl'), `{"memory_id": "${S}", ${S}\n`);
+    const thrown = await runSyncPass(runtime, syncModel({ content: JSON.stringify({ queries: [S] }) }, {}), syncInput, { model: 'm' }).then(() => undefined, (e: unknown) => e);
+    expect(thrown).toBeInstanceOf(Error);
+    // Building the store-backed trust now would throw a second time; the crash record does not need it.
+    expect(() => syncTrust(store, syncInput)).toThrow();
+    const trace = toCrashTrace('sync', thrown, header);
+    expect(trace).toEqual({ schema_version: 1, lane: 'sync', batch_id: 'batch-1', session_id: 'conv-1', at: NOW, crashed: true, error_class: 'exception', exception: (thrown as Error).constructor.name });
+    expect(['SyntaxError', 'Error']).toContain(trace.exception);
     expectClean(trace);
   });
 });
@@ -374,7 +436,7 @@ describe('sync trace', () => {
 describe('trace allowlists', () => {
   it('know every harness tool and drop a timestamp that is not one', () => {
     expect([...TRACE_TOOL_NAMES].sort()).toEqual(harnessTools().map((tool) => tool.function.name).sort());
-    const trace = toCrashTrace('sync', new Error(S), { batchId: 'b', sessionId: 's', at: S, wallMs: S as any, memoryIds: new Set() });
+    const trace = toCrashTrace('sync', new Error(S), { batchId: 'b', sessionId: 's', at: S, wallMs: S as any });
     expect(trace).toEqual({ schema_version: 1, lane: 'sync', batch_id: 'b', session_id: 's', crashed: true, error_class: 'exception', exception: 'Error' });
   });
 });
