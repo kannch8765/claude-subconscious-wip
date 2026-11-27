@@ -100,7 +100,11 @@ function remembersDescription(): string {
 
 const stringList = { type: 'array', minItems: 1, uniqueItems: true, items: { type: 'string', minLength: 1 } };
 
-export function harnessTools(): ChatTool[] {
+// The intent field exists only when the batch has intents: offered without them, models fill it with evidence ids.
+const intentField = { type: 'string', minLength: 1, description: 'Only an intent id from <remember_intents>, never an evidence_id.' };
+
+export function harnessTools(withIntents = true): ChatTool[] {
+  const intent = withIntents ? { assistant_intent_id: intentField } : {};
   const fn = (name: string, description: string, parameters: Record<string, unknown>): ChatTool => ({ type: 'function', function: { name, description, parameters } });
   return [
     fn('memory_search', 'Search canonical relationship memories. Each hit appears once, under eligible (may be whispered) or known_do_not_whisper (Kohaku already has it this session; still fine for upkeep). Quotes: n = number for deliver_whisper, r = u/a/legacy, d = date.', {
@@ -118,7 +122,7 @@ export function harnessTools(): ChatTool[] {
     fn('skip_whisper', 'Record that no memory is worth surfacing this pass.', { type: 'object', additionalProperties: false, properties: {} }),
     fn('memory_reinforce', 'Add evidence from this batch to an existing memory that holds the same moment or fact.', {
       type: 'object', additionalProperties: false, required: ['memory_id', 'evidence_ids'],
-      properties: { memory_id: { type: 'string', minLength: 1 }, evidence_ids: stringList, assistant_intent_id: { type: 'string', minLength: 1 } },
+      properties: { memory_id: { type: 'string', minLength: 1 }, evidence_ids: stringList, ...intent },
     }),
     fn('memory_remember', remembersDescription(), {
       type: 'object', additionalProperties: false, required: ['kind', 'summary', 'participants', 'evidence_ids', 'payload'],
@@ -129,7 +133,7 @@ export function harnessTools(): ChatTool[] {
         evidence_ids: stringList,
         payload: { type: 'object' },
         linked_memory_ids: { type: 'array', uniqueItems: true, items: { type: 'string', minLength: 1 } },
-        assistant_intent_id: { type: 'string', minLength: 1 },
+        ...intent,
       },
     }),
     fn('suggest_memory_relation', 'Propose a relation between 2-8 current memories for owner review.', {
@@ -214,7 +218,7 @@ export async function runAsyncPass(
   input: PassInput,
   config: PassConfig,
 ): Promise<PassResult> {
-  const tools = harnessTools();
+  const tools = harnessTools(input.assistantIntents.length > 0);
   const toolNames = new Set(tools.map((tool) => tool.function.name));
   const handles = new SnippetHandles();
   const known = new Set(input.sessionKnownMemoryIds);

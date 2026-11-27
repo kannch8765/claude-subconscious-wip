@@ -82,7 +82,11 @@ export interface ReplayDeps {
 }
 
 interface Session { picked: string[]; written: string[]; passes: Array<Array<{ memory_id: string; summary: string }>> }
-interface State { sessions: Record<string, Session>; pending_embed: string[] }
+// handled: per session, the transcript messages a committed turn has already seen (see messageKey).
+interface State { sessions: Record<string, Session>; pending_embed: string[]; handled?: Record<string, string[]> }
+
+// One transcript message block, whatever conversation (and so evidence id) a batch carried it under.
+const messageKey = (m: any): string => [m.message_id, m.block_index ?? '', m.event_kind ?? '', m.tool_use_id ?? ''].join('|');
 
 const STATE = 'state.json';
 const RESULTS = 'results.jsonl';
@@ -355,9 +359,15 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
           // resolved leaves the catalog here, as it would live.
           for (const intent of batch.assistant_intents) store.appendAssistantIntent(intent);
           const intents = batch.assistant_intents.filter((intent: any) => !store.getTerminalAssistantIntentOutcome(intent.intent_id));
+          // Kohaku's session is the Claude session; the recorded Letta conversation inside it rotated on retries.
+          const sessionKey: string = batch.session_id ?? batch.letta_session;
+          // Live, the hook's cursor moves on once a pass completes, so the harness never gets a message twice. The recorded
+          // batches re-send Letta's backlog (held cursor, retry rotation): keep only what this run has not handled yet.
+          const handled = new Set((state.handled ??= {})[sessionKey] ?? []);
+          const fresh = batch.canonical_messages.filter((m: any) => !handled.has(messageKey(m)));
           const makeRuntime = (canonical: any[]) => new RelationshipMemoryRuntime(
             store,
-            new Map(canonical.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: batch.letta_session }])),
+            new Map(canonical.map((m: any) => [m.evidence_id ?? m.message_id, { ...m, conversation_id: sessionKey }])),
             () => new Date().toISOString(),
             new Map(intents.map((intent: any) => [intent.intent_id, intent])),
             true,
@@ -365,24 +375,24 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
           );
           await drainPending();
 
-          const session = (state.sessions[batch.letta_session] ??= { picked: [], written: [], passes: [] });
+          const session = (state.sessions[sessionKey] ??= { picked: [], written: [], passes: [] });
           const started = Date.now();
           const turn = prepareTurn({
             latestUserMessage: batch.latest_user_message as string,
-            canonicalMessages: batch.canonical_messages,
+            canonicalMessages: fresh,
             previousUserMessage: batch.sync_context?.prev_user ?? '',
             previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
           });
-          const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}), intents_listed: batch.assistant_intents.length, intents_open: intents.length };
+          const input = { dropped: turn.dropped, ...(turn.latest_dropped ? { latest_dropped: turn.latest_dropped } : {}), intents_listed: batch.assistant_intents.length, intents_open: intents.length, messages_resent: batch.canonical_messages.length - fresh.length };
           let record: Record<string, unknown>;
           if (turn.empty) {
-            record = { batch_id: batch.batch_id, session: batch.letta_session, input, skip: 'input_empty', usage_before: meters };
+            record = { batch_id: batch.batch_id, session: sessionKey, input, skip: 'input_empty', usage_before: meters };
           } else {
             const runtime = makeRuntime(turn.canonicalMessages!);
             const knownBefore = [...new Set([...session.picked, ...session.written])];
             const { result: sync, settled } = await runSyncPassSettled(runtime, b.transport, {
               batchId: batch.batch_id,
-              sessionId: batch.letta_session,
+              sessionId: sessionKey,
               latestUserMessage: turn.latestUserMessage,
               previousUserMessage: turn.previousUserMessage!,
               previousKohakuReply: turn.previousKohakuReply!,
@@ -398,7 +408,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
             const asyncStarted = Date.now();
             const result = await runAsyncPass(runtime, b.transport, {
               batchId: batch.batch_id,
-              sessionId: batch.letta_session,
+              sessionId: sessionKey,
               latestUserMessage: turn.latestUserMessage,
               canonicalMessages: turn.canonicalMessages!,
               assistantIntents: intents,
@@ -422,7 +432,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
             session.written.push(...created);
             session.passes = [...session.passes, result.surfaced_memory_ids.map((id) => ({ memory_id: id, summary: Array.from(store.getMemory(id)?.summary ?? '').slice(0, 150).join('') }))].slice(-3);
             record = {
-              batch_id: batch.batch_id, session: batch.letta_session, group: batch.group, input, usage_before: meters,
+              batch_id: batch.batch_id, session: sessionKey, group: batch.group, input, usage_before: meters,
               known_count: knownBefore.length, wall_ms: Date.now() - started, async_ms: asyncMs, sync, ...result,
               new_memory_coverage: created.map((id) => ({ memory_id: id, coverage: evidenceCoverage(store.getMemory(id)?.summary ?? '', store.listEvidenceForMemoryIds([id]).map((e) => e.quote), ignore) })),
               ...(embedMs !== undefined ? { embed_ms: embedMs } : {}),
@@ -430,6 +440,8 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
               ...(state.pending_embed.length ? { pending_embed: state.pending_embed.length } : {}),
             };
           }
+          for (const m of batch.canonical_messages) handled.add(messageKey(m));
+          state.handled[sessionKey] = [...handled];
           saveState();
           fs.appendFileSync(resultsFile, `${JSON.stringify({ at: new Date().toISOString(), ...record })}\n`, { mode: 0o600 });
           commit(out, work);

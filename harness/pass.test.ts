@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
 import { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import type { ChatTransport, TransportReply } from './llm.js';
-import { runAsyncPass } from './pass.js';
+import { harnessTools, runAsyncPass } from './pass.js';
 
 const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true }); });
@@ -66,5 +66,17 @@ describe('async pass completion', () => {
     const result = await run([[{ name: 'SENTINEL_tool_name', args: {} }], [search], [skip]]);
     expect(result.steps[0].tool_calls).toEqual(['unknown']);
     expect(JSON.stringify(result.steps)).not.toContain('SENTINEL');
+  });
+});
+
+describe('intent field', () => {
+  const props = (withIntents: boolean, name: string) =>
+    (harnessTools(withIntents).find((tool) => tool.function.name === name)!.function.parameters as any).properties;
+
+  it('is offered only when the batch has intents', () => {
+    for (const name of ['memory_reinforce', 'memory_remember']) {
+      expect(props(false, name)).not.toHaveProperty('assistant_intent_id');
+      expect(props(true, name)).toHaveProperty('assistant_intent_id');
+    }
   });
 });

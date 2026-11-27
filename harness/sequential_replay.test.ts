@@ -226,6 +226,19 @@ describe('sequential replay', () => {
     expect(fs.readFileSync(intentsFile, 'utf8').split('\n').filter(Boolean)).toHaveLength(1);
   });
 
+  it('drops messages a committed turn of the same session already handled, whatever conversation re-sent them', async () => {
+    const { options } = setup();
+    const lines = fs.readFileSync(options.batchesFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    const first = lines[0].canonical_messages[0];
+    // t2 re-sends t1's message under a rotated conversation (new evidence id); t3 belongs to another session.
+    lines[0] = { ...lines[0], session_id: 's-1' };
+    lines[1] = { ...lines[1], session_id: 's-1', letta_session: 'conv-2', canonical_messages: [{ ...first, evidence_id: 'rotated-e' }, ...lines[1].canonical_messages] };
+    lines[2] = { ...lines[2], session_id: 's-2', latest_user_message: '下班了', canonical_messages: [{ ...first, evidence_id: 'other-e' }] };
+    fs.writeFileSync(options.batchesFile, lines.map((b) => JSON.stringify(b)).join('\n') + '\n');
+    await runSequentialReplay(options, deps(model()));
+    expect(results(options.outDir).map((r) => [r.session, r.input.messages_resent])).toEqual([['s-1', 0], ['s-1', 1], ['s-2', 0]]);
+  });
+
   it('refuses to resume with a different batches file', async () => {
     const { options } = setup();
     await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
