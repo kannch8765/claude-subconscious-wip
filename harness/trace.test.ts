@@ -232,15 +232,25 @@ describe('async trace', () => {
 
   it('a tool that throws: a fixed code and an allowlisted class name, never the message', async () => {
     const { store, runtime, input } = await setup();
-    vi.spyOn(runtime, 'entitySearchRecallHybrid').mockRejectedValueOnce(new SentinelError(S)).mockRejectedValueOnce(new TypeError(S));
-    const result = await runAsyncPass(runtime, scripted([
-      { calls: [search, { name: 'entity_search', args: { query: S } }, { name: 'entity_search', args: { query: S } }] },
+    // A runtime tool throws an error whose class cannot even be read: the model still gets the tool result.
+    const hostile = new Error(S);
+    Object.defineProperty(hostile, 'constructor', { get() { throw new Error(S); } });
+    vi.spyOn(runtime, 'entitySearchRecallHybrid').mockRejectedValueOnce(new SentinelError(S)).mockRejectedValueOnce(new TypeError(S)).mockRejectedValueOnce(hostile);
+    const transport = scripted([
+      { calls: [search, ...Array.from({ length: 3 }, () => ({ name: 'entity_search', args: { query: S } }))] },
       { calls: [{ name: 'skip_whisper', args: {} }] },
-    ]), input, { model: 'm', maxSteps: 4 });
+    ]);
+    const chat = vi.spyOn(transport, 'chat');
+    const result = await runAsyncPass(runtime, transport, input, { model: 'm', maxSteps: 4 });
+    const toolResults = chat.mock.calls[1][0].messages.filter((m) => m.role === 'tool').map((m) => String(m.content));
+    expect(toolResults.filter((content) => content.startsWith('{"error"'))).toHaveLength(3);
+    expect(result.succeeded).toBe(true);
+    expect(store.listBatches().filter((b) => b.batch_id === input.batchId).at(-1)?.status).not.toBe('pending');
     const trace = toAsyncTrace(result, asyncTrust(store, input));
     expect(trace.tool_errors).toEqual([
       { tool: 'entity_search', code: 'exception', exception: 'other' },
       { tool: 'entity_search', code: 'exception', exception: 'TypeError' },
+      { tool: 'entity_search', code: 'exception', exception: 'other' },
     ]);
     expectClean(trace, result);
   });

@@ -187,6 +187,16 @@ class ToolCallError extends Error {
   constructor(readonly code: ToolErrorCode, message: string) { super(message); }
 }
 
+/** The class of an unexpected error, best-effort: reading it must never cost the model its tool result. */
+function exceptionClass(error: unknown): string | undefined {
+  try {
+    const name = error instanceof Error ? error.constructor?.name : typeof error;
+    return typeof name === 'string' ? name : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 const DECISION_TOOLS = new Set(['deliver_whisper', 'skip_whisper', 'memory_reinforce', 'memory_remember', 'suggest_memory_relation', 'entity_remember']);
 
 function parseArgs(raw: string): Record<string, any> | undefined {
@@ -336,7 +346,7 @@ export async function runAsyncPass(
       } catch (error) {
         const text = error instanceof Error ? error.message : String(error);
         const code = error instanceof ToolCallError ? error.code : 'exception';
-        const exception = code === 'exception' ? (error instanceof Error ? error.constructor?.name : typeof error) : undefined;
+        const exception = code === 'exception' ? exceptionClass(error) : undefined;
         toolErrors.push({ name: toolNames.has(name) ? name : 'unknown', code, ...(exception ? { exception } : {}), message: text.slice(0, 200) });
         return JSON.stringify({ error: text });
       }
