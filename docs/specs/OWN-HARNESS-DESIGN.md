@@ -333,7 +333,7 @@ Changes:
 | B: 2 steps, with diet | 53k | 94k | 67M |
 
 The search changes above are not in this number. Measured with the prototype:
-§6.1.
+§6.2.
 
 ### 4.3.2 Resurfacing view: quote sampler (experimental)
 
@@ -486,7 +486,50 @@ known pitfalls are covered there.
 3. **Switch** lane by lane (sync first, then recall, then async), with Letta kept as fallback
    until the shadow numbers hold.
 
-### 6.1 Offline replay results (prototype, 2026-11-27)
+### 6.1 Shadow lane plan (draft, 2026-11-28)
+
+Goal: run the prototype's async pass next to Letta on real traffic, write
+nothing that Letta or Kohaku can see, and collect the numbers for the switch.
+
+- **Scope:** the async pass only (it is the part that exists). Sync stays as
+  is; recall mode comes later. This puts async before sync, unlike the order
+  above; the switch order is decided after the shadow numbers.
+- **Trigger:** the `Stop` hook (`send_messages_to_letta.ts`) already writes a
+  payload file and spawns the Letta worker. Behind a flag (`SUBCON_SHADOW=1`)
+  it also copies the payload and spawns a shadow worker. The Letta path is
+  unchanged; the shadow spawn is wrapped so a failure cannot reach it.
+- **Isolation:**
+  - The shadow works on its own copy of the store, refreshed from the live
+    store when the shadow starts (the files are append-only JSONL, so an
+    incremental copy is fast). The Letta worker spends its first LLM steps
+    before writing, so the copy normally reflects the state before this batch.
+    The copy records whether the live files changed during the copy.
+  - Its writes stay in the copy and are discarded at the next refresh.
+  - It never delivers a whisper and never marks session-known. Session state
+    (session-known, recently seen) is read-only.
+- **Load:** at most one shadow worker at a time (lock file); a batch that
+  finds it busy is recorded as skipped, not queued. Lower CPU priority.
+  Same model and provider as the live agent, so no new data exposure (the
+  provider ZDR re-check applies to both).
+- **Cost:** DS V4.1 period ≈ 287 Letta steps/day (median) ≈ 70 passes/day.
+  At ≈ 27k prompt tokens per pass the shadow adds ≈ 2M prompt tokens/day,
+  about 4 % of what Letta uses.
+- **Traces:** one record per pass, the same shape as the offline replay
+  (tokens, steps, decisions with memory IDs, outcomes, errors, wall time).
+  Content traces follow the existing trace policy (encryption, retention). A
+  daily report joins Letta's outcome for the same batch: numbers and IDs only.
+- **Exit criteria for switching async:**
+  - at least 7 days and 300 passes;
+  - nothing in the shadow affected Letta;
+  - completion ≥ 98 %;
+  - remember intents resolved no worse than Letta;
+  - owner blind judging of a sample of differing whispers (≥ 30): at least parity;
+  - reinforce spot check: wrong ≤ 10 %.
+- **Rollback:** turn the flag off. There is nothing to undo in the live store.
+- **Not in the shadow v1:** the quote sampler (one change at a time),
+  checkpoint/routine handling (§9).
+
+### 6.2 Offline replay results (prototype, 2026-11-27)
 
 Prototype on branch `task/own-harness-prototype` (`harness/`): one async pass
 (whisper + upkeep in one context), the slim search view (§4.3.1), one search
