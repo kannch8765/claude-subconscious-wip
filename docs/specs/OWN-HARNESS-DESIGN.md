@@ -513,48 +513,100 @@ known pitfalls are covered there.
 3. **Switch** lane by lane (sync first, then recall, then async), with Letta kept as fallback
    until the shadow numbers hold.
 
-### 6.1 Shadow lane plan (draft, 2026-11-28)
+### 6.1 Shadow plan: both lanes (draft, 2026-11-28)
 
-Goal: run the prototype's async pass next to Letta on real traffic, write
-nothing that Letta or Kohaku can see, and collect the numbers for the switch.
+Goal: run the whole new harness (sync and async) next to Letta on real
+traffic, write nothing that Letta or Kohaku can see, and collect the numbers
+for the switch.
 
-- **Scope:** the async pass only (it is the part that exists). Sync stays as
-  is; recall mode comes later. This puts async before sync, unlike the order
-  above; the switch order is decided after the shadow numbers.
-- **Trigger:** the `Stop` hook (`send_messages_to_letta.ts`) already writes a
-  payload file and spawns the Letta worker. Behind a flag (`SUBCON_SHADOW=1`)
-  it also copies the payload and spawns a shadow worker. The Letta path is
-  unchanged; the shadow spawn is wrapped so a failure cannot reach it.
-- **Isolation:**
-  - The shadow works on its own copy of the store, refreshed from the live
-    store when the shadow starts (the files are append-only JSONL, so an
-    incremental copy is fast). The Letta worker spends its first LLM steps
-    before writing, so the copy normally reflects the state before this batch.
-    The copy records whether the live files changed during the copy.
-  - Its writes stay in the copy and are discarded at the next refresh.
-  - It never delivers a whisper and never marks session-known. Session state
-    (session-known, recently seen) is read-only.
-- **Load:** at most one shadow worker at a time (lock file); a batch that
-  finds it busy is recorded as skipped, not queued. Lower CPU priority.
-  Same model and provider as the live agent, so no new data exposure (the
-  provider ZDR re-check applies to both).
-- **Cost:** DS V4.1 period ≈ 287 Letta steps/day (median) ≈ 70 passes/day.
-  At ≈ 27k prompt tokens per pass the shadow adds ≈ 2M prompt tokens/day,
-  about 4 % of what Letta uses.
-- **Traces:** one record per pass, the same shape as the offline replay
-  (tokens, steps, decisions with memory IDs, outcomes, errors, wall time).
-  Content traces follow the existing trace policy (encryption, retention). A
-  daily report joins Letta's outcome for the same batch: numbers and IDs only.
-- **Exit criteria for switching async:**
-  - at least 7 days and 300 passes;
-  - nothing in the shadow affected Letta;
-  - completion ≥ 98 %;
-  - remember intents resolved no worse than Letta;
-  - owner blind judging of a sample of differing whispers (≥ 30): at least parity;
-  - reinforce spot check: wrong ≤ 10 %.
-- **Rollback:** turn the flag off. There is nothing to undo in the live store.
-- **Not in the shadow v1:** the quote sampler (one change at a time),
-  checkpoint/routine handling (§9).
+**Why both lanes.** In the new harness, sync is the main whisper path and
+async is the fallback (offline run `both`: sync whispered in 28 of 36 turns,
+async added none). Shadowing async alone would measure the fallback only.
+Prod has no sync lane today: `sync_subcon.ts` exists but no hook calls it. So
+the comparison per user turn N is:
+
+| | Letta (prod) | New harness (shadow) |
+|---|---|---|
+| Before Kohaku's reply to N | nothing | sync whisper for N |
+| After the reply (Stop) | async pass; its whisper reaches turn N+1 | async pass (fallback whisper, reinforce, remember, link) |
+
+The unit of comparison is the turn, with each side's whole lane output.
+
+**Triggers.** Both behind one flag, `SUBCON_SHADOW=1`. The live hooks only
+spawn a detached worker and return; the spawn is wrapped so a failure cannot
+reach the live path.
+
+- *Shadow sync:* the `UserPromptSubmit` hook (`sync_letta_memory.ts`) writes
+  `{session_id, prompt, transcript_path, turn_at}` to a payload file and spawns
+  `harness/shadow_sync.ts`. The worker reads the previous user message and
+  Kohaku's last reply from the transcript, prepares the turn (§4.3.3), and runs
+  the sync pass. The hook does no extra work, so Kohaku's reply is not delayed.
+- *Shadow async:* the `Stop` hook (`send_messages_to_letta.ts`) copies the
+  payload it already writes for Letta and spawns `harness/shadow_async.ts`.
+  The worker waits up to 15 s for the shadow sync record of the same turn (the
+  lane-`both` rule: sync's whisper counts as session-known for async), then
+  runs the async pass. A missing sync record is recorded, not waited for.
+
+**Isolation.**
+
+- One shadow directory with a copy of the store and a copy of the semantic
+  index. The store copy is refreshed incrementally (append-only JSONL) when
+  an async shadow pass starts. The index is copied only when its file changed,
+  and is **never rebuilt**: search uses the existing embeddings (`rankExisting`)
+  plus one query embedding per search, the same as the live recall.
+- Shadow writes stay in the copy and are discarded at the next refresh.
+- Shadow session state (session-known, recently seen, sync picks) lives in the
+  shadow directory. Live session state is read, never written.
+- No whisper is delivered, nothing reaches the whisper queue, Letta, or
+  Kohaku's context.
+
+**Load.** At most one worker per lane at a time (one lock file per lane, so
+a long async pass never blocks sync). A trigger that finds its lane busy is
+recorded as skipped, not queued. Lower CPU priority.
+
+**Models and data.** Async uses the live agent's model and provider. Sync uses
+the small model of §4.2 (glm-5.3-flash) on the same provider (OpenCode Go).
+Its ZDR status is checked before the shadow starts, the same as for the
+async model.
+
+**Cost.** DS V4.1 period ≈ 287 Letta steps/day (median) ≈ 70 async passes/day
+at ≈ 27k prompt tokens each ≈ 2M prompt tokens/day, about 4 % of Letta. Sync
+runs on every user message: two small-model calls, ≈ 1.1k prompt tokens in
+total (offline p50).
+
+**Traces.** One record per lane per turn, in the offline replay's shape. Content
+traces follow the existing trace policy (encryption, retention). A daily
+report joins Letta's outcome for the same turn and prints numbers and IDs
+only:
+
+- per lane: completion, errors, skips (busy, `input_empty` with
+  `input.dropped` per rule), tokens, steps, wall time;
+- sync: latency per stage (phrase, search, gate) p50/p95, share finished
+  within the §4.2 budget, gate outcome (pick / none / failed). The offline p50
+  through the ssh relay was 6.1 s; the numbers on racknerd decide whether
+  the budget holds;
+- per turn: whisper by Letta / by sync / by shadow async / none, and whether
+  the memory IDs agree;
+- reinforce / remember / link counts on both sides, remember intents resolved;
+- new memories on both sides: evidence coverage (share of the summary's
+  distinctive bigrams found in its evidence; store-wide p50 43 %, random
+  evidence 0 %).
+
+**Exit criteria for switching to the new harness:**
+
+- at least 7 days and 300 turns;
+- nothing in the shadow affected Letta or Kohaku's replies;
+- async completion ≥ 98 %; sync finishes within budget in ≥ 95 % of turns;
+- remember intents resolved no worse than Letta;
+- owner blind judging, per turn, Letta's whole lane vs the new harness's whole
+  lane, on a sample where they differ (≥ 30): at least parity;
+- reinforce spot check: wrong ≤ 10 %;
+- new-memory evidence coverage no worse than Letta's.
+
+**Rollback.** Turn the flag off. There is nothing to undo in the live store.
+
+**Not in shadow v1:** the quote sampler (one change at a time), the
+remember-time evidence check, checkpoint/routine handling (§9).
 
 ### 6.2 Offline replay results (prototype, 2026-11-27)
 
