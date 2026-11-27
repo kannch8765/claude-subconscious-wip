@@ -24,7 +24,8 @@ by scripts outside this repo (metadata only).
 | Error responses | 76 of 4,344 steps |
 
 Each step re-sends the whole conversation, so the per-message cost is
-roughly *steps × history size*.
+roughly *steps × history size*. Regrouped into passes for the dry run (§4.3):
+p50 647k, p90 1,330k prompt tokens per pass.
 
 **What the prompt is made of** (120 sampled requests, ~431k chars each):
 
@@ -226,8 +227,41 @@ passes.
   instead of one step per tool. Runtime validation stays per item.
 - Skip the deep pass when sync already covered the turn.
 
-Rough estimate, not measured: 1–2 calls × ~15k tokens ≈ 20–40k per message,
-against ~700k today. The offline replay (§6) gives the real number.
+**Dry run on the archived traces** (DS V4.1 period, 1,113 passes, no LLM
+calls): each historical pass rebuilt with the §4.1 layout (session card fixed
+at 2,000 chars, recently seen = IDs + one line from the previous 3 passes, the
+instructions moved into the stable layer), sizes converted at the measured
+0.415 tokens/char.
+
+| Prompt tokens per pass | p50 | p90 | Sum |
+|---|---|---|---|
+| Letta (real) | 647k | 1,330k | 858M |
+| A: new layout, same steps as Letta | 113k | 429k | 242M |
+| B: new layout, 2 steps | 88k | 152k | 108M |
+
+Where the rest goes (tokens per step, p50):
+
+| Layer | Tokens |
+|---|---|
+| Tool schemas | 13,057 |
+| System prompt | 3,107 |
+| Instructions (moved to system) | 2,430 |
+| Session card (assumed) | 830 |
+| Recently seen | 1,594 |
+| This batch | 1,053 (p90 10,577) |
+| One `memory_search` result | 10,569 (p90 13,127); 2 per pass p50, 4 p90 |
+
+The first estimate (20–40k per message) was too low: it missed the tool
+schemas and the size of one search result. Two levers are left, both inside
+our own code:
+
+- **Tool schemas** (13k tokens, stable and cacheable but still billed): shorter
+  descriptions, fewer kind-specific remember tools.
+- **Search results** (~10.5k each): fewer quote snippets per memory, shorter
+  snippets, or summaries first and snippets on demand.
+
+With layout B the stable prefix is cache-eligible on the second step. The
+offline replay (§6) measures the real numbers, including cache hits.
 
 ### 4.4 Recall mode
 
