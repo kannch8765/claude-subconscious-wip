@@ -571,3 +571,41 @@ Design consequence for now: keep the core module-agnostic.
   separate passes is a config switch, chosen later by measurement. Shared pass:
   one cache, fewer calls. Separate passes: rules do not interfere, steadier on
   small models.
+
+## 9. Later: checkpoints, routines and events (idea, after the harness)
+
+Found in the reinforce spot check (2026-11-28): the 3 of 12 harness
+reinforces judged "borderline" all attached a later location-sharing message
+to a memory of a *first time* (a milestone) or of one specific day. The new
+messages were 1–2 days later, so this is not "the same activity still going
+on"; a same-day guard would not catch it (tried and reverted).
+
+Owner's framing: three things are mixed today.
+
+| | What it is | How it grows |
+|---|---|---|
+| **Checkpoint** | A one-time turning point ("the first time …"). Checkpoints form a time-ordered line. | Can be recalled (whispered), but is **not reinforced** by routine repeats; only a genuinely new related event links to it. |
+| **Routine** | Something that keeps happening ("we do X together"). | Each ordinary new instance lands here. |
+| **Event** | One specific occurrence. | Recorded on its own only when the day is special; links to its routine. |
+
+```
+checkpoint  ←started_by—  routine  ←instance_of—  event
+```
+
+What exists today: five kinds (`shared_experience`, `relationship_event`,
+`inside_joke`, `personal_experience`, `user_preference`), no routine kind, and
+relation kinds that are similarity-type only (`same_meaning`,
+`changed_over_time`, `context_dependent`, `conflict`, `related`,
+`unrelated`): nothing hierarchical. A milestone may also be stored as a
+`shared_experience`. So every new instance can only reinforce the most similar
+memory, which is often the milestone.
+
+`reinforce` also carries two meanings: "this was brought up again" (a recall)
+and "this happened again" (a recurrence). Checkpoints should take only the
+first; recurrences belong to the routine.
+
+Open, for a separate memory-model design: how to find the existing
+checkpoints among the stored memories, how to create routines from repeated
+reinforces, how to re-link existing evidence, and what changes for `recall`.
+Two notes for any day-based rule: use local time (JST), not UTC; and the exam
+batches' canonical messages lack `conversation_id`.
