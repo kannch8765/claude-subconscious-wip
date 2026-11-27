@@ -380,7 +380,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
         if (sync.whisper) session.picked.push(sync.whisper.memory_id);
         if (result.decisions.whisper) session.picked.push(result.decisions.whisper.memory_id);
         session.written.push(...created);
-        session.passes = [...session.passes, result.surfaced_memory_ids.map((id) => ({ memory_id: id, summary: (store.getMemory(id)?.summary ?? '').slice(0, 150) }))].slice(-3);
+        session.passes = [...session.passes, result.surfaced_memory_ids.map((id) => ({ memory_id: id, summary: Array.from(store.getMemory(id)?.summary ?? '').slice(0, 150).join('') }))].slice(-3);
         record = {
           batch_id: batch.batch_id, session: batch.letta_session, group: batch.group, input, usage_before: meters,
           known_count: knownBefore.length, wall_ms: Date.now() - started, async_ms: asyncMs, sync, ...result,

@@ -52,6 +52,17 @@ export interface ChatTransport {
   close?(): Promise<void>;
 }
 
+/**
+ * Every model request is serialized here. A string cut inside a surrogate pair (half an emoji) would become a lone
+ * `\uD83D` escape, which the upstream JSON parser rejects with a 400 for the whole request. Lone surrogates become
+ * U+FFFD instead, whoever cut the string.
+ */
+export function requestJson(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => (typeof item === 'string' ? item.replace(LONE_SURROGATE, '\uFFFD') : item));
+}
+
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
 export type ChatErrorClass = 'none' | 'rate_limited' | 'server' | 'client' | 'transport' | 'malformed';
 
 export interface ChatResult {
@@ -132,7 +143,7 @@ export class HttpChatTransport implements ChatTransport {
           'User-Agent': this.userAgent,
           'x-opencode-session': sessionId,
         },
-        body: JSON.stringify(body),
+        body: requestJson(body),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
       const text = await response.text();
@@ -174,7 +185,7 @@ export class RelayProcess {
     const id = String(this.next++);
     return new Promise((resolve) => {
       this.pending.set(id, resolve);
-      this.child.stdin.write(`${JSON.stringify({ id, ...payload })}\n`);
+      this.child.stdin.write(`${requestJson({ id, ...payload })}\n`);
     });
   }
 
