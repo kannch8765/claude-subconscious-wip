@@ -11,6 +11,7 @@
  *
  * Usage: tsx harness/offline_replay.ts --batches <file> --out <dir> --relay-host <ssh host>
  *        --relay-script <file> --index <semantic index.json> [--model m] [--max-steps n] [--parallel n] [--only id,id]
+ *        [--lane async|sync|both] [--sync-model m] [--gate model|rank] [--min-lists n]
  */
 import * as fs from 'fs';
 import * as path from 'path';
@@ -18,6 +19,7 @@ import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.
 import { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import { FileBackedSemanticRetriever, type EmbeddingProvider } from '../relationship-memory/src/retrieval/index.js';
 import { RelayChatTransport, RelayProcess } from './llm.js';
+import { runSyncPass } from './sync_pass.js';
 import { runAsyncPass } from './pass.js';
 
 function arg(name: string, fallback?: string): string {
@@ -56,6 +58,11 @@ async function main(): Promise<void> {
   const maxSteps = Number(arg('max-steps', '4'));
   const parallel = Number(arg('parallel', '3'));
   const only = new Set(arg('only', '').split(',').filter(Boolean));
+  // async = the async pass alone; sync = the sync pass alone; both = sync first, its whisper becomes session-known for async.
+  const lane = arg('lane', 'async');
+  const syncModel = arg('sync-model', 'glm-5.3-flash');
+  const minLists = Number(arg('min-lists', '2'));
+  const gate = arg('gate', 'model') as 'rank' | 'model';
   fs.mkdirSync(outDir, { recursive: true, mode: 0o700 });
 
   // One shared, read-only copy of the semantic index for this run (cooldown files land here, not in the source).
@@ -96,22 +103,37 @@ async function main(): Promise<void> {
     const started = Date.now();
     let record: Record<string, unknown>;
     try {
-      const result = await runAsyncPass(runtime, transport, {
-        batchId: batch.batch_id,
-        sessionId: batch.letta_session,
-        latestUserMessage: batch.latest_user_message,
-        canonicalMessages: batch.canonical_messages,
-        assistantIntents: batch.assistant_intents,
-        sessionKnownMemoryIds: batch.session_known,
-        recentSeen: batch.recent_seen,
-      }, { model, maxSteps, reasoningEffort: 'none' });
-      record = { batch_id: batch.batch_id, group: batch.group, wall_ms: Date.now() - started, ...result };
+      let sync: Awaited<ReturnType<typeof runSyncPass>> | undefined;
+      if (lane !== 'async') {
+        sync = await runSyncPass(runtime, transport, {
+          batchId: batch.batch_id,
+          sessionId: batch.letta_session,
+          latestUserMessage: batch.latest_user_message,
+          previousUserMessage: batch.sync_context?.prev_user ?? '',
+          previousKohakuReply: batch.sync_context?.prev_kohaku ?? '',
+          sessionKnownMemoryIds: batch.session_known,
+        }, { model: syncModel, reasoningEffort: 'none', minLists, gate });
+      }
+      let result: Record<string, unknown> = {};
+      if (lane !== 'sync') {
+        const known = sync?.whisper ? [...batch.session_known, sync.whisper.memory_id] : batch.session_known;
+        result = await runAsyncPass(runtime, transport, {
+          batchId: batch.batch_id,
+          sessionId: batch.letta_session,
+          latestUserMessage: batch.latest_user_message,
+          canonicalMessages: batch.canonical_messages,
+          assistantIntents: batch.assistant_intents,
+          sessionKnownMemoryIds: known,
+          recentSeen: batch.recent_seen,
+        }, { model, maxSteps, reasoningEffort: 'none' }) as unknown as Record<string, unknown>;
+      }
+      record = { batch_id: batch.batch_id, group: batch.group, wall_ms: Date.now() - started, lane, ...result, ...(sync ? { sync } : {}) };
     } catch (error) {
       record = { batch_id: batch.batch_id, group: batch.group, wall_ms: Date.now() - started, crashed: error instanceof Error ? `${error.name}: ${error.message.slice(0, 200)}` : 'unknown' };
     }
     for (const file of fs.readdirSync(indexDir)) if (file.includes('provider-cooldown')) fs.rmSync(path.join(indexDir, file), { force: true });
     fs.appendFileSync(resultsFile, `${JSON.stringify(record)}\n`, { mode: 0o600 });
-    process.stderr.write(`  ${batch.batch_id} ${batch.group}: ${'crashed' in record ? 'CRASHED' : (record as any).completion} in ${record.wall_ms} ms\n`);
+    process.stderr.write(`  ${batch.batch_id} ${batch.group}: ${'crashed' in record ? 'CRASHED' : ((record as any).completion ?? ((record as any).sync?.whisper ? 'sync-whisper' : `sync-${(record as any).sync?.skip_reason}`))} in ${record.wall_ms} ms\n`);
   };
 
   const workers = Array.from({ length: Math.max(1, parallel) }, async () => {
