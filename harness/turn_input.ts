@@ -79,6 +79,26 @@ export function prepareTurn<T extends RawTurn>(turn: T): T & TurnPreparation {
   return prepared;
 }
 
+export interface TurnText { role: 'user' | 'assistant'; text: string }
+
+/**
+ * The last kept turn before the new message: its user text and Kohaku's reply (all her texts in that turn).
+ * Turns a rule drops are skipped. When the transcript already ends with the new message, that turn is ignored.
+ */
+export function previousTurn(messages: TurnText[], latestUserMessage: string): { previousUserMessage: string; previousKohakuReply: string } {
+  const turns: Array<{ user: string; replies: string[] }> = [];
+  for (const message of messages) {
+    if (!message.text?.trim()) continue;
+    if (message.role === 'user') turns.push({ user: message.text, replies: [] });
+    else turns.at(-1)?.replies.push(message.text);
+  }
+  const same = (a: string, b: string): boolean => a.replace(/\s+/g, ' ').trim() === b.replace(/\s+/g, ' ').trim();
+  const last = turns.at(-1);
+  if (last && !last.replies.length && same(last.user, latestUserMessage)) turns.pop();
+  const previous = [...turns].reverse().find((turn) => !ruleFor(turn.user));
+  return { previousUserMessage: previous?.user ?? '', previousKohakuReply: previous?.replies.join('\n') ?? '' };
+}
+
 /**
  * Text as the model sees it. Live-location tags carry coordinates, accuracy and
  * heading the model cannot use, and in a short message they are most of the

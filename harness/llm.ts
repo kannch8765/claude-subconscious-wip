@@ -7,6 +7,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'child_process';
 import * as readline from 'readline';
+import type { EmbeddingProvider } from '../relationship-memory/src/retrieval/index.js';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -188,5 +189,28 @@ export class RelayChatTransport implements ChatTransport {
 
   chat(body: ChatRequestBody, sessionId: string): Promise<TransportReply> {
     return this.relay.request({ op: 'chat', session: sessionId, body });
+  }
+}
+
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Query embeddings through the relay (keys stay remote). Documents are never embedded. */
+export class RelayQueryEmbeddingProvider implements EmbeddingProvider {
+  readonly model = 'text-embedding-v4';
+  readonly dimensions = 1024;
+  readonly maxBatchSize = 10;
+  constructor(readonly fingerprint: string, private readonly relay: RelayProcess) {}
+  async embedDocuments(): Promise<number[][]> {
+    throw new Error('the relay never embeds documents');
+  }
+  async embedQuery(text: string): Promise<number[]> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const reply = await this.relay.request({ op: 'embed_query', text });
+      if (reply.status === 200 && Array.isArray(reply.body?.vector)) return reply.body.vector;
+      await new Promise((resolve) => setTimeout(resolve, 1_000 * 2 ** attempt));
+    }
+    throw new Error('query embedding failed');
   }
 }

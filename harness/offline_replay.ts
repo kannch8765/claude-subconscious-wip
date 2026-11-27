@@ -17,8 +17,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
 import { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
-import { FileBackedSemanticRetriever, type EmbeddingProvider } from '../relationship-memory/src/retrieval/index.js';
-import { RelayChatTransport, RelayProcess } from './llm.js';
+import { FileBackedSemanticRetriever } from '../relationship-memory/src/retrieval/index.js';
+import { RelayChatTransport, RelayProcess, RelayQueryEmbeddingProvider, shellQuote } from './llm.js';
 import { runSyncPass } from './sync_pass.js';
 import { runAsyncPass } from './pass.js';
 import { prepareTurn } from './turn_input.js';
@@ -28,28 +28,6 @@ function arg(name: string, fallback?: string): string {
   const value = index >= 0 ? process.argv[index + 1] : fallback;
   if (value === undefined) throw new Error(`--${name} is required`);
   return value;
-}
-
-function shellQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-class RelayQueryEmbeddingProvider implements EmbeddingProvider {
-  readonly model = 'text-embedding-v4';
-  readonly dimensions = 1024;
-  readonly maxBatchSize = 10;
-  constructor(readonly fingerprint: string, private readonly relay: RelayProcess) {}
-  async embedDocuments(): Promise<number[][]> {
-    throw new Error('offline replay never embeds documents');
-  }
-  async embedQuery(text: string): Promise<number[]> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const reply = await this.relay.request({ op: 'embed_query', text });
-      if (reply.status === 200 && Array.isArray(reply.body?.vector)) return reply.body.vector;
-      await new Promise((resolve) => setTimeout(resolve, 1_000 * 2 ** attempt));
-    }
-    throw new Error('query embedding failed');
-  }
 }
 
 async function main(): Promise<void> {
