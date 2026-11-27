@@ -2,6 +2,7 @@ import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
+import { readJsonlRecords } from '../store/read_cache.js';
 
 export const LEGACY_BUCKET_TYPES = ['permanent', 'dynamic', 'feel', 'archive'] as const;
 export type LegacyBucketType = (typeof LEGACY_BUCKET_TYPES)[number];
@@ -334,11 +335,6 @@ export function parseLegacySource(
   };
 }
 
-function readJsonl<T>(file: string): T[] {
-  if (!fs.existsSync(file)) return [];
-  return fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line) as T);
-}
-
 function appendJsonl(file: string, value: unknown): void {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.appendFileSync(file, `${JSON.stringify(value)}\n`, 'utf8');
@@ -362,12 +358,13 @@ export class LegacyMemorySourceStore {
   }
 
   private file(name: string): string { return path.join(this.rootDir, name); }
+  private readRecords<T>(name: string): T[] { return readJsonlRecords<T>(this.file(name)); }
   withMutationBoundary<T>(operation: () => T): T { return this.mutationStore.withMutationBoundary(operation); }
   listSources(): LegacyAssistantMemorySourceRecord[] {
-    return readJsonl<unknown>(this.file('legacy-assistant-sources.jsonl')).map((source) => validateLegacyAssistantMemorySourceRecord(source));
+    return this.readRecords<unknown>('legacy-assistant-sources.jsonl').map((source) => validateLegacyAssistantMemorySourceRecord(source));
   }
-  listProvenance(): LegacyMemoryProvenanceLink[] { return readJsonl(this.file('legacy-memory-provenance.jsonl')); }
-  listReceipts(): LegacyImportReceipt[] { return readJsonl(this.file('legacy-import-receipts.jsonl')); }
+  listProvenance(): LegacyMemoryProvenanceLink[] { return this.readRecords('legacy-memory-provenance.jsonl'); }
+  listReceipts(): LegacyImportReceipt[] { return this.readRecords('legacy-import-receipts.jsonl'); }
   getSource(id: string): LegacyAssistantMemorySourceRecord | undefined { return this.listSources().find((source) => source.legacy_source_id === id); }
   appendSource(source: LegacyAssistantMemorySourceRecord): 'accepted' | 'duplicate' {
     return this.withMutationBoundary(() => {
