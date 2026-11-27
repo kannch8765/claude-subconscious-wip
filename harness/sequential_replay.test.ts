@@ -91,11 +91,14 @@ function deps(transport: ChatTransport, opts: ProviderOptions & { meters?: () =>
   return { backends, meters: opts.meters ?? (async () => undefined), log: () => {} };
 }
 
+/** Time passes: every saved cooldown, and any the provider left in work/, has expired. */
 function expireCooldowns(out: string): void {
-  const dir = path.join(out, 'cooldown');
-  for (const name of fs.readdirSync(dir)) {
-    const file = path.join(dir, name);
-    fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), retry_after: '2000-01-01T00:00:00Z' }));
+  for (const dir of [path.join(out, 'cooldown'), path.join(out, 'work', 'semantic-index')]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir).filter((n) => n.includes('.provider-cooldown.'))) {
+      const file = path.join(dir, name);
+      fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), retry_after: '2000-01-01T00:00:00Z' }));
+    }
   }
 }
 
@@ -184,6 +187,12 @@ describe('sequential replay', () => {
     expect(fs.existsSync(path.join(options.outDir, 'RUN.lock'))).toBe(false);
   });
 
+  it('rebuilds an initialization that stopped before INIT.json', async () => {
+    const { options } = setup();
+    fs.mkdirSync(path.join(options.outDir, 'checkpoint', 'store'), { recursive: true });
+    expect(await runSequentialReplay(options, deps(model()))).toEqual({ ran: 3, done: 3 });
+  });
+
   it('refuses to resume with a different batches file', async () => {
     const { options } = setup();
     await runSequentialReplay({ ...options, limit: 1 }, deps(model()));
@@ -201,6 +210,8 @@ describe('sequential replay', () => {
     fs.writeFileSync(stateFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(stateFile, 'utf8')), pending_embed: ['mem_seed'] }));
     await expect(runSequentialReplay(options, deps(model(), { failQueries: true }))).rejects.toThrow(/cooldown during t2/);
     expect(fs.readdirSync(path.join(options.outDir, 'cooldown')).length).toBe(1);
+    // As if the runner had been killed before its cleanup: the cooldown survives only in work/.
+    fs.rmSync(path.join(options.outDir, 'cooldown'), { recursive: true });
     const counts = { queries: 0, documents: 0 };
     await expect(runSequentialReplay(options, deps(model(), { counts }))).rejects.toThrow(/embedding cooldown until/);
     expect(counts.queries).toBe(0);

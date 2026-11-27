@@ -162,10 +162,6 @@ function takeRunLock(outDir: string): () => void {
   };
 }
 
-function sha256File(file: string): string {
-  return crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
-}
-
 // ---- embedding cooldowns survive rollback
 
 function saveCooldowns(outDir: string, indexDir: string): void {
@@ -215,12 +211,16 @@ function restoreWork(outDir: string): string {
   return work;
 }
 
-/** Entries a crashed initialization can leave behind; anything else means the directory is not ours. */
-const INIT_LEFTOVERS = new Set(['RUN.lock', 'checkpoint.tmp-init']);
+/**
+ * Entries a crashed initialization can leave behind; anything else means the directory is not ours. Without
+ * INIT.json no turn has run, so an unmarked checkpoint/ is only the seed copy and is rebuilt.
+ */
+const INIT_LEFTOVERS = new Set(['RUN.lock', 'checkpoint.tmp-init', 'checkpoint']);
 
 function initialize(opts: ReplayOptions, out: string, b: Backends, batchesSha256: string): void {
   const seed = path.join(out, 'checkpoint.tmp-init');
   fs.rmSync(seed, { recursive: true, force: true });
+  fs.rmSync(path.join(out, 'checkpoint'), { recursive: true, force: true });
   fs.mkdirSync(path.join(seed, 'store'), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.join(seed, 'semantic-index'), { recursive: true, mode: 0o700 });
   for (const name of storeDataFiles(opts.seedStore)) copyRegular(path.join(opts.seedStore, name), path.join(seed, 'store', name));
@@ -260,9 +260,13 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
   let ran = 0;
   let indexDir: string | undefined;
   try {
-    const batchesSha256 = sha256File(opts.batchesFile);
+    // One read: the bytes that are hashed are the bytes that are replayed.
+    const batchesBytes = fs.readFileSync(opts.batchesFile);
+    const batchesSha256 = crypto.createHash('sha256').update(batchesBytes).digest('hex');
     if (!fs.existsSync(initFile)) initialize(opts, out, b, batchesSha256);
     else if (JSON.parse(fs.readFileSync(initFile, 'utf8')).batches_sha256 !== batchesSha256) throw new Refused('--batches differs from the file this run was initialized with');
+    // A runner killed before its cleanup leaves the provider's cooldown only in work/: keep it before work/ is rebuilt.
+    saveCooldowns(out, path.join(out, 'work', 'semantic-index'));
     checkCooldowns(out);
     const work = restoreWork(out);
     const storeDir = path.join(work, 'store');
@@ -274,7 +278,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
     const state: State = JSON.parse(fs.readFileSync(path.join(work, STATE), 'utf8'));
     const saveState = (): void => fs.writeFileSync(path.join(work, STATE), JSON.stringify(state), { mode: 0o600 });
 
-    const batches = fs.readFileSync(opts.batchesFile, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
+    const batches = batchesBytes.toString('utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line));
     if (doneIds.some((id, i) => batches[i]?.batch_id !== id)) throw new Refused('committed results are not a prefix of --batches');
     let queue = batches.slice(doneIds.length);
     if (opts.limit && opts.limit > 0) queue = queue.slice(0, Math.max(0, opts.limit - doneIds.length));
