@@ -18,7 +18,7 @@ import type {
   RememberOutcome,
   ReinforcementRecord,
 } from '../schema/index.js';
-import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
+import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, isCitableEvidenceKind, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { materializeEffectiveMemory } from '../owner/index.js';
 import { applyMemoryResolutions, currentReviewableMemoryIds, materializeCurrentMemoryView } from '../resolution/index.js';
@@ -66,6 +66,16 @@ export interface RememberResult {
   entity_id?: string;
   rejection_code?: string;
   reason?: string;
+}
+
+/**
+ * A call citing any self_note / meta_text id is rejected whole, before any write: dropping just those ids could keep a
+ * claim they alone supported. The rejection leaves a linked remember intent open, so a corrected call can still use it.
+ */
+const NOT_CITABLE_EVIDENCE = 'not_citable_evidence';
+
+function notCitableRejection(ids: readonly string[]): string {
+  return `Cited evidence includes self_note (the agent's own scheduled prompt firing) or meta_text (runtime or system text). Neither is the user's words, so neither can be cited, and nothing was saved. Resubmit citing only user_text, assistant_text, assistant_tool_use or tool_result evidence that itself supports every claim; drop any claim only these ids supported. Not citable: ${ids.join(', ')}`;
 }
 
 export type MemoryRememberToolName = `memory_remember_${MemoryKind}`;
@@ -649,12 +659,15 @@ export class RelationshipMemoryRuntime {
     const proposal = validation.proposal;
     const legacyEvidenceField = this.legacyEvidenceField(rawProposal);
     const evidenceMessages: CanonicalMessage[] = [];
+    const skipped: string[] = [];
     for (const evidenceId of proposal.evidence_message_ids) {
       const resolved = this.trustedEvidence(evidenceId, legacyEvidenceField);
       if (resolved.ambiguous) return this.entityPermanent(batchId, sourceKey, 'ambiguous_evidence', `Legacy message_id identifies multiple trusted transcript events; use an exact evidence_id: ${evidenceId}`, now);
       if (!resolved.message) return this.entityPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${evidenceId}`, now);
-      evidenceMessages.push(resolved.message);
+      if (isCitableEvidenceKind(resolved.message.event_kind)) evidenceMessages.push(resolved.message);
+      else skipped.push(evidenceId);
     }
+    if (skipped.length > 0) return this.entityPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
     const recovered = this.store.getEntityBySourceKey(sourceKey);
     if (recovered) {
       const recoveredEvidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({
@@ -924,12 +937,15 @@ export class RelationshipMemoryRuntime {
     const memory = this.store.getMemory(memoryId);
     if (!memory) return this.persistPermanent(batchId, sourceKey, 'unknown_memory', `Unknown canonical memory ID: ${memoryId}`, now);
     const messages: CanonicalMessage[] = [];
+    const skipped: string[] = [];
     for (const id of normalizedIds) {
       const resolved = this.trustedEvidence(id, legacyEvidenceField);
       if (resolved.ambiguous) return this.persistPermanent(batchId, sourceKey, 'ambiguous_evidence', `Legacy message_id identifies multiple trusted transcript events; use an exact evidence_id: ${id}`, now);
       if (!resolved.message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
-      messages.push(resolved.message);
+      if (isCitableEvidenceKind(resolved.message.event_kind)) messages.push(resolved.message);
+      else skipped.push(id);
     }
+    if (skipped.length > 0) return this.persistPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
     const memoryEvidence = this.store.listEvidence().filter((item) => item.memory_id === memoryId);
     const originalEvidenceIds = this.originalMemoryEvidenceIds(memory, memoryEvidence);
     if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now, intent);
@@ -1000,7 +1016,7 @@ export class RelationshipMemoryRuntime {
         previous.rejection_code ?? 'invalid_schema',
         previous.reason ?? 'Previously rejected proposal.',
         now,
-        rawTrustedIntent,
+        previous.rejection_code === NOT_CITABLE_EVIDENCE ? undefined : rawTrustedIntent,
       );
     }
 
@@ -1039,6 +1055,7 @@ export class RelationshipMemoryRuntime {
     }
 
     const evidenceMessages: CanonicalMessage[] = [];
+    const skipped: string[] = [];
     for (const evidenceId of proposal.evidence_message_ids) {
       const resolved = this.trustedEvidence(evidenceId, legacyEvidenceField);
       if (resolved.ambiguous) {
@@ -1047,8 +1064,10 @@ export class RelationshipMemoryRuntime {
       if (!resolved.message) {
         return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${evidenceId}`, now, assistantIntent);
       }
-      evidenceMessages.push(resolved.message);
+      if (isCitableEvidenceKind(resolved.message.event_kind)) evidenceMessages.push(resolved.message);
+      else skipped.push(evidenceId);
     }
+    if (skipped.length > 0) return this.persistPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
 
     const canonicalEvidenceIds = evidenceMessages.map(canonicalEvidenceId);
     const dedupeKey = stableId('dedupe', {
