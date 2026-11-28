@@ -56,18 +56,18 @@ function transcriptEventId(
 
 const SCHEDULING_TOOL_NAMES = new Set(['ScheduleWakeup', 'CronCreate']);
 
-/** Counts for one pass, metadata only: never any text or transcript field value. */
+/** Counts for one pass, per text block, metadata only: never any text or transcript field value. */
 export interface TranscriptTextStats {
   /** ScheduleWakeup / CronCreate prompts in the whole transcript, including before the pass. */
   scheduled_prompts: number;
   self_note: number;
   meta_text: number;
   /**
-   * User text without `isMeta: true` that equals an earlier scheduled prompt. Kept as user_text: either the user
-   * typed the same words, or Claude Code stopped marking firings.
+   * User text blocks without `isMeta: true` that equal an earlier scheduled prompt. Kept as user_text: either the
+   * user typed the same words, or Claude Code stopped marking firings.
    */
   unmarked_prompt_match: number;
-  /** promptSource of the self_note / meta_text entries, in fixed buckets: only `sdk` is a known value. */
+  /** promptSource of the entry each self_note / meta_text block is on, in fixed buckets: only `sdk` is a known value. */
   prompt_source: { sdk: number; other: number; none: number };
 }
 
