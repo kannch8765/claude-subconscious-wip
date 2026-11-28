@@ -29,7 +29,7 @@ import { materializeEffectiveMemory } from '../owner/index.js';
 import { applyMemoryResolutions, currentReviewableMemoryIds, materializeCurrentMemoryView, serveWorldMemoriesForSearch } from '../resolution/index.js';
 import { projectRelationReviewInbox } from '../review_inbox.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
-import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
+import { hybridScore, lexicalTextScore, semanticText, type SemanticDocument, type SemanticRetriever } from '../retrieval/index.js';
 import { linkedAssistantIntentIndex } from '../intent/provenance.js';
 import { deferredIntentCounts } from '../intent/index.js';
 import {
@@ -189,6 +189,14 @@ function evidenceProvenance(message: CanonicalMessage) {
     ...(message.tool_name ? { tool_name: message.tool_name } : {}),
     ...(message.tool_use_id ? { tool_use_id: message.tool_use_id } : {}),
   };
+}
+
+/** One recall candidate. haystack() and document() are built on first use and kept for the other queries of a call. */
+interface RecallCandidate {
+  memory: EffectiveMemoryRecord;
+  linkedIntents: Array<{ memory: string; feel: string }>;
+  haystack(): string;
+  document(): SemanticDocument;
 }
 
 export class RelationshipMemoryRuntime {
@@ -370,6 +378,49 @@ export class RelationshipMemoryRuntime {
     return this.attachRecallEvidence(await this.memorySearchRecallHybrid(query, signal));
   }
 
+  /**
+   * memorySearchRecallHybridWithEvidence for several queries, one result list per query in input order, each equal to
+   * the single call for that query. The candidate set is built once, the queries share one embedding call, and
+   * evidence is attached once per memory. If that embedding call fails, every query falls back to lexical scores.
+   */
+  async memorySearchRecallHybridManyWithEvidence(queries: readonly SearchQuery[], signal?: AbortSignal): Promise<MemoryRecallResult[][]> {
+    if (queries.length === 0) return [];
+    const candidates = this.recallCandidates();
+    const filtered = queries.map((query) => this.filterRecallCandidates(candidates, query));
+    const semanticQueries = queries.map((query) => query.query?.trim());
+    const searched = semanticQueries.flatMap((semanticQuery, position) => semanticQuery ? [position] : []);
+    const requests = searched.map((position) => ({ documents: filtered[position].map((item) => item.document()), query: semanticQueries[position]! }));
+    const semantic = new Map<number, Map<string, number>>();
+    const retriever = this.semanticRetriever;
+    if (requests.length > 0 && retriever?.rankExisting) {
+      let scores: Map<string, number>[];
+      if (retriever.rankExistingMany) {
+        try { scores = await retriever.rankExistingMany(requests, signal); }
+        catch { scores = requests.map(() => new Map()); }
+      } else {
+        scores = await Promise.all(requests.map(async (request) => {
+          try { return await retriever.rankExisting!(request.documents, request.query, signal); }
+          catch { return new Map<string, number>(); }
+        }));
+      }
+      searched.forEach((position, index) => semantic.set(position, scores[index] ?? new Map()));
+    }
+    const lists = queries.map((query, position) => {
+      const semanticQuery = semanticQueries[position];
+      return semanticQuery
+        ? this.rankRecallCandidates(filtered[position], semanticQuery, semantic.get(position) ?? new Map(), boundedSearchLimit(query.limit))
+        : filtered[position].slice(0, boundedSearchLimit(query.limit)).map((item) => withoutWorldRevisions(item.memory));
+    });
+    const distinct = new Map<string, EffectiveMemoryRecord>();
+    for (const memory of lists.flat()) if (!distinct.has(memory.memory_id)) distinct.set(memory.memory_id, memory);
+    const attached = new Map(this.attachRecallEvidence([...distinct.values()]).map((memory) => [memory.memory_id, memory] as const));
+    // Each list gets its own objects, as separate single calls would return.
+    return lists.map((list) => list.map((memory) => {
+      const result = attached.get(memory.memory_id)!;
+      return { ...result, quote_snippets: [...result.quote_snippets] };
+    }));
+  }
+
   async memorySearchMaintenanceCurrentWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {
     // Async maintenance shares the reviewed current view with foreground recall,
     // but still refreshes vectors for new writes, as the old maintenance search did.
@@ -458,13 +509,28 @@ export class RelationshipMemoryRuntime {
 
   async memorySearchRecallHybrid(query: SearchQuery, signal?: AbortSignal, refreshIndex = false): Promise<EffectiveMemoryRecord[]> {
     const semanticQuery = query.query?.trim();
-    const trigger = query.trigger?.trim().toLowerCase();
     const limit = boundedSearchLimit(query.limit);
-    const excluded = new Set(query.excludeMemoryIds ?? []);
+    const candidates = this.filterRecallCandidates(this.recallCandidates(), query);
+    if (!semanticQuery) return candidates.slice(0, limit).map((item) => withoutWorldRevisions(item.memory));
 
-    // Preserve the existing memory_search result/search semantics without the
-    // hot path's old per-memory JSONL rescans. Materialize each supporting file
-    // once, then join by memory id in memory.
+    const documents = candidates.map((item) => item.document());
+    let semantic = new Map<string, number>();
+    if (refreshIndex && this.semanticRetriever?.rank) {
+      try { semantic = await this.semanticRetriever.rank(documents, semanticQuery); }
+      catch { semantic = new Map(); }
+    } else if (this.semanticRetriever?.rankExisting) {
+      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery, signal); }
+      catch { semantic = new Map(); }
+    }
+    return this.rankRecallCandidates(candidates, semanticQuery, semantic, limit);
+  }
+
+  /**
+   * The active recall view with reinforcement counts and linked intents joined in. Nothing here depends on the query,
+   * so one call can serve several queries. Preserve the existing memory_search result/search semantics without the
+   * hot path's old per-memory JSONL rescans: materialize each supporting file once, then join by memory id in memory.
+   */
+  private recallCandidates(): RecallCandidate[] {
     const allReinforcements = this.store.listReinforcements();
     const reinforcementsByMemory = new Map<string, ReinforcementRecord[]>();
     for (const reinforcement of allReinforcements) {
@@ -474,7 +540,7 @@ export class RelationshipMemoryRuntime {
     }
     const linkedIntentsByMemory = this.linkedIntentSemanticByMemory();
 
-    const candidates = this.resolvedRecallMemories(allReinforcements).map((memory) => {
+    return this.resolvedRecallMemories(allReinforcements).filter((memory) => memory.status === 'active').map((memory) => {
       const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
       const reinforcements = memory.kind === WORLD_UPDATE_KIND
         ? headConfirmations(memory, reinforcementsByMemory)
@@ -491,38 +557,41 @@ export class RelationshipMemoryRuntime {
         } : {}),
       };
       const linkedIntents = sourceIds.flatMap((memoryId) => linkedIntentsByMemory.get(memoryId) ?? []);
-      return { memory: enriched, linkedIntents };
-    }).filter(({ memory, linkedIntents }) => {
+      // Built on first use and kept, so queries sharing this candidate pay for them once.
+      let haystack: string | undefined;
+      let document: SemanticDocument | undefined;
+      return {
+        memory: enriched,
+        linkedIntents,
+        haystack: () => haystack ??= stableJson({ summary: enriched.summary, payload: enriched.payload, context: enriched.resolution_context, assistant_intents: linkedIntents }).toLowerCase(),
+        document: () => document ??= { id: `memory:${enriched.memory_id}`, text: this.memoryDocumentText(enriched, linkedIntents) },
+      };
+    });
+  }
+
+  private filterRecallCandidates(candidates: readonly RecallCandidate[], query: SearchQuery): RecallCandidate[] {
+    const trigger = query.trigger?.trim().toLowerCase();
+    const excluded = new Set(query.excludeMemoryIds ?? []);
+    return candidates.filter(({ memory, haystack }) => {
       const foregroundIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
-      if (memory.status !== 'active' || foregroundIds.some((memoryId) => excluded.has(memoryId))) return false;
+      if (foregroundIds.some((memoryId) => excluded.has(memoryId))) return false;
       if (query.kind && memory.kind !== query.kind) return false;
       if (query.participant && !memory.participants.includes(query.participant)) return false;
       if (query.linked_memory_id && !memory.linked_memory_ids?.includes(query.linked_memory_id)) return false;
       if (query.time_start && memory.observed_at < query.time_start) return false;
       if (query.time_end && memory.observed_at > query.time_end) return false;
-      const haystack = stableJson({ summary: memory.summary, payload: memory.payload, context: memory.resolution_context, assistant_intents: linkedIntents }).toLowerCase();
-      if (trigger && !haystack.includes(trigger)) return false;
+      if (trigger && !haystack().includes(trigger)) return false;
       return true;
     });
-    if (!semanticQuery) return candidates.slice(0, limit).map((item) => withoutWorldRevisions(item.memory));
+  }
 
-    const documents = candidates.map(({ memory, linkedIntents }) => ({
-      id: `memory:${memory.memory_id}`,
-      text: this.memoryDocumentText(memory, linkedIntents),
-    }));
-    let semantic = new Map<string, number>();
-    if (refreshIndex && this.semanticRetriever?.rank) {
-      try { semantic = await this.semanticRetriever.rank(documents, semanticQuery); }
-      catch { semantic = new Map(); }
-    } else if (this.semanticRetriever?.rankExisting) {
-      try { semantic = await this.semanticRetriever.rankExisting(documents, semanticQuery, signal); }
-      catch { semantic = new Map(); }
-    }
-    const scored = candidates.map(({ memory }, index) => {
-      const lexical = lexicalTextScore(documents[index].text, semanticQuery);
-      const semanticScore = semantic.get(documents[index].id);
-      const ownerRemembered = candidates[index].linkedIntents.length > 0;
-      return { memory, lexical, semantic: semanticScore,
+  private rankRecallCandidates(candidates: readonly RecallCandidate[], semanticQuery: string, semantic: ReadonlyMap<string, number>, limit: number): EffectiveMemoryRecord[] {
+    const scored = candidates.map((candidate) => {
+      const document = candidate.document();
+      const lexical = lexicalTextScore(document.text, semanticQuery);
+      const semanticScore = semantic.get(document.id);
+      const ownerRemembered = candidate.linkedIntents.length > 0;
+      return { memory: candidate.memory, lexical, semantic: semanticScore,
         score: hybridScore(lexical, semanticScore) + (ownerRemembered ? this.ownerRememberRecallBoost : 0) };
     }).filter((item) => item.semantic !== undefined || item.lexical > 0);
     return scored
