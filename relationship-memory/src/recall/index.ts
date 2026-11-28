@@ -10,6 +10,9 @@ import type { AssistantRememberIntentRecord, EffectiveMemoryRecord, MemoryKind }
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 import { RelationshipMemoryRuntime } from '../tools/index.js';
+import { WORLD_UPDATE_KIND } from '../schema/index.js';
+import { withoutWorldRevisions, worldUpdateIndexText } from '../world/index.js';
+import { serveWorldMemoriesForSearch } from '../resolution/index.js';
 
 export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
@@ -444,10 +447,13 @@ export class RelationshipMemoryRecallSession {
       { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string }
       | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string }
     > = [];
-    for (const memory of owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) })) {
+    // A world_update is served like on every search path: merges applied, head only, summary from topic + head.
+    for (const memory of serveWorldMemoriesForSearch(this.store, owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) })).map(withoutWorldRevisions)) {
       if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;
       const intents = this.linkedAssistantIntents(memory.memory_id);
-      const text = semanticText(memory.kind, memory.summary, memory.participants, memory.payload, intents.map((intent) => [intent.memory.text, intent.feel.text]));
+      const text = memory.kind === WORLD_UPDATE_KIND
+        ? worldUpdateIndexText(memory)
+        : semanticText(memory.kind, memory.summary, memory.participants, memory.payload, intents.map((intent) => [intent.memory.text, intent.feel.text]));
       candidateTexts.push({ kind: 'memory', memory, intents, text });
     }
     if (!input.kind) {
@@ -489,7 +495,7 @@ export class RelationshipMemoryRecallSession {
       }
       const { memory, intents } = item;
       const sourceRef = this.register('relationship_memory', { memory_id: memory.memory_id, latest_revision_id: memory.latest_revision_id }, { memory_id: memory.memory_id, observed_at: memory.observed_at });
-      return { source_ref: sourceRef, record_type: 'relationship_memory', memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary, participants: memory.participants, payload: memory.payload, observed_at: memory.observed_at, owner_corrected: memory.owner_corrected, assistant_intents: intents.map((intent) => ({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text, captured_at: intent.captured_at })) };
+      return { source_ref: sourceRef, record_type: 'relationship_memory', memory_id: memory.memory_id, kind: memory.kind, summary: memory.summary, participants: memory.participants, payload: memory.payload, observed_at: memory.observed_at, owner_corrected: memory.owner_corrected, assistant_intents: intents.map((intent) => ({ intent_id: intent.intent_id, memory: intent.memory.text, feel: intent.feel.text, captured_at: intent.captured_at })), ...(memory.world_update ? { world_update: memory.world_update } : {}) };
     }) };
   }
 

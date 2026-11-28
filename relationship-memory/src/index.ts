@@ -6,6 +6,7 @@ export * from './adapter/index.js';
 export * from './intent/index.js';
 export * from './owner/index.js';
 export * from './resolution/index.js';
+export * from './world/index.js';
 
 export * from './observability/index.js';
 export * from './admin/index.js';

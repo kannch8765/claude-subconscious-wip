@@ -1,5 +1,5 @@
 import type { EffectiveSearchQuery, RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
-import { MEMORY_KINDS, type MemoryKind, type ParticipantRole } from '../schema/index.js';
+import { MEMORY_KINDS, WORLD_UPDATE_KIND, type CanonicalMemoryKind, type MemoryKind, type ParticipantRole } from '../schema/index.js';
 import {
   LettaReadError,
   collectAgentPromptCacheEffectiveness,
@@ -56,14 +56,15 @@ export interface RelationshipMemorySummary {
   activeMemoryCount: number;
   inactiveMemoryCount: number;
   ownerCorrectedCount: number;
-  countsByKind: Record<MemoryKind, number>;
+  /** The five relationship kinds always; world_update only when the store has one. */
+  countsByKind: Record<MemoryKind, number> & Partial<Record<typeof WORLD_UPDATE_KIND, number>>;
   ownerRevisionCount: number;
   latestOwnerRevisionAt?: string;
 }
 
 export interface EffectiveMemoryAdminRow {
   memoryId: string;
-  kind: MemoryKind;
+  kind: CanonicalMemoryKind;
   summary: string;
   status: 'active' | 'inactive';
   ownerCorrected: boolean;
@@ -134,8 +135,8 @@ export function summarizeRelationshipMemory(owner: RelationshipMemoryOwnerContro
   const genesis = owner.store.listMemories();
   const effective = owner.listEffective();
   const revisions = owner.store.listOwnerRevisions();
-  const countsByKind = Object.fromEntries(MEMORY_KINDS.map(kind => [kind, 0])) as Record<MemoryKind, number>;
-  for (const memory of effective) countsByKind[memory.kind] += 1;
+  const countsByKind: RelationshipMemorySummary['countsByKind'] = Object.fromEntries(MEMORY_KINDS.map(kind => [kind, 0])) as Record<MemoryKind, number>;
+  for (const memory of effective) countsByKind[memory.kind] = (countsByKind[memory.kind] ?? 0) + 1;
   const latestOwnerRevisionAt = revisions
     .map(revision => revision.recorded_at)
     .filter(Boolean)

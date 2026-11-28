@@ -1,3 +1,4 @@
+/** The five relationship kinds. The Letta observer's create tools, admin counts and other per-kind loops use this list. */
 export const MEMORY_KINDS = [
   'personal_experience',
   'shared_experience',
@@ -7,6 +8,16 @@ export const MEMORY_KINDS = [
 ] as const;
 
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
+
+/**
+ * `world_update` is a knowledge patch: a fact about the outside world, newer than the foreground model's training, that
+ * the user states or a tool result shows. One anchor memory per topic plus append-only revisions (`world-revisions.jsonl`).
+ * It is not in MEMORY_KINDS, so nothing generated from that list (Letta tools included) offers it.
+ */
+export const WORLD_UPDATE_KIND = 'world_update' as const;
+/** Every kind a canonical memory can have: the five relationship kinds plus world_update. */
+export const CANONICAL_MEMORY_KINDS = [...MEMORY_KINDS, WORLD_UPDATE_KIND] as const;
+export type CanonicalMemoryKind = (typeof CANONICAL_MEMORY_KINDS)[number];
 export type ParticipantRole = 'user' | 'assistant';
 /**
  * `self_note`: text on an `isMeta` user entry that repeats the prompt of an earlier ScheduleWakeup / CronCreate, i.e.
@@ -19,6 +30,11 @@ const NON_CITABLE_EVIDENCE_KINDS: ReadonlySet<TranscriptEvidenceKind> = new Set(
 /** Legacy evidence without an event kind stays citable. */
 export function isCitableEvidenceKind(kind: TranscriptEvidenceKind | undefined): boolean {
   return kind === undefined || !NON_CITABLE_EVIDENCE_KINDS.has(kind);
+}
+
+/** A world fact comes from the user's words or a tool result, never from the agent; legacy evidence without a kind is not trusted. */
+export function isWorldSourceEvidenceKind(kind: TranscriptEvidenceKind | undefined): boolean {
+  return kind === 'user_text' || kind === 'tool_result';
 }
 export type RememberOutcomeKind = 'accepted' | 'duplicate' | 'permanently_rejected' | 'retryable_failed';
 export type BatchCompletion = 'completed' | 'retryable_failure';
@@ -43,13 +59,15 @@ export interface CanonicalMessage {
 
 export interface MemoryProposalV1 {
   schema_version: 1;
-  kind: MemoryKind;
+  kind: CanonicalMemoryKind;
   summary: string;
   participants: ParticipantRole[];
   evidence_message_ids: string[];
   payload: Record<string, unknown>;
   linked_memory_ids?: string[];
   assistant_intent_id?: string;
+  /** world_update only: when the fact started to hold (YYYY-MM-DD). */
+  as_of?: string;
 }
 
 export interface EntityIdentityProposalV1 {
@@ -135,7 +153,7 @@ export interface CanonicalMemoryRecord {
   schema_version: 1;
   memory_id: string;
   subject_id: string;
-  kind: MemoryKind;
+  kind: CanonicalMemoryKind;
   summary: string;
   participants: ParticipantRole[];
   payload: Record<string, unknown>;
@@ -147,6 +165,50 @@ export interface CanonicalMemoryRecord {
   dedupe_key: string;
 }
 
+export type WorldUpdateSource = 'user' | 'tool';
+
+/** One append-only revision of a `world_update` anchor. The newest recorded revision is the head; nothing is rewritten. */
+export interface WorldRevisionRecord {
+  schema_version: 1;
+  revision_id: string;
+  memory_id: string;
+  fact: string;
+  /** When this fact started to hold: the call's date (YYYY-MM-DD), else the latest captured_at of the cited evidence. */
+  as_of: string;
+  /** Derived by the runtime: `tool` when any cited event is a tool_result. */
+  source: WorldUpdateSource;
+  /** Memory evidence ids (evidence.jsonl rows of the anchor), one per cited transcript event. */
+  evidence_ids: string[];
+  batch_id: string;
+  recorded_at: string;
+  /**
+   * Commit order under the canonical mutation lock: 0 for an anchor's r1, else 1 + the number of revisions already
+   * stored. The chain is ordered by (recorded_at, sequence), so r1 stays first even when a replay repairs it late.
+   */
+  sequence: number;
+}
+
+export interface WorldUpdateHead {
+  /** Absent only while an anchor's r1 has not landed yet (a torn remember that its batch retry repairs). */
+  revision_id?: string;
+  fact: string;
+  as_of: string;
+  source?: WorldUpdateSource;
+  recorded_at: string;
+}
+
+/** Derived on read from the anchor(s), their revisions, evidence and reinforcements. Never stored. */
+export interface WorldUpdateView {
+  head: WorldUpdateHead;
+  revision_count: number;
+  /** Latest captured_at over the head's own evidence and evidence reinforced onto the anchor after the head was recorded. */
+  last_confirmed: string;
+  /** Memory evidence ids behind `last_confirmed`: the head's own plus those reinforced after it. */
+  head_evidence_ids: string[];
+  /** The whole chain in recorded_at order, oldest first, for the timeline renderer. Search and recall results omit it. */
+  revisions?: WorldRevisionRecord[];
+}
+
 export interface ReinforcementRecord {
   schema_version: 1;
   reinforcement_id: string;
@@ -155,6 +217,8 @@ export interface ReinforcementRecord {
   evidence_ids: string[];
   latest_evidence_at: string;
   recorded_at: string;
+  /** world_update only: the head revision this reinforcement confirmed (checked against the head under the lock). */
+  world_revision_id?: string;
 }
 
 export interface EvidenceRecord {
@@ -292,7 +356,17 @@ export const MEMORY_KIND_DEFINITIONS = {
       recall_triggers: { valueType: 'string_array', required: false },
     },
   },
-} satisfies Record<MemoryKind, MemoryKindDefinition>;
+  world_update: {
+    fields: {
+      topic: { valueType: 'string', required: true },
+      fact: {
+        valueType: 'string', required: true,
+        description: 'The fact at creation. Later revisions append through the world update runtime method; the effective view shows the newest one.',
+      },
+      domain: { valueType: 'string', required: false },
+    },
+  },
+} satisfies Record<CanonicalMemoryKind, MemoryKindDefinition>;
 
 function plainObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -326,15 +400,20 @@ function containsHan(value: string): boolean {
   return /\p{Script=Han}/u.test(value);
 }
 
-const semanticProseFields: Record<MemoryKind, string[]> = {
+const semanticProseFields: Record<CanonicalMemoryKind, string[]> = {
   personal_experience: ['experience', 'emotional_tone', 'why_memorable'],
   shared_experience: ['event', 'shared_meaning'],
   relationship_event: ['event', 'meaning', 'prior_context', 'resulting_change'],
   inside_joke: ['meaning', 'origin', 'tone'],
   user_preference: ['preference', 'context', 'reason'],
+  world_update: ['fact'],
 };
 
-function validateChineseSemanticProse(kind: MemoryKind, summary: string, payload: Record<string, unknown>): ValidationResult | null {
+export function containsChineseSemanticProse(value: string): boolean {
+  return containsHan(value);
+}
+
+function validateChineseSemanticProse(kind: CanonicalMemoryKind, summary: string, payload: Record<string, unknown>): ValidationResult | null {
   if (!containsHan(summary)) return reject('non_chinese_semantic_prose', 'summary must contain Chinese semantic prose for DS-authored canonical writes.');
   for (const field of semanticProseFields[kind]) {
     const value = payload[field];
@@ -356,9 +435,15 @@ export interface SemanticContentValidationResult {
   reason?: string;
 }
 
+export interface SemanticContentValidationOptions {
+  requireChineseSemanticProse?: boolean;
+  /** `world_update` needs its revision chain, so only writers that keep it (remember) accept the kind. */
+  allowWorldUpdate?: boolean;
+}
+
 export function validateSemanticContent(
   input: unknown,
-  options: { requireChineseSemanticProse?: boolean } = {},
+  options: SemanticContentValidationOptions = {},
 ): SemanticContentValidationResult {
   if (!plainObject(input)) return { ok: false, code: 'invalid_schema', reason: 'Semantic content must be an object.' };
   const allowedFields = new Set(['schema_version', 'kind', 'summary', 'participants', 'payload', 'linked_memory_ids']);
@@ -367,8 +452,10 @@ export function validateSemanticContent(
     if (forbiddenAuthorityKeys.has(key)) return { ok: false, code: 'authority_field_forbidden', reason: `Authoritative field is backend-owned: ${key}` };
   }
   if (input.schema_version !== 1) return { ok: false, code: 'invalid_schema_version', reason: 'schema_version must be literal 1.' };
-  if (!MEMORY_KINDS.includes(input.kind as MemoryKind)) return { ok: false, code: 'invalid_kind', reason: 'Unsupported relationship-memory kind.' };
-  const kind = input.kind as MemoryKind;
+  if (!CANONICAL_MEMORY_KINDS.includes(input.kind as CanonicalMemoryKind) || (input.kind === WORLD_UPDATE_KIND && !options.allowWorldUpdate)) {
+    return { ok: false, code: 'invalid_kind', reason: 'Unsupported relationship-memory kind.' };
+  }
+  const kind = input.kind as CanonicalMemoryKind;
   const summary = cleanString(input.summary);
   if (!summary) return { ok: false, code: 'invalid_summary', reason: 'summary must be a non-empty string.' };
 
@@ -438,9 +525,18 @@ export function validateSemanticContent(
   };
 }
 
+/** A calendar date as YYYY-MM-DD, or null. */
+export function cleanWorldAsOf(value: unknown): string | null {
+  const text = cleanString(value);
+  if (!text || !/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const parsed = new Date(`${text}T00:00:00Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === text ? text : null;
+}
+
 export function validateProposal(input: unknown, options: { requireChineseSemanticProse?: boolean } = {}): ValidationResult {
   if (!plainObject(input)) return reject('invalid_schema', 'Proposal must be an object.');
   for (const key of Object.keys(input)) {
+    if (key === 'as_of' && input.kind === WORLD_UPDATE_KIND) continue;
     if (!commonKeys.has(key)) return reject('unknown_field', `Unknown proposal field: ${key}`);
     if (forbiddenAuthorityKeys.has(key)) return reject('authority_field_forbidden', `Authoritative field is backend-owned: ${key}`);
   }
@@ -452,8 +548,15 @@ export function validateProposal(input: unknown, options: { requireChineseSemant
     participants: input.participants,
     payload: input.payload,
     ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}),
-  }, options);
+  }, { ...options, allowWorldUpdate: true });
   if (!semantic.ok || !semantic.content) return reject(semantic.code ?? 'invalid_schema', semantic.reason ?? 'Invalid semantic content.');
+
+  let asOf: string | undefined;
+  if ('as_of' in input) {
+    const cleaned = cleanWorldAsOf(input.as_of);
+    if (!cleaned) return reject('invalid_as_of', 'as_of must be a calendar date (YYYY-MM-DD) when present.');
+    asOf = cleaned;
+  }
 
   if ('evidence_ids' in input && 'evidence_message_ids' in input) return reject('ambiguous_evidence_ids', 'Supply evidence_ids or legacy evidence_message_ids, not both.');
   const evidenceIds = cleanStringArray(input.evidence_ids ?? input.evidence_message_ids, true);
@@ -477,6 +580,7 @@ export function validateProposal(input: unknown, options: { requireChineseSemant
       payload: semantic.content.payload,
       ...(semantic.content.linked_memory_ids ? { linked_memory_ids: semantic.content.linked_memory_ids } : {}),
       ...(assistantIntentId ? { assistant_intent_id: assistantIntentId } : {}),
+      ...(asOf ? { as_of: asOf } : {}),
     },
   };
 }
@@ -573,7 +677,7 @@ export type MemoryResolutionRecord = MemoryResolutionResolveRecord | MemoryResol
 export type OwnerRevisionAction = 'revise' | 'deactivate' | 'restore';
 
 export interface OwnerSemanticContent {
-  kind: MemoryKind;
+  kind: CanonicalMemoryKind;
   summary: string;
   participants: ParticipantRole[];
   payload: Record<string, unknown>;
@@ -607,4 +711,6 @@ export interface EffectiveMemoryRecord extends Omit<CanonicalMemoryRecord, 'stat
   resolution_historical_memory_ids?: string[];
   /** Current direct neighbors explicitly confirmed as related by the owner. Computed view, not canonical storage. */
   resolution_confirmed_related_memory_ids?: string[];
+  /** world_update only: the head (its fact is also `payload.fact`), revision count and last_confirmed. */
+  world_update?: WorldUpdateView;
 }

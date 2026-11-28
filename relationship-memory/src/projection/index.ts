@@ -4,6 +4,7 @@ import type {
   CanonicalMemoryRecord,
   EffectiveMemoryRecord,
 } from '../schema/index.js';
+import { WORLD_UPDATE_KIND } from '../schema/index.js';
 import { RelationshipMemoryStore, stableId } from '../store/index.js';
 import { materializeCurrentMemoryView } from '../resolution/index.js';
 
@@ -35,7 +36,8 @@ export function renderProjection(
   memories: Array<CanonicalMemoryRecord | EffectiveMemoryRecord>,
   assistantProvenance: Map<string, AssistantRememberIntentRecord[]> = new Map(),
 ): ProjectionBundle {
-  const sorted = [...memories].filter((m) => m.status === 'active').sort((a, b) => a.memory_id.localeCompare(b.memory_id));
+  // world_update stays out of the Letta blocks and out of their revision, so a knowledge patch never changes them.
+  const sorted = [...memories].filter((m) => m.status === 'active' && m.kind !== WORLD_UPDATE_KIND).sort((a, b) => a.memory_id.localeCompare(b.memory_id));
   const render = (memory: CanonicalMemoryRecord | EffectiveMemoryRecord) => renderMemory(memory, assistantProvenance.get(memory.memory_id) ?? []);
   const sharedLanguage = sorted.filter((m) => m.kind === 'inside_joke').map(render);
   const experiences = sorted.filter((m) => m.kind === 'personal_experience' || m.kind === 'shared_experience').map(render);
