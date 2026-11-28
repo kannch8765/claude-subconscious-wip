@@ -37,7 +37,7 @@ export function materializeEffectiveMemory(genesis: CanonicalMemoryRecord, revis
   };
 }
 
-function validateReplacement(input: OwnerReviseCommand, genesis: CanonicalMemoryRecord): OwnerSemanticContent {
+function validateReplacement(input: OwnerReviseCommand, genesis: CanonicalMemoryRecord, current: EffectiveMemoryRecord): OwnerSemanticContent {
   const allowed = new Set(['revision_id','note','kind','summary','participants','payload','linked_memory_ids']);
   for (const key of Object.keys(input as any)) if (!allowed.has(key)) throw new Error(`Owner revise cannot replace authoritative field: ${key}`);
   // An owner revision changes an existing memory's semantic surface. Evidence
@@ -50,6 +50,10 @@ function validateReplacement(input: OwnerReviseCommand, genesis: CanonicalMemory
   if (genesis.kind === WORLD_UPDATE_KIND && result.content.kind !== WORLD_UPDATE_KIND) {
     throw new Error('invalid_kind: a world_update memory keeps kind world_update.');
   }
+  // The effective view shows the head revision's fact, so an owner edit of `fact` would be accepted and never shown.
+  if (genesis.kind === WORLD_UPDATE_KIND && result.content.payload.fact !== current.payload.fact) {
+    throw new Error('invalid_world_revision: a world_update fact changes only through a new revision (world update), not an owner revise.');
+  }
   return result.content;
 }
 
@@ -58,7 +62,7 @@ export class RelationshipMemoryOwnerControlPlane {
 
   revise(memoryId: string, command: OwnerReviseCommand): OwnerRevisionRecord {
     const genesis = this.requireGenesis(memoryId);
-    const replacement = validateReplacement(command, genesis);
+    const replacement = validateReplacement(command, genesis, materializeEffectiveMemory(genesis, this.history(memoryId)));
     for (const linked of replacement.linked_memory_ids ?? []) if (!this.store.getMemory(linked)) throw new Error(`Unknown canonical memory ID: ${linked}`);
     const n = note(command.note);
     return this.append({ schema_version: 1, revision_id: nonEmpty(command.revision_id, 'revision_id'), subject_id: genesis.subject_id, memory_id: memoryId,

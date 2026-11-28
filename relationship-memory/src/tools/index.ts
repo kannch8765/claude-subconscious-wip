@@ -1250,7 +1250,8 @@ export class RelationshipMemoryRuntime {
       source: worldUpdateSource(messages),
       evidence_ids: evidence.map((item) => item.evidence_id),
       batch_id: batchId,
-      recorded_at: now,
+      // The anchor's time, also when a replay repairs a torn remember: a revision appended meanwhile stays the head.
+      recorded_at: memory.created_at,
     };
     this.store.withMutationBoundary(() => {
       this.store.appendMemory(memory, evidence);

@@ -138,6 +138,28 @@ describe('world_update remember', () => {
     expect(store.listWorldRevisionsForMemoryIds([torn.memory_id])).toHaveLength(1);
     expect(runtime.finalizeBatch('batch-torn', true)).toBe('completed');
   });
+
+  it('keeps a revision appended during the torn window as head when the replay repairs r1 later', () => {
+    let failNext = true;
+    const { store, runtime, clock } = setup({ failureInjector: (phase) => {
+      if (phase !== 'world_revision_commit' || !failNext) return false;
+      failNext = false;
+      return true;
+    } });
+    const proposal = anchor([ev('u-first')]);
+    expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('retryable_failed');
+    const [torn] = store.listMemories();
+    clock.now = '2026-05-10T09:00:00.000Z';
+    expect(runtime.worldUpdate('batch-other', { memory_id: torn.memory_id, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] }).outcome).toBe('accepted');
+    clock.now = '2026-05-11T09:00:00.000Z';
+    expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('duplicate');
+    const view = runtime.currentWorldUpdate(torn.memory_id)!.world_update!;
+    expect(view.revisions!.map((item) => [item.fact, item.recorded_at])).toEqual([
+      ['Person A is the prime minister of Country X', torn.created_at],
+      ['Person B is the prime minister of Country X', '2026-05-10T09:00:00.000Z'],
+    ]);
+    expect(view.head.fact).toBe('Person B is the prime minister of Country X');
+  });
 });
 
 describe('world_update reinforce and revisions', () => {
@@ -495,7 +517,11 @@ describe('world_update stays out of the Letta surface', () => {
     }).memory_id!;
     expect(() => owner.revise(preferenceId, { revision_id: 'rev-1', kind: 'world_update', summary: 'Country X', participants: ['user'], payload: { topic: 'Country X', fact: 'Person A' } })).toThrow(/invalid_kind/);
     expect(() => owner.revise(worldId, { revision_id: 'rev-2', kind: 'user_preference', summary: 'news', participants: ['user'], payload: { topic: 'news', preference: 'news' } })).toThrow(/invalid_kind/);
-    expect(owner.revise(worldId, { revision_id: 'rev-3', kind: 'world_update', summary: 'Leader of Country X', participants: ['user'], payload: { topic: TOPIC, fact: 'Person A' } }).action).toBe('revise');
+    // The fact moves only through revisions: an owner edit of it would be hidden by the head, so it is refused.
+    expect(() => owner.revise(worldId, { revision_id: 'rev-3', kind: 'world_update', summary: 'Leader of Country X', participants: ['user'], payload: { topic: TOPIC, fact: 'Person Z leads Country X' } })).toThrow(/invalid_world_revision/);
+    const current = owner.getEffective(worldId)!;
+    expect(owner.revise(worldId, { revision_id: 'rev-4', kind: 'world_update', summary: 'Leader of Country X', participants: current.participants, payload: current.payload }).action).toBe('revise');
+    expect(runtime.currentWorldUpdate(worldId)!.summary).toBe('Leader of Country X');
   });
 
   it('leaves the Letta projection (blocks and revision) unchanged by a world_update', () => {
