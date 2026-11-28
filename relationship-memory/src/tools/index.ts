@@ -10,6 +10,7 @@ import type {
   EntityEvidenceRecord,
   EntityIdentityRecord,
   MaintenanceReviewKind,
+  CanonicalMemoryKind,
   MaintenanceReviewRecord,
   MemoryRelationKind,
   MemoryKind,
@@ -17,19 +18,27 @@ import type {
   ParticipantRole,
   RememberOutcome,
   ReinforcementRecord,
+  WorldRevisionRecord,
 } from '../schema/index.js';
-import { MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, isCitableEvidenceKind, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition } from '../schema/index.js';
+import {
+  MEMORY_KINDS, MEMORY_KIND_DEFINITIONS, MEMORY_RELATION_KINDS, WORLD_UPDATE_KIND, cleanWorldAsOf, containsChineseSemanticProse,
+  isCitableEvidenceKind, isWorldSourceEvidenceKind, normalizeEntityAlias, validateEntityIdentityProposal, validateProposal, type MemoryPayloadFieldDefinition,
+} from '../schema/index.js';
 import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { materializeEffectiveMemory } from '../owner/index.js';
-import { applyMemoryResolutions, currentReviewableMemoryIds, materializeCurrentMemoryView } from '../resolution/index.js';
+import { applyMemoryResolutions, currentReviewableMemoryIds, materializeCurrentMemoryView, serveWorldMemoriesForSearch } from '../resolution/index.js';
 import { projectRelationReviewInbox } from '../review_inbox.js';
 import { LegacyMemorySourceStore, type LegacyAssistantMemorySourceRecord } from '../legacy/index.js';
 import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 import { linkedAssistantIntentIndex } from '../intent/provenance.js';
 import { deferredIntentCounts } from '../intent/index.js';
+import {
+  INVALID_WORLD_RELATION, OVERLAPPING_WORLD_EVIDENCE, attachWorldUpdateViews, evidenceSourceKey, normalizeWorldFact, withoutWorldRevisions, worldAsOf, worldFamilyBlocks, worldMergeOverlap, worldRelationViolation, worldRevisionId,
+  worldUpdateIndexText, worldUpdateSource,
+} from '../world/index.js';
 
 export interface SearchQuery {
-  kind?: MemoryKind;
+  kind?: CanonicalMemoryKind;
   participant?: ParticipantRole;
   trigger?: string;
   linked_memory_id?: string;
@@ -40,9 +49,14 @@ export interface SearchQuery {
   excludeMemoryIds?: readonly string[];  // Runtime-only foreground context mask; never exposed in the tool schema.
 }
 
-export interface ReinforceInput { memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[]; assistant_intent_id?: string }
+export interface ReinforceInput {
+  memory_id: string; evidence_ids?: string[]; evidence_message_ids?: string[]; assistant_intent_id?: string;
+  /** world_update anchors only, and required there: the head revision (from search) this evidence confirms. */
+  world_revision_id?: string;
+}
+export interface WorldUpdateInput { memory_id: string; fact: string; as_of?: string; evidence_ids: string[] }
 export interface MaintenanceReviewInput { memory_ids: string[]; relation: MemoryRelationKind; reason: string }
-export interface MaintenanceReviewResult { outcome: 'accepted' | 'duplicate' | 'rejected'; review_id?: string; reason?: string }
+export interface MaintenanceReviewResult { outcome: 'accepted' | 'duplicate' | 'rejected'; review_id?: string; reason?: string; rejection_code?: string }
 export interface EntitySearchQuery { query?: string; limit?: number }
 export interface EntitySearchResult extends EntityIdentityRecord { evidence_ids: string[]; evidence_message_ids: string[] }
 
@@ -78,9 +92,54 @@ function notCitableRejection(ids: readonly string[]): string {
   return `Cited evidence includes self_note (the agent's own scheduled prompt firing) or meta_text (runtime or system text). Neither is the user's words, so neither can be cited, and nothing was saved. Resubmit citing only user_text, assistant_text, assistant_tool_use or tool_result evidence that itself supports every claim; drop any claim only these ids supported. Not citable: ${ids.join(', ')}`;
 }
 
-export type MemoryRememberToolName = `memory_remember_${MemoryKind}`;
+/**
+ * A world_update (remember, reinforce or world update) may cite only user_text and tool_result events: the agent's own
+ * beliefs are never a source of world facts. Any other cited kind rejects the whole call before any write, the same way
+ * as not_citable_evidence, and leaves a linked remember intent open.
+ */
+const UNTRUSTED_WORLD_SOURCE = 'untrusted_world_source';
 
-export function memoryRememberToolName(kind: MemoryKind): MemoryRememberToolName {
+function untrustedWorldRejection(ids: readonly string[]): string {
+  return `A world_update can cite only user_text (the user's words) or tool_result evidence, and nothing was saved. Resubmit citing only evidence of those kinds that itself supports the fact. Not allowed here: ${ids.join(', ')}`;
+}
+
+const NOT_WORLD_UPDATE = 'not_world_update';
+const WORLD_FACT_DUPLICATE_REASON = 'The fact equals the current head of this world_update; nothing was written. Use memory_reinforce to confirm a fact that still holds.';
+
+function worldReplayDuplicate(ids: readonly string[]): string {
+  return `These cited transcript blocks already back a revision or a confirmation of this world_update, so nothing was written: ${ids.join(', ')}. Cite only evidence that newly states the change.`;
+}
+
+/** A world_update reinforcement confirmed a revision that is no longer the head (another write landed after the search). */
+const STALE_WORLD_REVISION = 'stale_world_revision';
+
+/** A world_update call cited blocks already behind a write of the family together with blocks that are new. */
+const REUSED_WORLD_EVIDENCE = 'reused_world_evidence';
+
+function reusedWorldEvidenceRejection(ids: readonly string[]): string {
+  return `Some cited transcript blocks already back a revision or a confirmation of this world_update, so nothing was saved: ${ids.join(', ')}. Resubmit citing only evidence that newly supports the fact.`;
+}
+
+/** The transcript-block identity reinforce dedupe uses; message-level evidence falls back to its evidence id. */
+function messageBlockKey(message: CanonicalMessage): string {
+  return evidenceSourceKey(message) ?? canonicalEvidenceId(message);
+}
+
+/** A world_update card reports only the confirmations of its head, from every merged anchor. */
+function headConfirmations(memory: EffectiveMemoryRecord, byMemory: ReadonlyMap<string, ReinforcementRecord[]>): ReinforcementRecord[] {
+  const head = memory.world_update?.head.revision_id;
+  if (!head) return [];
+  return (memory.resolution_source_memory_ids ?? [memory.memory_id])
+    .flatMap((memoryId) => byMemory.get(memoryId) ?? [])
+    .filter((item) => item.world_revision_id === head);
+}
+
+/** Rejections that refuse the cited evidence itself; their replay never resolves a linked remember intent. */
+const EVIDENCE_REFUSAL_CODES: ReadonlySet<string> = new Set([NOT_CITABLE_EVIDENCE, UNTRUSTED_WORLD_SOURCE]);
+
+export type MemoryRememberToolName = `memory_remember_${CanonicalMemoryKind}`;
+
+export function memoryRememberToolName(kind: CanonicalMemoryKind): MemoryRememberToolName {
   return `memory_remember_${kind}`;
 }
 
@@ -130,23 +189,6 @@ function evidenceProvenance(message: CanonicalMessage) {
     ...(message.tool_name ? { tool_name: message.tool_name } : {}),
     ...(message.tool_use_id ? { tool_use_id: message.tool_use_id } : {}),
   };
-}
-
-type EvidenceSource = Pick<EvidenceRecord, 'message_id' | 'block_index' | 'event_kind' | 'tool_use_id'>;
-
-/**
- * Which transcript block evidence came from, without the conversation that carried it: a later conversation can carry
- * the same message again under a new transcript evidence id. Message-level evidence (no block_index or event_kind,
- * the shape from before per-block evidence) has no block source; it is matched by evidence id only.
- */
-function evidenceSourceKey(item: EvidenceSource): string | undefined {
-  if (item.block_index === undefined || item.event_kind === undefined) return undefined;
-  return stableJson({
-    message_id: item.message_id,
-    block_index: item.block_index,
-    event_kind: item.event_kind,
-    ...(item.tool_use_id ? { tool_use_id: item.tool_use_id } : {}),
-  });
 }
 
 export class RelationshipMemoryRuntime {
@@ -304,7 +346,10 @@ export class RelationshipMemoryRuntime {
     const evidence = this.store.listEvidenceForMemoryIds(evidenceMemoryIds);
     const transcript = new Map(memories.map((memory) => {
       const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
-      const snippets = sourceIds.flatMap((memoryId) => this.recallQuoteSnippets(memoryId, evidence, 12));
+      // A world_update quotes only what supports its head, so an older fact never comes back through a quote.
+      const headEvidence = memory.world_update ? new Set(memory.world_update.head_evidence_ids) : undefined;
+      const scoped = headEvidence ? evidence.filter((item) => headEvidence.has(item.evidence_id)) : evidence;
+      const snippets = sourceIds.flatMap((memoryId) => this.recallQuoteSnippets(memoryId, scoped, 12));
       return [memory.memory_id, this.boundRecallSnippets(snippets, 8)] as const;
     }));
     const missingSources = [...new Set(memories
@@ -356,8 +401,39 @@ export class RelationshipMemoryRuntime {
     ]));
   }
 
-  private resolvedRecallMemories(): EffectiveMemoryRecord[] {
-    return applyMemoryResolutions(this.effectiveMemories(), this.store.listActiveMemoryResolutions());
+  private resolvedRecallMemories(reinforcements?: readonly ReinforcementRecord[]): EffectiveMemoryRecord[] {
+    return serveWorldMemoriesForSearch(this.store, applyMemoryResolutions(this.effectiveMemories(), this.store.listActiveMemoryResolutions()), {
+      resolved: true, ...(reinforcements ? { reinforcements } : {}),
+    });
+  }
+
+  /** Index text: topic + head fact for a world_update, unchanged for the other kinds. */
+  private memoryDocumentText(memory: EffectiveMemoryRecord, linkedIntents: Array<{ memory: string; feel: string }>): string {
+    if (memory.kind === WORLD_UPDATE_KIND) return worldUpdateIndexText(memory);
+    return semanticText(memory.kind, memory.summary, memory.participants, memory.payload, memory.resolution_context ?? '', linkedIntents);
+  }
+
+  /**
+   * The current effective view of the world_update containing this anchor (after any owner same_meaning merge), with its
+   * whole revision chain, for the timeline renderer. Search and recall results carry the head only.
+   */
+  currentWorldUpdate(memoryId: string): EffectiveMemoryRecord | undefined {
+    const current = this.resolvedRecallMemories().find((memory) =>
+      memory.kind === WORLD_UPDATE_KIND && (memory.resolution_source_memory_ids ?? [memory.memory_id]).includes(memoryId));
+    if (current) return current;
+    const genesis = this.store.getMemory(memoryId);
+    if (genesis?.kind !== WORLD_UPDATE_KIND) return undefined;
+    const effective = this.effectiveMemories().find((memory) => memory.memory_id === memoryId);
+    return effective ? attachWorldUpdateViews(this.store, [effective])[0] : undefined;
+  }
+
+  /**
+   * The transcript blocks behind every write of a world_update family: each revision and each confirmation, on every
+   * merged anchor. Only written rows count, so a half-committed revision or reinforcement is still repaired.
+   */
+  private worldFamilyUsedBlocks(memoryId: string, family: EffectiveMemoryRecord | undefined): Set<string> {
+    const anchorIds = new Set([memoryId, ...(family?.resolution_source_memory_ids ?? (family ? [family.memory_id] : []))]);
+    return new Set(worldFamilyBlocks(this.store, [...anchorIds]).keys());
   }
 
   async prepareCurrentMemorySemanticIndex(): Promise<void> {
@@ -370,7 +446,7 @@ export class RelationshipMemoryRuntime {
         const linkedIntents = sourceIds.flatMap((memoryId) => intentsByMemory.get(memoryId) ?? []);
         return {
           id: `memory:${memory.memory_id}`,
-          text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, memory.resolution_context ?? '', linkedIntents),
+          text: this.memoryDocumentText(memory, linkedIntents),
         };
       });
     await this.semanticRetriever.prepare(documents);
@@ -389,17 +465,20 @@ export class RelationshipMemoryRuntime {
     // Preserve the existing memory_search result/search semantics without the
     // hot path's old per-memory JSONL rescans. Materialize each supporting file
     // once, then join by memory id in memory.
+    const allReinforcements = this.store.listReinforcements();
     const reinforcementsByMemory = new Map<string, ReinforcementRecord[]>();
-    for (const reinforcement of this.store.listReinforcements()) {
+    for (const reinforcement of allReinforcements) {
       const bucket = reinforcementsByMemory.get(reinforcement.memory_id) ?? [];
       bucket.push(reinforcement);
       reinforcementsByMemory.set(reinforcement.memory_id, bucket);
     }
     const linkedIntentsByMemory = this.linkedIntentSemanticByMemory();
 
-    const candidates = this.resolvedRecallMemories().map((memory) => {
+    const candidates = this.resolvedRecallMemories(allReinforcements).map((memory) => {
       const sourceIds = memory.resolution_source_memory_ids ?? [memory.memory_id];
-      const reinforcements = sourceIds.flatMap((memoryId) => reinforcementsByMemory.get(memoryId) ?? []);
+      const reinforcements = memory.kind === WORLD_UPDATE_KIND
+        ? headConfirmations(memory, reinforcementsByMemory)
+        : sourceIds.flatMap((memoryId) => reinforcementsByMemory.get(memoryId) ?? []);
       const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
       const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
       const enriched: EffectiveMemoryRecord = {
@@ -425,11 +504,11 @@ export class RelationshipMemoryRuntime {
       if (trigger && !haystack.includes(trigger)) return false;
       return true;
     });
-    if (!semanticQuery) return candidates.slice(0, limit).map((item) => item.memory);
+    if (!semanticQuery) return candidates.slice(0, limit).map((item) => withoutWorldRevisions(item.memory));
 
     const documents = candidates.map(({ memory, linkedIntents }) => ({
       id: `memory:${memory.memory_id}`,
-      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, memory.resolution_context ?? '', linkedIntents),
+      text: this.memoryDocumentText(memory, linkedIntents),
     }));
     let semantic = new Map<string, number>();
     if (refreshIndex && this.semanticRetriever?.rank) {
@@ -449,15 +528,16 @@ export class RelationshipMemoryRuntime {
     return scored
       .sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
       .slice(0, limit)
-      .map((item) => item.memory);
+      .map((item) => withoutWorldRevisions(item.memory));
   }
 
   private materializedMemorySearchRows(): Array<{
     memory: EffectiveMemoryRecord;
     linkedIntents: Array<{ memory: string; feel: string }>;
   }> {
+    const allReinforcements = this.store.listReinforcements();
     const reinforcementsByMemory = new Map<string, ReinforcementRecord[]>();
-    for (const reinforcement of this.store.listReinforcements()) {
+    for (const reinforcement of allReinforcements) {
       const bucket = reinforcementsByMemory.get(reinforcement.memory_id) ?? [];
       bucket.push(reinforcement);
       reinforcementsByMemory.set(reinforcement.memory_id, bucket);
@@ -482,8 +562,12 @@ export class RelationshipMemoryRuntime {
       linkedIntentsByMemory.set(outcome.memory_id, bucket);
     }
 
-    return this.effectiveMemories().map((memory) => {
-      const reinforcements = reinforcementsByMemory.get(memory.memory_id) ?? [];
+    // Raw for the five relationship kinds (owner review inspects every canonical memory); world_update is served resolved.
+    const effective = this.effectiveMemories();
+    return serveWorldMemoriesForSearch(this.store, effective, { allEffective: effective, reinforcements: allReinforcements }).map((memory) => {
+      const reinforcements = memory.kind === WORLD_UPDATE_KIND
+        ? headConfirmations(memory, reinforcementsByMemory)
+        : reinforcementsByMemory.get(memory.memory_id) ?? [];
       const evidenceIds = [...new Set(reinforcements.flatMap((item) => item.evidence_ids))];
       const latest = reinforcements.map((item) => item.latest_evidence_at).sort().at(-1);
       const enriched: EffectiveMemoryRecord = {
@@ -528,7 +612,7 @@ export class RelationshipMemoryRuntime {
   }
 
   memorySearch(query: SearchQuery): EffectiveMemoryRecord[] {
-    return this.filterMemorySearchRows(this.materializedMemorySearchRows(), query).map(({ memory }) => memory);
+    return this.filterMemorySearchRows(this.materializedMemorySearchRows(), query).map(({ memory }) => withoutWorldRevisions(memory));
   }
 
   async memorySearchHybrid(query: SearchQuery): Promise<EffectiveMemoryRecord[]> {
@@ -536,12 +620,14 @@ export class RelationshipMemoryRuntime {
     const limit = boundedSearchLimit(query.limit);
     const rows = this.materializedMemorySearchRows();
     if (!this.semanticRetriever || !semanticQuery) {
-      return this.filterMemorySearchRows(rows, query).slice(0, limit).map(({ memory }) => memory);
+      return this.filterMemorySearchRows(rows, query).slice(0, limit).map(({ memory }) => withoutWorldRevisions(memory));
     }
     const candidates = this.filterMemorySearchRows(rows, query, false);
     const documents = candidates.map(({ memory, linkedIntents }) => ({
       id: `memory:${memory.memory_id}`,
-      text: semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
+      text: memory.kind === WORLD_UPDATE_KIND
+        ? worldUpdateIndexText(memory)
+        : semanticText(memory.kind, memory.summary, memory.participants, memory.payload, linkedIntents),
     }));
     try {
       const semantic = await this.semanticRetriever.rank(documents, semanticQuery);
@@ -550,9 +636,9 @@ export class RelationshipMemoryRuntime {
         score: hybridScore(lexicalTextScore(documents[index].text, semanticQuery), semantic.get(documents[index].id)),
       })).sort((a, b) => b.score - a.score || b.memory.observed_at.localeCompare(a.memory.observed_at))
         .slice(0, limit)
-        .map((item) => item.memory);
+        .map((item) => withoutWorldRevisions(item.memory));
     } catch {
-      return this.filterMemorySearchRows(rows, query).slice(0, limit).map(({ memory }) => memory);
+      return this.filterMemorySearchRows(rows, query).slice(0, limit).map(({ memory }) => withoutWorldRevisions(memory));
     }
   }
 
@@ -834,9 +920,9 @@ export class RelationshipMemoryRuntime {
       return { outcome: 'rejected', reason: 'maintenance review requires 2-8 unique memory_ids, a valid relation, and a non-empty reason up to 1000 characters' };
     }
     const memoryIds = [...rawIds].sort();
-    const knownMemoryIds = new Set(this.store.listMemories().map((memory) => memory.memory_id));
+    const kindById = new Map(this.store.listMemories().map((memory) => [memory.memory_id, memory.kind] as const));
     for (const memoryId of memoryIds) {
-      if (!knownMemoryIds.has(memoryId)) return { outcome: 'rejected', reason: `unknown canonical memory ID: ${memoryId}` };
+      if (!kindById.has(memoryId)) return { outcome: 'rejected', reason: `unknown canonical memory ID: ${memoryId}` };
     }
     // Suggestions must refer to the *current* memories the owner can review.
     // Merged/historical/conflicted/inactive genesis remains available as evidence,
@@ -844,6 +930,20 @@ export class RelationshipMemoryRuntime {
     const currentIds = currentReviewableMemoryIds(this.store);
     const stale = memoryIds.find((memoryId) => !currentIds.has(memoryId));
     if (stale) return { outcome: 'rejected', reason: `memory is not current and active: ${stale}` };
+    // Checked before the review-id lookups: a review id does not include the relation.
+    const worldViolation = worldRelationViolation(memoryIds.map((memoryId) => kindById.get(memoryId)!), relation);
+    if (worldViolation) return { outcome: 'rejected', rejection_code: INVALID_WORLD_RELATION, reason: worldViolation };
+    if (relation === 'same_meaning' && memoryIds.every((memoryId) => kindById.get(memoryId) === WORLD_UPDATE_KIND)) {
+      const shared = worldMergeOverlap(this.store, memoryIds.map((memoryId) =>
+        this.currentWorldUpdate(memoryId)?.resolution_source_memory_ids ?? [memoryId]));
+      if (shared.length > 0) {
+        return {
+          outcome: 'rejected',
+          rejection_code: OVERLAPPING_WORLD_EVIDENCE,
+          reason: `These world_update memories share transcript evidence (${shared.join(', ')}), so one is likely a replay of the other and a merge would cite a block twice. Suggest related instead: the owner can then review the pair and deactivate the duplicate.`,
+        };
+      }
+    }
     const reviewId = stableId('maintenance_review', {
       subject_id: this.store.subjectId,
       kind,
@@ -900,9 +1000,12 @@ export class RelationshipMemoryRuntime {
     // An intent id is part of the source only when given, so reinforcement keys without one stay as they were.
     const intentId = rawAssistantIntentId(input);
     const intentKey = intentId ? { assistant_intent_id: intentId } : {};
+    // Likewise a world revision id is part of the source only when given.
+    const worldRevisionId = typeof input?.world_revision_id === 'string' ? input.world_revision_id.trim() : undefined;
+    const worldKey = input?.world_revision_id === undefined ? {} : { world_revision_id: input.world_revision_id };
     const sourceKey = legacyEvidenceField
-      ? stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_message_ids: normalizedIds, ...intentKey })
-      : stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_ids: normalizedIds, ...intentKey });
+      ? stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_message_ids: normalizedIds, ...intentKey, ...worldKey })
+      : stableId('reinforce_src', { batch_id: batchId, memory_id: memoryId, evidence_ids: normalizedIds, ...intentKey, ...worldKey });
     // Reinforcing with an intent says the intent's moment is already remembered: the intent links to this memory as a
     // `duplicate`. Only a write or retryable failure carries the intent; a rejected reinforcement leaves it unresolved
     // (the turn budget still applies), so a wrong memory_id cannot consume it.
@@ -936,16 +1039,28 @@ export class RelationshipMemoryRuntime {
     }
     const memory = this.store.getMemory(memoryId);
     if (!memory) return this.persistPermanent(batchId, sourceKey, 'unknown_memory', `Unknown canonical memory ID: ${memoryId}`, now);
+    const world = memory.kind === WORLD_UPDATE_KIND;
+    if (!world && input.world_revision_id !== undefined) {
+      return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'world_revision_id applies only to a world_update memory.', now);
+    }
+    if (world && !worldRevisionId) {
+      return this.persistPermanent(batchId, sourceKey, 'invalid_reinforcement', 'A world_update reinforcement must cite the head revision it confirms: world_revision_id from memory_search.', now);
+    }
     const messages: CanonicalMessage[] = [];
     const skipped: string[] = [];
+    const untrusted: string[] = [];
     for (const id of normalizedIds) {
       const resolved = this.trustedEvidence(id, legacyEvidenceField);
       if (resolved.ambiguous) return this.persistPermanent(batchId, sourceKey, 'ambiguous_evidence', `Legacy message_id identifies multiple trusted transcript events; use an exact evidence_id: ${id}`, now);
       if (!resolved.message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
+      if (world && !isWorldSourceEvidenceKind(resolved.message.event_kind)) untrusted.push(id);
       if (isCitableEvidenceKind(resolved.message.event_kind)) messages.push(resolved.message);
       else skipped.push(id);
     }
+    if (untrusted.length > 0) return this.persistPermanent(batchId, sourceKey, UNTRUSTED_WORLD_SOURCE, untrustedWorldRejection(untrusted), now);
     if (skipped.length > 0) return this.persistPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
+    // The merged world_update family this anchor belongs to, read under the mutation lock.
+    const family = world ? this.currentWorldUpdate(memoryId) : undefined;
     const memoryEvidence = this.store.listEvidence().filter((item) => item.memory_id === memoryId);
     const originalEvidenceIds = this.originalMemoryEvidenceIds(memory, memoryEvidence);
     if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now, intent);
@@ -954,31 +1069,52 @@ export class RelationshipMemoryRuntime {
       if (reinforcement.memory_id !== memoryId) continue;
       for (const evidenceId of reinforcement.evidence_ids) completedEvidenceIds.add(evidenceId);
     }
+    // A world_update anchor also holds the evidence of its revisions; citing it again confirms nothing new.
+    if (world) for (const revision of this.store.listWorldRevisionsForMemoryIds([memoryId])) for (const evidenceId of revision.evidence_ids) completedEvidenceIds.add(evidenceId);
     // A message is already attached when the memory holds its evidence id, or holds the same transcript block under
     // another conversation's id; a block repeated inside this call is attached once. Only completed evidence counts,
-    // so a half-committed reinforcement is still repaired.
-    const attachedSources = new Set(memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)).map(evidenceSourceKey));
+    // so a half-committed reinforcement is still repaired. For a world_update, a block behind any write of the merged
+    // family is attached too.
+    const attachedSources = new Set<string | undefined>(memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)).map(evidenceSourceKey));
+    if (world) for (const block of this.worldFamilyUsedBlocks(memoryId, family)) attachedSources.add(block);
+    // Used before this call, judged before the filter below adds this call's own blocks.
+    const usedBefore = world
+      ? messages.filter((message) => completedEvidenceIds.has(memoryEvidenceId(memoryId, message)) || attachedSources.has(messageBlockKey(message)))
+      : [];
     const newMessages = messages.filter((message) => {
       if (completedEvidenceIds.has(memoryEvidenceId(memoryId, message))) return false;
-      const source = evidenceSourceKey(message);
+      const source = world ? messageBlockKey(message) : evidenceSourceKey(message);
       if (source === undefined) return true;
       if (attachedSources.has(source)) return false;
       attachedSources.add(source);
       return true;
     });
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
+    // A world reinforcement that cites a block already behind a write of the family beside new ones is refused whole;
+    // checked after the duplicate check (a torn replay is all used) and before the head check.
+    if (world && usedBefore.length > 0) return this.persistPermanent(batchId, sourceKey, REUSED_WORLD_EVIDENCE, reusedWorldEvidenceRejection(usedBefore.map(canonicalEvidenceId)), now);
+    if (world) {
+      // Evidence for a fact that has since changed must not confirm the new head. Checked after the duplicate check,
+      // so a torn reinforcement still replays as a duplicate.
+      const head = family?.world_update?.head;
+      if (!head?.revision_id || head.revision_id !== worldRevisionId) {
+        return this.persistPermanent(batchId, sourceKey, STALE_WORLD_REVISION, `The current head of this world_update is ${head?.revision_id ?? 'not recorded yet'}, not ${worldRevisionId}; nothing was saved. Search again, then reinforce the current head or record a changed fact as a world update.`, now);
+      }
+    }
     const newMessageIds = newMessages.map(canonicalEvidenceId).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({
       evidence_id: memoryEvidenceId(memoryId, message), memory_id: memoryId,
       conversation_id: message.conversation_id, message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
       ...evidenceProvenance(message),
     }));
+    const confirms = world ? { world_revision_id: worldRevisionId! } : {};
     const reinforcement: ReinforcementRecord = {
       schema_version: 1, reinforcement_id: legacyEvidenceField
-        ? stableId('reinforce', { memory_id: memoryId, evidence_message_ids: newMessageIds })
-        : stableId('reinforce', { memory_id: memoryId, evidence_ids: newMessageIds }),
+        ? stableId('reinforce', { memory_id: memoryId, evidence_message_ids: newMessageIds, ...confirms })
+        : stableId('reinforce', { memory_id: memoryId, evidence_ids: newMessageIds, ...confirms }),
       memory_id: memoryId, batch_id: batchId, evidence_ids: evidence.map((item) => item.evidence_id),
       latest_evidence_at: newMessages.map((message) => message.captured_at).sort().at(-1)!, recorded_at: now,
+      ...confirms,
     };
     const existed = this.store.listReinforcements().some((item) => item.reinforcement_id === reinforcement.reinforcement_id);
     try { this.store.appendReinforcement(reinforcement, evidence); }
@@ -986,7 +1122,7 @@ export class RelationshipMemoryRuntime {
     return this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now, intent, 'duplicate');
   }
 
-  rememberKind(batchId: string, kind: MemoryKind, rawInput: unknown): RememberResult {
+  rememberKind(batchId: string, kind: CanonicalMemoryKind, rawInput: unknown): RememberResult {
     const input = rawInput !== null && typeof rawInput === 'object' && !Array.isArray(rawInput)
       ? rawInput as Record<string, unknown>
       : {};
@@ -1016,7 +1152,7 @@ export class RelationshipMemoryRuntime {
         previous.rejection_code ?? 'invalid_schema',
         previous.reason ?? 'Previously rejected proposal.',
         now,
-        previous.rejection_code === NOT_CITABLE_EVIDENCE ? undefined : rawTrustedIntent,
+        previous.rejection_code && EVIDENCE_REFUSAL_CODES.has(previous.rejection_code) ? undefined : rawTrustedIntent,
       );
     }
 
@@ -1054,8 +1190,10 @@ export class RelationshipMemoryRuntime {
       }
     }
 
+    const world = proposal.kind === WORLD_UPDATE_KIND;
     const evidenceMessages: CanonicalMessage[] = [];
     const skipped: string[] = [];
+    const untrusted: string[] = [];
     for (const evidenceId of proposal.evidence_message_ids) {
       const resolved = this.trustedEvidence(evidenceId, legacyEvidenceField);
       if (resolved.ambiguous) {
@@ -1064,9 +1202,11 @@ export class RelationshipMemoryRuntime {
       if (!resolved.message) {
         return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${evidenceId}`, now, assistantIntent);
       }
+      if (world && !isWorldSourceEvidenceKind(resolved.message.event_kind)) untrusted.push(evidenceId);
       if (isCitableEvidenceKind(resolved.message.event_kind)) evidenceMessages.push(resolved.message);
       else skipped.push(evidenceId);
     }
+    if (untrusted.length > 0) return this.persistPermanent(batchId, sourceKey, UNTRUSTED_WORLD_SOURCE, untrustedWorldRejection(untrusted), now);
     if (skipped.length > 0) return this.persistPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
 
     const canonicalEvidenceIds = evidenceMessages.map(canonicalEvidenceId);
@@ -1093,7 +1233,7 @@ export class RelationshipMemoryRuntime {
         ...evidenceProvenance(message),
       }));
       try {
-        this.store.appendMemory(recoveredMemory, recoveredEvidence);
+        this.appendMemoryWithFirstRevision(batchId, recoveredMemory, recoveredEvidence, evidenceMessages, proposal.as_of, now);
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error);
         return this.markRetryable(batchId, sourceKey, reason, now, assistantIntent);
@@ -1152,12 +1292,143 @@ export class RelationshipMemoryRuntime {
     }));
 
     try {
-      this.store.appendMemory(memory, evidence);
+      this.appendMemoryWithFirstRevision(batchId, memory, evidence, evidenceMessages, proposal.as_of, now);
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       return this.markRetryable(batchId, sourceKey, reason, now, assistantIntent);
     }
     return this.persistOutcomePair(batchId, sourceKey, 'accepted', memoryId, now, assistantIntent);
+  }
+
+  /** A world_update's r1 and evidence land before its anchor row, in one mutation boundary; other kinds append the memory only. */
+  private appendMemoryWithFirstRevision(
+    batchId: string,
+    memory: CanonicalMemoryRecord,
+    evidence: EvidenceRecord[],
+    messages: readonly CanonicalMessage[],
+    asOf: string | undefined,
+    now: string,
+  ): void {
+    if (memory.kind !== WORLD_UPDATE_KIND) {
+      this.store.appendMemory(memory, evidence);
+      return;
+    }
+    const fact = String(memory.payload.fact);
+    const resolvedAsOf = worldAsOf(asOf, messages, now);
+    const revision: Omit<WorldRevisionRecord, 'sequence'> = {
+      schema_version: 1,
+      revision_id: worldRevisionId(memory.memory_id, fact, resolvedAsOf, messages.map(messageBlockKey)),
+      memory_id: memory.memory_id,
+      fact,
+      as_of: resolvedAsOf,
+      source: worldUpdateSource(messages),
+      evidence_ids: evidence.map((item) => item.evidence_id),
+      batch_id: batchId,
+      // The anchor's time. On a replay after a crash before the anchor row, r1 keeps the first attempt's time.
+      recorded_at: memory.created_at,
+    };
+    this.store.withMutationBoundary(() => {
+      // r1 and its evidence land before the anchor row, so an anchor never exists without them. A crash in between
+      // leaves an r1 no anchor points to: invisible, and the same-batch replay derives the same memory_id and r1.
+      this.store.appendWorldRevision(revision, evidence, true);
+      this.store.appendMemory(memory, evidence);
+    });
+  }
+
+  private persistWorldDuplicate(batchId: string, sourceKey: string, memoryId: string, reason: string, now: string): RememberResult {
+    try {
+      this.store.appendOutcome({
+        batch_id: batchId, ...this.attemptFields(batchId), source_key: sourceKey, outcome: 'duplicate', memory_id: memoryId, reason, recorded_at: now,
+      });
+      return { outcome: 'duplicate', memory_id: memoryId, reason };
+    } catch (error) {
+      return this.markRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now);
+    }
+  }
+
+  /**
+   * Appends a revision to a world_update anchor: the fact changed. Runs under one canonical mutation boundary, so the
+   * duplicate check sees every committed revision. Evidence rules match remember / reinforce for this kind; `source`
+   * is derived from the cited events, never taken from the caller.
+   */
+  worldUpdate(batchId: string, input: WorldUpdateInput): RememberResult {
+    return this.store.withMutationBoundary(() => this.worldUpdateInBoundary(batchId, input));
+  }
+
+  private worldUpdateInBoundary(batchId: string, input: WorldUpdateInput): RememberResult {
+    const now = this.now();
+    this.ensureRetryAttempt(batchId, now);
+    const memoryId = typeof input?.memory_id === 'string' ? input.memory_id.trim() : '';
+    const fact = typeof input?.fact === 'string' ? input.fact.trim() : '';
+    const rawAsOf = input?.as_of;
+    const ids = Array.isArray(input?.evidence_ids) ? input.evidence_ids.map((id) => typeof id === 'string' ? id.trim() : '') : [];
+    const normalizedIds = [...ids].sort();
+    const sourceKey = stableId('world_update_src', {
+      batch_id: batchId, memory_id: memoryId, fact, evidence_ids: normalizedIds, ...(rawAsOf === undefined ? {} : { as_of: rawAsOf }),
+    });
+    const previous = this.store.getTerminalOutcome(sourceKey);
+    if (previous) {
+      if (previous.outcome === 'accepted' || previous.outcome === 'duplicate') {
+        return { outcome: 'duplicate', memory_id: previous.memory_id ?? memoryId, ...(previous.reason ? { reason: previous.reason } : {}) };
+      }
+      return { outcome: previous.outcome, rejection_code: previous.rejection_code, reason: previous.reason };
+    }
+    if (!memoryId || !fact || ids.length === 0 || ids.some((id) => !id) || new Set(ids).size !== ids.length) {
+      return this.persistPermanent(batchId, sourceKey, 'invalid_world_update', 'memory_id, a non-empty fact and unique non-empty evidence_ids are required.', now);
+    }
+    const asOf = rawAsOf === undefined ? undefined : cleanWorldAsOf(rawAsOf);
+    if (asOf === null) return this.persistPermanent(batchId, sourceKey, 'invalid_as_of', 'as_of must be a calendar date (YYYY-MM-DD) when present.', now);
+    const memory = this.store.getMemory(memoryId);
+    if (!memory) return this.persistPermanent(batchId, sourceKey, 'unknown_memory', `Unknown canonical memory ID: ${memoryId}`, now);
+    if (memory.kind !== WORLD_UPDATE_KIND) {
+      return this.persistPermanent(batchId, sourceKey, NOT_WORLD_UPDATE, `Memory ${memoryId} is a ${memory.kind}, not a world_update; only a world_update takes revisions.`, now);
+    }
+    if (this.requireChineseSemanticProse && !containsChineseSemanticProse(fact)) {
+      return this.persistPermanent(batchId, sourceKey, 'non_chinese_semantic_prose', 'world_update.fact must contain Chinese semantic prose for DS-authored canonical writes.', now);
+    }
+    const messages: CanonicalMessage[] = [];
+    const untrusted: string[] = [];
+    for (const id of normalizedIds) {
+      const resolved = this.trustedEvidence(id);
+      if (resolved.ambiguous) return this.persistPermanent(batchId, sourceKey, 'ambiguous_evidence', `Evidence id identifies multiple trusted transcript events: ${id}`, now);
+      if (!resolved.message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
+      if (isWorldSourceEvidenceKind(resolved.message.event_kind)) messages.push(resolved.message);
+      else untrusted.push(id);
+    }
+    if (untrusted.length > 0) return this.persistPermanent(batchId, sourceKey, UNTRUSTED_WORLD_SOURCE, untrustedWorldRejection(untrusted), now);
+
+    // The merged chain this anchor belongs to: the head and every earlier revision of the family.
+    const family = this.currentWorldUpdate(memoryId);
+    const head = family?.world_update?.head;
+    if (head && normalizeWorldFact(head.fact) === normalizeWorldFact(fact)) return this.persistWorldDuplicate(batchId, sourceKey, memoryId, WORLD_FACT_DUPLICATE_REASON, now);
+    // A transcript block backs at most one write of a family. A block already behind a revision or a confirmation,
+    // under any conversation, is a replay whatever the fact's wording, and must not bring an earlier fact back.
+    const used = this.worldFamilyUsedBlocks(memoryId, family);
+    const reused = messages.filter((message) => used.has(messageBlockKey(message))).map(canonicalEvidenceId);
+    if (reused.length === messages.length && reused.length > 0) return this.persistWorldDuplicate(batchId, sourceKey, memoryId, worldReplayDuplicate(reused), now);
+    if (reused.length > 0) return this.persistPermanent(batchId, sourceKey, REUSED_WORLD_EVIDENCE, reusedWorldEvidenceRejection(reused), now);
+
+    const resolvedAsOf = worldAsOf(asOf, messages, now);
+    const evidence: EvidenceRecord[] = messages.map((message) => ({
+      evidence_id: memoryEvidenceId(memoryId, message), memory_id: memoryId,
+      conversation_id: message.conversation_id, message_id: message.message_id, role: message.role, quote: message.quote, captured_at: message.captured_at,
+      ...evidenceProvenance(message),
+    }));
+    const revision: Omit<WorldRevisionRecord, 'sequence'> = {
+      schema_version: 1,
+      revision_id: worldRevisionId(memoryId, fact, resolvedAsOf, messages.map(messageBlockKey)),
+      memory_id: memoryId,
+      fact,
+      as_of: resolvedAsOf,
+      source: worldUpdateSource(messages),
+      evidence_ids: evidence.map((item) => item.evidence_id),
+      batch_id: batchId,
+      recorded_at: now,
+    };
+    const existed = this.store.listWorldRevisionsForMemoryIds([memoryId]).some((item) => item.revision_id === revision.revision_id);
+    try { this.store.appendWorldRevision(revision, evidence); }
+    catch (error) { return this.markRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }
+    return this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now);
   }
 
   /** Records a `deferred` outcome per unresolved intent and returns the ones that must still hold the batch. */
@@ -1232,7 +1503,7 @@ export function cursorShouldAdvance(completion: BatchCompletion): boolean {
   return completion === 'completed';
 }
 
-export function memoryRememberKindToolSchema(kind: MemoryKind): Record<string, unknown> {
+export function memoryRememberKindToolSchema(kind: CanonicalMemoryKind): Record<string, unknown> {
   const stringSchema = (): Record<string, unknown> => ({ type: 'string', minLength: 1 });
   const stringArraySchema = (requireNonEmpty = false): Record<string, unknown> => ({
     type: 'array',

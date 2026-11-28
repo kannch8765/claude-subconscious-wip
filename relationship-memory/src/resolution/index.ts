@@ -1,16 +1,18 @@
 import type {
   EffectiveMemoryRecord,
+  ReinforcementRecord,
   MaintenanceReviewRecord,
   MemoryRelationKind,
   MemoryResolutionRecord,
   MemoryResolutionResolveRecord,
 } from '../schema/index.js';
-import { MEMORY_RELATION_KINDS } from '../schema/index.js';
+import { MEMORY_RELATION_KINDS, WORLD_UPDATE_KIND } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
 import { findConflictingOwnerLinks, validOwnerConflictReconciliation } from '../owner_relation_conflicts.js';
 import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../intent/provenance.js';
+import { INVALID_WORLD_RELATION, OVERLAPPING_WORLD_EVIDENCE, attachWorldUpdateViews, withServedWorldSummary, worldMergeOverlap, worldRelationViolation } from '../world/index.js';
 
 export interface ResolveReviewCommand {
   resolution_id: string;
@@ -253,7 +255,34 @@ export function applyMemoryResolutions(
 
 export function materializeCurrentMemoryView(store: RelationshipMemoryStore): EffectiveMemoryRecord[] {
   const owner = new RelationshipMemoryOwnerControlPlane(store);
-  return applyMemoryResolutions(owner.listEffective(), store.listActiveMemoryResolutions());
+  return attachWorldUpdateViews(store, applyMemoryResolutions(owner.listEffective(), store.listActiveMemoryResolutions()));
+}
+
+/**
+ * What every search and recall path serves for world_update memories, whether the rest of its list is raw or resolved:
+ * owner merges applied (one card, one chain; a merged-away anchor is not served), the head as `payload.fact`, and a
+ * summary derived from topic + head. Other kinds pass through as given. Owner views (materializeCurrentMemoryView,
+ * listEffective) keep the stored summary and the raw anchors.
+ */
+export function serveWorldMemoriesForSearch(
+  store: RelationshipMemoryStore,
+  memories: readonly EffectiveMemoryRecord[],
+  options: { resolved?: boolean; allEffective?: readonly EffectiveMemoryRecord[]; reinforcements?: readonly ReinforcementRecord[] } = {},
+): EffectiveMemoryRecord[] {
+  if (!memories.some((memory) => memory.kind === WORLD_UPDATE_KIND)) return [...memories];
+  let served: readonly EffectiveMemoryRecord[] = memories;
+  if (!options.resolved) {
+    const everything = options.allEffective ?? new RelationshipMemoryOwnerControlPlane(store).listEffective();
+    const current = new Map(applyMemoryResolutions(everything, store.listActiveMemoryResolutions())
+      .filter((memory) => memory.kind === WORLD_UPDATE_KIND)
+      .map((memory) => [memory.memory_id, memory] as const));
+    served = memories.flatMap((memory) => {
+      if (memory.kind !== WORLD_UPDATE_KIND) return [memory];
+      const resolved = current.get(memory.memory_id);
+      return resolved ? [resolved] : [];
+    });
+  }
+  return attachWorldUpdateViews(store, served, options.reinforcements).map(withServedWorldSummary);
 }
 
 /** A review can act only on current, active memories. Historical records stay on disk. */
@@ -325,6 +354,8 @@ export class RelationshipMemoryResolutionControlPlane {
     const currentIds = currentReviewableMemoryIds(this.store);
     const staleId = memoryIds.find((memoryId) => !currentIds.has(memoryId));
     if (staleId) throw new Error(`Review references a memory that is no longer current and active: ${staleId}`);
+    const worldViolation = worldRelationViolation(memoryIds.map((memoryId) => this.store.getMemory(memoryId)!.kind), relation);
+    if (worldViolation) throw new Error(`${INVALID_WORLD_RELATION}: ${worldViolation}`);
 
     if (relation === 'same_meaning' || relation === 'changed_over_time') {
       if (!targetMemoryId || !memoryIds.includes(targetMemoryId)) throw new Error(`${relation} resolution requires target_memory_id from the reviewed memory set`);
@@ -394,6 +425,23 @@ export class RelationshipMemoryResolutionControlPlane {
       ...(contexts ? { contexts } : {}),
       ...(note ? { note } : {}),
     };
+    if (relation === 'same_meaning' && memoryIds.every((memoryId) => this.store.getMemory(memoryId)!.kind === WORLD_UPDATE_KIND)) {
+      // The overlap check and the append share one mutation boundary, so a write cannot land between them.
+      return this.store.withMutationBoundary(() => {
+        // Re-read under the lock: a racing resolve may have merged a member away since the checks above.
+        const reviewable = currentReviewableMemoryIds(this.store);
+        const current = materializeCurrentMemoryView(this.store);
+        const shared = worldMergeOverlap(this.store, memoryIds.map((memoryId) => {
+          const memory = current.find((item) => item.memory_id === memoryId);
+          if (!memory || !reviewable.has(memoryId)) throw new Error(`Review references a memory that is no longer current and active: ${memoryId}`);
+          return memory.resolution_source_memory_ids ?? [memory.memory_id];
+        }));
+        if (shared.length > 0) {
+          throw new Error(`${OVERLAPPING_WORLD_EVIDENCE}: these world_update memories share transcript evidence (${shared.join(', ')}); deactivate the replayed duplicate instead of merging.`);
+        }
+        return this.store.appendMemoryResolution(record);
+      });
+    }
     return this.store.appendMemoryResolution(record);
   }
 
