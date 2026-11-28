@@ -17,6 +17,13 @@ export interface EmbeddingProvider {
   readonly maxBatchSize: number;
   embedDocuments(texts: string[]): Promise<number[][]>;
   embedQuery(text: string, signal?: AbortSignal): Promise<number[]>;
+  /** Several queries, one request per maxBatchSize chunk; vectors come back in input order. */
+  embedQueries?(texts: string[], signal?: AbortSignal): Promise<number[][]>;
+}
+
+export interface SemanticRankRequest {
+  documents: SemanticDocument[];
+  query: string;
 }
 
 export interface SemanticRetriever {
@@ -28,6 +35,12 @@ export interface SemanticRetriever {
    * refreshes or embeds documents and is intended for foreground read-only recall.
    */
   rankExisting?(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>>;
+  /**
+   * rankExisting for several requests with one query embedding call. Each map equals
+   * rankExisting(request.documents, request.query). A failed shared request rejects the whole call;
+   * with per-query requests, a query whose request failed gets an empty map.
+   */
+  rankExistingMany?(requests: readonly SemanticRankRequest[], signal?: AbortSignal): Promise<Map<string, number>[]>;
 }
 
 interface SemanticIndexEntry {
@@ -204,14 +217,22 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
       try { payload = await response.json(); } catch { payload = {}; }
       if (!response.ok) throw providerError(response.status, payload);
       const embeddings = Array.isArray(payload?.output?.embeddings) ? payload.output.embeddings : [];
-      const ordered = embeddings
-        .map((entry: any, index: number) => ({ index: Number.isInteger(entry?.text_index) ? entry.text_index : index, vector: entry?.embedding }))
-        .sort((a: { index: number }, b: { index: number }) => a.index - b.index)
-        .map((entry: { vector: unknown }) => entry.vector);
-      if (ordered.length !== texts.length || ordered.some((vector: unknown) => !Array.isArray(vector) || vector.length !== this.dimensions || vector.some((item) => typeof item !== 'number' || !Number.isFinite(item)))) {
+      // One slot per input, filled by text_index, or by row position only when the field is absent. A text_index that
+      // is present but not an integer, or a duplicate, out-of-range or missing slot, would hand one text another
+      // text's vector, so it fails the whole payload.
+      const slots: unknown[] = new Array(texts.length);
+      const filled = new Set<number>();
+      let positionsValid = embeddings.length === texts.length;
+      embeddings.forEach((entry: any, position: number) => {
+        const index: unknown = entry?.text_index === undefined ? position : entry.text_index;
+        if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= texts.length || filled.has(index)) { positionsValid = false; return; }
+        filled.add(index);
+        slots[index] = entry?.embedding;
+      });
+      if (!positionsValid || filled.size !== texts.length || slots.some((vector) => !Array.isArray(vector) || vector.length !== this.dimensions || vector.some((item) => typeof item !== 'number' || !Number.isFinite(item)))) {
         throw new Error('Embedding provider returned an invalid vector payload.');
       }
-      return ordered as number[][];
+      return slots as number[][];
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener('abort', onAbort);
@@ -225,6 +246,15 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
   async embedQuery(text: string, signal?: AbortSignal): Promise<number[]> {
     const [vector] = await this.embed([text], 'query', signal);
     return vector;
+  }
+
+  /** Chunks go out one after another, so a long list never bursts the rate limit; any failed chunk rejects the call. */
+  async embedQueries(texts: string[], signal?: AbortSignal): Promise<number[][]> {
+    const vectors: number[][] = [];
+    for (let offset = 0; offset < texts.length; offset += this.maxBatchSize) {
+      vectors.push(...await this.embed(texts.slice(offset, offset + this.maxBatchSize), 'query', signal));
+    }
+    return vectors;
   }
 }
 
@@ -453,20 +483,25 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     await this.ensureDocuments(documents);
   }
 
-  async rankExisting(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>> {
-    if (!query.trim() || documents.length === 0) return new Map();
-    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
-    const index = readIndex(this.indexFile, this.provider.fingerprint);
-    const hashOf = contentHasher();
-    const usable = documents.flatMap((document) => {
+  /**
+   * The documents whose index vector matches their current text. Missing vectors and content-hash
+   * mismatches are lexical fallback signals, never permission for foreground recall to refresh embeddings.
+   */
+  private usableVectors(index: SemanticIndexFileV1, documents: readonly SemanticDocument[], hashOf: (text: string) => string): Array<readonly [string, number[]]> {
+    return documents.flatMap((document) => {
       const cached = index.documents[document.id];
       if (!cached
         || cached.content_hash !== hashOf(document.text)
         || !usableVector(cached.vector, this.provider.dimensions)) return [];
       return [[document.id, cached.vector] as const];
     });
-    // Missing vectors and content-hash mismatches are lexical fallback signals,
-    // never permission for foreground sync recall to refresh document embeddings.
+  }
+
+  async rankExisting(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>> {
+    if (!query.trim() || documents.length === 0) return new Map();
+    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
+    const index = readIndex(this.indexFile, this.provider.fingerprint);
+    const usable = this.usableVectors(index, documents, contentHasher());
     if (usable.length === 0) return new Map();
     let queryVector: number[];
     try {
@@ -481,6 +516,67 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     const ranked = new Map(usable.map(([id, vector]) => [id, cosine(queryVector, vector)]));
     emitRecallTimingSegment('semantic_local_vector_comparison', localCompareStartedAt, { usable_document_count: usable.length });
     return ranked;
+  }
+
+  async rankExistingMany(requests: readonly SemanticRankRequest[], signal?: AbortSignal): Promise<Map<string, number>[]> {
+    // Same early outs as rankExisting, per request: a blank query or no documents never embeds.
+    const active = requests.map(({ documents, query }) => Boolean(query.trim()) && documents.length > 0);
+    if (!active.some(Boolean)) return requests.map(() => new Map());
+    assertProviderNotCoolingDown(this.indexFile, this.provider.fingerprint);
+    const index = readIndex(this.indexFile, this.provider.fingerprint);
+    // One hashing pass for every request: the requests usually share most of their documents.
+    const passHash = contentHasher();
+    const hashes = new Map<string, string>();
+    const hashOf = (text: string) => {
+      let hash = hashes.get(text);
+      if (hash === undefined) hashes.set(text, hash = passHash(text));
+      return hash;
+    };
+    const usable = requests.map((request, position) => active[position] ? this.usableVectors(index, request.documents, hashOf) : []);
+    const texts = [...new Set(requests.filter((_, position) => usable[position].length > 0).map((request) => request.query))];
+    if (texts.length === 0) return requests.map(() => new Map());
+    const embedStartedAt = monotonicNow();
+    let vectors: Array<number[] | undefined>;
+    if (this.provider.embedQueries) {
+      // One shared request: if it fails, every query falls back.
+      try {
+        vectors = await this.provider.embedQueries(texts, signal);
+        if (vectors.length !== texts.length) throw new Error('Embedding provider returned the wrong number of query vectors.');
+      } catch (error) {
+        if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+        throw error;
+      }
+    } else {
+      // Separate requests fail one query at a time, as parallel rankExisting calls do. Each query runs in its own
+      // async boundary, so a synchronous throw, a rejection or a failed cooldown write gives only that query an empty
+      // map (lexical fallback), and the queries that succeeded keep their vectors.
+      vectors = await Promise.all(texts.map(async (text) => {
+        try {
+          return await this.provider.embedQuery(text, signal);
+        } catch (error) {
+          try {
+            if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+          } catch { /* the single call would fail this query too; it still falls back */ }
+          return undefined;
+        }
+      }));
+    }
+    emitRecallTimingSegment('semantic_query_embedding_external_batch', embedStartedAt, {
+      query_count: texts.length,
+      request_count: this.provider.embedQueries ? Math.ceil(texts.length / this.provider.maxBatchSize) : texts.length,
+      failed_query_count: vectors.filter((vector) => vector === undefined).length,
+      // Distinct usable documents across all requests; the per-query comparison segments keep their own counts.
+      usable_document_union_count: new Set(usable.flatMap((items) => items.map(([id]) => id))).size,
+    });
+    const queryVectors = new Map(texts.map((text, position) => [text, vectors[position]]));
+    return requests.map((request, position) => {
+      const queryVector = queryVectors.get(request.query);
+      if (usable[position].length === 0 || !queryVector) return new Map();
+      const localCompareStartedAt = monotonicNow();
+      const ranked = new Map(usable[position].map(([id, vector]) => [id, cosine(queryVector, vector)]));
+      emitRecallTimingSegment('semantic_local_vector_comparison', localCompareStartedAt, { usable_document_count: usable[position].length });
+      return ranked;
+    });
   }
 
   async rank(documents: SemanticDocument[], query: string): Promise<Map<string, number>> {
