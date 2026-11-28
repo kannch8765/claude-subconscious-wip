@@ -728,6 +728,11 @@ describe('world_update review round 2', () => {
     ];
     replays.forEach((call, index) => {
       const result = runtime.worldUpdate(`batch-replay-${index}`, { memory_id: memoryId, ...call });
+      if (call.evidence_ids.includes(UNRELATED.evidence_id!)) {
+        // Some blocks used before and some fresh: refused whole.
+        expect(result).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'reused_world_evidence' }));
+        return;
+      }
       expect(result).toEqual(expect.objectContaining({ outcome: 'duplicate', memory_id: memoryId }));
       expect(result.reason).toContain('already back a revision or a confirmation');
     });
@@ -823,5 +828,191 @@ describe('world_update review round 2', () => {
     expect(store.listWorldRevisions()).toHaveLength(1);
     expect(runtime.worldUpdate('batch-2', { memory_id: memoryId, fact: PERSON_B, evidence_ids: [ev('u-changed')] }).outcome).toBe('accepted');
     expect(headOf(runtime, memoryId).fact).toBe(PERSON_B);
+  });
+});
+
+describe('world_update review round 3', () => {
+  const byId = (id: string) => EVENTS.find((item) => item.evidence_id === ev(id))!;
+  const replayOf = (base: CanonicalMessage): CanonicalMessage => ({ ...base, conversation_id: 'conv-replay', evidence_id: `${base.evidence_id}-conv-replay` });
+  const REPLAYED_FIRST = replayOf(byId('u-first'));
+  const REPLAYED_AGAIN = replayOf(byId('u-again'));
+  const UNRELATED = event('u-office', 'user_text', '2026-05-15T08:00:00Z', 'Example Corp opened a new office.');
+  const PERSON_A = 'Person A is the prime minister of Country X';
+  const PERSON_B = 'Person B is the prime minister of Country X';
+
+  function setupWith(extra: CanonicalMessage[] = [], failureInjector?: FailureInjector) {
+    const root = tempDir();
+    const store = new RelationshipMemoryStore(root, 'subject', failureInjector);
+    const clock = { now: '2026-05-01T00:00:00.000Z' };
+    const runtime = new RelationshipMemoryRuntime(store, new Map([...EVENTS, ...extra].map((item) => [item.evidence_id!, item])), () => clock.now);
+    return { root, store, runtime, clock };
+  }
+  const headOf = (runtime: RelationshipMemoryRuntime, memoryId: string) => runtime.currentWorldUpdate(memoryId)!.world_update!.head;
+  const cardsOf = async (runtime: RelationshipMemoryRuntime) => [
+    await runtime.memorySearchMaintenanceCurrentWithEvidence({ kind: 'world_update' }),
+    await runtime.memorySearchRecallHybridWithEvidence({ kind: 'world_update' }),
+    await runtime.memorySearchHybridWithEvidence({ kind: 'world_update' }),
+    runtime.memorySearch({ kind: 'world_update' }),
+  ];
+  const REUSED = expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'reused_world_evidence' });
+
+  /** r1 Person A (u-first), r2 Person B (u-changed). */
+  function chainAB() {
+    const ctx = setupWith([REPLAYED_FIRST, REPLAYED_AGAIN, UNRELATED]);
+    const memoryId = ctx.runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+    ctx.clock.now = '2026-05-10T09:00:00.000Z';
+    ctx.runtime.worldUpdate('batch-2', { memory_id: memoryId, fact: PERSON_B, evidence_ids: [ev('u-changed')] });
+    ctx.clock.now = '2026-05-11T09:00:00.000Z';
+    return { ...ctx, memoryId };
+  }
+
+  describe('a mixed world reinforce', () => {
+    it('is refused whole, writing no reinforcement, no quote and no new last_confirmed', async () => {
+      const { store, runtime, memoryId } = chainAB();
+      const call = { memory_id: memoryId, evidence_ids: [REPLAYED_FIRST.evidence_id!, UNRELATED.evidence_id!], world_revision_id: headOf(runtime, memoryId).revision_id };
+      const result = runtime.reinforce('batch-mixed', call);
+      expect(result).toEqual(REUSED);
+      expect(result.reason).toContain(REPLAYED_FIRST.evidence_id!);
+      expect(result.reason).not.toContain(UNRELATED.evidence_id!);
+      expect(store.listReinforcements()).toHaveLength(0);
+      expect(store.listEvidence().some((item) => item.source_evidence_id === UNRELATED.evidence_id)).toBe(false);
+      // The same batch replays to the same outcome.
+      expect(runtime.reinforce('batch-mixed', call)).toEqual(result);
+      expect(store.listReinforcements()).toHaveLength(0);
+      expect(runtime.currentWorldUpdate(memoryId)!.world_update!.last_confirmed).toBe('2026-05-10T08:00:00Z');
+      for (const hits of await cardsOf(runtime)) {
+        expect(hits[0].world_update!.last_confirmed).toBe('2026-05-10T08:00:00Z');
+        expect(JSON.stringify(hits)).not.toContain('Example Corp');
+      }
+    });
+
+    it('is also refused when the used block is an earlier confirmation', () => {
+      const { store, runtime, memoryId, clock } = chainAB();
+      const head = headOf(runtime, memoryId).revision_id;
+      clock.now = '2026-05-12T09:00:00.000Z';
+      expect(runtime.reinforce('batch-ok', { memory_id: memoryId, evidence_ids: [UNRELATED.evidence_id!], world_revision_id: head }).outcome).toBe('accepted');
+      expect(runtime.reinforce('batch-a', { memory_id: memoryId, evidence_ids: [UNRELATED.evidence_id!, ev('u-changed')], world_revision_id: head }).outcome).toBe('duplicate');
+      expect(runtime.reinforce('batch-b', { memory_id: memoryId, evidence_ids: [ev('tool-found'), ev('u-changed')], world_revision_id: head })).toEqual(REUSED);
+      expect(runtime.reinforce('batch-c', { memory_id: memoryId, evidence_ids: [ev('tool-found'), UNRELATED.evidence_id!], world_revision_id: head })).toEqual(REUSED);
+      expect(store.listReinforcements()).toHaveLength(1);
+    });
+
+    it('stays a duplicate when every cited message was used before', () => {
+      const { store, runtime, memoryId } = chainAB();
+      const head = headOf(runtime, memoryId).revision_id;
+      expect(runtime.reinforce('batch-all', { memory_id: memoryId, evidence_ids: [REPLAYED_FIRST.evidence_id!, ev('u-changed')], world_revision_id: head }))
+        .toEqual({ outcome: 'duplicate', memory_id: memoryId });
+      expect(runtime.reinforce('batch-one', { memory_id: memoryId, evidence_ids: [REPLAYED_FIRST.evidence_id!], world_revision_id: head }))
+        .toEqual({ outcome: 'duplicate', memory_id: memoryId });
+      expect(store.listReinforcements()).toHaveLength(0);
+    });
+
+    it('does not treat a block repeated inside one call as used before', () => {
+      const twin = replayOf(UNRELATED);
+      const { store, runtime } = setupWith([twin, UNRELATED]);
+      const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+      expect(runtime.reinforce('batch-twin', { memory_id: memoryId, evidence_ids: [UNRELATED.evidence_id!, twin.evidence_id!], world_revision_id: headOf(runtime, memoryId).revision_id }).outcome).toBe('accepted');
+      expect(store.listReinforcements()).toHaveLength(1);
+    });
+
+    it('is refused for a world update too, writing no revision', () => {
+      const { store, runtime, memoryId } = chainAB();
+      expect(runtime.worldUpdate('batch-wu', { memory_id: memoryId, fact: 'Country X is led by Person A', evidence_ids: [REPLAYED_FIRST.evidence_id!, UNRELATED.evidence_id!] })).toEqual(REUSED);
+      expect(store.listWorldRevisions()).toHaveLength(2);
+      expect(headOf(runtime, memoryId).fact).toBe(PERSON_B);
+    });
+  });
+
+  describe('a torn first write', () => {
+    it('reserves the blocks of the anchor evidence until r1 is repaired', () => {
+      let failNext = true;
+      const { store, runtime } = setupWith([REPLAYED_FIRST], (phase) => {
+        if (phase !== 'world_revision_commit' || !failNext) return false;
+        failNext = false;
+        return true;
+      });
+      const proposal = anchor([ev('u-first')]);
+      expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('retryable_failed');
+      const [torn] = store.listMemories();
+      expect(store.listWorldRevisions()).toHaveLength(0);
+
+      const replay = runtime.worldUpdate('batch-other', { memory_id: torn.memory_id, fact: 'Country X is led by Person A', evidence_ids: [REPLAYED_FIRST.evidence_id!] });
+      expect(replay).toEqual(expect.objectContaining({ outcome: 'duplicate', memory_id: torn.memory_id }));
+      expect(store.listWorldRevisions()).toHaveLength(0);
+
+      expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('duplicate');
+      const revisions = store.listWorldRevisionsForMemoryIds([torn.memory_id]);
+      expect(revisions).toHaveLength(1);
+      expect(revisions[0].fact).toBe(PERSON_A);
+      expect(headOf(runtime, torn.memory_id).fact).toBe(PERSON_A);
+    });
+  });
+
+  describe('the chain enforces one write per block', () => {
+    /** A: r1 Person A (u-first), r2 Person B (u-changed). B: a later anchor citing u-first replayed. Merged into `target`. */
+    function mergedPair(target: 'a' | 'b') {
+      const ctx = chainAB();
+      const { store, runtime, clock, memoryId: a } = ctx;
+      clock.now = '2026-05-12T09:00:00.000Z';
+      const b = runtime.rememberKind('batch-3', 'world_update', anchor([REPLAYED_FIRST.evidence_id!], { summary: 'Country X leadership' }, PERSON_A)).memory_id!;
+      expect(store.listWorldRevisionsForMemoryIds([b])).toHaveLength(1);
+      const pair = runtime.suggestMaintenanceReview('batch-4', 'relation', { memory_ids: [a, b], relation: 'same_meaning', reason: 'one topic' }).review_id!;
+      new RelationshipMemoryResolutionControlPlane(store, () => '2026-05-20T00:00:00.000Z').resolveReview(pair, { resolution_id: 'res-merge', relation: 'same_meaning', target_memory_id: target === 'a' ? a : b });
+      return { ...ctx, a, b };
+    }
+
+    it.each(['a', 'b'] as const)('ignores a replayed r1 of a merged anchor (target %s): head, count, chain and every search path', async (target) => {
+      const { root, store, runtime, a, b } = mergedPair(target);
+      const merged = runtime.currentWorldUpdate(a)!;
+      expect(merged.memory_id).toBe(target === 'a' ? a : b);
+      const view = merged.world_update!;
+      expect(view.head.fact).toBe(PERSON_B);
+      expect(view.revision_count).toBe(2);
+      expect(view.revisions!.map((item) => [item.memory_id, item.fact])).toEqual([[a, PERSON_A], [a, PERSON_B]]);
+
+      const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject', transcriptRoots: [] });
+      const direct = (recall.relationshipMemorySearch({ query: 'Country X' }) as any).results.filter((item: any) => item.kind === 'world_update');
+      for (const hits of [direct, ...await cardsOf(runtime)]) {
+        expect(hits.map((hit: any) => [hit.payload.fact, hit.world_update.revision_count])).toEqual([[PERSON_B, 2]]);
+      }
+      expect(new RelationshipMemoryOwnerControlPlane(store).search({ kind: 'world_update' }).map((memory) => memory.memory_id).sort()).toEqual([a, b].sort());
+      expect(store.listWorldRevisions()).toHaveLength(3);
+    });
+
+    it('ignores an r1 that reuses a block behind a confirmation of another anchor', () => {
+      const { store, runtime, clock } = setupWith([REPLAYED_AGAIN]);
+      const a = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+      clock.now = '2026-05-02T00:00:00.000Z';
+      expect(runtime.reinforce('batch-2', { memory_id: a, evidence_ids: [ev('u-again')], world_revision_id: headOf(runtime, a).revision_id }).outcome).toBe('accepted');
+      clock.now = '2026-05-12T09:00:00.000Z';
+      const b = runtime.rememberKind('batch-3', 'world_update', anchor([REPLAYED_AGAIN.evidence_id!], { summary: 'Country X leadership' }, 'Quillon is the prime minister of Country X')).memory_id!;
+      const pair = runtime.suggestMaintenanceReview('batch-4', 'relation', { memory_ids: [a, b], relation: 'same_meaning', reason: 'one topic' }).review_id!;
+      new RelationshipMemoryResolutionControlPlane(store, () => '2026-05-20T00:00:00.000Z').resolveReview(pair, { resolution_id: 'res-merge', relation: 'same_meaning', target_memory_id: a });
+      const view = runtime.currentWorldUpdate(a)!.world_update!;
+      expect(view.head.fact).toBe(PERSON_A);
+      expect(view.revision_count).toBe(1);
+      expect(view.revisions!.map((item) => item.memory_id)).toEqual([a]);
+      expect(view.last_confirmed).toBe('2026-04-20T09:00:00Z');
+      expect(view.confirmation_ids).toHaveLength(1);
+    });
+
+    it('does not count a reinforcement whose block an earlier write already used', async () => {
+      const { store, runtime } = setupWith([REPLAYED_FIRST]);
+      const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+      const r1 = headOf(runtime, memoryId).revision_id!;
+      const base = REPLAYED_FIRST;
+      store.appendReinforcement({
+        schema_version: 1, reinforcement_id: 'reinforce-reused-block', memory_id: memoryId, batch_id: 'direct', world_revision_id: r1,
+        evidence_ids: ['ev-reused'], latest_evidence_at: '2026-06-01T00:00:00Z', recorded_at: '2026-06-01T00:00:00.000Z',
+      }, [{ evidence_id: 'ev-reused', memory_id: memoryId, conversation_id: base.conversation_id, message_id: base.message_id, role: 'user', quote: base.quote, captured_at: '2026-06-01T00:00:00Z', source_evidence_id: base.evidence_id, event_kind: 'user_text', block_index: 0 }]);
+      const view = runtime.currentWorldUpdate(memoryId)!.world_update!;
+      expect(view.last_confirmed).toBe('2026-04-01T10:00:00Z');
+      expect(view.head_evidence_ids).not.toContain('ev-reused');
+      expect(view.confirmation_ids).toEqual([]);
+      for (const hits of await cardsOf(runtime)) {
+        expect(hits[0]).not.toHaveProperty('reinforcement_count');
+        expect(hits[0].world_update!.last_confirmed).toBe('2026-04-01T10:00:00Z');
+      }
+    });
   });
 });

@@ -33,7 +33,7 @@ import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } f
 import { linkedAssistantIntentIndex } from '../intent/provenance.js';
 import { deferredIntentCounts } from '../intent/index.js';
 import {
-  INVALID_WORLD_RELATION, attachWorldUpdateViews, normalizeWorldFact, withoutWorldRevisions, worldAsOf, worldRelationViolation, worldRevisionId,
+  INVALID_WORLD_RELATION, attachWorldUpdateViews, evidenceBlockKey, evidenceSourceKey, normalizeWorldFact, withoutWorldRevisions, worldAsOf, worldRelationViolation, worldRevisionId,
   worldUpdateIndexText, worldUpdateSource,
 } from '../world/index.js';
 
@@ -113,22 +113,26 @@ function worldReplayDuplicate(ids: readonly string[]): string {
 /** A world_update reinforcement confirmed a revision that is no longer the head (another write landed after the search). */
 const STALE_WORLD_REVISION = 'stale_world_revision';
 
+/** A world_update call cited blocks already behind a write of the family together with blocks that are new. */
+const REUSED_WORLD_EVIDENCE = 'reused_world_evidence';
+
+function reusedWorldEvidenceRejection(ids: readonly string[]): string {
+  return `Some cited transcript blocks already back a revision or a confirmation of this world_update, so nothing was saved: ${ids.join(', ')}. Resubmit citing only evidence that newly supports the fact.`;
+}
+
 /** The transcript-block identity reinforce dedupe uses; message-level evidence falls back to its evidence id. */
 function messageBlockKey(message: CanonicalMessage): string {
   return evidenceSourceKey(message) ?? canonicalEvidenceId(message);
-}
-
-function evidenceBlockKey(item: EvidenceRecord): string {
-  return evidenceSourceKey(item) ?? item.source_evidence_id ?? item.evidence_id;
 }
 
 /** A world_update card reports only the confirmations of its head, from every merged anchor. */
 function headConfirmations(memory: EffectiveMemoryRecord, byMemory: ReadonlyMap<string, ReinforcementRecord[]>): ReinforcementRecord[] {
   const head = memory.world_update?.head.revision_id;
   if (!head) return [];
+  const confirmed = new Set(memory.world_update?.confirmation_ids ?? []);
   return (memory.resolution_source_memory_ids ?? [memory.memory_id])
     .flatMap((memoryId) => byMemory.get(memoryId) ?? [])
-    .filter((item) => item.world_revision_id === head);
+    .filter((item) => item.world_revision_id === head && confirmed.has(item.reinforcement_id));
 }
 
 /** Rejections that refuse the cited evidence itself; their replay never resolves a linked remember intent. */
@@ -186,23 +190,6 @@ function evidenceProvenance(message: CanonicalMessage) {
     ...(message.tool_name ? { tool_name: message.tool_name } : {}),
     ...(message.tool_use_id ? { tool_use_id: message.tool_use_id } : {}),
   };
-}
-
-type EvidenceSource = Pick<EvidenceRecord, 'message_id' | 'block_index' | 'event_kind' | 'tool_use_id'>;
-
-/**
- * Which transcript block evidence came from, without the conversation that carried it: a later conversation can carry
- * the same message again under a new transcript evidence id. Message-level evidence (no block_index or event_kind,
- * the shape from before per-block evidence) has no block source; it is matched by evidence id only.
- */
-function evidenceSourceKey(item: EvidenceSource): string | undefined {
-  if (item.block_index === undefined || item.event_kind === undefined) return undefined;
-  return stableJson({
-    message_id: item.message_id,
-    block_index: item.block_index,
-    event_kind: item.event_kind,
-    ...(item.tool_use_id ? { tool_use_id: item.tool_use_id } : {}),
-  });
 }
 
 export class RelationshipMemoryRuntime {
@@ -447,12 +434,26 @@ export class RelationshipMemoryRuntime {
    */
   private worldFamilyUsedBlocks(memoryId: string, family: EffectiveMemoryRecord | undefined): Set<string> {
     const anchorIds = new Set([memoryId, ...(family?.resolution_source_memory_ids ?? (family ? [family.memory_id] : []))]);
+    const revisions = this.store.listWorldRevisionsForMemoryIds([...anchorIds]);
     const written = new Set<string>();
-    for (const revision of this.store.listWorldRevisionsForMemoryIds([...anchorIds])) for (const id of revision.evidence_ids) written.add(id);
+    for (const revision of revisions) for (const id of revision.evidence_ids) written.add(id);
     for (const reinforcement of this.store.listReinforcements()) {
       if (anchorIds.has(reinforcement.memory_id)) for (const id of reinforcement.evidence_ids) written.add(id);
     }
-    return new Set(this.store.listEvidenceForMemoryIds([...anchorIds]).filter((item) => written.has(item.evidence_id)).map(evidenceBlockKey));
+    const evidence = this.store.listEvidenceForMemoryIds([...anchorIds]);
+    const blocks = new Set(evidence.filter((item) => written.has(item.evidence_id)).map(evidenceBlockKey));
+    // An anchor whose r1 is not written yet (a torn first write) holds its original evidence for that r1: the replay
+    // of the remember will write it, so those blocks are reserved already.
+    const withR1 = new Set(revisions.filter((revision) => revision.sequence === 0).map((revision) => revision.memory_id));
+    for (const anchorId of anchorIds) {
+      if (withR1.has(anchorId)) continue;
+      const anchor = this.store.getMemory(anchorId);
+      if (!anchor) continue;
+      const rows = evidence.filter((item) => item.memory_id === anchorId);
+      const original = this.originalMemoryEvidenceIds(anchor, rows);
+      for (const item of rows) if (!original || original.has(item.evidence_id)) blocks.add(evidenceBlockKey(item));
+    }
+    return blocks;
   }
 
   async prepareCurrentMemorySemanticIndex(): Promise<void> {
@@ -1085,6 +1086,10 @@ export class RelationshipMemoryRuntime {
     // family is attached too.
     const attachedSources = new Set<string | undefined>(memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)).map(evidenceSourceKey));
     if (world) for (const block of this.worldFamilyUsedBlocks(memoryId, family)) attachedSources.add(block);
+    // Used before this call, judged before the filter below adds this call's own blocks.
+    const usedBefore = world
+      ? messages.filter((message) => completedEvidenceIds.has(memoryEvidenceId(memoryId, message)) || attachedSources.has(messageBlockKey(message)))
+      : [];
     const newMessages = messages.filter((message) => {
       if (completedEvidenceIds.has(memoryEvidenceId(memoryId, message))) return false;
       const source = world ? messageBlockKey(message) : evidenceSourceKey(message);
@@ -1094,6 +1099,9 @@ export class RelationshipMemoryRuntime {
       return true;
     });
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
+    // A world reinforcement that cites a block already behind a write of the family beside new ones is refused whole;
+    // checked after the duplicate check (a torn replay is all used) and before the head check.
+    if (world && usedBefore.length > 0) return this.persistPermanent(batchId, sourceKey, REUSED_WORLD_EVIDENCE, reusedWorldEvidenceRejection(usedBefore.map(canonicalEvidenceId)), now);
     if (world) {
       // Evidence for a fact that has since changed must not confirm the new head. Checked after the duplicate check,
       // so a torn reinforcement still replays as a duplicate.
@@ -1404,7 +1412,8 @@ export class RelationshipMemoryRuntime {
     // under any conversation, is a replay whatever the fact's wording, and must not bring an earlier fact back.
     const used = this.worldFamilyUsedBlocks(memoryId, family);
     const reused = messages.filter((message) => used.has(messageBlockKey(message))).map(canonicalEvidenceId);
-    if (reused.length > 0) return this.persistWorldDuplicate(batchId, sourceKey, memoryId, worldReplayDuplicate(reused), now);
+    if (reused.length === messages.length && reused.length > 0) return this.persistWorldDuplicate(batchId, sourceKey, memoryId, worldReplayDuplicate(reused), now);
+    if (reused.length > 0) return this.persistPermanent(batchId, sourceKey, REUSED_WORLD_EVIDENCE, reusedWorldEvidenceRejection(reused), now);
 
     const resolvedAsOf = worldAsOf(asOf, messages, now);
     const evidence: EvidenceRecord[] = messages.map((message) => ({

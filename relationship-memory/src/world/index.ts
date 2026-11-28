@@ -10,7 +10,7 @@ import type {
   WorldUpdateView,
 } from '../schema/index.js';
 import { WORLD_UPDATE_KIND } from '../schema/index.js';
-import { RelationshipMemoryStore, stableId } from '../store/index.js';
+import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js';
 import { semanticText } from '../retrieval/index.js';
 
 /** Two facts are the same when they match after trimming and collapsing whitespace. */
@@ -36,14 +36,36 @@ export function worldAsOf(explicit: string | undefined, messages: readonly Canon
   return explicit ?? messages.map((message) => message.captured_at).sort().at(-1) ?? fallback;
 }
 
+export type EvidenceSource = Pick<EvidenceRecord, 'message_id' | 'block_index' | 'event_kind' | 'tool_use_id'>;
+
+/**
+ * Which transcript block evidence came from, without the conversation that carried it: a later conversation can carry
+ * the same message again under a new transcript evidence id. Message-level evidence (no block_index or event_kind,
+ * the shape from before per-block evidence) has no block source; it is matched by evidence id only.
+ */
+export function evidenceSourceKey(item: EvidenceSource): string | undefined {
+  if (item.block_index === undefined || item.event_kind === undefined) return undefined;
+  return stableJson({
+    message_id: item.message_id,
+    block_index: item.block_index,
+    event_kind: item.event_kind,
+    ...(item.tool_use_id ? { tool_use_id: item.tool_use_id } : {}),
+  });
+}
+
+/** The transcript block behind an evidence row; message-level evidence falls back to its source or own evidence id. */
+export function evidenceBlockKey(item: EvidenceSource & Pick<EvidenceRecord, 'evidence_id' | 'source_evidence_id'>): string {
+  return evidenceSourceKey(item) ?? item.source_evidence_id ?? item.evidence_id;
+}
+
 export interface WorldChainInput {
   /** The anchor and, after an owner same_meaning merge, the anchors merged into it. */
   anchors: ReadonlyArray<Pick<EffectiveMemoryRecord, 'memory_id' | 'payload' | 'observed_at' | 'created_at'>>;
   /** Revisions of any of the anchors, in any order. */
   revisions: readonly WorldRevisionRecord[];
-  /** Evidence rows of the anchors (only captured_at is read). */
-  evidence: ReadonlyArray<Pick<EvidenceRecord, 'evidence_id' | 'memory_id' | 'captured_at'>>;
-  reinforcements: ReadonlyArray<Pick<ReinforcementRecord, 'memory_id' | 'evidence_ids' | 'latest_evidence_at' | 'world_revision_id'>>;
+  /** Evidence rows of the anchors: captured_at, and the block identity each write is checked by. */
+  evidence: ReadonlyArray<Pick<EvidenceRecord, 'evidence_id' | 'memory_id' | 'captured_at' | 'message_id' | 'block_index' | 'event_kind' | 'tool_use_id' | 'source_evidence_id'>>;
+  reinforcements: ReadonlyArray<Pick<ReinforcementRecord, 'reinforcement_id' | 'memory_id' | 'evidence_ids' | 'latest_evidence_at' | 'world_revision_id' | 'recorded_at'>>;
 }
 
 /** Chain order: recorded_at, then the commit sequence (an anchor's r1 is 0), then revision_id. */
@@ -55,12 +77,39 @@ export function compareWorldRevisions(a: WorldRevisionRecord, b: WorldRevisionRe
  * One chain for the anchor(s): every revision in recorded_at order, oldest first, ties by commit sequence. The head is
  * the last one; an earlier `as_of` never reorders it. `last_confirmed` is the latest captured_at over the head's own
  * evidence and every reinforcement that confirmed this head (its `world_revision_id`), whenever it was written.
+ *
+ * A transcript block backs at most one write of the family. Revisions and reinforcements are walked in time order
+ * (revisions first on a tie); a write citing a block an earlier write already used is ignored: it is not in the chain,
+ * the count or the head, and a reinforcement does not confirm. The raw rows stay in the store.
  */
 export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
   const anchorIds = new Set(input.anchors.map((anchor) => anchor.memory_id));
-  const revisions = input.revisions.filter((revision) => anchorIds.has(revision.memory_id)).sort(compareWorldRevisions);
-  const capturedAt = new Map(input.evidence.filter((item) => anchorIds.has(item.memory_id)).map((item) => [item.evidence_id, item.captured_at]));
-  const reinforcements = input.reinforcements.filter((item) => anchorIds.has(item.memory_id));
+  const allRevisions = input.revisions.filter((revision) => anchorIds.has(revision.memory_id)).sort(compareWorldRevisions);
+  const anchorEvidence = input.evidence.filter((item) => anchorIds.has(item.memory_id));
+  const capturedAt = new Map(anchorEvidence.map((item) => [item.evidence_id, item.captured_at]));
+  const blockOf = new Map(anchorEvidence.map((item) => [item.evidence_id, evidenceBlockKey(item)]));
+  const allReinforcements = input.reinforcements.filter((item) => anchorIds.has(item.memory_id))
+    .sort((a, b) => a.recorded_at.localeCompare(b.recorded_at) || a.reinforcement_id.localeCompare(b.reinforcement_id));
+  const usedBlocks = new Set<string>();
+  const accept = (evidenceIds: readonly string[]): boolean => {
+    const blocks = new Set(evidenceIds.map((id) => blockOf.get(id) ?? id));
+    if ([...blocks].some((block) => usedBlocks.has(block))) return false;
+    for (const block of blocks) usedBlocks.add(block);
+    return true;
+  };
+  const revisions: WorldRevisionRecord[] = [];
+  const reinforcements: typeof allReinforcements = [];
+  for (let r = 0, c = 0; r < allRevisions.length || c < allReinforcements.length;) {
+    const revision = allRevisions[r];
+    const reinforcement = allReinforcements[c];
+    if (revision && (!reinforcement || revision.recorded_at.localeCompare(reinforcement.recorded_at) <= 0)) {
+      r += 1;
+      if (accept(revision.evidence_ids)) revisions.push(revision);
+    } else {
+      c += 1;
+      if (accept(reinforcement.evidence_ids)) reinforcements.push(reinforcement);
+    }
+  }
   const latest = (values: Array<string | undefined>): string | undefined => values.filter((value): value is string => Boolean(value)).sort().at(-1);
   const head = revisions.at(-1);
 
@@ -73,6 +122,7 @@ export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
       revision_count: 0,
       last_confirmed: latest([...capturedAt.values()]) ?? anchor?.observed_at ?? '',
       head_evidence_ids: [...new Set(evidenceIds)],
+      confirmation_ids: [],
       revisions: [],
     };
   }
@@ -86,6 +136,7 @@ export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
       ...confirming.map((item) => item.latest_evidence_at),
     ]) ?? head.recorded_at,
     head_evidence_ids: [...new Set([...head.evidence_ids, ...confirming.flatMap((item) => item.evidence_ids)])],
+    confirmation_ids: confirming.map((item) => item.reinforcement_id),
     revisions,
   };
 }
