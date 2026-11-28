@@ -35,6 +35,10 @@ export interface TranscriptMessage {
   tool_result?: any;
   timestamp?: string;
   uuid?: string;
+  // Claude Code sets isMeta on user entries it writes itself (a fired scheduled prompt, runtime nudges). An internal
+  // field, not a documented contract; promptSource is read for logs only.
+  isMeta?: boolean;
+  promptSource?: string;
   // Summary message fields
   summary?: string;
   // System message fields

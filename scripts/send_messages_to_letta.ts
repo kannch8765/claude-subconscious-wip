@@ -40,7 +40,7 @@ import {
   extractAllContent,
   type TranscriptMessage,
 } from './transcript_utils.js';
-import { buildCanonicalMessages, deferredIntentReplay, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
+import { buildCanonicalMessagesWithStats, deferredIntentReplay, logTranscriptTextStats, makeBatchId, relationshipMemoryRoot } from '../relationship-memory/src/adapter/index.js';
 import { extractAssistantRememberIntents, persistAssistantRememberIntents } from '../relationship-memory/src/intent/index.js';
 import { RelationshipMemoryStore } from '../relationship-memory/src/store/index.js';
 
@@ -246,8 +246,10 @@ The foreground sees only explicit deliver_whisper output. Ordinary assistant pro
   const batchId = makeBatchId(hookInput.session_id, state.lastProcessedIndex, messages.length - 1);
   const replay = deferredIntentReplay(intentStore, messages, state.lastProcessedIndex, hookInput.session_id, conversationId);
   if (replay.intents.length > 0) log(`Re-offering ${replay.intents.length} deferred assistant remember intent(s)`);
-  const canonicalMessages = [...replay.evidence, ...buildCanonicalMessages(messages, state.lastProcessedIndex, conversationId)];
+  const pass = buildCanonicalMessagesWithStats(messages, state.lastProcessedIndex, conversationId);
+  const canonicalMessages = [...replay.evidence, ...pass.messages];
   log(`Relationship-memory batch: ${batchId} (${canonicalMessages.length} canonical evidence messages)`);
+  logTranscriptTextStats(pass.stats, log);
 
   const nativePayload = {
     agentId,

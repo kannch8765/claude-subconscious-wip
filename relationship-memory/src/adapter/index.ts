@@ -54,13 +54,65 @@ function transcriptEventId(
   });
 }
 
+const SCHEDULING_TOOL_NAMES = new Set(['ScheduleWakeup', 'CronCreate']);
+const SAFE_PROMPT_SOURCE = /^[A-Za-z0-9_-]{1,32}$/;
+
+/** Counts for one pass, metadata only: never any text. */
+export interface TranscriptTextStats {
+  /** ScheduleWakeup / CronCreate prompts in the whole transcript, including before the pass. */
+  scheduled_prompts: number;
+  self_note: number;
+  meta_text: number;
+  /** self_note matches on entries without `isMeta: true`: the sign that Claude Code changed its transcript format. */
+  self_note_without_is_meta: number;
+  /** promptSource of the self_note / meta_text entries: 'none' when absent, 'other' when not a short identifier. */
+  prompt_sources: Record<string, number>;
+}
+
+/**
+ * Index of the first transcript entry that scheduled each (trimmed) prompt. A wakeup fires in a later pass than the
+ * one that scheduled it, so this reads the whole transcript, not only the new range.
+ */
+function scheduledPromptIndex(messages: TranscriptMessage[]): { firstIndex: Map<string, number>; count: number } {
+  const firstIndex = new Map<string, number>();
+  let count = 0;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].type !== 'assistant') continue;
+    const content = messages[i].message?.content ?? messages[i].content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content as any[]) {
+      if (block?.type !== 'tool_use' || !SCHEDULING_TOOL_NAMES.has(block.name)) continue;
+      const prompt = typeof block.input?.prompt === 'string' ? block.input.prompt.trim() : '';
+      if (!prompt) continue;
+      count += 1;
+      if (!firstIndex.has(prompt)) firstIndex.set(prompt, i);
+    }
+  }
+  return { firstIndex, count };
+}
+
 export function buildCanonicalMessages(
   messages: TranscriptMessage[],
   startIndex: number,
   conversationId: string,
 ): CanonicalMessage[] {
+  return buildCanonicalMessagesWithStats(messages, startIndex, conversationId).messages;
+}
+
+/**
+ * Text on a user entry is `self_note` when it equals the prompt of an earlier ScheduleWakeup / CronCreate (with or
+ * without `isMeta`, so a format change can't turn it back into the user's words), else `meta_text` when the entry has
+ * `isMeta: true`, else `user_text`.
+ */
+export function buildCanonicalMessagesWithStats(
+  messages: TranscriptMessage[],
+  startIndex: number,
+  conversationId: string,
+): { messages: CanonicalMessage[]; stats: TranscriptTextStats } {
   const result: CanonicalMessage[] = [];
   const toolNames = new Map<string, string>();
+  const scheduled = scheduledPromptIndex(messages);
+  const stats: TranscriptTextStats = { scheduled_prompts: scheduled.count, self_note: 0, meta_text: 0, self_note_without_is_meta: 0, prompt_sources: {} };
   for (let i = startIndex + 1; i < messages.length; i++) {
     const message = messages[i];
     if (message.type !== 'user' && message.type !== 'assistant') continue;
@@ -77,7 +129,12 @@ export function buildCanonicalMessages(
       let toolUseId: string | undefined;
 
       if (block?.type === 'text') {
-        eventKind = role === 'user' ? 'user_text' : 'assistant_text';
+        if (role === 'user') {
+          const scheduledAt = typeof block.text === 'string' ? scheduled.firstIndex.get(block.text.trim()) : undefined;
+          eventKind = scheduledAt !== undefined && scheduledAt < i ? 'self_note' : message.isMeta === true ? 'meta_text' : 'user_text';
+        } else {
+          eventKind = 'assistant_text';
+        }
         quote = boundedEvidenceText(block.text);
       } else if (role === 'assistant' && block?.type === 'tool_use' && block.name) {
         eventKind = 'assistant_tool_use';
@@ -104,9 +161,23 @@ export function buildCanonicalMessages(
         quote,
         captured_at: capturedAt,
       });
+      if (eventKind === 'self_note' || eventKind === 'meta_text') {
+        stats[eventKind] += 1;
+        if (eventKind === 'self_note' && message.isMeta !== true) stats.self_note_without_is_meta += 1;
+        const source = typeof message.promptSource !== 'string' ? 'none' : SAFE_PROMPT_SOURCE.test(message.promptSource) ? message.promptSource : 'other';
+        stats.prompt_sources[source] = (stats.prompt_sources[source] ?? 0) + 1;
+      }
     }
   }
-  return result;
+  return { messages: result, stats };
+}
+
+/** One counts line per pass, plus one warning line when a self_note match lacked `isMeta: true`. Never logs text. */
+export function logTranscriptTextStats(stats: TranscriptTextStats, log: (message: string) => void): void {
+  log(`Transcript text kinds: scheduled_prompts_seen=${stats.scheduled_prompts} self_note=${stats.self_note} meta_text=${stats.meta_text} prompt_sources=${JSON.stringify(stats.prompt_sources)}`);
+  if (stats.self_note_without_is_meta > 0) {
+    log(`WARNING: ${stats.self_note_without_is_meta} self_note match(es) without isMeta: true; Claude Code may have changed its transcript format (the prompt match still classified them as self_note)`);
+  }
 }
 
 function escapeWorkerXml(value: string): string {
@@ -142,6 +213,7 @@ export function appendCanonicalEvidenceCatalog(
     'Judge semantics yourself. Ignore routine code edits, installs, tests, file reads, shell noise, and arbitrary tool results unless they carry durable relationship-relevant meaning.',
     'Relationship-relevant durable meaning that appears only in assistant tool input or textual tool results is eligible when cited by exact evidence_id.',
     'Never invent evidence IDs; use the backend-owned evidence_id from the catalog.',
+    'event_kind="self_note" (the agent\'s own scheduled prompt firing) and event_kind="meta_text" (runtime or system text) sit on role="user" entries but are not the user\'s words: read them as context only; they cannot be cited as evidence.',
     '</relationship_memory_evidence_semantics>',
   ].join('\n');
   return `${workerMessage}\n\n${semantics}\n\n<relationship_memory_evidence_catalog trusted="transcript_provenance_only">\n${entries}\n</relationship_memory_evidence_catalog>`;

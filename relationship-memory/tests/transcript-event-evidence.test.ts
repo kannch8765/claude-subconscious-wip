@@ -6,7 +6,9 @@ import {
   appendCanonicalEvidenceCatalog,
   ASSISTANT_REMEMBER_TOOL_NAME,
   buildCanonicalMessages,
+  buildCanonicalMessagesWithStats,
   extractAssistantRememberIntents,
+  logTranscriptTextStats,
   RELATIONSHIP_ALLOWED_BUILTIN_TOOLS,
   RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS,
   RelationshipMemoryRuntime,
@@ -259,4 +261,110 @@ describe('reinforce matches evidence by transcript source, not by conversation',
     expect(runtime.reinforce('message-level-again', { memory_id: memoryId, evidence_message_ids: ['msg-3'] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
     expect(evidenceOf()).toHaveLength(2);
   });
+});
+
+describe('scheduled prompts and isMeta text on user entries', () => {
+  const WAKE_PROMPT = 'Check the garden plan draft.';
+  // The same shape main produced its evidence ids from; see the id test below.
+  const base = [
+    { type: 'user', uuid: 'user-typed', timestamp: '2026-03-01T09:00:00Z', message: { role: 'user', content: 'Can we look at the garden plan again?' } },
+    { type: 'assistant', uuid: 'asst-1', timestamp: '2026-03-01T09:01:00Z', message: { content: [
+      { type: 'text', text: 'Sure, I will check back later.' },
+      { type: 'tool_use', id: 'toolu_wake', name: 'ScheduleWakeup', input: { delaySeconds: 1200, prompt: WAKE_PROMPT, reason: 'waiting' } },
+    ] } },
+    { type: 'user', uuid: 'user-result', timestamp: '2026-03-01T09:01:01Z', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_wake', content: 'scheduled' }] } },
+    { type: 'user', uuid: 'user-blocks', timestamp: '2026-03-01T09:02:00Z', message: { content: [{ type: 'text', text: 'Also add the bench.' }] } },
+  ] as any[];
+  const fired = (uuid: string, text: string, extra: Record<string, unknown> = { isMeta: true }) =>
+    ({ type: 'user', uuid, timestamp: '2026-03-01T09:30:00Z', ...extra, message: { role: 'user', content: text } });
+  const kinds = (events: CanonicalMessage[]) => events.map((event) => [event.message_id, event.event_kind]);
+  const logged = (stats: Parameters<typeof logTranscriptTextStats>[0]) => {
+    const lines: string[] = [];
+    logTranscriptTextStats(stats, (line) => lines.push(line));
+    return lines;
+  };
+
+  it('classifies a fired ScheduleWakeup prompt with isMeta as self_note, with no drift warning', () => {
+    const { messages, stats } = buildCanonicalMessagesWithStats([...base, fired('wake-1', WAKE_PROMPT, { isMeta: true, promptSource: 'sdk' })], -1, 'conv-meta');
+    expect(messages.at(-1)).toEqual(expect.objectContaining({ message_id: 'wake-1', role: 'user', event_kind: 'self_note', quote: WAKE_PROMPT }));
+    expect(stats).toEqual({ scheduled_prompts: 1, self_note: 1, meta_text: 0, self_note_without_is_meta: 0, prompt_sources: { sdk: 1 } });
+    const lines = logged(stats);
+    expect(lines).toEqual(['Transcript text kinds: scheduled_prompts_seen=1 self_note=1 meta_text=0 prompt_sources={"sdk":1}']);
+  });
+
+  it('still classifies the firing as self_note without isMeta, and warns once without logging text', () => {
+    const { messages, stats } = buildCanonicalMessagesWithStats([...base, fired('wake-1', WAKE_PROMPT, {})], -1, 'conv-meta');
+    expect(messages.at(-1)?.event_kind).toBe('self_note');
+    expect(stats.self_note_without_is_meta).toBe(1);
+    const lines = logged(stats);
+    expect(lines.filter((line) => line.startsWith('WARNING:'))).toHaveLength(1);
+    expect(lines.join('\n')).not.toContain(WAKE_PROMPT);
+    expect(lines.join('\n')).not.toContain('garden');
+  });
+
+  it('finds the scheduling tool_use before startIndex when the firing comes in a later pass', () => {
+    const transcript = [...base, fired('wake-1', `  ${WAKE_PROMPT}\n`)];
+    const events = buildCanonicalMessages(transcript, base.length - 1, 'conv-meta');
+    expect(kinds(events)).toEqual([['wake-1', 'self_note']]);
+  });
+
+  it('classifies every firing of a recurring CronCreate as self_note', () => {
+    const cronPrompt = 'Water the herbs and note how they look.';
+    const transcript = [
+      ...base,
+      { type: 'assistant', uuid: 'asst-cron', timestamp: '2026-03-01T09:03:00Z', message: { content: [
+        { type: 'tool_use', id: 'toolu_cron', name: 'CronCreate', input: { cron: '0 8 * * *', prompt: cronPrompt, recurring: true } },
+      ] } },
+      fired('cron-1', cronPrompt),
+      fired('cron-2', cronPrompt),
+    ];
+    const { messages, stats } = buildCanonicalMessagesWithStats(transcript, base.length, 'conv-meta');
+    expect(kinds(messages)).toEqual([['cron-1', 'self_note'], ['cron-2', 'self_note']]);
+    expect(messages[0].evidence_id).not.toBe(messages[1].evidence_id);
+    expect(stats).toEqual(expect.objectContaining({ scheduled_prompts: 2, self_note: 2 }));
+  });
+
+  it('classifies other isMeta text, in a string or a block array, as meta_text', () => {
+    const transcript = [
+      ...base,
+      fired('nudge-1', 'Runtime note: the last reply was empty.'),
+      { type: 'user', uuid: 'nudge-2', timestamp: '2026-03-01T09:31:00Z', isMeta: true, promptSource: 'not a short id', message: { content: [{ type: 'text', text: 'Runtime note: image resized.' }] } },
+    ];
+    const { messages, stats } = buildCanonicalMessagesWithStats(transcript, base.length - 1, 'conv-meta');
+    expect(kinds(messages)).toEqual([['nudge-1', 'meta_text'], ['nudge-2', 'meta_text']]);
+    expect(stats).toEqual({ scheduled_prompts: 1, self_note: 0, meta_text: 2, self_note_without_is_meta: 0, prompt_sources: { none: 1, other: 1 } });
+  });
+
+  it("keeps main's evidence ids for user_text, assistant_text, assistant_tool_use and tool_result events", () => {
+    const events = buildCanonicalMessages([...base, fired('wake-1', WAKE_PROMPT), fired('nudge-1', 'Runtime note.')], -1, 'conv-meta');
+    // Ids computed on main 308bc6b from `base`.
+    expect(events.slice(0, 5).map((event) => [event.message_id, event.event_kind, event.evidence_id])).toEqual([
+      ['user-typed', 'user_text', 'transcript_ev_ec8568da5172f0fa57c3d4d4'],
+      ['asst-1', 'assistant_text', 'transcript_ev_cf7c72d8c4b6a2317654a9fb'],
+      ['asst-1', 'assistant_tool_use', 'transcript_ev_40fecf5bd2677aca97681a92'],
+      ['user-result', 'tool_result', 'transcript_ev_957dc17fd14edc03e333e7a8'],
+      ['user-blocks', 'user_text', 'transcript_ev_e4046d115ca3c5f4aa5d3cea'],
+    ]);
+    expect(kinds(events.slice(5))).toEqual([['wake-1', 'self_note'], ['nudge-1', 'meta_text']]);
+  });
+
+  it('keeps user text that equals a prompt scheduled only later as user_text', () => {
+    const transcript = [
+      { type: 'user', uuid: 'user-asks', timestamp: '2026-03-01T10:00:00Z', message: { role: 'user', content: 'Remind me about the seed order.' } },
+      { type: 'assistant', uuid: 'asst-wake', timestamp: '2026-03-01T10:01:00Z', message: { content: [
+        { type: 'tool_use', id: 'toolu_later', name: 'ScheduleWakeup', input: { delaySeconds: 600, prompt: 'Remind me about the seed order.' } },
+      ] } },
+      fired('wake-later', 'Remind me about the seed order.'),
+    ];
+    expect(kinds(buildCanonicalMessages(transcript, -1, 'conv-meta')).filter(([, kind]) => kind !== 'assistant_tool_use'))
+      .toEqual([['user-asks', 'user_text'], ['wake-later', 'self_note']]);
+  });
+
+  it('shows the new kinds to the observer and says they are not the user\'s words', () => {
+    const events = buildCanonicalMessages([...base, fired('wake-1', WAKE_PROMPT)], base.length - 1, 'conv-meta');
+    const catalog = appendCanonicalEvidenceCatalog('observe', events);
+    expect(catalog).toContain(`evidence_id="${events[0].evidence_id}" message_id="wake-1" role="user" event_kind="self_note"`);
+    expect(catalog).toContain('cannot be cited as evidence');
+  });
+
 });
