@@ -54,13 +54,69 @@ function transcriptEventId(
   });
 }
 
+const SCHEDULING_TOOL_NAMES = new Set(['ScheduleWakeup', 'CronCreate']);
+
+/** Counts for one pass, per text block, metadata only: never any text or transcript field value. */
+export interface TranscriptTextStats {
+  /** ScheduleWakeup / CronCreate prompts in the whole transcript, including before the pass. */
+  scheduled_prompts: number;
+  self_note: number;
+  meta_text: number;
+  /**
+   * User text blocks without `isMeta: true` that equal an earlier scheduled prompt. Kept as user_text: either the
+   * user typed the same words, or Claude Code stopped marking firings.
+   */
+  unmarked_prompt_match: number;
+  /** promptSource of the entry each self_note / meta_text block is on, in fixed buckets: only `sdk` is a known value. */
+  prompt_source: { sdk: number; other: number; none: number };
+}
+
+/**
+ * Index of the first transcript entry that scheduled each (trimmed) prompt. A wakeup fires in a later pass than the
+ * one that scheduled it, so this reads the whole transcript, not only the new range.
+ */
+function scheduledPromptIndex(messages: TranscriptMessage[]): { firstIndex: Map<string, number>; count: number } {
+  const firstIndex = new Map<string, number>();
+  let count = 0;
+  for (let i = 0; i < messages.length; i++) {
+    if (messages[i].type !== 'assistant') continue;
+    const content = messages[i].message?.content ?? messages[i].content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content as any[]) {
+      if (block?.type !== 'tool_use' || !SCHEDULING_TOOL_NAMES.has(block.name)) continue;
+      const prompt = typeof block.input?.prompt === 'string' ? block.input.prompt.trim() : '';
+      if (!prompt) continue;
+      count += 1;
+      if (!firstIndex.has(prompt)) firstIndex.set(prompt, i);
+    }
+  }
+  return { firstIndex, count };
+}
+
 export function buildCanonicalMessages(
   messages: TranscriptMessage[],
   startIndex: number,
   conversationId: string,
 ): CanonicalMessage[] {
+  return buildCanonicalMessagesWithStats(messages, startIndex, conversationId).messages;
+}
+
+/**
+ * Text on a user entry marked `isMeta: true` is `self_note` when it equals the prompt of an earlier ScheduleWakeup /
+ * CronCreate, else `meta_text`. Text alone can't tell a firing from the user typing the same words, so text on an
+ * unmarked entry stays `user_text`; a match there is only counted (`unmarked_prompt_match`).
+ */
+export function buildCanonicalMessagesWithStats(
+  messages: TranscriptMessage[],
+  startIndex: number,
+  conversationId: string,
+): { messages: CanonicalMessage[]; stats: TranscriptTextStats } {
   const result: CanonicalMessage[] = [];
   const toolNames = new Map<string, string>();
+  const scheduled = scheduledPromptIndex(messages);
+  const stats: TranscriptTextStats = {
+    scheduled_prompts: scheduled.count, self_note: 0, meta_text: 0, unmarked_prompt_match: 0, prompt_source: { sdk: 0, other: 0, none: 0 },
+  };
   for (let i = startIndex + 1; i < messages.length; i++) {
     const message = messages[i];
     if (message.type !== 'user' && message.type !== 'assistant') continue;
@@ -75,9 +131,16 @@ export function buildCanonicalMessages(
       let quote: string | null = null;
       let toolName: string | undefined;
       let toolUseId: string | undefined;
+      let matchesEarlierPrompt = false;
 
       if (block?.type === 'text') {
-        eventKind = role === 'user' ? 'user_text' : 'assistant_text';
+        if (role === 'user') {
+          const scheduledAt = typeof block.text === 'string' ? scheduled.firstIndex.get(block.text.trim()) : undefined;
+          matchesEarlierPrompt = scheduledAt !== undefined && scheduledAt < i;
+          eventKind = message.isMeta !== true ? 'user_text' : matchesEarlierPrompt ? 'self_note' : 'meta_text';
+        } else {
+          eventKind = 'assistant_text';
+        }
         quote = boundedEvidenceText(block.text);
       } else if (role === 'assistant' && block?.type === 'tool_use' && block.name) {
         eventKind = 'assistant_tool_use';
@@ -104,9 +167,24 @@ export function buildCanonicalMessages(
         quote,
         captured_at: capturedAt,
       });
+      if (eventKind === 'self_note' || eventKind === 'meta_text') {
+        stats[eventKind] += 1;
+        stats.prompt_source[message.promptSource === undefined ? 'none' : message.promptSource === 'sdk' ? 'sdk' : 'other'] += 1;
+      } else if (eventKind === 'user_text' && matchesEarlierPrompt) {
+        stats.unmarked_prompt_match += 1;
+      }
     }
   }
-  return result;
+  return { messages: result, stats };
+}
+
+/** One counts line per pass, plus one warning line when unmarked user text matched a prompt. Numbers only. */
+export function logTranscriptTextStats(stats: TranscriptTextStats, log: (message: string) => void): void {
+  const { sdk, other, none } = stats.prompt_source;
+  log(`Transcript text kinds: scheduled_prompts_seen=${stats.scheduled_prompts} self_note=${stats.self_note} meta_text=${stats.meta_text} unmarked_prompt_match=${stats.unmarked_prompt_match} prompt_source_sdk=${sdk} prompt_source_other=${other} prompt_source_none=${none}`);
+  if (stats.unmarked_prompt_match > 0) {
+    log(`WARNING: ${stats.unmarked_prompt_match} user text(s) without isMeta: true equal an earlier scheduled prompt and stay user_text; either the user repeated it or Claude Code stopped marking firings with isMeta`);
+  }
 }
 
 function escapeWorkerXml(value: string): string {
@@ -142,6 +220,7 @@ export function appendCanonicalEvidenceCatalog(
     'Judge semantics yourself. Ignore routine code edits, installs, tests, file reads, shell noise, and arbitrary tool results unless they carry durable relationship-relevant meaning.',
     'Relationship-relevant durable meaning that appears only in assistant tool input or textual tool results is eligible when cited by exact evidence_id.',
     'Never invent evidence IDs; use the backend-owned evidence_id from the catalog.',
+    'event_kind="self_note" (the agent\'s own scheduled prompt firing) and event_kind="meta_text" (runtime or system text) sit on role="user" entries but are not the user\'s words: read them as context only; they cannot be cited as evidence.',
     '</relationship_memory_evidence_semantics>',
   ].join('\n');
   return `${workerMessage}\n\n${semantics}\n\n<relationship_memory_evidence_catalog trusted="transcript_provenance_only">\n${entries}\n</relationship_memory_evidence_catalog>`;

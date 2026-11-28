@@ -6,7 +6,9 @@ import {
   appendCanonicalEvidenceCatalog,
   ASSISTANT_REMEMBER_TOOL_NAME,
   buildCanonicalMessages,
+  buildCanonicalMessagesWithStats,
   extractAssistantRememberIntents,
+  logTranscriptTextStats,
   RELATIONSHIP_ALLOWED_BUILTIN_TOOLS,
   RELATIONSHIP_DISALLOWED_BUILTIN_TOOLS,
   RelationshipMemoryRuntime,
@@ -258,5 +260,240 @@ describe('reinforce matches evidence by transcript source, not by conversation',
     expect(runtime.reinforce('message-level', { memory_id: memoryId, evidence_message_ids: ['msg-3'] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
     expect(runtime.reinforce('message-level-again', { memory_id: memoryId, evidence_message_ids: ['msg-3'] })).toEqual({ outcome: 'duplicate', memory_id: memoryId });
     expect(evidenceOf()).toHaveLength(2);
+  });
+});
+
+describe('scheduled prompts and isMeta text on user entries', () => {
+  const WAKE_PROMPT = 'Check the garden plan draft.';
+  // The same shape main produced its evidence ids from; see the id test below.
+  const base = [
+    { type: 'user', uuid: 'user-typed', timestamp: '2026-03-01T09:00:00Z', message: { role: 'user', content: 'Can we look at the garden plan again?' } },
+    { type: 'assistant', uuid: 'asst-1', timestamp: '2026-03-01T09:01:00Z', message: { content: [
+      { type: 'text', text: 'Sure, I will check back later.' },
+      { type: 'tool_use', id: 'toolu_wake', name: 'ScheduleWakeup', input: { delaySeconds: 1200, prompt: WAKE_PROMPT, reason: 'waiting' } },
+    ] } },
+    { type: 'user', uuid: 'user-result', timestamp: '2026-03-01T09:01:01Z', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_wake', content: 'scheduled' }] } },
+    { type: 'user', uuid: 'user-blocks', timestamp: '2026-03-01T09:02:00Z', message: { content: [{ type: 'text', text: 'Also add the bench.' }] } },
+  ] as any[];
+  const fired = (uuid: string, text: string, extra: Record<string, unknown> = { isMeta: true }) =>
+    ({ type: 'user', uuid, timestamp: '2026-03-01T09:30:00Z', ...extra, message: { role: 'user', content: text } });
+  const typed = (uuid: string, text: string) => ({ type: 'user', uuid, timestamp: '2026-03-01T09:40:00Z', message: { role: 'user', content: text } });
+  const kinds = (events: CanonicalMessage[]) => events.map((event) => [event.message_id, event.event_kind]);
+  const logged = (stats: Parameters<typeof logTranscriptTextStats>[0]) => {
+    const lines: string[] = [];
+    logTranscriptTextStats(stats, (line) => lines.push(line));
+    return lines;
+  };
+
+  it('classifies a fired ScheduleWakeup prompt with isMeta as self_note, with no warning', () => {
+    const { messages, stats } = buildCanonicalMessagesWithStats([...base, fired('wake-1', WAKE_PROMPT, { isMeta: true, promptSource: 'sdk' })], -1, 'conv-meta');
+    expect(messages.at(-1)).toEqual(expect.objectContaining({ message_id: 'wake-1', role: 'user', event_kind: 'self_note', quote: WAKE_PROMPT }));
+    expect(stats).toEqual({ scheduled_prompts: 1, self_note: 1, meta_text: 0, unmarked_prompt_match: 0, prompt_source: { sdk: 1, other: 0, none: 0 } });
+    expect(logged(stats)).toEqual([
+      'Transcript text kinds: scheduled_prompts_seen=1 self_note=1 meta_text=0 unmarked_prompt_match=0 prompt_source_sdk=1 prompt_source_other=0 prompt_source_none=0',
+    ]);
+  });
+
+  it('keeps an unmarked entry equal to a scheduled prompt as user_text, and warns once without logging text', () => {
+    const { messages, stats } = buildCanonicalMessagesWithStats([...base, fired('wake-1', WAKE_PROMPT, {})], -1, 'conv-meta');
+    expect(messages.at(-1)?.event_kind).toBe('user_text');
+    expect(stats).toEqual(expect.objectContaining({ self_note: 0, unmarked_prompt_match: 1 }));
+    const lines = logged(stats);
+    expect(lines.filter((line) => line.startsWith('WARNING:'))).toHaveLength(1);
+    expect(lines.join('\n')).not.toContain(WAKE_PROMPT);
+    expect(lines.join('\n')).not.toContain('garden');
+  });
+
+  it('keeps the user typing a fired prompt again as citable user_text', () => {
+    const transcript = [...base, fired('wake-1', WAKE_PROMPT), typed('user-repeat', WAKE_PROMPT)];
+    const { messages, stats } = buildCanonicalMessagesWithStats(transcript, base.length - 1, 'conv-meta');
+    expect(kinds(messages)).toEqual([['wake-1', 'self_note'], ['user-repeat', 'user_text']]);
+    expect(stats).toEqual(expect.objectContaining({ self_note: 1, unmarked_prompt_match: 1 }));
+    const store = new RelationshipMemoryStore(tempDir(), 'subject');
+    const runtime = new RelationshipMemoryRuntime(store, new Map(messages.map((event) => [event.evidence_id!, event])), () => '2026-03-02T00:00:00Z');
+    expect(runtime.remember('repeat', {
+      schema_version: 1, kind: 'user_preference', summary: 'Keeps an eye on the garden plan draft', participants: ['user'],
+      evidence_ids: [messages[1].evidence_id!], payload: { topic: 'garden plan', preference: 'Wants the draft checked.' },
+    }).outcome).toBe('accepted');
+  });
+
+  it('finds the scheduling tool_use before startIndex when the firing comes in a later pass', () => {
+    const transcript = [...base, fired('wake-1', `  ${WAKE_PROMPT}\n`)];
+    expect(kinds(buildCanonicalMessages(transcript, base.length - 1, 'conv-meta'))).toEqual([['wake-1', 'self_note']]);
+  });
+
+  it('classifies every firing of a recurring CronCreate as self_note', () => {
+    const cronPrompt = 'Water the herbs and note how they look.';
+    const transcript = [
+      ...base,
+      { type: 'assistant', uuid: 'asst-cron', timestamp: '2026-03-01T09:03:00Z', message: { content: [
+        { type: 'tool_use', id: 'toolu_cron', name: 'CronCreate', input: { cron: '0 8 * * *', prompt: cronPrompt, recurring: true } },
+      ] } },
+      fired('cron-1', cronPrompt),
+      fired('cron-2', cronPrompt),
+    ];
+    const { messages, stats } = buildCanonicalMessagesWithStats(transcript, base.length, 'conv-meta');
+    expect(kinds(messages)).toEqual([['cron-1', 'self_note'], ['cron-2', 'self_note']]);
+    expect(messages[0].evidence_id).not.toBe(messages[1].evidence_id);
+    expect(stats).toEqual(expect.objectContaining({ scheduled_prompts: 2, self_note: 2 }));
+  });
+
+  it('classifies other isMeta text as meta_text and logs promptSource only in fixed buckets', () => {
+    const transcript = [
+      ...base,
+      fired('nudge-1', 'Runtime note: the last reply was empty.'),
+      { type: 'user', uuid: 'nudge-2', timestamp: '2026-03-01T09:31:00Z', isMeta: true, promptSource: 'SyntheticPrivateValue', message: { content: [{ type: 'text', text: 'Runtime note: image resized.' }] } },
+      fired('nudge-3', 'Runtime note: context trimmed.', { isMeta: true, promptSource: 'constructor' }),
+    ];
+    const { messages, stats } = buildCanonicalMessagesWithStats(transcript, base.length - 1, 'conv-meta');
+    expect(kinds(messages)).toEqual([['nudge-1', 'meta_text'], ['nudge-2', 'meta_text'], ['nudge-3', 'meta_text']]);
+    expect(stats).toEqual({ scheduled_prompts: 1, self_note: 0, meta_text: 3, unmarked_prompt_match: 0, prompt_source: { sdk: 0, other: 2, none: 1 } });
+    const line = logged(stats).join('\n');
+    expect(line).toContain('prompt_source_other=2 prompt_source_none=1');
+    expect(line).not.toContain('SyntheticPrivateValue');
+    expect(line).not.toContain('constructor');
+  });
+
+  it("keeps main's evidence ids for user_text, assistant_text, assistant_tool_use and tool_result events", () => {
+    const events = buildCanonicalMessages([...base, fired('wake-1', WAKE_PROMPT), fired('nudge-1', 'Runtime note.')], -1, 'conv-meta');
+    // Ids computed on main 308bc6b from `base`.
+    expect(events.slice(0, 5).map((event) => [event.message_id, event.event_kind, event.evidence_id])).toEqual([
+      ['user-typed', 'user_text', 'transcript_ev_ec8568da5172f0fa57c3d4d4'],
+      ['asst-1', 'assistant_text', 'transcript_ev_cf7c72d8c4b6a2317654a9fb'],
+      ['asst-1', 'assistant_tool_use', 'transcript_ev_40fecf5bd2677aca97681a92'],
+      ['user-result', 'tool_result', 'transcript_ev_957dc17fd14edc03e333e7a8'],
+      ['user-blocks', 'user_text', 'transcript_ev_e4046d115ca3c5f4aa5d3cea'],
+    ]);
+    expect(kinds(events.slice(5))).toEqual([['wake-1', 'self_note'], ['nudge-1', 'meta_text']]);
+  });
+
+  it('keeps user text that equals a prompt scheduled only later as user_text', () => {
+    const transcript = [
+      typed('user-asks', 'Remind me about the seed order.'),
+      { type: 'assistant', uuid: 'asst-wake', timestamp: '2026-03-01T10:01:00Z', message: { content: [
+        { type: 'tool_use', id: 'toolu_later', name: 'ScheduleWakeup', input: { delaySeconds: 600, prompt: 'Remind me about the seed order.' } },
+      ] } },
+      fired('wake-later', 'Remind me about the seed order.'),
+    ];
+    const { messages, stats } = buildCanonicalMessagesWithStats(transcript, -1, 'conv-meta');
+    expect(kinds(messages).filter(([, kind]) => kind !== 'assistant_tool_use')).toEqual([['user-asks', 'user_text'], ['wake-later', 'self_note']]);
+    expect(stats.unmarked_prompt_match).toBe(0);
+  });
+
+  it('shows the new kinds to the observer and says they are not the user\'s words', () => {
+    const events = buildCanonicalMessages([...base, fired('wake-1', WAKE_PROMPT)], base.length - 1, 'conv-meta');
+    const catalog = appendCanonicalEvidenceCatalog('observe', events);
+    expect(catalog).toContain(`evidence_id="${events[0].evidence_id}" message_id="wake-1" role="user" event_kind="self_note"`);
+    expect(catalog).toContain('cannot be cited as evidence');
+  });
+
+  describe('citing the new kinds', () => {
+    const transcript = [
+      ...base,
+      fired('wake-1', WAKE_PROMPT),
+      fired('nudge-1', 'Runtime note: the user keeps bees on the roof.'),
+      typed('user-thanks', 'Thanks for checking.'),
+    ];
+    const events = buildCanonicalMessages(transcript, -1, 'conv-meta');
+    const idOf = (messageId: string) => events.find((event) => event.message_id === messageId)!.evidence_id!;
+    const proposal = (evidence: Record<string, string[]>, extra: Record<string, unknown> = {}) => ({
+      schema_version: 1, kind: 'personal_experience', summary: 'Keeps bees on the roof', participants: ['user'], ...evidence, ...extra,
+      payload: { title: 'Keeps bees on the roof', experience: 'The user keeps bees on the roof.' },
+    });
+    function setup(intents: AssistantRememberIntentRecord[] = []) {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject');
+      for (const intent of intents) store.appendAssistantIntent(intent);
+      const runtime = new RelationshipMemoryRuntime(
+        store, new Map(events.map((event) => [event.evidence_id!, event])), () => '2026-03-02T00:00:00Z',
+        new Map(intents.map((intent) => [intent.intent_id, intent])),
+      );
+      return { store, runtime };
+    }
+    const rejected = expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'not_citable_evidence' });
+
+    it('rejects a remember that cites only a self_note, by evidence id or legacy message id', () => {
+      const { store, runtime } = setup();
+      const result = runtime.remember('only-note', proposal({ evidence_ids: [idOf('wake-1')] }));
+      expect(result).toEqual(rejected);
+      expect(result.reason).toContain(idOf('wake-1'));
+      expect(result.reason).toContain("Neither is the user's words");
+      expect(runtime.remember('only-note-legacy', proposal({ evidence_message_ids: ['wake-1'] }))).toEqual(rejected);
+      expect(store.listMemories()).toHaveLength(0);
+      expect(store.listEvidence()).toHaveLength(0);
+    });
+
+    it('rejects a mixed remember whole, so a claim only meta_text supported is never saved', () => {
+      const { store, runtime } = setup();
+      const result = runtime.remember('mixed', proposal({ evidence_ids: [idOf('nudge-1'), idOf('user-thanks')] }));
+      expect(result).toEqual(rejected);
+      expect(result.reason).toContain(idOf('nudge-1'));
+      expect(result.reason).not.toContain(idOf('user-thanks'));
+      expect(store.listMemories()).toHaveLength(0);
+      expect(store.listEvidence()).toHaveLength(0);
+    });
+
+    it('leaves a linked remember intent open across a replay in the same batch, for a corrected call', () => {
+      const intents = extractAssistantRememberIntents([{
+        type: 'assistant', uuid: 'asst-intent', timestamp: '2026-03-01T09:05:00Z',
+        message: { content: [{ type: 'tool_use', id: 'toolu_intent', name: ASSISTANT_REMEMBER_TOOL_NAME, input: { memory: { text: 'The garden plan.' }, feel: { text: 'Looking forward to it.' } } }] },
+      }] as any[], -1, 'session-1', 'subject');
+      const { store, runtime } = setup(intents);
+      const intentId = intents[0].intent_id;
+      store.beginBatch('intent-batch', '2026-03-02T00:00:00Z');
+      const bad = proposal({ evidence_ids: [idOf('nudge-1'), idOf('user-typed')] }, { assistant_intent_id: intentId });
+      expect(runtime.remember('intent-batch', bad)).toEqual(rejected);
+      expect(runtime.remember('intent-batch', bad)).toEqual(rejected);
+      expect(store.getTerminalAssistantIntentOutcome(intentId)).toBeUndefined();
+      const corrected = {
+        schema_version: 1, kind: 'personal_experience', summary: 'Looking at the garden plan again', participants: ['user'],
+        evidence_ids: [idOf('user-typed')], assistant_intent_id: intentId,
+        payload: { title: 'Looking at the garden plan again', experience: 'The user asked to look at the garden plan again.' },
+      };
+      const accepted = runtime.remember('intent-batch', corrected);
+      expect(accepted.outcome).toBe('accepted');
+      expect(store.getTerminalAssistantIntentOutcome(intentId, 'intent-batch')).toEqual(expect.objectContaining({ outcome: 'accepted', memory_id: accepted.memory_id }));
+      expect(runtime.finalizeBatch('intent-batch', true)).toBe('completed');
+    });
+
+    it('rejects a reinforce that cites a self_note, alone or mixed, and attaches nothing', () => {
+      const { store, runtime } = setup();
+      const memoryId = runtime.remember('seed', proposal({ evidence_ids: [idOf('user-typed')] })).memory_id!;
+      expect(runtime.reinforce('only-note', { memory_id: memoryId, evidence_ids: [idOf('wake-1')] })).toEqual(rejected);
+      expect(runtime.reinforce('mixed', { memory_id: memoryId, evidence_ids: [idOf('wake-1'), idOf('user-blocks')] })).toEqual(rejected);
+      expect(store.listReinforcements()).toHaveLength(0);
+      expect(store.listEvidence().map((item) => item.message_id)).toEqual(['user-typed']);
+      expect(runtime.reinforce('corrected', { memory_id: memoryId, evidence_ids: [idOf('user-blocks')] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+    });
+
+    it('applies the same rule to entity evidence', () => {
+      const { store, runtime } = setup();
+      const entity = (ids: string[]) => ({ schema_version: 1, canonical_name: 'Roof hive', aliases: ['the hive'], entity_type: 'other', description: 'A beehive the user keeps on the roof.', evidence_ids: ids });
+      expect(runtime.rememberEntity('entity-note', entity([idOf('nudge-1')]))).toEqual(rejected);
+      expect(runtime.rememberEntity('entity-mixed', entity([idOf('nudge-1'), idOf('user-thanks')]))).toEqual(rejected);
+      expect(store.listEntities()).toHaveLength(0);
+      expect(store.listEntityEvidence()).toHaveLength(0);
+    });
+
+    it('leaves stored self_note / meta_text evidence out of recall quote snippets', async () => {
+      const { store, runtime } = setup();
+      const memoryId = runtime.remember('seed', proposal({ evidence_ids: [idOf('user-typed')] })).memory_id!;
+      // Only a direct store write can hold these kinds; recall must still never quote them as anyone's words.
+      const stored = ['wake-1', 'nudge-1'].map((messageId) => {
+        const event = events.find((item) => item.message_id === messageId)!;
+        return {
+          evidence_id: `ev-${messageId}`, memory_id: memoryId, conversation_id: event.conversation_id, message_id: messageId, role: event.role,
+          quote: event.quote, captured_at: event.captured_at, source_evidence_id: event.evidence_id, event_kind: event.event_kind, block_index: 0,
+        };
+      });
+      store.appendReinforcement({
+        schema_version: 1, reinforcement_id: 'reinforce-direct', memory_id: memoryId, batch_id: 'direct',
+        evidence_ids: stored.map((item) => item.evidence_id), latest_evidence_at: '2026-03-01T09:30:00Z', recorded_at: '2026-03-02T00:00:00Z',
+      }, stored);
+      const [hit] = await runtime.memorySearchHybridWithEvidence({});
+      expect(hit.memory_id).toBe(memoryId);
+      expect(hit.quote_snippets.map((snippet) => snippet.evidence_id)).not.toContain('ev-wake-1');
+      expect(hit.quote_snippets.map((snippet) => snippet.evidence_id)).not.toContain('ev-nudge-1');
+      expect(hit.quote_snippets.map((snippet) => snippet.quote)).toEqual(['Can we look at the garden plan again?']);
+    });
   });
 });
