@@ -37,7 +37,8 @@ export interface SemanticRetriever {
   rankExisting?(documents: SemanticDocument[], query: string, signal?: AbortSignal): Promise<Map<string, number>>;
   /**
    * rankExisting for several requests with one query embedding call. Each map equals
-   * rankExisting(request.documents, request.query); any failure rejects the whole call.
+   * rankExisting(request.documents, request.query). A failed shared request rejects the whole call;
+   * with per-query requests, a query whose request failed gets an empty map.
    */
   rankExistingMany?(requests: readonly SemanticRankRequest[], signal?: AbortSignal): Promise<Map<string, number>[]>;
 }
@@ -216,14 +217,21 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
       try { payload = await response.json(); } catch { payload = {}; }
       if (!response.ok) throw providerError(response.status, payload);
       const embeddings = Array.isArray(payload?.output?.embeddings) ? payload.output.embeddings : [];
-      const ordered = embeddings
-        .map((entry: any, index: number) => ({ index: Number.isInteger(entry?.text_index) ? entry.text_index : index, vector: entry?.embedding }))
-        .sort((a: { index: number }, b: { index: number }) => a.index - b.index)
-        .map((entry: { vector: unknown }) => entry.vector);
-      if (ordered.length !== texts.length || ordered.some((vector: unknown) => !Array.isArray(vector) || vector.length !== this.dimensions || vector.some((item) => typeof item !== 'number' || !Number.isFinite(item)))) {
+      // One slot per input, filled by text_index (or row position when it is missing). A duplicate, out-of-range or
+      // missing index would hand one text another text's vector, so it fails the whole payload.
+      const slots: unknown[] = new Array(texts.length);
+      const filled = new Set<number>();
+      let positionsValid = embeddings.length === texts.length;
+      embeddings.forEach((entry: any, position: number) => {
+        const index = Number.isInteger(entry?.text_index) ? entry.text_index as number : position;
+        if (index < 0 || index >= texts.length || filled.has(index)) { positionsValid = false; return; }
+        filled.add(index);
+        slots[index] = entry?.embedding;
+      });
+      if (!positionsValid || filled.size !== texts.length || slots.some((vector) => !Array.isArray(vector) || vector.length !== this.dimensions || vector.some((item) => typeof item !== 'number' || !Number.isFinite(item)))) {
         throw new Error('Embedding provider returned an invalid vector payload.');
       }
-      return ordered as number[][];
+      return slots as number[][];
     } finally {
       clearTimeout(timeout);
       signal?.removeEventListener('abort', onAbort);
@@ -526,27 +534,37 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
     const usable = requests.map((request, position) => active[position] ? this.usableVectors(index, request.documents, hashOf) : []);
     const texts = [...new Set(requests.filter((_, position) => usable[position].length > 0).map((request) => request.query))];
     if (texts.length === 0) return requests.map(() => new Map());
-    let vectors: number[][];
-    try {
-      const embedStartedAt = monotonicNow();
-      vectors = this.provider.embedQueries
-        ? await this.provider.embedQueries(texts, signal)
-        : await Promise.all(texts.map((text) => this.provider.embedQuery(text, signal)));
-      if (vectors.length !== texts.length) throw new Error('Embedding provider returned the wrong number of query vectors.');
-      emitRecallTimingSegment('semantic_query_embedding_external_batch', embedStartedAt, {
-        query_count: texts.length,
-        request_count: this.provider.embedQueries ? Math.ceil(texts.length / this.provider.maxBatchSize) : texts.length,
-        // Distinct usable documents across all requests; the per-query comparison segments keep their own counts.
-        usable_document_union_count: new Set(usable.flatMap((items) => items.map(([id]) => id))).size,
-      });
-    } catch (error) {
-      if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
-      throw error;
+    const embedStartedAt = monotonicNow();
+    let vectors: Array<number[] | undefined>;
+    if (this.provider.embedQueries) {
+      // One shared request: if it fails, every query falls back.
+      try {
+        vectors = await this.provider.embedQueries(texts, signal);
+        if (vectors.length !== texts.length) throw new Error('Embedding provider returned the wrong number of query vectors.');
+      } catch (error) {
+        if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+        throw error;
+      }
+    } else {
+      // Separate requests fail one query at a time, as parallel rankExisting calls do: a failed query gets an
+      // empty map (lexical fallback) and writes the cooldown, and the queries that succeeded keep their vectors.
+      const settled = await Promise.allSettled(texts.map((text) => this.provider.embedQuery(text, signal)));
+      for (const result of settled) {
+        if (result.status === 'rejected' && !signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, result.reason);
+      }
+      vectors = settled.map((result) => result.status === 'fulfilled' ? result.value : undefined);
     }
+    emitRecallTimingSegment('semantic_query_embedding_external_batch', embedStartedAt, {
+      query_count: texts.length,
+      request_count: this.provider.embedQueries ? Math.ceil(texts.length / this.provider.maxBatchSize) : texts.length,
+      failed_query_count: vectors.filter((vector) => vector === undefined).length,
+      // Distinct usable documents across all requests; the per-query comparison segments keep their own counts.
+      usable_document_union_count: new Set(usable.flatMap((items) => items.map(([id]) => id))).size,
+    });
     const queryVectors = new Map(texts.map((text, position) => [text, vectors[position]]));
     return requests.map((request, position) => {
-      if (usable[position].length === 0) return new Map();
-      const queryVector = queryVectors.get(request.query)!;
+      const queryVector = queryVectors.get(request.query);
+      if (usable[position].length === 0 || !queryVector) return new Map();
       const localCompareStartedAt = monotonicNow();
       const ranked = new Map(usable[position].map(([id, vector]) => [id, cosine(queryVector, vector)]));
       emitRecallTimingSegment('semantic_local_vector_comparison', localCompareStartedAt, { usable_document_count: usable[position].length });

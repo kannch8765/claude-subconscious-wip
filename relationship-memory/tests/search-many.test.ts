@@ -48,11 +48,26 @@ function vectorFor(text: string): number[] {
 }
 
 type QueryMode = 'ok' | 'fail' | 'hang' | 'bad_vector';
+/** How the rows of a successful response are laid out; only 'ok', 'reversed' and 'no_index' are well formed. */
+type RowShape = 'ok' | 'reversed' | 'no_index' | 'duplicate_index' | 'out_of_range' | 'extra_row';
+
+function shapeRows(rows: Array<{ text_index: number; embedding: number[] }>, shape: RowShape): unknown[] {
+  switch (shape) {
+    case 'ok': return rows;
+    case 'reversed': return [...rows].reverse();
+    case 'no_index': return rows.map(({ embedding }) => ({ embedding }));
+    case 'duplicate_index': return rows.map(({ embedding }) => ({ text_index: 0, embedding }));
+    case 'out_of_range': return rows.map((row, index) => index === rows.length - 1 ? { ...row, text_index: rows.length } : row);
+    case 'extra_row': return [...rows, { text_index: rows.length, embedding: rows[0].embedding }];
+  }
+}
 
 /** A fetch for the real DashScope provider that never leaves the process and counts every request. */
 function fakeDashScope() {
   const state = {
     mode: 'ok' as QueryMode,
+    queryShape: 'ok' as RowShape,
+    documentShape: 'ok' as RowShape,
     /** Fail only from this query request on (1-based), when mode is 'fail'. */
     failFromRequest: 1,
     documentRequests: [] as string[][],
@@ -79,7 +94,8 @@ function fakeDashScope() {
       text_index: index,
       embedding: isQuery && state.mode === 'bad_vector' ? [1, 2] : vectorFor(text),
     }));
-    return new Response(JSON.stringify({ output: { embeddings } }), { status: 200 });
+    const shaped = shapeRows(embeddings, isQuery ? state.queryShape : state.documentShape);
+    return new Response(JSON.stringify({ output: { embeddings: shaped } }), { status: 200 });
   }) as unknown as typeof fetch;
   return { state, fetchFn };
 }
@@ -449,6 +465,70 @@ describe('memorySearchRecallHybridManyWithEvidence', () => {
 
     expect(await runtime.memorySearchRecallHybridManyWithEvidence(queries)).toEqual(await singles(runtime, queries));
     expect(calls.slice(0, 5)).toEqual(queries.map((query) => query.query));
+  });
+});
+
+describe('query vectors land on their own query', () => {
+  it.each(['reversed', 'no_index'] as const)('maps a well-formed %s response to the right inputs', async (shape) => {
+    const f = await fixture();
+    const queries = queryList(4);
+    const expected = await singles(f.runtime, queries);
+    f.dashScope.state.queryShape = shape;
+
+    expect(await f.runtime.memorySearchRecallHybridManyWithEvidence(queries)).toEqual(expected);
+    expect(await f.provider.embedQueries(['amber jar', 'cobalt tin'])).toEqual([vectorFor('amber jar'), vectorFor('cobalt tin')]);
+    expect(fs.existsSync(cooldownFile(f))).toBe(false);
+  });
+
+  it.each(['duplicate_index', 'out_of_range', 'extra_row'] as const)('refuses a %s response, so no query takes another query\'s vector', async (shape) => {
+    const f = await fixture();
+    const queries = queryList(2);
+    const lexical = await singles(f.lexicalRuntime, queries);
+    f.dashScope.state.queryShape = shape;
+
+    await expect(f.provider.embedQueries(['amber jar', 'cobalt tin'])).rejects.toThrow('invalid vector payload');
+    expect(await f.runtime.memorySearchRecallHybridManyWithEvidence(queries)).toEqual(lexical);
+    expect(fs.existsSync(cooldownFile(f))).toBe(true);
+  });
+
+  it('refuses a malformed document response without writing the index', async () => {
+    const f = await fixture();
+    const before = fs.readFileSync(f.indexFile, 'utf8');
+    f.dashScope.state.documentShape = 'duplicate_index';
+
+    await expect(f.provider.embedDocuments(['amber one', 'basil two'])).rejects.toThrow('invalid vector payload');
+    await expect(f.retriever.prepare([{ id: 'n1', text: 'amber one' }, { id: 'n2', text: 'basil two' }])).rejects.toThrow('invalid vector payload');
+    expect(fs.readFileSync(f.indexFile, 'utf8')).toBe(before);
+  });
+});
+
+describe('separate query requests (provider without embedQueries)', () => {
+  it('keeps the queries whose request succeeded and falls back only for the failed one, as parallel single calls do', async () => {
+    const f = await fixture();
+    const sent: string[] = [];
+    // Same fingerprint and vectors as the fixture's provider, so it ranks against the fixture's index.
+    const provider: EmbeddingProvider = {
+      fingerprint: f.provider.fingerprint, model: 'plain', dimensions: DIMENSIONS, maxBatchSize: 10,
+      embedDocuments: async (texts) => texts.map(vectorFor),
+      embedQuery: async (text) => {
+        sent.push(text);
+        if (text.includes('cobalt')) throw new Error('synthetic failure');
+        return vectorFor(text);
+      },
+    };
+    const runtime = new RelationshipMemoryRuntime(f.store, f.runtime.messages, f.runtime.now, new Map(), false, new FileBackedSemanticRetriever(provider, f.indexFile));
+    const queries: SearchQuery[] = [{ query: 'amber jar', limit: 12 }, { query: 'cobalt tin', limit: 12 }];
+    const lexical = await singles(f.lexicalRuntime, queries);
+
+    const many = await runtime.memorySearchRecallHybridManyWithEvidence(queries);
+
+    expect(sent).toEqual(['amber jar', 'cobalt tin']);
+    expect(many[1]).toEqual(lexical[1]);
+    expect(many[0]).not.toEqual(lexical[0]);
+    expect(fs.existsSync(cooldownFile(f))).toBe(true);
+    // Parallel single calls from a clean cooldown state give the same lists.
+    fs.rmSync(cooldownFile(f));
+    expect(many).toEqual(await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence(query))));
   });
 });
 
