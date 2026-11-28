@@ -11,6 +11,7 @@
  *      summaries and picks one or none, with the same criteria as the async whisper.
  *   5. Quotes: the memory's quotes sharing most character bigrams with the phrases and message.
  */
+import { WORLD_UPDATE_KIND } from '../relationship-memory/src/schema/index.js';
 import type { RelationshipMemoryRuntime } from '../relationship-memory/src/tools/index.js';
 import type { MemoryRecallResult } from '../relationship-memory/src/tools/index.js';
 import { chat, type ChatResult, type ChatTransport, type ChatUsage } from './llm.js';
@@ -55,7 +56,8 @@ export interface SyncResult {
   total_ms: number;
   usage: ChatUsage;
   candidates: SyncCandidate[];
-  whisper?: { memory_id: string; snippet_ids: string[] };
+  /** A world_update whisper carries no quotes: the runtime renders its timeline (see whisper.ts). */
+  whisper?: { memory_id: string; snippet_ids: string[]; world_update?: true };
   skip_reason?: 'model_none' | 'no_candidate' | 'weak_support' | 'gate_none' | 'gate_failed';
   /** A model call failed at the provider (rate limit, server, transport). Timeouts are normal outcomes, not this. */
   provider_error?: string;
@@ -216,7 +218,9 @@ async function syncPass(runtime: RelationshipMemoryRuntime, transport: ChatTrans
   const top = candidates[0];
   const done = { ...base, search_ms: searchMs, total_ms: Date.now() - started, candidates: candidates.slice(0, 5) };
   if (!top) return { ...done, skip_reason: 'no_candidate' };
-  const whisperOf = (memoryId: string) => ({ memory_id: memoryId, snippet_ids: pickQuotes(byId.get(memoryId)!, queries, config.maxQuotes ?? 2) });
+  const whisperOf = (memoryId: string): NonNullable<SyncResult['whisper']> => byId.get(memoryId)!.kind === WORLD_UPDATE_KIND
+    ? { memory_id: memoryId, snippet_ids: [], world_update: true }
+    : { memory_id: memoryId, snippet_ids: pickQuotes(byId.get(memoryId)!, queries, config.maxQuotes ?? 2) };
   if ((config.gate ?? 'model') === 'rank') {
     if (top.lists < Math.min(config.minLists ?? 2, lists.length)) return { ...done, skip_reason: 'weak_support' };
     return { ...done, whisper: whisperOf(top.memory_id) };

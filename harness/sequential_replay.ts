@@ -51,6 +51,7 @@ import { commonBigrams, evidenceCoverage } from './evidence_coverage.js';
 import { runAsyncPass } from './pass.js';
 import { runSyncPassSettled } from './sync_pass.js';
 import { prepareTurn } from './turn_input.js';
+import { worldWhisperText } from './whisper.js';
 
 export class Refused extends Error {}
 export class Paused extends Error {
@@ -463,22 +464,28 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
             if (cooldown()) throw new Paused(`query-embedding cooldown during ${batch.batch_id}`, true);
 
             const created = result.decisions.remember.filter((r) => r.outcome === 'accepted' && r.memory_id).map((r) => r.memory_id!);
+            // A new world_update head changes the anchor's index text, so it is embedded again like a new memory.
+            const updated = result.decisions.world_updates.filter((w) => w.outcome === 'accepted').map((w) => w.memory_id);
+            const toEmbed = [...new Set([...created, ...updated])];
             let embedMs: number | undefined;
-            if (created.length && b.canEmbedDocuments) {
+            if (toEmbed.length && b.canEmbedDocuments) {
               const embedStarted = Date.now();
-              try { await runtime.prepareCurrentMemorySemanticIndex(new Set(created)); } catch { state.pending_embed.push(...created); }
+              try { await runtime.prepareCurrentMemorySemanticIndex(new Set(toEmbed)); } catch { state.pending_embed.push(...toEmbed); }
               embedMs = Date.now() - embedStarted;
             }
             if (sync.whisper) session.picked.push(sync.whisper.memory_id);
             if (result.decisions.whisper) session.picked.push(result.decisions.whisper.memory_id);
-            session.written.push(...created);
+            session.written.push(...created, ...updated);
             session.passes = [...session.passes, result.surfaced_memory_ids.map((id) => ({ memory_id: id, summary: Array.from(store.getMemory(id)?.summary ?? '').slice(0, 150).join('') }))].slice(-3);
             record = {
               batch_id: batch.batch_id, session: sessionKey, group: batch.group, input, usage_before: meters,
               known_count: knownBefore.length, wall_ms: Date.now() - started, async_ms: asyncMs, sync, ...result,
               new_memory_coverage: created.map((id) => ({ memory_id: id, coverage: evidenceCoverage(store.getMemory(id)?.summary ?? '', store.listEvidenceForMemoryIds([id]).map((e) => e.quote), ignore) })),
               ...(embedMs !== undefined ? { embed_ms: embedMs } : {}),
-              ...(created.length && !b.canEmbedDocuments ? { embed: 'unsupported' } : {}),
+              // The text Kohaku would get for a world_update whisper (results stay on the private side, like the store).
+              ...(sync.whisper?.world_update ? { sync_world_timeline: worldWhisperText(runtime, sync.whisper.memory_id) } : {}),
+              ...(result.decisions.whisper?.world_update ? { async_world_timeline: worldWhisperText(runtime, result.decisions.whisper.memory_id) } : {}),
+              ...(toEmbed.length && !b.canEmbedDocuments ? { embed: 'unsupported' } : {}),
               ...(state.pending_embed.length ? { pending_embed: state.pending_embed.length } : {}),
             };
           }

@@ -362,13 +362,14 @@ describe('async trace', () => {
     const trust = { batchId: 'b', sessionId: 's', memoryIds: new Set<string>(), evidenceIds: new Set<string>(), intentIds: new Set<string>() };
     const trace = toAsyncTrace({
       succeeded: false, completion: S as any, steps: [], tool_errors: [{ name: S, code: S as any, exception: S, message: S }], surfaced_memory_ids: [S],
-      decisions: { reinforce: [{ memory_id: S, outcome: S, rejection_code: S, evidence_ids: S as any }], remember: [{ kind: S, outcome: 'accepted', memory_id: S }], relations: [{ outcome: S }], entities: S as any, searches: 0, search_queries: 0, query_texts: [S] },
+      decisions: { reinforce: [{ memory_id: S, outcome: S, rejection_code: S, evidence_ids: S as any }], remember: [{ kind: S, outcome: 'accepted', memory_id: S }], world_updates: [{ memory_id: S, outcome: S, rejection_code: S }], relations: [{ outcome: S }], entities: S as any, searches: 0, search_queries: 0, query_texts: [S] },
     }, trust);
     expect(trace).toMatchObject({
       completion: 'other', entities: 0, surfaced: 1,
       reinforce: [{ outcome: 'other', rejection_code: 'other', evidence_ids: [], unresolved_ids: 2 }],
       remember: [{ kind: 'other', outcome: 'accepted', unresolved_ids: 1 }],
-      relations: [{ outcome: 'other' }], tool_errors: [{ tool: 'unknown', code: 'other' }], unresolved_ids: 3,
+      world_updates: [{ outcome: 'other', rejection_code: 'other', unresolved_ids: 1 }],
+      relations: [{ outcome: 'other' }], tool_errors: [{ tool: 'unknown', code: 'other' }], unresolved_ids: 4,
     });
     expectClean(trace);
   });

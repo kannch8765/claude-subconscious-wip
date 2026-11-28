@@ -57,7 +57,7 @@ after the head was recorded. It is derived in the projection, not stored.
 | the same fact again | `memory_reinforce` on the anchor | evidence attached; `last_confirmed` moves forward; no revision |
 | the fact changed | **new** `memory_world_update(memory_id, fact, as_of?, evidence_ids)` | a new revision, which becomes the head |
 
-- Sameness of topic is the model's call, the same way reinforce decides "same episode": search `kind=world_update` first, update when found, remember when not.
+- Sameness of topic is the model's call, the same way reinforce decides "same episode": the topic goes into the pass's one memory_search (world_update anchors are served in every search, so no separate `kind=world_update` search step), update when found, remember when not.
 - `memory_world_update` on a non-`world_update` memory → `permanently_rejected`, new code `not_world_update`.
 - A `fact` equal to the head's (normalized) → `duplicate`, with a hint to use `memory_reinforce`.
 - **Evidence:** only `user_text` and `tool_result`. `assistant_text`, `assistant_tool_use`, `self_note` and `meta_text` are rejected for this kind (new code `untrusted_world_source`, whole call, before any write, like `not_citable_evidence`). The agent's own beliefs are never a source.

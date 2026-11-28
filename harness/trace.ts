@@ -11,7 +11,7 @@
  *     batch's evidence catalog, the batch's intent catalog). Any other id is counted in `unresolved_ids`.
  * Errors keep a fixed code and, for exceptions, an allowlisted class name; never the message.
  */
-import { MEMORY_KINDS, type CanonicalMemoryRecord } from '../relationship-memory/src/schema/index.js';
+import { CANONICAL_MEMORY_KINDS, type CanonicalMemoryRecord } from '../relationship-memory/src/schema/index.js';
 import type { ChatErrorClass } from './llm.js';
 import { TOOL_ERROR_CODES, type PassInput, type PassResult } from './pass.js';
 import type { SyncInput, SyncResult } from './sync_pass.js';
@@ -20,7 +20,7 @@ export const TRACE_SCHEMA_VERSION = 1;
 
 /** The harness tools (pass.ts harnessTools); any other name is 'unknown'. */
 export const TRACE_TOOL_NAMES = [
-  'memory_search', 'deliver_whisper', 'skip_whisper', 'memory_reinforce', 'memory_remember', 'suggest_memory_relation', 'entity_search', 'entity_remember',
+  'memory_search', 'deliver_whisper', 'skip_whisper', 'memory_reinforce', 'memory_remember', 'memory_world_update', 'suggest_memory_relation', 'entity_search', 'entity_remember',
 ] as const;
 const CHAT_ERROR_CLASSES = ['none', 'rate_limited', 'server', 'client', 'transport', 'malformed'] as const satisfies readonly ChatErrorClass[];
 const COMPLETIONS = ['completed', 'retryable_failure'] as const;
@@ -31,6 +31,7 @@ export const REJECTION_CODES = [
   'intent_already_linked', 'unknown_assistant_intent', 'invalid_reinforcement', 'unknown_memory', 'unknown_linked_memory', 'ambiguous_evidence', 'unresolvable_evidence',
   'invalid_schema', 'invalid_schema_version', 'invalid_kind', 'invalid_summary', 'invalid_participants', 'invalid_payload', 'invalid_payload_field', 'invalid_optional_null',
   'invalid_linked_memory_ids', 'invalid_evidence_ids', 'ambiguous_evidence_ids', 'unknown_field', 'unknown_payload_field', 'authority_field_forbidden', 'non_chinese_semantic_prose',
+  'not_citable_evidence', 'untrusted_world_source', 'not_world_update', 'invalid_world_update', 'invalid_as_of', 'stale_world_revision', 'reused_world_evidence',
 ] as const;
 /** Exception classes a trace may name: the built-in errors and the ones this code base throws during a pass. */
 export const EXCEPTION_NAMES = [
@@ -122,11 +123,18 @@ export interface ReinforceTrace {
 }
 
 export interface RememberTrace {
-  kind: Other<typeof MEMORY_KINDS>;
+  kind: Other<typeof CANONICAL_MEMORY_KINDS>;
   outcome: Other<typeof OUTCOMES>;
   rejection_code?: Other<typeof REJECTION_CODES>;
   memory_id?: string;
   assistant_intent_id?: string;
+  unresolved_ids: number;
+}
+
+export interface WorldUpdateTrace {
+  outcome: Other<typeof OUTCOMES>;
+  rejection_code?: Other<typeof REJECTION_CODES>;
+  memory_id?: string;
   unresolved_ids: number;
 }
 
@@ -142,8 +150,11 @@ export interface AsyncPassTrace extends TraceHead {
   whisper_known_skip?: true;
   whisper_memory_id?: string;
   whisper_quotes?: number;
+  /** The whisper is a world_update timeline (no quotes). */
+  whisper_world_update?: true;
   reinforce: ReinforceTrace[];
   remember: RememberTrace[];
+  world_updates: WorldUpdateTrace[];
   relations: Array<{ outcome: Other<typeof RELATION_OUTCOMES> }>;
   /** Catalog intents, and those an accepted or duplicate reinforce/remember carried. */
   intents: { catalog: number; resolved: number };
@@ -172,6 +183,7 @@ export interface SyncPassTrace extends TraceHead {
   whisper_selected: boolean;
   whisper_memory_id?: string;
   whisper_quotes?: number;
+  whisper_world_update?: true;
   skip_reason?: Other<typeof SKIP_REASONS>;
   provider_error?: Other<typeof CHAT_ERROR_CLASSES>;
   unresolved_ids: number;
@@ -293,11 +305,24 @@ export function toAsyncTrace(result: PassResult, trust: AsyncTrust): AsyncPassTr
     const intentId = ids.one(trust.intentIds, r.assistant_intent_id);
     total.unresolved += ids.unresolved;
     return compact({
-      kind: oneOf(MEMORY_KINDS, r.kind),
+      kind: oneOf(CANONICAL_MEMORY_KINDS, r.kind),
       outcome: oneOf(OUTCOMES, r.outcome),
       rejection_code: optionalOneOf(REJECTION_CODES, r.rejection_code),
       memory_id: memoryId,
       assistant_intent_id: intentId,
+      unresolved_ids: ids.unresolved,
+    });
+  });
+
+  // Older results (before world_update) have no world_updates list.
+  const worldUpdates = list(decisions.world_updates).map((r: PassResult['decisions']['world_updates'][number]): WorldUpdateTrace => {
+    const ids = new Resolver();
+    const memoryId = ids.one(trust.memoryIds, r.memory_id);
+    total.unresolved += ids.unresolved;
+    return compact({
+      outcome: oneOf(OUTCOMES, r.outcome),
+      rejection_code: optionalOneOf(REJECTION_CODES, r.rejection_code),
+      memory_id: memoryId,
       unresolved_ids: ids.unresolved,
     });
   });
@@ -317,8 +342,10 @@ export function toAsyncTrace(result: PassResult, trust: AsyncTrust): AsyncPassTr
     whisper_known_skip: decisions.whisper_known_skip === true ? true as const : undefined,
     whisper_memory_id: whisperMemoryId,
     whisper_quotes: decisions.whisper ? list(decisions.whisper.snippet_ids).length : undefined,
+    whisper_world_update: decisions.whisper?.world_update === true ? true as const : undefined,
     reinforce,
     remember,
+    world_updates: worldUpdates,
     relations: list(decisions.relations).map((r: PassResult['decisions']['relations'][number]) => ({ outcome: oneOf(RELATION_OUTCOMES, r.outcome) })),
     intents: { catalog: trust.intentIds.size, resolved: resolvedIntents.size },
     entities: num(decisions.entities) ?? 0,
@@ -353,6 +380,7 @@ export function toSyncTrace(result: SyncResult, trust: SyncTrust): SyncPassTrace
     whisper_selected: Boolean(result.whisper),
     whisper_memory_id: whisperMemoryId,
     whisper_quotes: result.whisper ? list(result.whisper.snippet_ids).length : undefined,
+    whisper_world_update: result.whisper?.world_update === true ? true as const : undefined,
     skip_reason: optionalOneOf(SKIP_REASONS, result.skip_reason),
     provider_error: optionalOneOf(CHAT_ERROR_CLASSES, result.provider_error),
     unresolved_ids: ids.unresolved,

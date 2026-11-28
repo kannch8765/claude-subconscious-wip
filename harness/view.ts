@@ -10,6 +10,9 @@ import { modelText } from './turn_input.js';
 
 export interface SlimQuote { n: number; r: 'u' | 'a' | 'legacy'; d: string; q: string }
 
+/** A world_update's current head: what holds now, since when, and the latest evidence that it still holds. */
+export interface SlimWorld { revision_id?: string; fact: string; as_of: string; last_confirmed: string; source?: string; revisions: number }
+
 export interface SlimMemory {
   memory_id: string;
   kind: string;
@@ -20,6 +23,7 @@ export interface SlimMemory {
   linked_memory_ids?: string[];
   reinforcements?: number;
   owner_corrected?: true;
+  world?: SlimWorld;
   quotes: SlimQuote[];
 }
 
@@ -58,6 +62,18 @@ export function isKnown(memory: MemoryRecallResult, known: ReadonlySet<string>):
   return (m.resolution_source_memory_ids ?? [m.memory_id]).some((id: string) => known.has(id));
 }
 
+function slimWorld(view: Record<string, any>): SlimWorld {
+  const head = view.head ?? {};
+  return {
+    ...(head.revision_id ? { revision_id: head.revision_id } : {}),
+    fact: head.fact,
+    as_of: day(head.as_of),
+    last_confirmed: day(view.last_confirmed),
+    ...(head.source ? { source: head.source } : {}),
+    revisions: view.revision_count,
+  };
+}
+
 export function slimMemory(memory: MemoryRecallResult, handles: SnippetHandles): SlimMemory {
   const m = memory as MemoryRecallResult & Record<string, any>;
   return {
@@ -70,6 +86,7 @@ export function slimMemory(memory: MemoryRecallResult, handles: SnippetHandles):
     ...(m.linked_memory_ids?.length ? { linked_memory_ids: m.linked_memory_ids } : {}),
     ...(m.reinforcement_count ? { reinforcements: m.reinforcement_count } : {}),
     ...(m.owner_corrected === true ? { owner_corrected: true as const } : {}),
+    ...(m.world_update ? { world: slimWorld(m.world_update) } : {}),
     quotes: (m.quote_snippets ?? []).map((snippet: RecallQuoteSnippet) => slimQuote(m.memory_id, snippet, handles)),
   };
 }
