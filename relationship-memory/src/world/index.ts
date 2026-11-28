@@ -23,8 +23,12 @@ export function worldUpdateSource(messages: readonly CanonicalMessage[]): WorldU
   return messages.some((message) => message.event_kind === 'tool_result') ? 'tool' : 'user';
 }
 
-export function worldRevisionId(memoryId: string, fact: string, asOf: string, sourceEvidenceIds: readonly string[]): string {
-  return stableId('world_rev', { memory_id: memoryId, fact, as_of: asOf, source_evidence_ids: [...sourceEvidenceIds].sort() });
+/**
+ * `sourceBlocks`: the transcript-block identity of each cited event (the key reinforce dedupe uses), so the same block
+ * carried again by another conversation gives the same revision id.
+ */
+export function worldRevisionId(memoryId: string, fact: string, asOf: string, sourceBlocks: readonly string[]): string {
+  return stableId('world_rev', { memory_id: memoryId, fact, as_of: asOf, source_blocks: [...sourceBlocks].sort() });
 }
 
 /** The call's date when given, else the latest captured_at of the cited evidence. */
@@ -39,21 +43,22 @@ export interface WorldChainInput {
   revisions: readonly WorldRevisionRecord[];
   /** Evidence rows of the anchors (only captured_at is read). */
   evidence: ReadonlyArray<Pick<EvidenceRecord, 'evidence_id' | 'memory_id' | 'captured_at'>>;
-  reinforcements: ReadonlyArray<Pick<ReinforcementRecord, 'memory_id' | 'evidence_ids' | 'latest_evidence_at' | 'recorded_at'>>;
+  reinforcements: ReadonlyArray<Pick<ReinforcementRecord, 'memory_id' | 'evidence_ids' | 'latest_evidence_at' | 'world_revision_id'>>;
 }
 
-function byRecordedAt(a: WorldRevisionRecord, b: WorldRevisionRecord): number {
-  return a.recorded_at.localeCompare(b.recorded_at) || a.revision_id.localeCompare(b.revision_id);
+/** Chain order: recorded_at, then the commit sequence (an anchor's r1 is 0), then revision_id. */
+export function compareWorldRevisions(a: WorldRevisionRecord, b: WorldRevisionRecord): number {
+  return a.recorded_at.localeCompare(b.recorded_at) || (a.sequence ?? 0) - (b.sequence ?? 0) || a.revision_id.localeCompare(b.revision_id);
 }
 
 /**
- * One chain for the anchor(s): every revision in recorded_at order (ties by revision_id), oldest first. The head is the
- * last one recorded; an earlier `as_of` never reorders it. `last_confirmed` is the latest captured_at over the head's own
- * evidence and every reinforcement recorded after the head.
+ * One chain for the anchor(s): every revision in recorded_at order, oldest first, ties by commit sequence. The head is
+ * the last one; an earlier `as_of` never reorders it. `last_confirmed` is the latest captured_at over the head's own
+ * evidence and every reinforcement that confirmed this head (its `world_revision_id`), whenever it was written.
  */
 export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
   const anchorIds = new Set(input.anchors.map((anchor) => anchor.memory_id));
-  const revisions = input.revisions.filter((revision) => anchorIds.has(revision.memory_id)).sort(byRecordedAt);
+  const revisions = input.revisions.filter((revision) => anchorIds.has(revision.memory_id)).sort(compareWorldRevisions);
   const capturedAt = new Map(input.evidence.filter((item) => anchorIds.has(item.memory_id)).map((item) => [item.evidence_id, item.captured_at]));
   const reinforcements = input.reinforcements.filter((item) => anchorIds.has(item.memory_id));
   const latest = (values: Array<string | undefined>): string | undefined => values.filter((value): value is string => Boolean(value)).sort().at(-1);
@@ -66,13 +71,13 @@ export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
     return {
       head: { fact: String(anchor?.payload.fact ?? ''), as_of: anchor?.observed_at ?? '', recorded_at: anchor?.created_at ?? '' },
       revision_count: 0,
-      last_confirmed: latest([...capturedAt.values(), ...reinforcements.map((item) => item.latest_evidence_at)]) ?? anchor?.observed_at ?? '',
+      last_confirmed: latest([...capturedAt.values()]) ?? anchor?.observed_at ?? '',
       head_evidence_ids: [...new Set(evidenceIds)],
       revisions: [],
     };
   }
 
-  const confirming = reinforcements.filter((item) => item.recorded_at > head.recorded_at);
+  const confirming = reinforcements.filter((item) => item.world_revision_id === head.revision_id);
   return {
     head: { revision_id: head.revision_id, fact: head.fact, as_of: head.as_of, source: head.source, recorded_at: head.recorded_at },
     revision_count: revisions.length,
@@ -102,10 +107,21 @@ export function attachWorldUpdateViews(
   const worldMemories = memories.filter((memory) => memory.kind === WORLD_UPDATE_KIND);
   if (worldMemories.length === 0) return [...memories];
   const anchorIds = [...new Set(worldMemories.flatMap(sourceIds))];
-  const revisions = store.listWorldRevisionsForMemoryIds(anchorIds);
-  const evidence = store.listEvidenceForMemoryIds(anchorIds);
   const wanted = new Set(anchorIds);
-  const anchorReinforcements = (reinforcements ?? store.listReinforcements()).filter((item) => wanted.has(item.memory_id));
+  // Grouped once by anchor, so each chain only reads its own rows.
+  const byAnchor = <T extends { memory_id: string }>(rows: readonly T[]): Map<string, T[]> => {
+    const grouped = new Map<string, T[]>();
+    for (const row of rows) {
+      if (!wanted.has(row.memory_id)) continue;
+      const bucket = grouped.get(row.memory_id) ?? [];
+      bucket.push(row);
+      grouped.set(row.memory_id, bucket);
+    }
+    return grouped;
+  };
+  const revisions = byAnchor(store.listWorldRevisionsForMemoryIds(anchorIds));
+  const evidence = byAnchor(store.listEvidenceForMemoryIds(anchorIds));
+  const anchorReinforcements = byAnchor(reinforcements ?? store.listReinforcements());
   const genesisById = new Map<string, Pick<EffectiveMemoryRecord, 'memory_id' | 'payload' | 'observed_at' | 'created_at'>>();
   for (const memory of memories) genesisById.set(memory.memory_id, memory);
   for (const memoryId of anchorIds) {
@@ -116,10 +132,22 @@ export function attachWorldUpdateViews(
   }
   return memories.map((memory) => {
     if (memory.kind !== WORLD_UPDATE_KIND) return memory;
-    const anchors = sourceIds(memory).map((id) => genesisById.get(id)).filter((anchor): anchor is NonNullable<typeof anchor> => Boolean(anchor));
-    const view = buildWorldUpdateView({ anchors, revisions, evidence, reinforcements: anchorReinforcements });
+    const ids = sourceIds(memory);
+    const anchors = ids.map((id) => genesisById.get(id)).filter((anchor): anchor is NonNullable<typeof anchor> => Boolean(anchor));
+    const view = buildWorldUpdateView({
+      anchors,
+      revisions: ids.flatMap((id) => revisions.get(id) ?? []),
+      evidence: ids.flatMap((id) => evidence.get(id) ?? []),
+      reinforcements: ids.flatMap((id) => anchorReinforcements.get(id) ?? []),
+    });
     return { ...memory, payload: { ...memory.payload, fact: view.head.fact }, world_update: view };
   });
+}
+
+/** The summary a search or recall card serves for a world_update: its topic and current head, never the r1 wording. */
+export function withServedWorldSummary<T extends EffectiveMemoryRecord>(memory: T): T {
+  if (memory.kind !== WORLD_UPDATE_KIND || !memory.world_update) return memory;
+  return { ...memory, summary: `${String(memory.payload.topic ?? '')}：${memory.world_update.head.fact}` };
 }
 
 /** Search and recall show the head only: the chain is dropped, the head, count and last_confirmed stay. */

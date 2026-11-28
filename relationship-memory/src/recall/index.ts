@@ -11,7 +11,8 @@ import { RelationshipMemoryStore, stableId, stableJson } from '../store/index.js
 import { createSemanticRetrieverFromEnvironment, hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } from '../retrieval/index.js';
 import { RelationshipMemoryRuntime } from '../tools/index.js';
 import { WORLD_UPDATE_KIND } from '../schema/index.js';
-import { attachWorldUpdateViews, withoutWorldRevisions, worldUpdateIndexText } from '../world/index.js';
+import { withoutWorldRevisions, worldUpdateIndexText } from '../world/index.js';
+import { serveWorldMemoriesForSearch } from '../resolution/index.js';
 
 export type RecallSourceKind = 'relationship_memory' | 'entity_identity' | 'transcript_search' | 'transcript_read';
 export type RecallStatus = 'ok' | 'timeout' | 'cancelled' | 'failed';
@@ -446,8 +447,8 @@ export class RelationshipMemoryRecallSession {
       { kind: 'memory'; memory: EffectiveMemoryRecord; intents: AssistantRememberIntentRecord[]; text: string }
       | { kind: 'entity'; entity: ReturnType<RelationshipMemoryStore['listEntities']>[number]; text: string }
     > = [];
-    // A world_update shows its head only (fact, as_of, source, revision count), never older revisions.
-    for (const memory of attachWorldUpdateViews(this.store, owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) })).map(withoutWorldRevisions)) {
+    // A world_update is served like on every search path: merges applied, head only, summary from topic + head.
+    for (const memory of serveWorldMemoriesForSearch(this.store, owner.search({ active: true, ...(input.kind ? { kind: input.kind } : {}) })).map(withoutWorldRevisions)) {
       if (!inTimeWindow(memory.observed_at, input.time_start, input.time_end)) continue;
       const intents = this.linkedAssistantIntents(memory.memory_id);
       const text = memory.kind === WORLD_UPDATE_KIND

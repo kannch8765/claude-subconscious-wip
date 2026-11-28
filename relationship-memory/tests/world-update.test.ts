@@ -89,6 +89,7 @@ describe('world_update remember', () => {
       evidence_ids: store.listEvidence().map((item) => item.evidence_id),
       batch_id: 'batch-1',
       recorded_at: '2026-05-01T00:00:00.000Z',
+      sequence: 0,
     }]);
 
     const view = runtime.currentWorldUpdate(memoryId)!;
@@ -167,7 +168,8 @@ describe('world_update reinforce and revisions', () => {
     const { store, runtime, clock } = setup();
     const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
     clock.now = '2026-05-02T00:00:00.000Z';
-    expect(runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev('u-again')] })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+    const head = runtime.currentWorldUpdate(memoryId)!.world_update!.head.revision_id;
+    expect(runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev('u-again')], world_revision_id: head })).toEqual({ outcome: 'accepted', memory_id: memoryId });
     expect(store.listWorldRevisions()).toHaveLength(1);
     const view = runtime.currentWorldUpdate(memoryId)!.world_update!;
     expect(view.head.as_of).toBe('2026-04-01T10:00:00Z');
@@ -288,8 +290,9 @@ describe('world_update evidence rule', () => {
     const { store, runtime } = setup();
     const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
     const evidenceBefore = store.listEvidence().length;
-    expect(runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev(id)] })).toEqual(untrusted);
-    expect(runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev('u-again'), ev(id)] })).toEqual(untrusted);
+    const head = runtime.currentWorldUpdate(memoryId)!.world_update!.head.revision_id;
+    expect(runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev(id)], world_revision_id: head })).toEqual(untrusted);
+    expect(runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev('u-again'), ev(id)], world_revision_id: head })).toEqual(untrusted);
     expect(runtime.worldUpdate('batch-2', { memory_id: memoryId, fact: 'Person D leads Country X', evidence_ids: [ev(id)] })).toEqual(untrusted);
     expect(runtime.worldUpdate('batch-2', { memory_id: memoryId, fact: 'Person B leads Country X', evidence_ids: [ev('u-changed'), ev(id)] })).toEqual(untrusted);
     expect(store.listReinforcements()).toHaveLength(0);
@@ -437,7 +440,8 @@ describe('world_update embedding', () => {
 
     await runtime.prepareCurrentMemorySemanticIndex();
     clock.now = '2026-05-02T00:00:00.000Z';
-    runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev('u-again')] });
+    runtime.reinforce('batch-2', { memory_id: memoryId, evidence_ids: [ev('u-again')], world_revision_id: runtime.currentWorldUpdate(memoryId)!.world_update!.head.revision_id });
+    expect(store.listReinforcements()).toHaveLength(1);
     await runtime.prepareCurrentMemorySemanticIndex();
     expect(provider.embedded).toHaveLength(1);
 
@@ -521,7 +525,7 @@ describe('world_update stays out of the Letta surface', () => {
     expect(() => owner.revise(worldId, { revision_id: 'rev-3', kind: 'world_update', summary: 'Leader of Country X', participants: ['user'], payload: { topic: TOPIC, fact: 'Person Z leads Country X' } })).toThrow(/invalid_world_revision/);
     const current = owner.getEffective(worldId)!;
     expect(owner.revise(worldId, { revision_id: 'rev-4', kind: 'world_update', summary: 'Leader of Country X', participants: current.participants, payload: current.payload }).action).toBe('revise');
-    expect(runtime.currentWorldUpdate(worldId)!.summary).toBe('Leader of Country X');
+    expect(materializeCurrentMemoryView(store).find((memory) => memory.memory_id === worldId)!.summary).toBe('Leader of Country X');
   });
 
   it('leaves the Letta projection (blocks and revision) unchanged by a world_update', () => {
@@ -541,5 +545,142 @@ describe('world_update stays out of the Letta surface', () => {
     expect(summarizeRelationshipMemory(owner).countsByKind).not.toHaveProperty('world_update');
     runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')]));
     expect(summarizeRelationshipMemory(owner).countsByKind).toEqual(expect.objectContaining({ world_update: 1, user_preference: 0 }));
+  });
+});
+
+describe('world_update review round 1', () => {
+  const replayOf = (base: CanonicalMessage, conversationId: string): CanonicalMessage => ({ ...base, conversation_id: conversationId, evidence_id: `${base.evidence_id}-${conversationId}` });
+  const REPLAYED = replayOf(EVENTS[0], 'conv-replay');
+  const SPRUCE_AGAIN = event('u-spruce-again', 'user_text', '2026-05-15T08:00:00Z', 'Person A is back as prime minister of Country X.');
+
+  function setupWith(extra: CanonicalMessage[], failureInjector?: FailureInjector) {
+    const root = tempDir();
+    const store = new RelationshipMemoryStore(root, 'subject', failureInjector);
+    const clock = { now: '2026-05-01T00:00:00.000Z' };
+    const runtime = new RelationshipMemoryRuntime(store, new Map([...EVENTS, ...extra].map((item) => [item.evidence_id!, item])), () => clock.now);
+    return { root, store, runtime, clock };
+  }
+  const headOf = (runtime: RelationshipMemoryRuntime, memoryId: string) => runtime.currentWorldUpdate(memoryId)!.world_update!.head;
+
+  it('refuses a reinforcement that confirms a revision which is no longer the head', async () => {
+    const { store, runtime, clock } = setupWith([]);
+    const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+    const seen = headOf(runtime, memoryId).revision_id!;
+    clock.now = '2026-05-10T09:00:00.000Z';
+    runtime.worldUpdate('batch-b', { memory_id: memoryId, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] });
+    clock.now = '2026-05-10T10:00:00.000Z';
+    const stale = runtime.reinforce('batch-a', { memory_id: memoryId, evidence_ids: [ev('u-again')], world_revision_id: seen });
+    expect(stale).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'stale_world_revision' }));
+    expect(runtime.reinforce('batch-a', { memory_id: memoryId, evidence_ids: [ev('u-again')], world_revision_id: seen })).toEqual(stale);
+    expect(store.listReinforcements()).toHaveLength(0);
+    const [card] = await runtime.memorySearchRecallHybridWithEvidence({ kind: 'world_update' });
+    expect(card.world_update!.last_confirmed).toBe('2026-05-10T08:00:00Z');
+    expect(card.quote_snippets.map((snippet) => snippet.quote)).toEqual(['Country X has a new prime minister: Person B.']);
+
+    expect(runtime.reinforce('batch-c', { memory_id: memoryId, evidence_ids: [ev('tool-found')] }))
+      .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'invalid_reinforcement' }));
+    const head = headOf(runtime, memoryId).revision_id!;
+    expect(runtime.reinforce('batch-c', { memory_id: memoryId, evidence_ids: [ev('tool-found')], world_revision_id: head })).toEqual({ outcome: 'accepted', memory_id: memoryId });
+    expect(store.listReinforcements()[0].world_revision_id).toBe(head);
+    expect(runtime.currentWorldUpdate(memoryId)!.world_update!.last_confirmed).toBe('2026-05-11T08:00:00Z');
+  });
+
+  it('counts only reinforcements tied to the head, whatever their write time', () => {
+    const { store, runtime, clock } = setupWith([]);
+    const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+    const r1 = headOf(runtime, memoryId).revision_id!;
+    clock.now = '2026-05-10T09:00:00.000Z';
+    runtime.worldUpdate('batch-2', { memory_id: memoryId, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] });
+    const late = EVENTS.find((item) => item.evidence_id === ev('u-again'))!;
+    store.appendReinforcement({
+      schema_version: 1, reinforcement_id: 'reinforce-late-r1', memory_id: memoryId, batch_id: 'direct', world_revision_id: r1,
+      evidence_ids: ['ev-late'], latest_evidence_at: '2026-06-01T00:00:00Z', recorded_at: '2026-06-01T00:00:00.000Z',
+    }, [{ evidence_id: 'ev-late', memory_id: memoryId, conversation_id: late.conversation_id, message_id: late.message_id, role: 'user', quote: late.quote, captured_at: '2026-06-01T00:00:00Z', source_evidence_id: late.evidence_id, event_kind: 'user_text', block_index: 0 }]);
+    const view = runtime.currentWorldUpdate(memoryId)!.world_update!;
+    expect(view.last_confirmed).toBe('2026-05-10T08:00:00Z');
+    expect(view.head_evidence_ids).not.toContain('ev-late');
+  });
+
+  it('treats the same transcript block replayed under another conversation as a duplicate, not a new revision', () => {
+    const { store, runtime, clock } = setupWith([REPLAYED, SPRUCE_AGAIN]);
+    const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+    clock.now = '2026-05-10T09:00:00.000Z';
+    runtime.worldUpdate('batch-2', { memory_id: memoryId, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] });
+    clock.now = '2026-05-11T09:00:00.000Z';
+    expect(runtime.worldUpdate('batch-3', { memory_id: memoryId, fact: 'Person A is the prime minister of Country X', evidence_ids: [REPLAYED.evidence_id!] }).outcome).toBe('duplicate');
+    expect(runtime.worldUpdate('batch-3', { memory_id: memoryId, fact: 'Person A is the prime minister of Country X', as_of: '2026-04-01', evidence_ids: [REPLAYED.evidence_id!] }).outcome).toBe('duplicate');
+    expect(store.listWorldRevisions()).toHaveLength(2);
+    expect(headOf(runtime, memoryId).fact).toBe('Person B is the prime minister of Country X');
+
+    clock.now = '2026-05-15T09:00:00.000Z';
+    expect(runtime.worldUpdate('batch-4', { memory_id: memoryId, fact: 'Person A is the prime minister of Country X', evidence_ids: [SPRUCE_AGAIN.evidence_id!] }).outcome).toBe('accepted');
+    expect(headOf(runtime, memoryId).fact).toBe('Person A is the prime minister of Country X');
+    expect(store.listWorldRevisions()).toHaveLength(3);
+  });
+
+  it.each(['Person B', 'Person E', 'Person F', 'Person G', 'Person H', 'Person J'])('keeps a same-millisecond revision (%s) as head when a torn r1 is repaired later', (name) => {
+    let failNext = true;
+    const { store, runtime } = setupWith([], (phase) => {
+      if (phase !== 'world_revision_commit' || !failNext) return false;
+      failNext = false;
+      return true;
+    });
+    const proposal = anchor([ev('u-first')]);
+    expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('retryable_failed');
+    const [torn] = store.listMemories();
+    const fact = `${name} is the prime minister of Country X`;
+    expect(runtime.worldUpdate('batch-other', { memory_id: torn.memory_id, fact, evidence_ids: [ev('u-changed')] }).outcome).toBe('accepted');
+    expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('duplicate');
+    const view = runtime.currentWorldUpdate(torn.memory_id)!.world_update!;
+    expect(view.revisions!.map((item) => item.fact)).toEqual(['Person A is the prime minister of Country X', fact]);
+    expect(view.head.fact).toBe(fact);
+  });
+
+  it('serves one current fact per card: summary is derived from topic and head, the owner view keeps the stored one', async () => {
+    const { store, runtime, clock } = setupWith([]);
+    const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')], { summary: 'Person A is the prime minister of Country X' })).memory_id!;
+    clock.now = '2026-05-10T09:00:00.000Z';
+    runtime.worldUpdate('batch-2', { memory_id: memoryId, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] });
+    const served = `${TOPIC}：Person B is the prime minister of Country X`;
+    for (const hits of [
+      await runtime.memorySearchMaintenanceCurrentWithEvidence({ kind: 'world_update' }),
+      await runtime.memorySearchRecallHybridWithEvidence({ kind: 'world_update' }),
+      await runtime.memorySearchHybridWithEvidence({ kind: 'world_update' }),
+      runtime.memorySearch({ kind: 'world_update' }),
+    ]) {
+      expect(hits.map((hit) => hit.summary)).toEqual([served]);
+      expect(JSON.stringify(hits)).not.toContain('Person A is the prime minister');
+    }
+    expect(runtime.memorySearch({ query: 'Person A is' })).toEqual([]);
+    expect(await runtime.memorySearchRecallHybridWithEvidence({ trigger: 'Person A is' })).toEqual([]);
+    expect(new RelationshipMemoryOwnerControlPlane(store).getEffective(memoryId)!.summary).toBe('Person A is the prime minister of Country X');
+    expect(materializeCurrentMemoryView(store).find((memory) => memory.memory_id === memoryId)!.summary).toBe('Person A is the prime minister of Country X');
+  });
+
+  it('shows a merged pair as one card on every search path', async () => {
+    const { root, store, runtime, clock } = setupWith([]);
+    const first = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
+    clock.now = '2026-05-12T09:00:00.000Z';
+    const second = runtime.rememberKind('batch-2', 'world_update', anchor([ev('u-later')], { summary: 'Country X leadership' }, 'Quillon is the prime minister of Country X')).memory_id!;
+    clock.now = '2026-05-13T09:00:00.000Z';
+    runtime.worldUpdate('batch-3', { memory_id: first, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] });
+    const pair = runtime.suggestMaintenanceReview('batch-4', 'relation', { memory_ids: [first, second], relation: 'same_meaning', reason: 'one topic' }).review_id!;
+    new RelationshipMemoryResolutionControlPlane(store, () => '2026-05-20T00:00:00.000Z').resolveReview(pair, { resolution_id: 'res-merge', relation: 'same_meaning', target_memory_id: first });
+
+    const head = 'Person B is the prime minister of Country X';
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject', transcriptRoots: [] });
+    const direct = (recall.relationshipMemorySearch({ query: 'Country X' }) as any).results.filter((item: any) => item.kind === 'world_update');
+    for (const hits of [
+      direct,
+      runtime.memorySearch({ kind: 'world_update' }),
+      await runtime.memorySearchHybridWithEvidence({ kind: 'world_update' }),
+      await runtime.memorySearchRecallHybridWithEvidence({ kind: 'world_update' }),
+    ]) {
+      expect(hits.map((hit: any) => [hit.memory_id, hit.payload.fact, hit.world_update.revision_count])).toEqual([[first, head, 3]]);
+    }
+    expect(runtime.memorySearch({ query: 'Quillon' })).toEqual([]);
+    expect((recall.relationshipMemorySearch({ query: 'Quillon' }) as any).results.filter((item: any) => item.kind === 'world_update')).toEqual([]);
+    // Owner views still inspect the raw anchors.
+    expect(new RelationshipMemoryOwnerControlPlane(store).search({ kind: 'world_update' }).map((memory) => memory.memory_id).sort()).toEqual([first, second].sort());
   });
 });

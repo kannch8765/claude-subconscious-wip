@@ -5,7 +5,7 @@ import { renderWorldUpdateTimeline } from './world_update_whisper.js';
 function revision(index: number, fact: string, asOf: string, recordedAt: string): WorldRevisionRecord {
   return {
     schema_version: 1, revision_id: `world_rev_${index}`, memory_id: 'mem-world', fact, as_of: asOf, source: 'user',
-    evidence_ids: [`ev-${index}`], batch_id: `batch-${index}`, recorded_at: recordedAt,
+    evidence_ids: [`ev-${index}`], batch_id: `batch-${index}`, recorded_at: recordedAt, sequence: index,
   };
 }
 

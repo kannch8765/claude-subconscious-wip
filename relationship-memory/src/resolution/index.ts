@@ -1,17 +1,18 @@
 import type {
   EffectiveMemoryRecord,
+  ReinforcementRecord,
   MaintenanceReviewRecord,
   MemoryRelationKind,
   MemoryResolutionRecord,
   MemoryResolutionResolveRecord,
 } from '../schema/index.js';
-import { MEMORY_RELATION_KINDS } from '../schema/index.js';
+import { MEMORY_RELATION_KINDS, WORLD_UPDATE_KIND } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
 import { findConflictingOwnerLinks, validOwnerConflictReconciliation } from '../owner_relation_conflicts.js';
 import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../intent/provenance.js';
-import { INVALID_WORLD_RELATION, attachWorldUpdateViews, worldRelationViolation } from '../world/index.js';
+import { INVALID_WORLD_RELATION, attachWorldUpdateViews, withServedWorldSummary, worldRelationViolation } from '../world/index.js';
 
 export interface ResolveReviewCommand {
   resolution_id: string;
@@ -255,6 +256,33 @@ export function applyMemoryResolutions(
 export function materializeCurrentMemoryView(store: RelationshipMemoryStore): EffectiveMemoryRecord[] {
   const owner = new RelationshipMemoryOwnerControlPlane(store);
   return attachWorldUpdateViews(store, applyMemoryResolutions(owner.listEffective(), store.listActiveMemoryResolutions()));
+}
+
+/**
+ * What every search and recall path serves for world_update memories, whether the rest of its list is raw or resolved:
+ * owner merges applied (one card, one chain; a merged-away anchor is not served), the head as `payload.fact`, and a
+ * summary derived from topic + head. Other kinds pass through as given. Owner views (materializeCurrentMemoryView,
+ * listEffective) keep the stored summary and the raw anchors.
+ */
+export function serveWorldMemoriesForSearch(
+  store: RelationshipMemoryStore,
+  memories: readonly EffectiveMemoryRecord[],
+  options: { resolved?: boolean; allEffective?: readonly EffectiveMemoryRecord[]; reinforcements?: readonly ReinforcementRecord[] } = {},
+): EffectiveMemoryRecord[] {
+  if (!memories.some((memory) => memory.kind === WORLD_UPDATE_KIND)) return [...memories];
+  let served: readonly EffectiveMemoryRecord[] = memories;
+  if (!options.resolved) {
+    const everything = options.allEffective ?? new RelationshipMemoryOwnerControlPlane(store).listEffective();
+    const current = new Map(applyMemoryResolutions(everything, store.listActiveMemoryResolutions())
+      .filter((memory) => memory.kind === WORLD_UPDATE_KIND)
+      .map((memory) => [memory.memory_id, memory] as const));
+    served = memories.flatMap((memory) => {
+      if (memory.kind !== WORLD_UPDATE_KIND) return [memory];
+      const resolved = current.get(memory.memory_id);
+      return resolved ? [resolved] : [];
+    });
+  }
+  return attachWorldUpdateViews(store, served, options.reinforcements).map(withServedWorldSummary);
 }
 
 /** A review can act only on current, active memories. Historical records stay on disk. */

@@ -523,12 +523,13 @@ export class RelationshipMemoryStore {
 
   /**
    * Appends one world_update revision and the evidence rows it cites (rows already present are kept as they are).
-   * Evidence goes first and the revision row last, so a revision never points at missing evidence.
+   * Evidence goes first and the revision row last, so a revision never points at missing evidence. `sequence` is
+   * assigned here, under the lock: 0 for an anchor's first revision, else 1 + the number of stored revisions.
    */
-  appendWorldRevision(record: WorldRevisionRecord, evidence: EvidenceRecord[]): void {
+  appendWorldRevision(record: Omit<WorldRevisionRecord, 'sequence'>, evidence: EvidenceRecord[], first = false): void {
     this.withMutationBoundary(() => {
       if (this.failureInjector?.('world_revision_commit')) throw new Error('injected world revision commit failure');
-      const identity = (item: WorldRevisionRecord) => stableJson({
+      const identity = (item: Omit<WorldRevisionRecord, 'sequence'>) => stableJson({
         memory_id: item.memory_id, fact: item.fact, as_of: item.as_of, source: item.source, evidence_ids: item.evidence_ids,
       });
       const revisionLookup = this.indexedEntry(
@@ -569,7 +570,8 @@ export class RelationshipMemoryStore {
         }
       }
       if (!existing) {
-        appendJsonl(this.file('world-revisions.jsonl'), record);
+        const stored: WorldRevisionRecord = { ...record, sequence: first ? 0 : this.listWorldRevisions().length + 1 };
+        appendJsonl(this.file('world-revisions.jsonl'), stored);
         this.recordIndexedAppend('world-revisions', 'world-revisions.jsonl', { key: record.revision_id, value: identity(record) }, revisionLookup.ready);
       }
     });

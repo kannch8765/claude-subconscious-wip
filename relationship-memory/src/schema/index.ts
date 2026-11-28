@@ -181,6 +181,11 @@ export interface WorldRevisionRecord {
   evidence_ids: string[];
   batch_id: string;
   recorded_at: string;
+  /**
+   * Commit order under the canonical mutation lock: 0 for an anchor's r1, else 1 + the number of revisions already
+   * stored. The chain is ordered by (recorded_at, sequence), so r1 stays first even when a replay repairs it late.
+   */
+  sequence: number;
 }
 
 export interface WorldUpdateHead {
@@ -212,6 +217,8 @@ export interface ReinforcementRecord {
   evidence_ids: string[];
   latest_evidence_at: string;
   recorded_at: string;
+  /** world_update only: the head revision this reinforcement confirmed (checked against the head under the lock). */
+  world_revision_id?: string;
 }
 
 export interface EvidenceRecord {
