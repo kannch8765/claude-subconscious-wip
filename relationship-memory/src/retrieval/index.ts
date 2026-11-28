@@ -217,14 +217,15 @@ export class DashScopeQwenEmbeddingProvider implements EmbeddingProvider {
       try { payload = await response.json(); } catch { payload = {}; }
       if (!response.ok) throw providerError(response.status, payload);
       const embeddings = Array.isArray(payload?.output?.embeddings) ? payload.output.embeddings : [];
-      // One slot per input, filled by text_index (or row position when it is missing). A duplicate, out-of-range or
-      // missing index would hand one text another text's vector, so it fails the whole payload.
+      // One slot per input, filled by text_index, or by row position only when the field is absent. A text_index that
+      // is present but not an integer, or a duplicate, out-of-range or missing slot, would hand one text another
+      // text's vector, so it fails the whole payload.
       const slots: unknown[] = new Array(texts.length);
       const filled = new Set<number>();
       let positionsValid = embeddings.length === texts.length;
       embeddings.forEach((entry: any, position: number) => {
-        const index = Number.isInteger(entry?.text_index) ? entry.text_index as number : position;
-        if (index < 0 || index >= texts.length || filled.has(index)) { positionsValid = false; return; }
+        const index: unknown = entry?.text_index === undefined ? position : entry.text_index;
+        if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= texts.length || filled.has(index)) { positionsValid = false; return; }
         filled.add(index);
         slots[index] = entry?.embedding;
       });
@@ -546,13 +547,19 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
         throw error;
       }
     } else {
-      // Separate requests fail one query at a time, as parallel rankExisting calls do: a failed query gets an
-      // empty map (lexical fallback) and writes the cooldown, and the queries that succeeded keep their vectors.
-      const settled = await Promise.allSettled(texts.map((text) => this.provider.embedQuery(text, signal)));
-      for (const result of settled) {
-        if (result.status === 'rejected' && !signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, result.reason);
-      }
-      vectors = settled.map((result) => result.status === 'fulfilled' ? result.value : undefined);
+      // Separate requests fail one query at a time, as parallel rankExisting calls do. Each query runs in its own
+      // async boundary, so a synchronous throw, a rejection or a failed cooldown write gives only that query an empty
+      // map (lexical fallback), and the queries that succeeded keep their vectors.
+      vectors = await Promise.all(texts.map(async (text) => {
+        try {
+          return await this.provider.embedQuery(text, signal);
+        } catch (error) {
+          try {
+            if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
+          } catch { /* the single call would fail this query too; it still falls back */ }
+          return undefined;
+        }
+      }));
     }
     emitRecallTimingSegment('semantic_query_embedding_external_batch', embedStartedAt, {
       query_count: texts.length,

@@ -49,7 +49,7 @@ function vectorFor(text: string): number[] {
 
 type QueryMode = 'ok' | 'fail' | 'hang' | 'bad_vector';
 /** How the rows of a successful response are laid out; only 'ok', 'reversed' and 'no_index' are well formed. */
-type RowShape = 'ok' | 'reversed' | 'no_index' | 'duplicate_index' | 'out_of_range' | 'extra_row';
+type RowShape = 'ok' | 'reversed' | 'no_index' | 'duplicate_index' | 'out_of_range' | 'extra_row' | 'string_index' | 'fractional_index' | 'null_index';
 
 function shapeRows(rows: Array<{ text_index: number; embedding: number[] }>, shape: RowShape): unknown[] {
   switch (shape) {
@@ -59,6 +59,10 @@ function shapeRows(rows: Array<{ text_index: number; embedding: number[] }>, sha
     case 'duplicate_index': return rows.map(({ embedding }) => ({ text_index: 0, embedding }));
     case 'out_of_range': return rows.map((row, index) => index === rows.length - 1 ? { ...row, text_index: rows.length } : row);
     case 'extra_row': return [...rows, { text_index: rows.length, embedding: rows[0].embedding }];
+    // Reversed rows whose explicit index is not an integer: read as "absent", row position would swap the vectors.
+    case 'string_index': return [...rows].reverse().map((row) => ({ ...row, text_index: String(row.text_index) }));
+    case 'fractional_index': return [...rows].reverse().map((row) => ({ ...row, text_index: row.text_index + 0.25 }));
+    case 'null_index': return [...rows].reverse().map((row) => ({ ...row, text_index: null }));
   }
 }
 
@@ -480,7 +484,7 @@ describe('query vectors land on their own query', () => {
     expect(fs.existsSync(cooldownFile(f))).toBe(false);
   });
 
-  it.each(['duplicate_index', 'out_of_range', 'extra_row'] as const)('refuses a %s response, so no query takes another query\'s vector', async (shape) => {
+  it.each(['duplicate_index', 'out_of_range', 'extra_row', 'string_index', 'fractional_index', 'null_index'] as const)('refuses a %s response, so no query takes another query\'s vector', async (shape) => {
     const f = await fixture();
     const queries = queryList(2);
     const lexical = await singles(f.lexicalRuntime, queries);
@@ -528,6 +532,53 @@ describe('separate query requests (provider without embedQueries)', () => {
     expect(fs.existsSync(cooldownFile(f))).toBe(true);
     // Parallel single calls from a clean cooldown state give the same lists.
     fs.rmSync(cooldownFile(f));
+    expect(many).toEqual(await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence(query))));
+  });
+});
+
+describe('separate query requests: failures stay inside their own query', () => {
+  function splitProvider(f: Fixture, failure: 'sync_throw' | 'reject'): EmbeddingProvider {
+    return {
+      fingerprint: f.provider.fingerprint, model: 'plain', dimensions: DIMENSIONS, maxBatchSize: 10,
+      embedDocuments: async (texts) => texts.map(vectorFor),
+      // Promise-returning but not async: the failure can be a synchronous throw.
+      embedQuery: (text: string) => {
+        if (text.includes('cobalt')) {
+          if (failure === 'sync_throw') throw new Error('synthetic synchronous failure');
+          return Promise.reject(new Error('synthetic failure'));
+        }
+        return Promise.resolve(vectorFor(text));
+      },
+    };
+  }
+  const queries: SearchQuery[] = [{ query: 'amber jar', limit: 12 }, { query: 'cobalt tin', limit: 12 }];
+
+  it('isolates a synchronous throw and still writes the cooldown, as parallel single calls do', async () => {
+    const f = await fixture();
+    const runtime = new RelationshipMemoryRuntime(f.store, f.runtime.messages, f.runtime.now, new Map(), false, new FileBackedSemanticRetriever(splitProvider(f, 'sync_throw'), f.indexFile));
+    const lexical = await singles(f.lexicalRuntime, queries);
+
+    const many = await runtime.memorySearchRecallHybridManyWithEvidence(queries);
+
+    expect(many[0]).not.toEqual(lexical[0]);
+    expect(many[1]).toEqual(lexical[1]);
+    expect(fs.existsSync(cooldownFile(f))).toBe(true);
+    fs.rmSync(cooldownFile(f));
+    expect(many).toEqual(await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence(query))));
+  });
+
+  it('keeps the successful query when the failed query cannot write its cooldown', async () => {
+    const f = await fixture();
+    const runtime = new RelationshipMemoryRuntime(f.store, f.runtime.messages, f.runtime.now, new Map(), false, new FileBackedSemanticRetriever(splitProvider(f, 'reject'), f.indexFile));
+    const lexical = await singles(f.lexicalRuntime, queries);
+    // A directory where the cooldown file goes: reading it finds no cooldown, and writing it fails.
+    fs.mkdirSync(cooldownFile(f));
+
+    const many = await runtime.memorySearchRecallHybridManyWithEvidence(queries);
+
+    expect(many[0]).not.toEqual(lexical[0]);
+    expect(many[1]).toEqual(lexical[1]);
+    expect(fs.statSync(cooldownFile(f)).isDirectory()).toBe(true);
     expect(many).toEqual(await Promise.all(queries.map((query) => runtime.memorySearchRecallHybridWithEvidence(query))));
   });
 });
