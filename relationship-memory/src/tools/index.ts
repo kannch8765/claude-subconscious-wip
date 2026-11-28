@@ -122,6 +122,23 @@ function evidenceProvenance(message: CanonicalMessage) {
   };
 }
 
+type EvidenceSource = Pick<EvidenceRecord, 'message_id' | 'block_index' | 'event_kind' | 'tool_use_id'>;
+
+/**
+ * Which transcript block evidence came from, without the conversation that carried it: a later conversation can carry
+ * the same message again under a new transcript evidence id. Message-level evidence (no block_index or event_kind,
+ * the shape from before per-block evidence) has no block source; it is matched by evidence id only.
+ */
+function evidenceSourceKey(item: EvidenceSource): string | undefined {
+  if (item.block_index === undefined || item.event_kind === undefined) return undefined;
+  return stableJson({
+    message_id: item.message_id,
+    block_index: item.block_index,
+    event_kind: item.event_kind,
+    ...(item.tool_use_id ? { tool_use_id: item.tool_use_id } : {}),
+  });
+}
+
 export class RelationshipMemoryRuntime {
   private readonly retryableAttempts = new Set<string>();
 
@@ -764,14 +781,13 @@ export class RelationshipMemoryRuntime {
     }
   }
 
-  private originalMemoryEvidenceIds(memory: CanonicalMemoryRecord): Set<string> | undefined {
+  private originalMemoryEvidenceIds(memory: CanonicalMemoryRecord, evidence: readonly EvidenceRecord[]): Set<string> | undefined {
     const legacyStore = new LegacyMemorySourceStore(this.store.rootDir);
     const legacyCreated = legacyStore.listProvenance().some((item) =>
       item.canonical_memory_id === memory.memory_id && item.disposition === 'created'
     );
     if (legacyCreated) return new Set();
 
-    const evidence = this.store.listEvidence().filter((item) => item.memory_id === memory.memory_id);
     for (let length = 1; length <= evidence.length; length += 1) {
       const prefix = evidence.slice(0, length);
       const dedupeKey = stableId('dedupe', {
@@ -917,14 +933,26 @@ export class RelationshipMemoryRuntime {
       if (!resolved.message) return this.persistPermanent(batchId, sourceKey, 'unresolvable_evidence', `Evidence event is not available in the trusted batch: ${id}`, now);
       messages.push(resolved.message);
     }
-    const originalEvidenceIds = this.originalMemoryEvidenceIds(memory);
+    const memoryEvidence = this.store.listEvidence().filter((item) => item.memory_id === memoryId);
+    const originalEvidenceIds = this.originalMemoryEvidenceIds(memory, memoryEvidence);
     if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now, intent);
     const completedEvidenceIds = new Set(originalEvidenceIds);
     for (const reinforcement of this.store.listReinforcements()) {
       if (reinforcement.memory_id !== memoryId) continue;
       for (const evidenceId of reinforcement.evidence_ids) completedEvidenceIds.add(evidenceId);
     }
-    const newMessages = messages.filter((message) => !completedEvidenceIds.has(memoryEvidenceId(memoryId, message)));
+    // A message is already attached when the memory holds its evidence id, or holds the same transcript block under
+    // another conversation's id; a block repeated inside this call is attached once. Only completed evidence counts,
+    // so a half-committed reinforcement is still repaired.
+    const attachedSources = new Set(memoryEvidence.filter((item) => completedEvidenceIds.has(item.evidence_id)).map(evidenceSourceKey));
+    const newMessages = messages.filter((message) => {
+      if (completedEvidenceIds.has(memoryEvidenceId(memoryId, message))) return false;
+      const source = evidenceSourceKey(message);
+      if (source === undefined) return true;
+      if (attachedSources.has(source)) return false;
+      attachedSources.add(source);
+      return true;
+    });
     if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
     const newMessageIds = newMessages.map(canonicalEvidenceId).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({
