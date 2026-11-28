@@ -657,7 +657,6 @@ describe('world_update review round 1', () => {
       expect(hits.map((hit) => hit.summary)).toEqual([served]);
       expect(JSON.stringify(hits)).not.toContain('Person A is the prime minister');
       for (const hit of hits) {
-        expect(hit.world_update).not.toHaveProperty('confirmation_ids');
         expect(hit.world_update).not.toHaveProperty('revisions');
       }
     }
@@ -957,72 +956,133 @@ describe('world_update review round 3', () => {
       expect(headOf(runtime, r1.memory_id).fact).toBe(PERSON_A);
     });
   });
+});
 
-  describe('the chain enforces one write per block', () => {
-    /** A: r1 Person A (u-first), r2 Person B (u-changed). B: a later anchor citing u-first replayed. Merged into `target`. */
-    function mergedPair(target: 'a' | 'b') {
-      const ctx = chainAB();
-      const { store, runtime, clock, memoryId: a } = ctx;
-      clock.now = '2026-05-12T09:00:00.000Z';
-      const b = runtime.rememberKind('batch-3', 'world_update', anchor([REPLAYED_FIRST.evidence_id!], { summary: 'Country X leadership' }, PERSON_A)).memory_id!;
-      expect(store.listWorldRevisionsForMemoryIds([b])).toHaveLength(1);
-      const pair = runtime.suggestMaintenanceReview('batch-4', 'relation', { memory_ids: [a, b], relation: 'same_meaning', reason: 'one topic' }).review_id!;
-      new RelationshipMemoryResolutionControlPlane(store, () => '2026-05-20T00:00:00.000Z').resolveReview(pair, { resolution_id: 'res-merge', relation: 'same_meaning', target_memory_id: target === 'a' ? a : b });
-      return { ...ctx, a, b };
+describe('world_update merges refuse shared evidence', () => {
+  const RAIL = 'Operator of the Country X rail line';
+  const SPRUCE = 'Spruce operates the Country X rail line';
+  const LILY = 'Lily operates the Country X rail line';
+  const SOURCE = event('rail-spruce', 'user_text', '2026-05-03T08:00:00Z', 'Spruce operates the Country X rail line.');
+  const SOURCE_REPLAY: CanonicalMessage = { ...SOURCE, conversation_id: 'conv-replay', evidence_id: `${SOURCE.evidence_id}-conv-replay` };
+  const HANDOVER = event('rail-handover', 'user_text', '2026-05-06T08:00:00Z', 'Spruce operates through today. Lily takes over tomorrow.');
+  const FRESH = event('rail-fresh', 'user_text', '2026-05-04T08:00:00Z', 'Spruce also won the Country X rail maintenance contract.');
+  const OTHER = event('rail-other', 'user_text', '2026-05-05T08:00:00Z', 'Quillon manages Country X rail operations.');
+  const OTHER_REPLAY: CanonicalMessage = { ...OTHER, conversation_id: 'conv-replay', evidence_id: `${OTHER.evidence_id}-conv-replay` };
+  const OVERLAP = expect.objectContaining({ outcome: 'rejected', rejection_code: 'overlapping_world_evidence' });
+
+  function setupWith() {
+    const root = tempDir();
+    const store = new RelationshipMemoryStore(root, 'subject');
+    const clock = { now: '2026-05-03T09:00:00.000Z' };
+    const runtime = new RelationshipMemoryRuntime(
+      store, new Map([...EVENTS, SOURCE, SOURCE_REPLAY, HANDOVER, FRESH, OTHER, OTHER_REPLAY].map((item) => [item.evidence_id!, item])), () => clock.now,
+    );
+    const resolution = new RelationshipMemoryResolutionControlPlane(store, () => '2026-05-20T00:00:00.000Z');
+    return { root, store, runtime, clock, resolution };
+  }
+  const railAnchor = (evidenceIds: string[], fact = SPRUCE) => ({
+    summary: 'Who runs the rail line', participants: ['user'], evidence_ids: evidenceIds, payload: { topic: RAIL, fact, domain: 'transport' },
+  });
+  const headOf = (runtime: RelationshipMemoryRuntime, memoryId: string) => runtime.currentWorldUpdate(memoryId)!.world_update!.head;
+  const cardsOf = async (runtime: RelationshipMemoryRuntime) => [
+    await runtime.memorySearchMaintenanceCurrentWithEvidence({ kind: 'world_update' }),
+    await runtime.memorySearchRecallHybridWithEvidence({ kind: 'world_update' }),
+    await runtime.memorySearchHybridWithEvidence({ kind: 'world_update' }),
+    runtime.memorySearch({ kind: 'world_update' }),
+  ];
+  const suggest = (runtime: RelationshipMemoryRuntime, ids: string[], relation: 'same_meaning' | 'related') =>
+    runtime.suggestMaintenanceReview(`suggest-${relation}-${ids.join('-')}`, 'relation', { memory_ids: ids, relation, reason: 'one topic' });
+
+  /** Refused at suggest; `related` is accepted; the owner merge is refused for either target. Nothing is written. */
+  function expectMergeRefused(ctx: ReturnType<typeof setupWith>, a: string, b: string) {
+    const { store, runtime, resolution } = ctx;
+    const resolutionsBefore = store.listMemoryResolutionRecords().length;
+    const reviewsBefore = store.listMaintenanceReviews().length;
+    const result = suggest(runtime, [a, b], 'same_meaning');
+    expect(result).toEqual(OVERLAP);
+    expect(result.reason).toContain('share transcript evidence');
+    expect(result.reason).toContain('related');
+    expect(store.listMaintenanceReviews()).toHaveLength(reviewsBefore);
+    const related = suggest(runtime, [a, b], 'related');
+    expect(related.outcome).toBe('accepted');
+    for (const target of [a, b]) {
+      expect(() => resolution.resolveReview(related.review_id!, { resolution_id: `res-${target}`, relation: 'same_meaning', target_memory_id: target }))
+        .toThrow(/overlapping_world_evidence/);
+    }
+    expect(store.listMemoryResolutionRecords()).toHaveLength(resolutionsBefore);
+  }
+
+  it('Round 3 repro: a confirmation and a newer revision share the handover block; the merge is refused and A serves Lily', async () => {
+    const ctx = setupWith();
+    const { root, store, runtime, clock } = ctx;
+    const a = runtime.rememberKind('batch-a', 'world_update', railAnchor([SOURCE.evidence_id!])).memory_id!;
+    clock.now = '2026-05-04T09:00:00.000Z';
+    const b = runtime.rememberKind('batch-b', 'world_update', railAnchor([SOURCE_REPLAY.evidence_id!])).memory_id!;
+    clock.now = '2026-05-06T09:00:00.000Z';
+    expect(runtime.reinforce('batch-b-confirm', { memory_id: b, evidence_ids: [HANDOVER.evidence_id!], world_revision_id: headOf(runtime, b).revision_id }).outcome).toBe('accepted');
+    clock.now = '2026-05-07T09:00:00.000Z';
+    expect(runtime.worldUpdate('batch-a-lily', { memory_id: a, fact: LILY, evidence_ids: [HANDOVER.evidence_id!] }).outcome).toBe('accepted');
+
+    expectMergeRefused(ctx, a, b);
+
+    const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject', transcriptRoots: [] });
+    const direct = (recall.relationshipMemorySearch({ query: 'rail' }) as any).results.filter((item: any) => item.kind === 'world_update');
+    expect(headOf(runtime, a).fact).toBe(LILY);
+    for (const hits of [direct, ...await cardsOf(runtime)]) {
+      expect(hits.find((hit: any) => hit.memory_id === a).payload.fact).toBe(LILY);
     }
 
-    it.each(['a', 'b'] as const)('ignores a replayed r1 of a merged anchor (target %s): head, count, chain and every search path', async (target) => {
-      const { root, store, runtime, a, b } = mergedPair(target);
-      const merged = runtime.currentWorldUpdate(a)!;
-      expect(merged.memory_id).toBe(target === 'a' ? a : b);
-      const view = merged.world_update!;
-      expect(view.head.fact).toBe(PERSON_B);
-      expect(view.revision_count).toBe(2);
-      expect(view.revisions!.map((item) => [item.memory_id, item.fact])).toEqual([[a, PERSON_A], [a, PERSON_B]]);
+    new RelationshipMemoryOwnerControlPlane(store).deactivate(b, { revision_id: 'deactivate-b' });
+    for (const hits of await cardsOf(runtime)) {
+      expect(hits.map((hit) => [hit.memory_id, hit.payload.fact])).toEqual([[a, LILY]]);
+    }
+  });
 
-      const recall = new RelationshipMemoryRecallSession({ rootDir: root, subjectId: 'subject', transcriptRoots: [] });
-      const direct = (recall.relationshipMemorySearch({ query: 'Country X' }) as any).results.filter((item: any) => item.kind === 'world_update');
-      for (const hits of [direct, ...await cardsOf(runtime)]) {
-        expect(hits.map((hit: any) => [hit.payload.fact, hit.world_update.revision_count])).toEqual([[PERSON_B, 2]]);
-      }
-      expect(new RelationshipMemoryOwnerControlPlane(store).search({ kind: 'world_update' }).map((memory) => memory.memory_id).sort()).toEqual([a, b].sort());
-      expect(store.listWorldRevisions()).toHaveLength(3);
-    });
+  it('Round 2 repro: a replayed r1 shared by two anchors refuses the merge', () => {
+    const ctx = setupWith();
+    const a = ctx.runtime.rememberKind('batch-a', 'world_update', railAnchor([SOURCE.evidence_id!])).memory_id!;
+    ctx.clock.now = '2026-05-04T09:00:00.000Z';
+    const b = ctx.runtime.rememberKind('batch-b', 'world_update', railAnchor([SOURCE_REPLAY.evidence_id!])).memory_id!;
+    expectMergeRefused(ctx, a, b);
+  });
 
-    it('ignores an r1 that reuses a block behind a confirmation of another anchor', () => {
-      const { store, runtime, clock } = setupWith([REPLAYED_AGAIN]);
-      const a = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
-      clock.now = '2026-05-02T00:00:00.000Z';
-      expect(runtime.reinforce('batch-2', { memory_id: a, evidence_ids: [ev('u-again')], world_revision_id: headOf(runtime, a).revision_id }).outcome).toBe('accepted');
-      clock.now = '2026-05-12T09:00:00.000Z';
-      const b = runtime.rememberKind('batch-3', 'world_update', anchor([REPLAYED_AGAIN.evidence_id!], { summary: 'Country X leadership' }, 'Quillon is the prime minister of Country X')).memory_id!;
-      const pair = runtime.suggestMaintenanceReview('batch-4', 'relation', { memory_ids: [a, b], relation: 'same_meaning', reason: 'one topic' }).review_id!;
-      new RelationshipMemoryResolutionControlPlane(store, () => '2026-05-20T00:00:00.000Z').resolveReview(pair, { resolution_id: 'res-merge', relation: 'same_meaning', target_memory_id: a });
-      const view = runtime.currentWorldUpdate(a)!.world_update!;
-      expect(view.head.fact).toBe(PERSON_A);
-      expect(view.revision_count).toBe(1);
-      expect(view.revisions!.map((item) => item.memory_id)).toEqual([a]);
-      expect(view.last_confirmed).toBe('2026-04-20T09:00:00Z');
-      expect(view.confirmation_ids).toHaveLength(1);
-    });
+  it('refuses a merge whose overlap is only through a confirmation', () => {
+    const ctx = setupWith();
+    const { runtime, clock } = ctx;
+    const a = runtime.rememberKind('batch-a', 'world_update', railAnchor([SOURCE.evidence_id!])).memory_id!;
+    clock.now = '2026-05-04T09:00:00.000Z';
+    const b = runtime.rememberKind('batch-b', 'world_update', railAnchor([FRESH.evidence_id!])).memory_id!;
+    clock.now = '2026-05-05T09:00:00.000Z';
+    expect(runtime.reinforce('batch-b-confirm', { memory_id: b, evidence_ids: [SOURCE_REPLAY.evidence_id!], world_revision_id: headOf(runtime, b).revision_id }).outcome).toBe('accepted');
+    expectMergeRefused(ctx, a, b);
+  });
 
-    it('does not count a reinforcement whose block an earlier write already used', async () => {
-      const { store, runtime } = setupWith([REPLAYED_FIRST]);
-      const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
-      const r1 = headOf(runtime, memoryId).revision_id!;
-      const base = REPLAYED_FIRST;
-      store.appendReinforcement({
-        schema_version: 1, reinforcement_id: 'reinforce-reused-block', memory_id: memoryId, batch_id: 'direct', world_revision_id: r1,
-        evidence_ids: ['ev-reused'], latest_evidence_at: '2026-06-01T00:00:00Z', recorded_at: '2026-06-01T00:00:00.000Z',
-      }, [{ evidence_id: 'ev-reused', memory_id: memoryId, conversation_id: base.conversation_id, message_id: base.message_id, role: 'user', quote: base.quote, captured_at: '2026-06-01T00:00:00Z', source_evidence_id: base.evidence_id, event_kind: 'user_text', block_index: 0 }]);
-      const view = runtime.currentWorldUpdate(memoryId)!.world_update!;
-      expect(view.last_confirmed).toBe('2026-04-01T10:00:00Z');
-      expect(view.head_evidence_ids).not.toContain('ev-reused');
-      expect(view.confirmation_ids).toEqual([]);
-      for (const hits of await cardsOf(runtime)) {
-        expect(hits[0]).not.toHaveProperty('reinforcement_count');
-        expect(hits[0].world_update!.last_confirmed).toBe('2026-04-01T10:00:00Z');
-      }
-    });
+  it('still merges disjoint families into one chain', async () => {
+    const ctx = setupWith();
+    const { runtime, clock, resolution } = ctx;
+    const a = runtime.rememberKind('batch-a', 'world_update', railAnchor([SOURCE.evidence_id!])).memory_id!;
+    clock.now = '2026-05-05T09:00:00.000Z';
+    const b = runtime.rememberKind('batch-b', 'world_update', railAnchor([OTHER.evidence_id!], LILY)).memory_id!;
+    const review = suggest(runtime, [a, b], 'same_meaning');
+    expect(review.outcome).toBe('accepted');
+    resolution.resolveReview(review.review_id!, { resolution_id: 'res-merge', relation: 'same_meaning', target_memory_id: a });
+    const view = runtime.currentWorldUpdate(b)!.world_update!;
+    expect(view.revision_count).toBe(2);
+    expect(view.head.fact).toBe(LILY);
+    for (const hits of await cardsOf(runtime)) expect(hits.map((hit) => [hit.memory_id, hit.payload.fact])).toEqual([[a, LILY]]);
+  });
+
+  it('counts the blocks of an already merged family: B shares a block only with the anchor merged into A', () => {
+    const ctx = setupWith();
+    const { runtime, clock, resolution } = ctx;
+    const a = runtime.rememberKind('batch-a', 'world_update', railAnchor([SOURCE.evidence_id!])).memory_id!;
+    clock.now = '2026-05-05T09:00:00.000Z';
+    const c = runtime.rememberKind('batch-c', 'world_update', railAnchor([OTHER.evidence_id!], LILY)).memory_id!;
+    const merge = suggest(runtime, [a, c], 'same_meaning');
+    resolution.resolveReview(merge.review_id!, { resolution_id: 'res-ac', relation: 'same_meaning', target_memory_id: a });
+    expect(runtime.currentWorldUpdate(a)!.resolution_source_memory_ids).toEqual(expect.arrayContaining([a, c]));
+    clock.now = '2026-05-06T09:00:00.000Z';
+    const b = runtime.rememberKind('batch-b', 'world_update', railAnchor([OTHER_REPLAY.evidence_id!], LILY)).memory_id!;
+    expectMergeRefused({ ...ctx, resolution: new RelationshipMemoryResolutionControlPlane(ctx.store, () => '2026-05-21T00:00:00.000Z') }, a, b);
   });
 });

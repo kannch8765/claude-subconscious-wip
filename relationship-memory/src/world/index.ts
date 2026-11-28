@@ -58,14 +58,33 @@ export function evidenceBlockKey(item: EvidenceSource & Pick<EvidenceRecord, 'ev
   return evidenceSourceKey(item) ?? item.source_evidence_id ?? item.evidence_id;
 }
 
+/**
+ * The transcript blocks behind every write of a world_update family: each revision and each reinforcement of the
+ * anchors. Only written rows count, so a half-committed revision or reinforcement is still repaired. Key: the block
+ * (`evidenceBlockKey`); value: the transcript evidence id (`source_evidence_id ?? evidence_id`).
+ */
+export function worldFamilyBlocks(store: RelationshipMemoryStore, anchorIds: readonly string[]): Map<string, string> {
+  const ids = new Set(anchorIds);
+  const written = new Set<string>();
+  for (const revision of store.listWorldRevisionsForMemoryIds([...ids])) for (const id of revision.evidence_ids) written.add(id);
+  for (const reinforcement of store.listReinforcements()) {
+    if (ids.has(reinforcement.memory_id)) for (const id of reinforcement.evidence_ids) written.add(id);
+  }
+  const blocks = new Map<string, string>();
+  for (const item of store.listEvidenceForMemoryIds([...ids])) {
+    if (written.has(item.evidence_id)) blocks.set(evidenceBlockKey(item), item.source_evidence_id ?? item.evidence_id);
+  }
+  return blocks;
+}
+
 export interface WorldChainInput {
   /** The anchor and, after an owner same_meaning merge, the anchors merged into it. */
   anchors: ReadonlyArray<Pick<EffectiveMemoryRecord, 'memory_id' | 'payload' | 'observed_at' | 'created_at'>>;
   /** Revisions of any of the anchors, in any order. */
   revisions: readonly WorldRevisionRecord[];
-  /** Evidence rows of the anchors: captured_at, and the block identity each write is checked by. */
-  evidence: ReadonlyArray<Pick<EvidenceRecord, 'evidence_id' | 'memory_id' | 'captured_at' | 'message_id' | 'block_index' | 'event_kind' | 'tool_use_id' | 'source_evidence_id'>>;
-  reinforcements: ReadonlyArray<Pick<ReinforcementRecord, 'reinforcement_id' | 'memory_id' | 'evidence_ids' | 'latest_evidence_at' | 'world_revision_id' | 'recorded_at'>>;
+  /** Evidence rows of the anchors (only captured_at is read). */
+  evidence: ReadonlyArray<Pick<EvidenceRecord, 'evidence_id' | 'memory_id' | 'captured_at'>>;
+  reinforcements: ReadonlyArray<Pick<ReinforcementRecord, 'memory_id' | 'evidence_ids' | 'latest_evidence_at' | 'world_revision_id'>>;
 }
 
 /** Chain order: recorded_at, then the commit sequence (an anchor's r1 is 0), then revision_id. */
@@ -78,38 +97,14 @@ export function compareWorldRevisions(a: WorldRevisionRecord, b: WorldRevisionRe
  * the last one; an earlier `as_of` never reorders it. `last_confirmed` is the latest captured_at over the head's own
  * evidence and every reinforcement that confirmed this head (its `world_revision_id`), whenever it was written.
  *
- * A transcript block backs at most one write of the family. Revisions and reinforcements are walked in time order
- * (revisions first on a tie); a write citing a block an earlier write already used is ignored: it is not in the chain,
- * the count or the head, and a reinforcement does not confirm. The raw rows stay in the store.
+ * A transcript block backs at most one write of a family (the write path refuses a reuse), and an owner merge of two
+ * families that share a block is refused, so the chain needs no per-block filtering.
  */
 export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
   const anchorIds = new Set(input.anchors.map((anchor) => anchor.memory_id));
-  const allRevisions = input.revisions.filter((revision) => anchorIds.has(revision.memory_id)).sort(compareWorldRevisions);
-  const anchorEvidence = input.evidence.filter((item) => anchorIds.has(item.memory_id));
-  const capturedAt = new Map(anchorEvidence.map((item) => [item.evidence_id, item.captured_at]));
-  const blockOf = new Map(anchorEvidence.map((item) => [item.evidence_id, evidenceBlockKey(item)]));
-  const allReinforcements = input.reinforcements.filter((item) => anchorIds.has(item.memory_id))
-    .sort((a, b) => a.recorded_at.localeCompare(b.recorded_at) || a.reinforcement_id.localeCompare(b.reinforcement_id));
-  const usedBlocks = new Set<string>();
-  const accept = (evidenceIds: readonly string[]): boolean => {
-    const blocks = new Set(evidenceIds.map((id) => blockOf.get(id) ?? id));
-    if ([...blocks].some((block) => usedBlocks.has(block))) return false;
-    for (const block of blocks) usedBlocks.add(block);
-    return true;
-  };
-  const revisions: WorldRevisionRecord[] = [];
-  const reinforcements: typeof allReinforcements = [];
-  for (let r = 0, c = 0; r < allRevisions.length || c < allReinforcements.length;) {
-    const revision = allRevisions[r];
-    const reinforcement = allReinforcements[c];
-    if (revision && (!reinforcement || revision.recorded_at.localeCompare(reinforcement.recorded_at) <= 0)) {
-      r += 1;
-      if (accept(revision.evidence_ids)) revisions.push(revision);
-    } else {
-      c += 1;
-      if (accept(reinforcement.evidence_ids)) reinforcements.push(reinforcement);
-    }
-  }
+  const revisions = input.revisions.filter((revision) => anchorIds.has(revision.memory_id)).sort(compareWorldRevisions);
+  const capturedAt = new Map(input.evidence.filter((item) => anchorIds.has(item.memory_id)).map((item) => [item.evidence_id, item.captured_at]));
+  const reinforcements = input.reinforcements.filter((item) => anchorIds.has(item.memory_id));
   const latest = (values: Array<string | undefined>): string | undefined => values.filter((value): value is string => Boolean(value)).sort().at(-1);
   const head = revisions.at(-1);
 
@@ -122,7 +117,6 @@ export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
       revision_count: 0,
       last_confirmed: latest([...capturedAt.values()]) ?? anchor?.observed_at ?? '',
       head_evidence_ids: [...new Set(evidenceIds)],
-      confirmation_ids: [],
       revisions: [],
     };
   }
@@ -136,7 +130,6 @@ export function buildWorldUpdateView(input: WorldChainInput): WorldUpdateView {
       ...confirming.map((item) => item.latest_evidence_at),
     ]) ?? head.recorded_at,
     head_evidence_ids: [...new Set([...head.evidence_ids, ...confirming.flatMap((item) => item.evidence_ids)])],
-    confirmation_ids: confirming.map((item) => item.reinforcement_id),
     revisions,
   };
 }
@@ -201,10 +194,10 @@ export function withServedWorldSummary<T extends EffectiveMemoryRecord>(memory: 
   return { ...memory, summary: `${String(memory.payload.topic ?? '')}：${memory.world_update.head.fact}` };
 }
 
-/** Search and recall show the head only: the chain and the confirmation ids are dropped, the head, count and last_confirmed stay. */
+/** Search and recall show the head only: the chain is dropped, the head, count and last_confirmed stay. */
 export function withoutWorldRevisions<T extends EffectiveMemoryRecord>(memory: T): T {
   if (!memory.world_update?.revisions) return memory;
-  const { revisions: _revisions, confirmation_ids: _confirmations, ...view } = memory.world_update;
+  const { revisions: _revisions, ...view } = memory.world_update;
   return { ...memory, world_update: view };
 }
 
@@ -212,6 +205,27 @@ const WORLD_WORLD_RELATIONS: ReadonlySet<MemoryRelationKind> = new Set(['related
 const WORLD_OTHER_RELATIONS: ReadonlySet<MemoryRelationKind> = new Set(['related', 'unrelated']);
 
 export const INVALID_WORLD_RELATION = 'invalid_world_relation';
+export const OVERLAPPING_WORLD_EVIDENCE = 'overlapping_world_evidence';
+
+/**
+ * Transcript evidence ids of the blocks that two or more of the families (each a list of anchor ids) both used for a
+ * write, sorted and unique. Empty means the families can merge without one chain citing a block twice.
+ */
+export function worldMergeOverlap(store: RelationshipMemoryStore, families: readonly (readonly string[])[]): string[] {
+  const blocks = families.map((anchorIds) => worldFamilyBlocks(store, anchorIds));
+  const shared = new Set<string>();
+  for (let i = 0; i < blocks.length; i += 1) {
+    for (let j = i + 1; j < blocks.length; j += 1) {
+      for (const [block, evidenceId] of blocks[i]) {
+        const other = blocks[j].get(block);
+        if (other === undefined) continue;
+        shared.add(evidenceId);
+        shared.add(other);
+      }
+    }
+  }
+  return [...shared].sort();
+}
 
 /**
  * Relations with a world_update member: world ↔ world may be related, unrelated or same_meaning (two anchors for one

@@ -33,7 +33,7 @@ import { hybridScore, lexicalTextScore, semanticText, type SemanticRetriever } f
 import { linkedAssistantIntentIndex } from '../intent/provenance.js';
 import { deferredIntentCounts } from '../intent/index.js';
 import {
-  INVALID_WORLD_RELATION, attachWorldUpdateViews, evidenceBlockKey, evidenceSourceKey, normalizeWorldFact, withoutWorldRevisions, worldAsOf, worldRelationViolation, worldRevisionId,
+  INVALID_WORLD_RELATION, OVERLAPPING_WORLD_EVIDENCE, attachWorldUpdateViews, evidenceSourceKey, normalizeWorldFact, withoutWorldRevisions, worldAsOf, worldFamilyBlocks, worldMergeOverlap, worldRelationViolation, worldRevisionId,
   worldUpdateIndexText, worldUpdateSource,
 } from '../world/index.js';
 
@@ -129,10 +129,9 @@ function messageBlockKey(message: CanonicalMessage): string {
 function headConfirmations(memory: EffectiveMemoryRecord, byMemory: ReadonlyMap<string, ReinforcementRecord[]>): ReinforcementRecord[] {
   const head = memory.world_update?.head.revision_id;
   if (!head) return [];
-  const confirmed = new Set(memory.world_update?.confirmation_ids ?? []);
   return (memory.resolution_source_memory_ids ?? [memory.memory_id])
     .flatMap((memoryId) => byMemory.get(memoryId) ?? [])
-    .filter((item) => item.world_revision_id === head && confirmed.has(item.reinforcement_id));
+    .filter((item) => item.world_revision_id === head);
 }
 
 /** Rejections that refuse the cited evidence itself; their replay never resolves a linked remember intent. */
@@ -434,15 +433,7 @@ export class RelationshipMemoryRuntime {
    */
   private worldFamilyUsedBlocks(memoryId: string, family: EffectiveMemoryRecord | undefined): Set<string> {
     const anchorIds = new Set([memoryId, ...(family?.resolution_source_memory_ids ?? (family ? [family.memory_id] : []))]);
-    const revisions = this.store.listWorldRevisionsForMemoryIds([...anchorIds]);
-    const written = new Set<string>();
-    for (const revision of revisions) for (const id of revision.evidence_ids) written.add(id);
-    for (const reinforcement of this.store.listReinforcements()) {
-      if (anchorIds.has(reinforcement.memory_id)) for (const id of reinforcement.evidence_ids) written.add(id);
-    }
-    const evidence = this.store.listEvidenceForMemoryIds([...anchorIds]);
-    const blocks = new Set(evidence.filter((item) => written.has(item.evidence_id)).map(evidenceBlockKey));
-    return blocks;
+    return new Set(worldFamilyBlocks(this.store, [...anchorIds]).keys());
   }
 
   async prepareCurrentMemorySemanticIndex(): Promise<void> {
@@ -942,6 +933,17 @@ export class RelationshipMemoryRuntime {
     // Checked before the review-id lookups: a review id does not include the relation.
     const worldViolation = worldRelationViolation(memoryIds.map((memoryId) => kindById.get(memoryId)!), relation);
     if (worldViolation) return { outcome: 'rejected', rejection_code: INVALID_WORLD_RELATION, reason: worldViolation };
+    if (relation === 'same_meaning' && memoryIds.every((memoryId) => kindById.get(memoryId) === WORLD_UPDATE_KIND)) {
+      const shared = worldMergeOverlap(this.store, memoryIds.map((memoryId) =>
+        this.currentWorldUpdate(memoryId)?.resolution_source_memory_ids ?? [memoryId]));
+      if (shared.length > 0) {
+        return {
+          outcome: 'rejected',
+          rejection_code: OVERLAPPING_WORLD_EVIDENCE,
+          reason: `These world_update memories share transcript evidence (${shared.join(', ')}), so one is likely a replay of the other and a merge would cite a block twice. Suggest related instead: the owner can then review the pair and deactivate the duplicate.`,
+        };
+      }
+    }
     const reviewId = stableId('maintenance_review', {
       subject_id: this.store.subjectId,
       kind,

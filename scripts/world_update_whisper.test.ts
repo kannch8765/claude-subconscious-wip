@@ -19,7 +19,6 @@ function view(revisions: WorldRevisionRecord[], lastConfirmed: string): Pick<Eff
       revision_count: revisions.length,
       last_confirmed: lastConfirmed,
       head_evidence_ids: head.evidence_ids,
-      confirmation_ids: [],
       revisions,
     },
   };

@@ -12,7 +12,7 @@ import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
 import { findConflictingOwnerLinks, validOwnerConflictReconciliation } from '../owner_relation_conflicts.js';
 import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../intent/provenance.js';
-import { INVALID_WORLD_RELATION, attachWorldUpdateViews, withServedWorldSummary, worldRelationViolation } from '../world/index.js';
+import { INVALID_WORLD_RELATION, OVERLAPPING_WORLD_EVIDENCE, attachWorldUpdateViews, withServedWorldSummary, worldMergeOverlap, worldRelationViolation } from '../world/index.js';
 
 export interface ResolveReviewCommand {
   resolution_id: string;
@@ -425,6 +425,18 @@ export class RelationshipMemoryResolutionControlPlane {
       ...(contexts ? { contexts } : {}),
       ...(note ? { note } : {}),
     };
+    if (relation === 'same_meaning' && memoryIds.every((memoryId) => this.store.getMemory(memoryId)!.kind === WORLD_UPDATE_KIND)) {
+      // The overlap check and the append share one mutation boundary, so a write cannot land between them.
+      return this.store.withMutationBoundary(() => {
+        const current = materializeCurrentMemoryView(this.store);
+        const shared = worldMergeOverlap(this.store, memoryIds.map((memoryId) =>
+          current.find((memory) => memory.memory_id === memoryId)?.resolution_source_memory_ids ?? [memoryId]));
+        if (shared.length > 0) {
+          throw new Error(`${OVERLAPPING_WORLD_EVIDENCE}: these world_update memories share transcript evidence (${shared.join(', ')}); deactivate the replayed duplicate instead of merging.`);
+        }
+        return this.store.appendMemoryResolution(record);
+      });
+    }
     return this.store.appendMemoryResolution(record);
   }
 
