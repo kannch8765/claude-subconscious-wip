@@ -119,49 +119,58 @@ describe('world_update remember', () => {
     })).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unknown_field' }));
   });
 
-  it('repairs a torn remember (anchor without r1) on the same-batch replay', () => {
+  it.each(['memory_commit', 'world_revision_commit'] as const)('completes a remember that crashed at %s on the same-batch replay', (crashAt) => {
     let failNext = true;
     const { store, runtime } = setup({ failureInjector: (phase) => {
-      if (phase !== 'world_revision_commit' || !failNext) return false;
+      if (phase !== crashAt || !failNext) return false;
       failNext = false;
       return true;
     } });
     store.beginBatch('batch-torn', '2026-05-01T00:00:00.000Z');
     const proposal = anchor([ev('u-first')]);
     expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('retryable_failed');
-    const [torn] = store.listMemories();
-    expect(store.listWorldRevisions()).toHaveLength(0);
-    expect(runtime.currentWorldUpdate(torn.memory_id)!.world_update).toEqual(expect.objectContaining({
-      head: expect.objectContaining({ fact: 'Person A is the prime minister of Country X' }), revision_count: 0,
-    }));
+    // The first revision and its evidence land before the anchor row, so an anchor never exists without them.
+    expect(store.listMemories()).toHaveLength(0);
+    expect(runtime.memorySearch({ kind: 'world_update' })).toEqual([]);
+    if (crashAt === 'memory_commit') {
+      expect(store.listWorldRevisions().map((item) => item.sequence)).toEqual([0]);
+      expect(store.listEvidence().map((item) => item.evidence_id)).toEqual(store.listWorldRevisions()[0].evidence_ids);
+      expect(store.listEvidence()).toHaveLength(1);
+    } else {
+      expect(store.listWorldRevisions()).toHaveLength(0);
+      expect(store.listEvidence()).toHaveLength(0);
+    }
     expect(runtime.finalizeBatch('batch-torn', true)).toBe('retryable_failure');
 
-    expect(runtime.rememberKind('batch-torn', 'world_update', proposal)).toEqual({ outcome: 'duplicate', memory_id: torn.memory_id });
+    const replay = runtime.rememberKind('batch-torn', 'world_update', proposal);
+    expect(replay.outcome).toBe('accepted');
     expect(store.listMemories()).toHaveLength(1);
-    expect(store.listWorldRevisionsForMemoryIds([torn.memory_id])).toHaveLength(1);
+    expect(store.listWorldRevisions()).toHaveLength(1);
+    const view = runtime.currentWorldUpdate(replay.memory_id!)!.world_update!;
+    expect(view.head.revision_id).toBe(store.listWorldRevisions()[0].revision_id);
+    expect(view.revision_count).toBe(1);
     expect(runtime.finalizeBatch('batch-torn', true)).toBe('completed');
   });
 
-  it('keeps a revision appended during the torn window as head when the replay repairs r1 later', () => {
+  it('refuses a revision on the id of an r1 whose anchor was never written, and the replay still completes', () => {
     let failNext = true;
-    const { store, runtime, clock } = setup({ failureInjector: (phase) => {
-      if (phase !== 'world_revision_commit' || !failNext) return false;
+    const { store, runtime } = setup({ failureInjector: (phase) => {
+      if (phase !== 'memory_commit' || !failNext) return false;
       failNext = false;
       return true;
     } });
     const proposal = anchor([ev('u-first')]);
     expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('retryable_failed');
-    const [torn] = store.listMemories();
-    clock.now = '2026-05-10T09:00:00.000Z';
-    expect(runtime.worldUpdate('batch-other', { memory_id: torn.memory_id, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] }).outcome).toBe('accepted');
-    clock.now = '2026-05-11T09:00:00.000Z';
-    expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('duplicate');
-    const view = runtime.currentWorldUpdate(torn.memory_id)!.world_update!;
-    expect(view.revisions!.map((item) => [item.fact, item.recorded_at])).toEqual([
-      ['Person A is the prime minister of Country X', torn.created_at],
-      ['Person B is the prime minister of Country X', '2026-05-10T09:00:00.000Z'],
-    ]);
-    expect(view.head.fact).toBe('Person B is the prime minister of Country X');
+    const orphanId = store.listWorldRevisions()[0].memory_id;
+    const before = { revisions: store.listWorldRevisions().length, evidence: store.listEvidence().length };
+    expect(runtime.worldUpdate('batch-other', { memory_id: orphanId, fact: 'Person B is the prime minister of Country X', evidence_ids: [ev('u-changed')] }))
+      .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unknown_memory' }));
+    expect({ revisions: store.listWorldRevisions().length, evidence: store.listEvidence().length }).toEqual(before);
+
+    const replay = runtime.rememberKind('batch-torn', 'world_update', proposal);
+    expect(replay).toEqual(expect.objectContaining({ outcome: 'accepted', memory_id: orphanId }));
+    expect(store.listWorldRevisions()).toHaveLength(1);
+    expect(runtime.currentWorldUpdate(orphanId)!.world_update!.head.fact).toBe('Person A is the prime minister of Country X');
   });
 });
 
@@ -620,21 +629,16 @@ describe('world_update review round 1', () => {
     expect(store.listWorldRevisions()).toHaveLength(3);
   });
 
-  it.each(['Person B', 'Person E', 'Person F', 'Person G', 'Person H', 'Person J'])('keeps a same-millisecond revision (%s) as head when a torn r1 is repaired later', (name) => {
-    let failNext = true;
-    const { store, runtime } = setupWith([], (phase) => {
-      if (phase !== 'world_revision_commit' || !failNext) return false;
-      failNext = false;
-      return true;
-    });
-    const proposal = anchor([ev('u-first')]);
-    expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('retryable_failed');
-    const [torn] = store.listMemories();
+  it.each(['Person B', 'Person E', 'Person F', 'Person G', 'Person H', 'Person J'])('keeps a same-millisecond revision (%s) as head', (name) => {
+    const { store, runtime } = setupWith([]);
+    const memoryId = runtime.rememberKind('batch-1', 'world_update', anchor([ev('u-first')])).memory_id!;
     const fact = `${name} is the prime minister of Country X`;
-    expect(runtime.worldUpdate('batch-other', { memory_id: torn.memory_id, fact, evidence_ids: [ev('u-changed')] }).outcome).toBe('accepted');
-    expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('duplicate');
-    const view = runtime.currentWorldUpdate(torn.memory_id)!.world_update!;
+    expect(runtime.worldUpdate('batch-other', { memory_id: memoryId, fact, evidence_ids: [ev('u-changed')] }).outcome).toBe('accepted');
+    const revisions = store.listWorldRevisions();
+    expect(revisions.map((item) => item.recorded_at)).toEqual([revisions[0].recorded_at, revisions[0].recorded_at]);
+    const view = runtime.currentWorldUpdate(memoryId)!.world_update!;
     expect(view.revisions!.map((item) => item.fact)).toEqual(['Person A is the prime minister of Country X', fact]);
+    expect(revisions[1].sequence).toBeGreaterThan(revisions[0].sequence);
     expect(view.head.fact).toBe(fact);
   });
 
@@ -652,6 +656,10 @@ describe('world_update review round 1', () => {
     ]) {
       expect(hits.map((hit) => hit.summary)).toEqual([served]);
       expect(JSON.stringify(hits)).not.toContain('Person A is the prime minister');
+      for (const hit of hits) {
+        expect(hit.world_update).not.toHaveProperty('confirmation_ids');
+        expect(hit.world_update).not.toHaveProperty('revisions');
+      }
     }
     expect(runtime.memorySearch({ query: 'Person A is' })).toEqual([]);
     expect(await runtime.memorySearchRecallHybridWithEvidence({ trigger: 'Person A is' })).toEqual([]);
@@ -923,28 +931,30 @@ describe('world_update review round 3', () => {
     });
   });
 
-  describe('a torn first write', () => {
-    it('reserves the blocks of the anchor evidence until r1 is repaired', () => {
+  describe('a crash during the first write', () => {
+    it('leaves no anchor to write to, so a replay of its block cannot take the block before the remember replay', () => {
       let failNext = true;
       const { store, runtime } = setupWith([REPLAYED_FIRST], (phase) => {
-        if (phase !== 'world_revision_commit' || !failNext) return false;
+        if (phase !== 'memory_commit' || !failNext) return false;
         failNext = false;
         return true;
       });
       const proposal = anchor([ev('u-first')]);
       expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('retryable_failed');
-      const [torn] = store.listMemories();
-      expect(store.listWorldRevisions()).toHaveLength(0);
+      expect(store.listMemories()).toHaveLength(0);
+      const [r1] = store.listWorldRevisions();
+      expect(r1.sequence).toBe(0);
+      expect(store.listEvidence().map((item) => item.evidence_id)).toEqual(r1.evidence_ids);
 
-      const replay = runtime.worldUpdate('batch-other', { memory_id: torn.memory_id, fact: 'Country X is led by Person A', evidence_ids: [REPLAYED_FIRST.evidence_id!] });
-      expect(replay).toEqual(expect.objectContaining({ outcome: 'duplicate', memory_id: torn.memory_id }));
-      expect(store.listWorldRevisions()).toHaveLength(0);
+      const replay = runtime.worldUpdate('batch-other', { memory_id: r1.memory_id, fact: 'Country X is led by Person A', evidence_ids: [REPLAYED_FIRST.evidence_id!] });
+      expect(replay).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'unknown_memory' }));
+      expect(store.listWorldRevisions()).toHaveLength(1);
 
-      expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('duplicate');
-      const revisions = store.listWorldRevisionsForMemoryIds([torn.memory_id]);
+      expect(runtime.rememberKind('batch-torn', 'world_update', proposal).outcome).toBe('accepted');
+      const revisions = store.listWorldRevisionsForMemoryIds([r1.memory_id]);
       expect(revisions).toHaveLength(1);
       expect(revisions[0].fact).toBe(PERSON_A);
-      expect(headOf(runtime, torn.memory_id).fact).toBe(PERSON_A);
+      expect(headOf(runtime, r1.memory_id).fact).toBe(PERSON_A);
     });
   });
 

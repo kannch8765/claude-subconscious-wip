@@ -442,17 +442,6 @@ export class RelationshipMemoryRuntime {
     }
     const evidence = this.store.listEvidenceForMemoryIds([...anchorIds]);
     const blocks = new Set(evidence.filter((item) => written.has(item.evidence_id)).map(evidenceBlockKey));
-    // An anchor whose r1 is not written yet (a torn first write) holds its original evidence for that r1: the replay
-    // of the remember will write it, so those blocks are reserved already.
-    const withR1 = new Set(revisions.filter((revision) => revision.sequence === 0).map((revision) => revision.memory_id));
-    for (const anchorId of anchorIds) {
-      if (withR1.has(anchorId)) continue;
-      const anchor = this.store.getMemory(anchorId);
-      if (!anchor) continue;
-      const rows = evidence.filter((item) => item.memory_id === anchorId);
-      const original = this.originalMemoryEvidenceIds(anchor, rows);
-      for (const item of rows) if (!original || original.has(item.evidence_id)) blocks.add(evidenceBlockKey(item));
-    }
     return blocks;
   }
 
@@ -1309,7 +1298,7 @@ export class RelationshipMemoryRuntime {
     return this.persistOutcomePair(batchId, sourceKey, 'accepted', memoryId, now, assistantIntent);
   }
 
-  /** A world_update anchor and its revision r1 land in one mutation boundary; other kinds append the memory only. */
+  /** A world_update's r1 and evidence land before its anchor row, in one mutation boundary; other kinds append the memory only. */
   private appendMemoryWithFirstRevision(
     batchId: string,
     memory: CanonicalMemoryRecord,
@@ -1333,12 +1322,14 @@ export class RelationshipMemoryRuntime {
       source: worldUpdateSource(messages),
       evidence_ids: evidence.map((item) => item.evidence_id),
       batch_id: batchId,
-      // The anchor's time, also when a replay repairs a torn remember: a revision appended meanwhile stays the head.
+      // The anchor's time. On a replay after a crash before the anchor row, r1 keeps the first attempt's time.
       recorded_at: memory.created_at,
     };
     this.store.withMutationBoundary(() => {
+      // r1 and its evidence land before the anchor row, so an anchor never exists without them. A crash in between
+      // leaves an r1 no anchor points to: invisible, and the same-batch replay derives the same memory_id and r1.
+      this.store.appendWorldRevision(revision, evidence, true);
       this.store.appendMemory(memory, evidence);
-      this.store.appendWorldRevision(revision, [], true);
     });
   }
 

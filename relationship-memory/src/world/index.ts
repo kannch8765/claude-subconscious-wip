@@ -201,10 +201,10 @@ export function withServedWorldSummary<T extends EffectiveMemoryRecord>(memory: 
   return { ...memory, summary: `${String(memory.payload.topic ?? '')}：${memory.world_update.head.fact}` };
 }
 
-/** Search and recall show the head only: the chain is dropped, the head, count and last_confirmed stay. */
+/** Search and recall show the head only: the chain and the confirmation ids are dropped, the head, count and last_confirmed stay. */
 export function withoutWorldRevisions<T extends EffectiveMemoryRecord>(memory: T): T {
   if (!memory.world_update?.revisions) return memory;
-  const { revisions: _revisions, ...view } = memory.world_update;
+  const { revisions: _revisions, confirmation_ids: _confirmations, ...view } = memory.world_update;
   return { ...memory, world_update: view };
 }
 

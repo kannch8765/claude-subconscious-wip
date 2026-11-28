@@ -205,8 +205,8 @@ export interface WorldUpdateView {
   last_confirmed: string;
   /** Memory evidence ids behind `last_confirmed`: the head's own plus those reinforced after it. */
   head_evidence_ids: string[];
-  /** The reinforcement ids counted as confirming the head: those whose blocks no earlier write of the family used. */
-  confirmation_ids: string[];
+  /** The reinforcement ids counted as confirming the head: those whose blocks no earlier write of the family used. Search and recall results omit it. */
+  confirmation_ids?: string[];
   /** The whole chain in recorded_at order, oldest first, for the timeline renderer. Search and recall results omit it. */
   revisions?: WorldRevisionRecord[];
 }
