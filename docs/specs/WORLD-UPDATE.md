@@ -55,7 +55,7 @@ after the head was recorded. It is derived in the projection, not stored.
 |---|---|---|
 | a new topic | `memory_remember`, kind `world_update` | anchor + revision r1, in one mutation boundary |
 | the same fact again | `memory_reinforce` on the anchor | evidence attached; `last_confirmed` moves forward; no revision |
-| the fact changed | **new** `memory_world_update(memory_id, fact, as_of?, evidence_ids)` | a new revision, which becomes the head when its `as_of` is latest |
+| the fact changed | **new** `memory_world_update(memory_id, fact, as_of?, evidence_ids)` | a new revision, which becomes the head |
 
 - Sameness of topic is the model's call, the same way reinforce decides "same episode": search `kind=world_update` first, update when found, remember when not.
 - `memory_world_update` on a non-`world_update` memory → `permanently_rejected`, new code `not_world_update`.
@@ -69,7 +69,7 @@ after the head was recorded. It is derived in the projection, not stored.
 
 | between | allowed | why |
 |---|---|---|
-| world ↔ world | `related`, `unrelated`, `same_meaning` | `same_meaning` = two anchors for one topic made by mistake. The merge unions both revision lists in one chain, ordered by `as_of`. |
+| world ↔ world | `related`, `unrelated`, `same_meaning` | `same_meaning` = two anchors for one topic made by mistake. The merge unions both revision lists in one chain, ordered by `recorded_at`. |
 | world ↔ any other kind | `related`, `unrelated` only | different axis; a merge or `changed_over_time` would break the revision chain |
 | revision ↔ revision | not a relation | revisions live inside one anchor; the chain is the supersede history |
 
@@ -80,7 +80,7 @@ after the head was recorded. It is derived in the projection, not stored.
 
 - Search and the effective view show the anchor with the **head only**: `topic`, `fact`, `as_of`, `last_confirmed`, `source`, and a revision count. History is not shown.
 - Index text = topic + head fact. A new head re-queues the anchor for embedding (`pending_embed`, as for new memories).
-- Whisper rendering for this kind is the **timeline** of the anchor, oldest first, no quotes needed. Storage is unchanged; only the text Kohaku gets shows the chain:
+- Whisper rendering for this kind is the **timeline** of the anchor in `recorded_at` order (oldest first; `as_of` is shown but never reorders), no quotes needed. Storage is unchanged; only the text Kohaku gets shows the chain:
 
   ```
   （知识补丁）<topic>
@@ -109,7 +109,7 @@ after the head was recorded. It is derived in the projection, not stored.
 - world_update with a new fact → r2 is the head; r1 is kept; search shows only r2.
 - same fact through world_update → `duplicate`.
 - `assistant_text` / `self_note` as evidence → `untrusted_world_source`, nothing written; `tool_result` → `source: tool`.
-- relation validation per the table; `same_meaning` merge of two anchors → one chain ordered by `as_of`.
+- relation validation per the table; `same_meaning` merge of two anchors → one chain ordered by `recorded_at`.
 - a new head re-queues embedding; whisper renders the timeline (all revisions, oldest first, `last_confirmed` on the head).
 - an anchor updated in a pass is session-known afterwards.
 - the Letta tool inventory is unchanged.
