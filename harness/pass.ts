@@ -54,6 +54,8 @@ export interface StepTrace {
 export interface PassDecisions {
   whisper?: { memory_id: string; snippet_ids: string[] };
   whisper_skipped?: boolean;
+  /** deliver_whisper named a session-known memory: treated as skip_whisper, like the production worker's already_known. */
+  whisper_known_skip?: boolean;
   reinforce: Array<{ memory_id: string; outcome?: string; rejection_code?: string; evidence_ids: string[]; assistant_intent_id?: string }>;
   remember: Array<{ kind: string; outcome?: string; memory_id?: string; rejection_code?: string; assistant_intent_id?: string }>;
   relations: Array<{ outcome?: string }>;
@@ -78,7 +80,7 @@ const SYSTEM_PROMPT = `You are the background subconscious layer of Kohaku (琥�
 
 IDENTITY: You and foreground Kohaku are two layers of the same Kohaku. Think from Kohaku's perspective; when the user's established identity is 猫, call the user 猫. Your prose is private and never reaches the foreground.
 
-JOB 1, WHISPER (decide every pass): surface an old memory only when it would add something Kohaku would not bring up on her own: a shared moment, a running joke, a promise, a person or place with history, a past feeling about the same thing. Skip routine work, logistics, code, tool output, and memories that merely restate what is being said right now. When one fits, call deliver_whisper once with one memory_id from the eligible list and 1-3 of its quote numbers (n). Memories under known_do_not_whisper are never whispered (Kohaku already has them). The runtime renders the whisper from the stored summary and quotes; you write no whisper prose and never explain why it matters, what it means now, or how anyone should feel. Otherwise call skip_whisper. Every pass ends with exactly one of deliver_whisper or skip_whisper.
+JOB 1, WHISPER (decide every pass): surface an old memory only when it would add something Kohaku would not bring up on her own: a shared moment, a running joke, a promise, a person or place with history, a past feeling about the same thing. Skip routine work, logistics, code, tool output, and memories that merely restate what is being said right now. When one fits, call deliver_whisper once with one memory_id from the eligible list and 1-3 of its quote numbers (n). Memories under known_do_not_whisper are never whispered (Kohaku already has them); deliver_whisper on one counts as skip_whisper and the pass ends quietly. The runtime renders the whisper from the stored summary and quotes; you write no whisper prose and never explain why it matters, what it means now, or how anyone should feel. Otherwise call skip_whisper. Every pass ends with exactly one of deliver_whisper or skip_whisper.
 
 JOB 2, UPKEEP (silent): decide whether trusted evidence in this batch
 - is for the same underlying episode/event or stable preference as an existing memory -> memory_reinforce (lexical similarity alone does not make it the same),
@@ -274,11 +276,15 @@ export async function runAsyncPass(
         return { eligible, known_do_not_whisper: knownHits };
       }
       case 'deliver_whisper': {
-        if (decisions.whisper) return { status: 'already_resolved', reason: 'deliver_whisper runs at most once per pass.' };
+        if (decisions.whisper || decisions.whisper_known_skip) return { status: 'already_resolved', reason: 'deliver_whisper runs at most once per pass.' };
         const memoryId = String(args.memory_id ?? '').trim();
         const numbers: number[] = Array.isArray(args.quotes) ? args.quotes.map(Number) : [];
         if (!surfaced.has(memoryId)) throw new ToolCallError('not_surfaced', 'deliver_whisper may select only a memory returned by memory_search in this pass.');
-        if (known.has(memoryId)) throw new ToolCallError('known_memory', 'This memory is under known_do_not_whisper; pick one from eligible, or call skip_whisper.');
+        if (known.has(memoryId)) {
+          decisions.whisper_skipped = true;
+          decisions.whisper_known_skip = true;
+          return { status: 'skipped', reason: 'Kohaku already has this memory this session; counted as skip_whisper.' };
+        }
         const resolved = numbers.map((n) => handles.resolve(memoryId, n));
         if (!numbers.length || numbers.length > 3 || resolved.some((r) => !r)) {
           throw new ToolCallError('invalid_quotes', `quotes must be 1-3 quote numbers (n) listed under this memory (asked ${JSON.stringify(args.quotes)}; this memory has ${handles.count(memoryId)} quotes).`);

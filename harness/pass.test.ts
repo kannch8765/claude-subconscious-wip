@@ -25,12 +25,19 @@ function scripted(steps: Call[][]): ChatTransport {
   };
 }
 
-function run(steps: Call[][], maxSteps = 4) {
+function run(steps: Call[][], maxSteps = 4, opts: { known?: string[]; hits?: string[] } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pass-test-'));
   dirs.push(root);
   const runtime = new RelationshipMemoryRuntime(new RelationshipMemoryStore(root, 'local-user'), new Map(), () => new Date().toISOString(), new Map(), true);
+  if (opts.hits) {
+    // Search returns made-up memories with one quote each, so deliver_whisper has something to pick.
+    (runtime as any).memorySearchRecallHybridWithEvidence = async () => opts.hits!.map((memory_id) => ({
+      memory_id, kind: 'inside_joke', summary: 'made up', participants: [], observed_at: '2026-10-01T00:00:00Z', payload: {},
+      quote_snippets: [{ snippet_id: `${memory_id}-q1`, role: 'user', captured_at: '2026-10-01T00:00:00Z', quote: 'made up' }],
+    }));
+  }
   return runAsyncPass(runtime, scripted(steps), {
-    batchId: 'batch-test', sessionId: 's', latestUserMessage: '今天好累', canonicalMessages: [], assistantIntents: [], sessionKnownMemoryIds: [], recentSeen: [],
+    batchId: 'batch-test', sessionId: 's', latestUserMessage: '今天好累', canonicalMessages: [], assistantIntents: [], sessionKnownMemoryIds: opts.known ?? [], recentSeen: [],
   }, { model: 'm', maxSteps });
 }
 
@@ -60,6 +67,28 @@ describe('async pass completion', () => {
     const result = await run([[search], [{ name: 'deliver_whisper', args: { memory_id: 'not-surfaced', quotes: [1] } }]], 2);
     expect(result.tool_errors.length).toBeGreaterThan(0);
     expect(result.succeeded).toBe(false);
+  });
+
+  it('treats a whisper of a session-known memory as a quiet skip, not an error', async () => {
+    const result = await run([[search], [{ name: 'deliver_whisper', args: { memory_id: 'mem_known', quotes: [1] } }]], 2, { known: ['mem_known'], hits: ['mem_known', 'mem_new'] });
+    expect(result.tool_errors).toEqual([]);
+    expect(result.succeeded).toBe(true);
+    expect(result.decisions.whisper).toBeUndefined();
+    expect(result.decisions).toMatchObject({ whisper_skipped: true, whisper_known_skip: true });
+    expect(result.steps).toHaveLength(2);
+  });
+
+  it('does not let a second deliver_whisper replace a known skip', async () => {
+    const result = await run([[search], [{ name: 'deliver_whisper', args: { memory_id: 'mem_known', quotes: [1] } }, { name: 'deliver_whisper', args: { memory_id: 'mem_new', quotes: [1] } }]], 2, { known: ['mem_known'], hits: ['mem_known', 'mem_new'] });
+    expect(result.decisions.whisper).toBeUndefined();
+    expect(result.decisions.whisper_known_skip).toBe(true);
+  });
+
+  it('still whispers an eligible memory', async () => {
+    const result = await run([[search], [{ name: 'deliver_whisper', args: { memory_id: 'mem_new', quotes: [1] } }]], 2, { known: ['mem_known'], hits: ['mem_known', 'mem_new'] });
+    expect(result.succeeded).toBe(true);
+    expect(result.decisions.whisper).toEqual({ memory_id: 'mem_new', snippet_ids: ['mem_new-q1'] });
+    expect(result.decisions.whisper_known_skip).toBeUndefined();
   });
 
   it('records unknown tool names as unknown', async () => {

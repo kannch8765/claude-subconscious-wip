@@ -313,6 +313,19 @@ describe('async trace', () => {
     expectClean(trace, result);
   });
 
+  it('a whisper of a session-known memory is a skip with a flag, not an error', async () => {
+    const { store, runtime, input, seedId } = await setup();
+    const known = { ...input, sessionKnownMemoryIds: [seedId] };
+    const result = await runAsyncPass(runtime, scripted([
+      { calls: [search] },
+      { calls: [{ name: 'deliver_whisper', args: { memory_id: seedId, quotes: [1] } }] },
+    ]), known, { model: 'm', maxSteps: 4 });
+    const trace = toAsyncTrace(result, asyncTrust(store, known));
+    expect(trace).toMatchObject({ succeeded: true, whisper: 'skipped', whisper_known_skip: true, tool_errors: [] });
+    expect(trace).not.toHaveProperty('whisper_memory_id');
+    expectClean(trace, result);
+  });
+
   it('ids padded with whitespace resolve as the runtime resolves them', async () => {
     const { store, runtime, input, seedId } = await setup();
     const result = await runAsyncPass(runtime, scripted([

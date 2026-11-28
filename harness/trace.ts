@@ -138,6 +138,8 @@ export interface AsyncPassTrace extends TraceHead {
   steps: AsyncStepTrace[];
   /** What the pass selected. Delivery is a receipt from the hook or the queue, not part of a pass trace. */
   whisper: 'selected' | 'skipped' | 'none';
+  /** The skip came from a deliver_whisper on a session-known memory. */
+  whisper_known_skip?: true;
   whisper_memory_id?: string;
   whisper_quotes?: number;
   reinforce: ReinforceTrace[];
@@ -312,6 +314,7 @@ export function toAsyncTrace(result: PassResult, trust: AsyncTrust): AsyncPassTr
     succeeded: result.succeeded === true,
     steps,
     whisper: decisions.whisper ? 'selected' as const : decisions.whisper_skipped === true ? 'skipped' as const : 'none' as const,
+    whisper_known_skip: decisions.whisper_known_skip === true ? true as const : undefined,
     whisper_memory_id: whisperMemoryId,
     whisper_quotes: decisions.whisper ? list(decisions.whisper.snippet_ids).length : undefined,
     reinforce,
