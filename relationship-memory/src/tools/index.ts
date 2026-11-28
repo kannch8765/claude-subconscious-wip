@@ -414,11 +414,8 @@ export class RelationshipMemoryRuntime {
     const distinct = new Map<string, EffectiveMemoryRecord>();
     for (const memory of lists.flat()) if (!distinct.has(memory.memory_id)) distinct.set(memory.memory_id, memory);
     const attached = new Map(this.attachRecallEvidence([...distinct.values()]).map((memory) => [memory.memory_id, memory] as const));
-    // Each list gets its own objects, as separate single calls would return.
-    return lists.map((list) => list.map((memory) => {
-      const result = attached.get(memory.memory_id)!;
-      return { ...result, quote_snippets: [...result.quote_snippets] };
-    }));
+    // Each list gets its own copies, as separate single calls would return.
+    return lists.map((list) => list.map((memory) => structuredClone(attached.get(memory.memory_id)!)));
   }
 
   async memorySearchMaintenanceCurrentWithEvidence(query: SearchQuery): Promise<MemoryRecallResult[]> {

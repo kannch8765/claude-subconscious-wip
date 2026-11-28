@@ -6,8 +6,10 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   DashScopeQwenEmbeddingProvider,
   FileBackedSemanticRetriever,
+  RelationshipMemoryResolutionControlPlane,
   RelationshipMemoryRuntime,
   RelationshipMemoryStore,
+  type AssistantRememberIntentRecord,
   type CanonicalMessage,
   type EmbeddingProvider,
   type SearchQuery,
@@ -101,7 +103,16 @@ const EVENTS: CanonicalMessage[] = [
   userEvent('club-first', day(50), 'The lantern club meets on Mondays now.'),
   userEvent('club-changed', day(60), 'The lantern club moved its meetings to Thursdays.'),
   userEvent('late', day(70), 'A fresh note about saffron moss kept after the index was built.'),
+  userEvent('kite-a', day(30), 'Flying the paper kite at the windy pier is my favourite.'),
+  userEvent('kite-b', day(31), 'Nothing beats a paper kite over the windy pier.'),
+  userEvent('pebble', day(32), 'I collect striped pebbles from the shore path.'),
 ];
+const INTENT: AssistantRememberIntentRecord = {
+  schema_version: 1, intent_id: 'intent-pebble', subject_id: 'subject', session_id: 'session-many',
+  assistant_message_id: 'assistant-pebble', tool_use_id: 'tool-pebble', tool_name: 'remember',
+  memory: { text: 'Striped pebble collecting walks' }, feel: { text: 'Glad to hear about the pebbles' },
+  captured_at: day(32),
+};
 const TOPIC = 'Lantern club meeting day';
 
 interface Fixture {
@@ -115,6 +126,8 @@ interface Fixture {
   retriever: FileBackedSemanticRetriever;
   worldId: string;
   preferenceIds: string[];
+  kiteIds: string[];
+  pebbleId: string;
 }
 
 async function fixture(): Promise<Fixture> {
@@ -122,12 +135,14 @@ async function fixture(): Promise<Fixture> {
   const storeDir = path.join(root, 'store');
   const indexFile = path.join(root, 'semantic-index', 'index.json');
   const store = new RelationshipMemoryStore(storeDir, 'subject');
+  store.appendAssistantIntent(INTENT);
+  const intents = new Map([[INTENT.intent_id, INTENT]]);
   const dashScope = fakeDashScope();
   const provider = new DashScopeQwenEmbeddingProvider({ apiKey: 'test-key', dimensions: DIMENSIONS, fetchFn: dashScope.fetchFn });
   const retriever = new FileBackedSemanticRetriever(provider, indexFile);
   const clock = { now: day(80) };
   const messages = new Map(EVENTS.map((item) => [item.evidence_id!, item]));
-  const runtime = new RelationshipMemoryRuntime(store, messages, () => clock.now, new Map(), false, retriever);
+  const runtime = new RelationshipMemoryRuntime(store, messages, () => clock.now, intents, false, retriever);
 
   const preferenceIds = PREFERENCES.map(({ index, first, second }) => {
     const result = runtime.rememberKind(`batch-pref-${index}`, 'user_preference', {
@@ -146,6 +161,23 @@ async function fixture(): Promise<Fixture> {
   });
   expect(world.outcome).toBe('accepted');
   expect(runtime.worldUpdate('batch-club-2', { memory_id: world.memory_id!, fact: 'The lantern club meets on Thursdays', evidence_ids: ['ev-club-changed'] }).outcome).toBe('accepted');
+  // Two memories of one meaning, merged by the owner into one card with two source ids.
+  const kiteIds = ['kite-a', 'kite-b'].map((id, index) => {
+    const result = runtime.rememberKind(`batch-${id}`, 'user_preference', {
+      summary: index === 0 ? 'Loves flying a paper kite at the pier' : 'Paper kite over the windy pier', participants: ['user'], evidence_ids: [`ev-${id}`],
+      payload: { topic: 'paper kite', preference: index === 0 ? 'kite flying at the windy pier' : 'a paper kite over the pier' },
+    });
+    expect(result.outcome).toBe('accepted');
+    return result.memory_id!;
+  });
+  const review = runtime.suggestMaintenanceReview('batch-kite-review', 'relation', { memory_ids: kiteIds, relation: 'same_meaning', reason: 'one kite habit' });
+  new RelationshipMemoryResolutionControlPlane(store, () => clock.now).resolveReview(review.review_id!, { resolution_id: 'res-kite', relation: 'same_meaning', target_memory_id: kiteIds[0] });
+  // Remembered through a trusted assistant intent: linked intent text and the owner boost.
+  const pebble = runtime.rememberKind('batch-pebble', 'user_preference', {
+    summary: 'Collects striped pebbles', participants: ['user'], evidence_ids: ['ev-pebble'], assistant_intent_id: INTENT.intent_id,
+    payload: { topic: 'pebbles', preference: 'striped pebbles from the shore path' },
+  });
+  expect(pebble.outcome).toBe('accepted');
   await runtime.prepareCurrentMemorySemanticIndex();
   // Written after the index was built: no vector, so it can only match lexically.
   expect(runtime.rememberKind('batch-late', 'user_preference', {
@@ -155,8 +187,8 @@ async function fixture(): Promise<Fixture> {
 
   dashScope.state.documentRequests.length = 0;
   dashScope.state.queryRequests.length = 0;
-  const lexicalRuntime = new RelationshipMemoryRuntime(store, messages, () => clock.now, new Map(), false);
-  return { root, indexFile, store, runtime, lexicalRuntime, dashScope, provider, retriever, worldId: world.memory_id!, preferenceIds };
+  const lexicalRuntime = new RelationshipMemoryRuntime(store, messages, () => clock.now, intents, false);
+  return { root, indexFile, store, runtime, lexicalRuntime, dashScope, provider, retriever, worldId: world.memory_id!, preferenceIds, kiteIds, pebbleId: pebble.memory_id! };
 }
 
 async function singles(runtime: RelationshipMemoryRuntime, queries: readonly SearchQuery[], signal?: AbortSignal) {
@@ -225,6 +257,33 @@ describe('memorySearchRecallHybridManyWithEvidence', () => {
     }
   });
 
+  it('serves a merged pair as one card and keeps the linked intent and owner boost, as the single call does', async () => {
+    const f = await fixture();
+    const queries: SearchQuery[] = [
+      { query: 'paper kite pier' },
+      { query: 'striped pebbles' },
+      { query: 'pebble walks', trigger: 'glad to hear' },
+      { query: 'paper kite', excludeMemoryIds: [f.kiteIds[1]] },
+      { kind: 'user_preference', time_start: day(29) },
+    ];
+
+    const many = await f.runtime.memorySearchRecallHybridManyWithEvidence(queries);
+
+    expect(many).toEqual(await singles(f.runtime, queries));
+    const kite = many[0].find((memory) => memory.memory_id === f.kiteIds[0])!;
+    expect(kite.resolution_source_memory_ids).toEqual(expect.arrayContaining(f.kiteIds));
+    expect(many[0].map((memory) => memory.memory_id)).not.toContain(f.kiteIds[1]);
+    expect(kite.quote_snippets.map((snippet) => snippet.quote).sort()).toEqual([
+      'Flying the paper kite at the windy pier is my favourite.', 'Nothing beats a paper kite over the windy pier.',
+    ]);
+    expect(many[1][0].memory_id).toBe(f.pebbleId);
+    // The trigger matches only the linked intent's feel text.
+    expect(many[2].map((memory) => memory.memory_id)).toEqual([f.pebbleId]);
+    // Excluding either source id hides the merged card.
+    expect(many[3].map((memory) => memory.memory_id)).not.toContain(f.kiteIds[0]);
+    expect(many[4].map((memory) => memory.memory_id)).toEqual(expect.arrayContaining([f.kiteIds[0], f.pebbleId]));
+  });
+
   it('applies kind, participant, trigger, linked memory, time range and excluded ids per query in one call', async () => {
     const f = await fixture();
     const queries: SearchQuery[] = [
@@ -268,9 +327,11 @@ describe('memorySearchRecallHybridManyWithEvidence', () => {
 
     expect(f.dashScope.state.queryRequests.splice(0)).toEqual([['amber jar']]);
     expect(many).toEqual(await singles(f.runtime, queries));
-    // Separate objects per list, as separate single calls would give.
+    // Separate objects per list, down to nested fields, as separate single calls would give.
     expect(many[1][0]).not.toBe(many[0][0]);
-    expect(many[1][0].quote_snippets).not.toBe(many[0][0].quote_snippets);
+    expect(many[1][0].payload).not.toBe(many[0][0].payload);
+    expect(many[1][0].participants).not.toBe(many[0][0].participants);
+    expect(many[1][0].quote_snippets[0]).not.toBe(many[0][0].quote_snippets[0]);
   });
 
   it.each(['fail', 'bad_vector'] as const)('falls back to lexical for every query when the batch embedding %s, as each single call does', async (mode) => {
@@ -366,7 +427,7 @@ describe('memorySearchRecallHybridManyWithEvidence', () => {
 
     const events = fs.readFileSync(timingFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
     expect(events.filter((event) => event.segment === 'semantic_query_embedding_external_batch')).toEqual([
-      expect.objectContaining({ query_count: 4, request_count: 1, usable_document_count: 25 }),
+      expect.objectContaining({ query_count: 4, request_count: 1, usable_document_union_count: 27 }),
     ]);
     expect(events.filter((event) => event.segment === 'semantic_query_embedding_external')).toEqual([]);
     expect(events.filter((event) => event.segment === 'semantic_local_vector_comparison')).toHaveLength(4);

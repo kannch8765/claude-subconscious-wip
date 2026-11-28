@@ -536,7 +536,8 @@ export class FileBackedSemanticRetriever implements SemanticRetriever {
       emitRecallTimingSegment('semantic_query_embedding_external_batch', embedStartedAt, {
         query_count: texts.length,
         request_count: this.provider.embedQueries ? Math.ceil(texts.length / this.provider.maxBatchSize) : texts.length,
-        usable_document_count: new Set(usable.flatMap((items) => items.map(([id]) => id))).size,
+        // Distinct usable documents across all requests; the per-query comparison segments keep their own counts.
+        usable_document_union_count: new Set(usable.flatMap((items) => items.map(([id]) => id))).size,
       });
     } catch (error) {
       if (!signal?.aborted) writeProviderCooldown(this.indexFile, this.provider.fingerprint, error);
