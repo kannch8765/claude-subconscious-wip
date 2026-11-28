@@ -1012,6 +1012,38 @@ describe('world_update merges refuse shared evidence', () => {
     expect(store.listMemoryResolutionRecords()).toHaveLength(resolutionsBefore);
   }
 
+  it('re-checks the reviewed memories inside the lock: a member merged away by a racing resolve is refused as stale', () => {
+    const ctx = setupWith();
+    const { store, runtime, clock, resolution } = ctx;
+    // A and C share the OTHER block; B shares nothing with either.
+    const a = runtime.rememberKind('batch-a', 'world_update', railAnchor([OTHER.evidence_id!])).memory_id!;
+    clock.now = '2026-05-04T09:00:00.000Z';
+    const b = runtime.rememberKind('batch-b', 'world_update', railAnchor([FRESH.evidence_id!])).memory_id!;
+    clock.now = '2026-05-05T09:00:00.000Z';
+    const c = runtime.rememberKind('batch-c', 'world_update', railAnchor([OTHER_REPLAY.evidence_id!])).memory_id!;
+    const reviewAB = suggest(runtime, [a, b], 'same_meaning');
+    const reviewBC = suggest(runtime, [b, c], 'same_meaning');
+    expect([reviewAB.outcome, reviewBC.outcome]).toEqual(['accepted', 'accepted']);
+    // The racing resolve lands after the (B, C) resolve passed its early checks, just before it takes the lock.
+    const original = store.withMutationBoundary.bind(store);
+    let raced = false;
+    (store as any).withMutationBoundary = <T>(fn: () => T): T => {
+      if (!raced) {
+        raced = true;
+        resolution.resolveReview(reviewAB.review_id!, { resolution_id: 'res-ab', relation: 'same_meaning', target_memory_id: a });
+      }
+      return original(fn);
+    };
+    try {
+      expect(() => resolution.resolveReview(reviewBC.review_id!, { resolution_id: 'res-bc', relation: 'same_meaning', target_memory_id: c }))
+        .toThrow(/no longer current/);
+    } finally {
+      (store as any).withMutationBoundary = original;
+    }
+    expect(raced).toBe(true);
+    expect(store.listMemoryResolutionRecords().map((record: any) => record.resolution_id)).toEqual(['res-ab']);
+  });
+
   it('Round 3 repro: a confirmation and a newer revision share the handover block; the merge is refused and A serves Lily', async () => {
     const ctx = setupWith();
     const { root, store, runtime, clock } = ctx;
