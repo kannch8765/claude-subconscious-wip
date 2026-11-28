@@ -9,9 +9,14 @@
  * max_rss_mb is the process peak; rss_mb and heap_used_mb are taken after a
  * forced GC, so heap_used_mb shows what the cache keeps resident.
  *
- *   npx tsx scripts/bench_recall_read_cache.ts [--dir <path>] [--runs 15]
+ *   npx tsx scripts/bench_recall_read_cache.ts [--dir <path>] [--runs 15] [--embed-ms 0]
  *
  * Set RELATIONSHIP_MEMORY_READ_CACHE=off to time the uncached read path.
+ *
+ * --embed-ms <n> makes every fake query embedding request sleep n ms (default 0), so
+ * the single4 / single4seq / many4 rows compare four single searches with one
+ * memorySearchRecallHybridManyWithEvidence call. A many call sends one request per
+ * 10 queries (the DashScope text-embedding-v4 batch size).
  */
 import { spawnSync } from 'node:child_process';
 import * as crypto from 'node:crypto';
@@ -35,7 +40,8 @@ const DATASET_VERSION = 'bench-v2';
 const SUBJECT_ID = 'bench-subject';
 const SCALE = { memories: 2_200, evidence: 37_000, reinforcements: 3_000, intents: 120 };
 const DIMENSIONS = 1024;
-const SCENARIOS = ['index', 'recall1', 'recall4', 'append'] as const;
+const SCENARIOS = ['index', 'recall1', 'recall4', 'append', 'single4', 'single4seq', 'many1', 'many4'] as const;
+const QUERY_BATCH_SIZE = 10;
 type Scenario = (typeof SCENARIOS)[number];
 
 function mulberry32(seed: number): () => number {
@@ -58,13 +64,27 @@ function vectorFor(text: string): number[] {
   return Array.from({ length: DIMENSIONS }, () => rand() * 2 - 1);
 }
 
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 class FakeEmbeddingProvider implements EmbeddingProvider {
   readonly fingerprint = 'bench-fake-provider-v1';
   readonly model = 'bench-fake';
   readonly dimensions = DIMENSIONS;
-  readonly maxBatchSize = 100_000;
+  /** Only query requests sleep: the dataset is built once with one big document batch. */
+  constructor(readonly maxBatchSize = 100_000, private readonly requestMs = 0) {}
   async embedDocuments(texts: string[]): Promise<number[][]> { return texts.map((text) => vectorFor(`doc:${text}`)); }
-  async embedQuery(text: string): Promise<number[]> { return vectorFor(`query:${text}`); }
+  async embedQuery(text: string): Promise<number[]> {
+    if (this.requestMs > 0) await sleep(this.requestMs);
+    return vectorFor(`query:${text}`);
+  }
+  async embedQueries(texts: string[]): Promise<number[][]> {
+    const vectors: number[][] = [];
+    for (let offset = 0; offset < texts.length; offset += this.maxBatchSize) {
+      if (this.requestMs > 0) await sleep(this.requestMs);
+      vectors.push(...texts.slice(offset, offset + this.maxBatchSize).map((text) => vectorFor(`query:${text}`)));
+    }
+    return vectors;
+  }
 }
 
 /** Made-up vocabulary: ASCII pseudo-words plus runs of random Han code points. */
@@ -210,7 +230,7 @@ async function timed(operation: () => Promise<unknown>): Promise<number> {
   return performance.now() - startedAt;
 }
 
-async function runChild(scenario: Scenario, dir: string, runs: number): Promise<void> {
+async function runChild(scenario: Scenario, dir: string, runs: number, embedMs: number): Promise<void> {
   const source = datasetPaths(dir);
   let storeDir = source.storeDir;
   let workDir: string | undefined;
@@ -220,10 +240,11 @@ async function runChild(scenario: Scenario, dir: string, runs: number): Promise<
     storeDir = path.join(workDir, 'store');
   }
   const queries = (JSON.parse(fs.readFileSync(source.marker, 'utf8')) as { queries: string[] }).queries;
-  const retriever = new FileBackedSemanticRetriever(new FakeEmbeddingProvider(), source.indexFile);
+  const retriever = new FileBackedSemanticRetriever(new FakeEmbeddingProvider(QUERY_BATCH_SIZE, embedMs), source.indexFile);
   // Recall sessions build a fresh read-only store and runtime for every recall.
   const runtime = () => new RelationshipMemoryRuntime(new RelationshipMemoryStore(storeDir, SUBJECT_ID, undefined, false), new Map(), undefined, new Map(), false, retriever);
   const recall = (query: string) => runtime().memorySearchRecallHybridWithEvidence({ query, limit: 10 });
+  const four = (run: number) => [0, 1, 2, 3].map((offset) => ({ query: queries[(run * 4 + offset) % queries.length], limit: 10 }));
   const rand = mulberry32(7);
   const words = vocabulary(rand);
   const text = textGenerator(rand, words);
@@ -236,6 +257,19 @@ async function runChild(scenario: Scenario, dir: string, runs: number): Promise<
         return timed(() => recall(queries[run % queries.length]));
       case 'recall4':
         return timed(() => Promise.all([0, 1, 2, 3].map((offset) => recall(queries[(run * 4 + offset) % queries.length]))));
+      // The harness pass today: one runtime, four single searches in parallel.
+      case 'single4': {
+        const shared = runtime();
+        return timed(() => Promise.all(four(run).map((query) => shared.memorySearchRecallHybridWithEvidence(query))));
+      }
+      case 'single4seq': {
+        const shared = runtime();
+        return timed(async () => { for (const query of four(run)) await shared.memorySearchRecallHybridWithEvidence(query); });
+      }
+      case 'many1':
+        return timed(() => runtime().memorySearchRecallHybridManyWithEvidence([{ query: queries[run % queries.length], limit: 10 }]));
+      case 'many4':
+        return timed(() => runtime().memorySearchRecallHybridManyWithEvidence(four(run)));
       case 'append': {
         if (run > 0) {
           // Another process appends one new memory plus its evidence between recalls.
@@ -285,22 +319,23 @@ function argValue(name: string): string | undefined {
 async function main(): Promise<void> {
   const dir = path.resolve(argValue('--dir') ?? path.join(os.tmpdir(), `relationship-memory-recall-bench-${DATASET_VERSION}`));
   const runs = Math.max(1, Number.parseInt(argValue('--runs') ?? '15', 10) || 15);
+  const embedMs = Math.max(0, Number.parseInt(argValue('--embed-ms') ?? '0', 10) || 0);
   const child = argValue('--child') as Scenario | undefined;
-  if (child) return runChild(child, dir, runs);
+  if (child) return runChild(child, dir, runs, embedMs);
 
   await generateDataset(dir);
   const sizes = fs.readdirSync(datasetPaths(dir).storeDir).filter((name) => name.endsWith('.jsonl'))
     .reduce((sum, name) => sum + fs.statSync(path.join(datasetPaths(dir).storeDir, name)).size, 0);
   console.log(`dataset ${dir}: store ${(sizes / 1048576).toFixed(1)} MB, index ${(fs.statSync(datasetPaths(dir).indexFile).size / 1048576).toFixed(1)} MB`);
-  console.log(`read cache: ${process.env.RELATIONSHIP_MEMORY_READ_CACHE ?? '(default)'}; runs per scenario: ${runs}`);
-  console.log('scenario  cold_ms  warm_p50_ms  warm_p95_ms  max_rss_mb  rss_mb  heap_used_mb');
+  console.log(`read cache: ${process.env.RELATIONSHIP_MEMORY_READ_CACHE ?? '(default)'}; runs per scenario: ${runs}; query embedding request: ${embedMs} ms`);
+  console.log('scenario    cold_ms  warm_p50_ms  warm_p95_ms  max_rss_mb  rss_mb  heap_used_mb');
   const self = fileURLToPath(import.meta.url);
   for (const scenario of SCENARIOS) {
-    const result = spawnSync(process.execPath, [...process.execArgv, '--expose-gc', self, '--child', scenario, '--dir', dir, '--runs', String(runs)], { encoding: 'utf8', env: process.env });
+    const result = spawnSync(process.execPath, [...process.execArgv, '--expose-gc', self, '--child', scenario, '--dir', dir, '--runs', String(runs), '--embed-ms', String(embedMs)], { encoding: 'utf8', env: process.env });
     if (result.status !== 0) throw new Error(`scenario ${scenario} failed: ${result.stderr}`);
     const row = JSON.parse(result.stdout.trim().split('\n').at(-1)!) as Record<string, number | string>;
     const fmt = (key: string) => (row[key] as number).toFixed(1).padStart(key.length);
-    console.log(`${String(row.scenario).padEnd(8)}  ${fmt('cold_ms')}  ${fmt('warm_p50_ms')}  ${fmt('warm_p95_ms')}  ${fmt('max_rss_mb')}  ${fmt('rss_mb')}  ${fmt('heap_used_mb')}`);
+    console.log(`${String(row.scenario).padEnd(10)}  ${fmt('cold_ms')}  ${fmt('warm_p50_ms')}  ${fmt('warm_p95_ms')}  ${fmt('max_rss_mb')}  ${fmt('rss_mb')}  ${fmt('heap_used_mb')}`);
   }
 }
 
