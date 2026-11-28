@@ -66,21 +66,16 @@ export interface RememberResult {
   entity_id?: string;
   rejection_code?: string;
   reason?: string;
-  /** Cited ids a successful call left off because they are self_note / meta_text; see NOT_CITABLE_REASON. */
-  skipped_evidence_ids?: string[];
-  skipped_reason?: string;
 }
 
-const NOT_CITABLE_REASON = "self_note (the agent's own scheduled prompt firing) and meta_text (runtime or system text) are not the user's words, so they cannot be cited as evidence";
+/**
+ * A call citing any self_note / meta_text id is rejected whole, before any write: dropping just those ids could keep a
+ * claim they alone supported. The rejection leaves a linked remember intent open, so a corrected call can still use it.
+ */
+const NOT_CITABLE_EVIDENCE = 'not_citable_evidence';
 
 function notCitableRejection(ids: readonly string[]): string {
-  return `Every cited evidence id is self_note / meta_text: ${NOT_CITABLE_REASON}. Cite user_text, assistant_text, assistant_tool_use or tool_result evidence instead. Not citable: ${ids.join(', ')}`;
-}
-
-/** A call that attached its citable evidence reports the ids it left off; other outcomes pass through unchanged. */
-function withSkipped(result: RememberResult, skipped: readonly string[]): RememberResult {
-  if (skipped.length === 0 || (result.outcome !== 'accepted' && result.outcome !== 'duplicate')) return result;
-  return { ...result, skipped_evidence_ids: [...skipped], skipped_reason: NOT_CITABLE_REASON };
+  return `Cited evidence includes self_note (the agent's own scheduled prompt firing) or meta_text (runtime or system text). Neither is the user's words, so neither can be cited, and nothing was saved. Resubmit citing only user_text, assistant_text, assistant_tool_use or tool_result evidence that itself supports every claim; drop any claim only these ids supported. Not citable: ${ids.join(', ')}`;
 }
 
 export type MemoryRememberToolName = `memory_remember_${MemoryKind}`;
@@ -672,7 +667,7 @@ export class RelationshipMemoryRuntime {
       if (isCitableEvidenceKind(resolved.message.event_kind)) evidenceMessages.push(resolved.message);
       else skipped.push(evidenceId);
     }
-    if (evidenceMessages.length === 0) return this.entityPermanent(batchId, sourceKey, 'not_citable_evidence', notCitableRejection(skipped), now);
+    if (skipped.length > 0) return this.entityPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
     const recovered = this.store.getEntityBySourceKey(sourceKey);
     if (recovered) {
       const recoveredEvidence: EntityEvidenceRecord[] = evidenceMessages.map((message) => ({
@@ -690,7 +685,7 @@ export class RelationshipMemoryRuntime {
       } catch (error) {
         return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now);
       }
-      return withSkipped(this.entityOutcome(batchId, sourceKey, 'duplicate', recovered.entity_id, now), skipped);
+      return this.entityOutcome(batchId, sourceKey, 'duplicate', recovered.entity_id, now);
     }
 
     const aliases = proposal.aliases.map(normalizeEntityAlias);
@@ -704,7 +699,7 @@ export class RelationshipMemoryRuntime {
         && existing.description === proposal.description
         && [...proposalNames].every((alias) => existingAliases.has(alias));
       if (!sameIdentity) return this.entityPermanent(batchId, sourceKey, 'alias_collision', `Alias already belongs to canonical entity ${existing.canonical_name}.`, now);
-      return withSkipped(this.entityOutcome(batchId, sourceKey, 'duplicate', existing.entity_id, now), skipped);
+      return this.entityOutcome(batchId, sourceKey, 'duplicate', existing.entity_id, now);
     }
     const entityId = stableId('entity', { subject_id: this.store.subjectId, canonical_name: normalizeEntityAlias(proposal.canonical_name) });
     const entity: EntityIdentityRecord = {
@@ -717,7 +712,7 @@ export class RelationshipMemoryRuntime {
       ...evidenceProvenance(message),
     }));
     try { this.store.appendEntity(entity, evidence); } catch (error) { return this.entityRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now); }
-    return withSkipped(this.entityOutcome(batchId, sourceKey, 'accepted', entityId, now), skipped);
+    return this.entityOutcome(batchId, sourceKey, 'accepted', entityId, now);
   }
 
   private trustedIntent(intentId: string | undefined): AssistantRememberIntentRecord | undefined {
@@ -950,7 +945,7 @@ export class RelationshipMemoryRuntime {
       if (isCitableEvidenceKind(resolved.message.event_kind)) messages.push(resolved.message);
       else skipped.push(id);
     }
-    if (messages.length === 0) return this.persistPermanent(batchId, sourceKey, 'not_citable_evidence', notCitableRejection(skipped), now);
+    if (skipped.length > 0) return this.persistPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
     const memoryEvidence = this.store.listEvidence().filter((item) => item.memory_id === memoryId);
     const originalEvidenceIds = this.originalMemoryEvidenceIds(memory, memoryEvidence);
     if (!originalEvidenceIds) return this.markRetryable(batchId, sourceKey, `Unable to reconstruct canonical evidence provenance for memory: ${memoryId}`, now, intent);
@@ -971,7 +966,7 @@ export class RelationshipMemoryRuntime {
       attachedSources.add(source);
       return true;
     });
-    if (newMessages.length === 0) return withSkipped(this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent), skipped);
+    if (newMessages.length === 0) return this.persistOutcomePair(batchId, sourceKey, 'duplicate', memoryId, now, intent);
     const newMessageIds = newMessages.map(canonicalEvidenceId).sort();
     const evidence: EvidenceRecord[] = newMessages.map((message) => ({
       evidence_id: memoryEvidenceId(memoryId, message), memory_id: memoryId,
@@ -988,7 +983,7 @@ export class RelationshipMemoryRuntime {
     const existed = this.store.listReinforcements().some((item) => item.reinforcement_id === reinforcement.reinforcement_id);
     try { this.store.appendReinforcement(reinforcement, evidence); }
     catch (error) { return this.markRetryable(batchId, sourceKey, error instanceof Error ? error.message : String(error), now, intent); }
-    return withSkipped(this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now, intent, 'duplicate'), skipped);
+    return this.persistOutcomePair(batchId, sourceKey, existed ? 'duplicate' : 'accepted', memoryId, now, intent, 'duplicate');
   }
 
   rememberKind(batchId: string, kind: MemoryKind, rawInput: unknown): RememberResult {
@@ -1021,7 +1016,7 @@ export class RelationshipMemoryRuntime {
         previous.rejection_code ?? 'invalid_schema',
         previous.reason ?? 'Previously rejected proposal.',
         now,
-        rawTrustedIntent,
+        previous.rejection_code === NOT_CITABLE_EVIDENCE ? undefined : rawTrustedIntent,
       );
     }
 
@@ -1072,9 +1067,7 @@ export class RelationshipMemoryRuntime {
       if (isCitableEvidenceKind(resolved.message.event_kind)) evidenceMessages.push(resolved.message);
       else skipped.push(evidenceId);
     }
-    if (evidenceMessages.length === 0) {
-      return this.persistPermanent(batchId, sourceKey, 'not_citable_evidence', notCitableRejection(skipped), now, assistantIntent);
-    }
+    if (skipped.length > 0) return this.persistPermanent(batchId, sourceKey, NOT_CITABLE_EVIDENCE, notCitableRejection(skipped), now);
 
     const canonicalEvidenceIds = evidenceMessages.map(canonicalEvidenceId);
     const dedupeKey = stableId('dedupe', {
@@ -1106,7 +1099,7 @@ export class RelationshipMemoryRuntime {
         return this.markRetryable(batchId, sourceKey, reason, now, assistantIntent);
       }
       const repaired = this.persistOutcomePair(batchId, sourceKey, 'accepted', recoveredMemory.memory_id, now, assistantIntent);
-      return repaired.outcome === 'retryable_failed' ? repaired : withSkipped({ outcome: 'duplicate', memory_id: recoveredMemory.memory_id }, skipped);
+      return repaired.outcome === 'retryable_failed' ? repaired : { outcome: 'duplicate', memory_id: recoveredMemory.memory_id };
     }
 
     const semanticShape = stableJson({
@@ -1128,7 +1121,7 @@ export class RelationshipMemoryRuntime {
         }) === semanticShape)
       : this.store.getMemoryByDedupeKey(dedupeKey);
     if (semanticDuplicate) {
-      return withSkipped(this.persistOutcomePair(batchId, sourceKey, 'duplicate', semanticDuplicate.memory_id, now, assistantIntent), skipped);
+      return this.persistOutcomePair(batchId, sourceKey, 'duplicate', semanticDuplicate.memory_id, now, assistantIntent);
     }
 
     const memoryId = stableId('mem', { subject_id: this.store.subjectId, source_key: sourceKey });
@@ -1164,7 +1157,7 @@ export class RelationshipMemoryRuntime {
       const reason = error instanceof Error ? error.message : String(error);
       return this.markRetryable(batchId, sourceKey, reason, now, assistantIntent);
     }
-    return withSkipped(this.persistOutcomePair(batchId, sourceKey, 'accepted', memoryId, now, assistantIntent), skipped);
+    return this.persistOutcomePair(batchId, sourceKey, 'accepted', memoryId, now, assistantIntent);
   }
 
   /** Records a `deferred` outcome per unresolved intent and returns the ones that must still hold the batch. */

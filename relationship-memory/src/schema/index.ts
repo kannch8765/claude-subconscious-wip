@@ -9,9 +9,9 @@ export const MEMORY_KINDS = [
 export type MemoryKind = (typeof MEMORY_KINDS)[number];
 export type ParticipantRole = 'user' | 'assistant';
 /**
- * `self_note`: text on a user entry that repeats the prompt of an earlier ScheduleWakeup / CronCreate, i.e. the
- * agent's own scheduled note coming back. `meta_text`: other `isMeta` text on a user entry (runtime nudges, system
- * notes). Both stay visible to the observer, but neither is the user's words, so neither can back memory evidence.
+ * `self_note`: text on an `isMeta` user entry that repeats the prompt of an earlier ScheduleWakeup / CronCreate, i.e.
+ * the agent's own scheduled note coming back. `meta_text`: other `isMeta` text on a user entry (runtime nudges, system
+ * notes). Both stay visible to the observer, but neither is the user's words, so neither can be cited as evidence.
  */
 export type TranscriptEvidenceKind = 'user_text' | 'assistant_text' | 'assistant_tool_use' | 'tool_result' | 'self_note' | 'meta_text';
 const NON_CITABLE_EVIDENCE_KINDS: ReadonlySet<TranscriptEvidenceKind> = new Set(['self_note', 'meta_text']);

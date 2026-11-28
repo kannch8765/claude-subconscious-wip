@@ -55,18 +55,20 @@ function transcriptEventId(
 }
 
 const SCHEDULING_TOOL_NAMES = new Set(['ScheduleWakeup', 'CronCreate']);
-const SAFE_PROMPT_SOURCE = /^[A-Za-z0-9_-]{1,32}$/;
 
-/** Counts for one pass, metadata only: never any text. */
+/** Counts for one pass, metadata only: never any text or transcript field value. */
 export interface TranscriptTextStats {
   /** ScheduleWakeup / CronCreate prompts in the whole transcript, including before the pass. */
   scheduled_prompts: number;
   self_note: number;
   meta_text: number;
-  /** self_note matches on entries without `isMeta: true`: the sign that Claude Code changed its transcript format. */
-  self_note_without_is_meta: number;
-  /** promptSource of the self_note / meta_text entries: 'none' when absent, 'other' when not a short identifier. */
-  prompt_sources: Record<string, number>;
+  /**
+   * User text without `isMeta: true` that equals an earlier scheduled prompt. Kept as user_text: either the user
+   * typed the same words, or Claude Code stopped marking firings.
+   */
+  unmarked_prompt_match: number;
+  /** promptSource of the self_note / meta_text entries, in fixed buckets: only `sdk` is a known value. */
+  prompt_source: { sdk: number; other: number; none: number };
 }
 
 /**
@@ -100,9 +102,9 @@ export function buildCanonicalMessages(
 }
 
 /**
- * Text on a user entry is `self_note` when it equals the prompt of an earlier ScheduleWakeup / CronCreate (with or
- * without `isMeta`, so a format change can't turn it back into the user's words), else `meta_text` when the entry has
- * `isMeta: true`, else `user_text`.
+ * Text on a user entry marked `isMeta: true` is `self_note` when it equals the prompt of an earlier ScheduleWakeup /
+ * CronCreate, else `meta_text`. Text alone can't tell a firing from the user typing the same words, so text on an
+ * unmarked entry stays `user_text`; a match there is only counted (`unmarked_prompt_match`).
  */
 export function buildCanonicalMessagesWithStats(
   messages: TranscriptMessage[],
@@ -112,7 +114,9 @@ export function buildCanonicalMessagesWithStats(
   const result: CanonicalMessage[] = [];
   const toolNames = new Map<string, string>();
   const scheduled = scheduledPromptIndex(messages);
-  const stats: TranscriptTextStats = { scheduled_prompts: scheduled.count, self_note: 0, meta_text: 0, self_note_without_is_meta: 0, prompt_sources: {} };
+  const stats: TranscriptTextStats = {
+    scheduled_prompts: scheduled.count, self_note: 0, meta_text: 0, unmarked_prompt_match: 0, prompt_source: { sdk: 0, other: 0, none: 0 },
+  };
   for (let i = startIndex + 1; i < messages.length; i++) {
     const message = messages[i];
     if (message.type !== 'user' && message.type !== 'assistant') continue;
@@ -127,11 +131,13 @@ export function buildCanonicalMessagesWithStats(
       let quote: string | null = null;
       let toolName: string | undefined;
       let toolUseId: string | undefined;
+      let matchesEarlierPrompt = false;
 
       if (block?.type === 'text') {
         if (role === 'user') {
           const scheduledAt = typeof block.text === 'string' ? scheduled.firstIndex.get(block.text.trim()) : undefined;
-          eventKind = scheduledAt !== undefined && scheduledAt < i ? 'self_note' : message.isMeta === true ? 'meta_text' : 'user_text';
+          matchesEarlierPrompt = scheduledAt !== undefined && scheduledAt < i;
+          eventKind = message.isMeta !== true ? 'user_text' : matchesEarlierPrompt ? 'self_note' : 'meta_text';
         } else {
           eventKind = 'assistant_text';
         }
@@ -163,20 +169,21 @@ export function buildCanonicalMessagesWithStats(
       });
       if (eventKind === 'self_note' || eventKind === 'meta_text') {
         stats[eventKind] += 1;
-        if (eventKind === 'self_note' && message.isMeta !== true) stats.self_note_without_is_meta += 1;
-        const source = typeof message.promptSource !== 'string' ? 'none' : SAFE_PROMPT_SOURCE.test(message.promptSource) ? message.promptSource : 'other';
-        stats.prompt_sources[source] = (stats.prompt_sources[source] ?? 0) + 1;
+        stats.prompt_source[message.promptSource === undefined ? 'none' : message.promptSource === 'sdk' ? 'sdk' : 'other'] += 1;
+      } else if (eventKind === 'user_text' && matchesEarlierPrompt) {
+        stats.unmarked_prompt_match += 1;
       }
     }
   }
   return { messages: result, stats };
 }
 
-/** One counts line per pass, plus one warning line when a self_note match lacked `isMeta: true`. Never logs text. */
+/** One counts line per pass, plus one warning line when unmarked user text matched a prompt. Numbers only. */
 export function logTranscriptTextStats(stats: TranscriptTextStats, log: (message: string) => void): void {
-  log(`Transcript text kinds: scheduled_prompts_seen=${stats.scheduled_prompts} self_note=${stats.self_note} meta_text=${stats.meta_text} prompt_sources=${JSON.stringify(stats.prompt_sources)}`);
-  if (stats.self_note_without_is_meta > 0) {
-    log(`WARNING: ${stats.self_note_without_is_meta} self_note match(es) without isMeta: true; Claude Code may have changed its transcript format (the prompt match still classified them as self_note)`);
+  const { sdk, other, none } = stats.prompt_source;
+  log(`Transcript text kinds: scheduled_prompts_seen=${stats.scheduled_prompts} self_note=${stats.self_note} meta_text=${stats.meta_text} unmarked_prompt_match=${stats.unmarked_prompt_match} prompt_source_sdk=${sdk} prompt_source_other=${other} prompt_source_none=${none}`);
+  if (stats.unmarked_prompt_match > 0) {
+    log(`WARNING: ${stats.unmarked_prompt_match} user text(s) without isMeta: true equal an earlier scheduled prompt and stay user_text; either the user repeated it or Claude Code stopped marking firings with isMeta`);
   }
 }
 
