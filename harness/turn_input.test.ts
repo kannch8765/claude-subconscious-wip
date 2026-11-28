@@ -74,3 +74,21 @@ describe('previousTurn', () => {
     expect(previousTurn([], '早')).toEqual({ previousUserMessage: '', previousKohakuReply: '' });
   });
 });
+
+describe('self note', () => {
+  it('is the scheduled note when it is the last user-side text of the batch', () => {
+    const turn = prepareTurn({ latestUserMessage: '', canonicalMessages: [msg('user', '晚安'), msg('assistant', '晚安'), msg('user', '早上叫醒对方', 'self_note')] });
+    expect(turn.selfNote).toBe('早上叫醒对方');
+    expect(turn.empty).toBe(false);
+  });
+
+  it('is empty when the user wrote after the note, or when there is no note', () => {
+    expect(prepareTurn({ latestUserMessage: '醒了', canonicalMessages: [msg('user', '早上叫醒对方', 'self_note'), msg('assistant', '早安'), msg('user', '醒了')] }).selfNote).toBe('');
+    expect(prepareTurn({ latestUserMessage: '醒了', canonicalMessages: [msg('user', '醒了')] }).selfNote).toBe('');
+  });
+
+  it('ignores runtime notes (meta_text)', () => {
+    expect(prepareTurn({ latestUserMessage: '', canonicalMessages: [msg('user', 'runtime nudge', 'meta_text')] }).selfNote).toBe('');
+  });
+});
+

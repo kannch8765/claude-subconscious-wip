@@ -39,6 +39,8 @@ export interface TurnPreparation {
   latest_dropped?: string;
   /** The rules left nothing to look at: the caller skips the pass. */
   empty: boolean;
+  /** Kohaku's own scheduled note (`self_note`) when it is the last user-side text of the batch, else ''. */
+  selfNote: string;
 }
 
 export function ruleFor(userText: string): TurnRule | undefined {
@@ -66,6 +68,10 @@ export function prepareTurn<T extends RawTurn>(turn: T): T & TurnPreparation {
   const latestRule = ruleFor(turn.latestUserMessage);
   // A dropped latest message falls back to the last kept user text of the batch.
   const latest = latestRule ? ([...(kept ?? [])].reverse().find(isUserText)?.quote ?? '') : turn.latestUserMessage;
+  const tail = [...(kept ?? [])].reverse();
+  const noteAt = tail.findIndex((m) => m.role === 'user' && m.event_kind === 'self_note');
+  const userAt = tail.findIndex(isUserText);
+  const selfNote = noteAt >= 0 && (userAt < 0 || noteAt < userAt) ? tail[noteAt].quote : '';
   const previousDropped = turn.previousUserMessage !== undefined && ruleFor(turn.previousUserMessage) !== undefined;
   const prepared: T & TurnPreparation = {
     ...turn,
@@ -73,6 +79,7 @@ export function prepareTurn<T extends RawTurn>(turn: T): T & TurnPreparation {
     ...(kept ? { canonicalMessages: kept } : {}),
     ...(previousDropped ? { previousUserMessage: '', previousKohakuReply: '' } : {}),
     dropped,
+    selfNote,
     ...(latestRule ? { latest_dropped: latestRule.id } : {}),
     empty: (Object.keys(dropped).length > 0 || latestRule !== undefined) && (kept ? !kept.some(isUserText) : !latest.trim()),
   };

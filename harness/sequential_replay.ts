@@ -437,6 +437,7 @@ export async function runSequentialReplay(opts: ReplayOptions, deps: ReplayDeps)
               previousUserMessage: turn.previousUserMessage!,
               previousKohakuReply: turn.previousKohakuReply!,
               sessionKnownMemoryIds: knownBefore,
+              ...(turn.selfNote ? { selfNote: turn.selfNote } : {}),
             }, { model: opts.syncModel ?? 'glm-5.3-flash', reasoningEffort: 'none', ...(opts.syncTimeoutMs ? { phraseTimeoutMs: opts.syncTimeoutMs } : {}) });
             // A sync call that missed its deadline is still running: let it finish before anything else, and pause if it
             // failed at the provider. The record keeps the latency outcome (timeout); the provider outcome gates the commit.

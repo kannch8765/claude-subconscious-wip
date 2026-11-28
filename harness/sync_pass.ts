@@ -25,6 +25,8 @@ export interface SyncInput {
   previousUserMessage: string;
   previousKohakuReply: string;
   sessionKnownMemoryIds: string[];
+  /** Kohaku's own scheduled note, for a turn where a wakeup fired and ゆう sent nothing new: it is what to recall around. */
+  selfNote?: string;
 }
 
 export interface SyncConfig {
@@ -87,7 +89,13 @@ export function syncUserPrompt(input: SyncInput): string {
   };
   return `Kohaku's previous reply:\n${cut(input.previousKohakuReply, 1500, true)}\n\n`
     + `ゆう's previous message:\n${cut(input.previousUserMessage, 600)}\n\n`
-    + `ゆう's NEW message (Kohaku has not replied yet):\n${cut(input.latestUserMessage, 1500)}`;
+    + (noteTurn(input)
+      ? `Kohaku's own note from a wakeup she scheduled (ゆう has sent nothing new; Kohaku is about to message ゆう on her own):\n${cut(input.selfNote!, 1500)}`
+      : `ゆう's NEW message (Kohaku has not replied yet):\n${cut(input.latestUserMessage, 1500)}`);
+}
+
+function noteTurn(input: SyncInput): boolean {
+  return !input.latestUserMessage.trim() && Boolean(input.selfNote?.trim());
 }
 
 export function parsePhrases(text: string): string[] | undefined {
@@ -163,7 +171,7 @@ export async function runSyncPassSettled(runtime: RelationshipMemoryRuntime, tra
 
 async function syncPass(runtime: RelationshipMemoryRuntime, transport: ChatTransport, input: SyncInput, config: SyncConfig, late: Promise<ChatResult>[]): Promise<SyncResult> {
   const started = Date.now();
-  const message = modelText(input.latestUserMessage);
+  const message = modelText(noteTurn(input) ? input.selfNote! : input.latestUserMessage);
   let phrases: string[] = [];
   let phraseStatus: SyncResult['phrase_status'] = 'ok';
   let usage: ChatUsage = {};
