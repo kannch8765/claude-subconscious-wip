@@ -208,12 +208,14 @@ describe('memorySearchRecallHybridManyWithEvidence', () => {
 
   it('serves the world_update head only, without revisions, quoting only head evidence, as the single call does', async () => {
     const f = await fixture();
-    const queries: SearchQuery[] = [{ query: 'lantern club' }, { query: 'amber jar' }, { kind: 'world_update' }];
+    // The no-query list comes first: evidence is attached to the first copy of each memory id.
+    const queries: SearchQuery[] = [{ kind: 'world_update' }, { query: 'lantern club' }, { query: 'amber jar' }];
 
     const many = await f.runtime.memorySearchRecallHybridManyWithEvidence(queries);
 
     expect(many).toEqual(await singles(f.runtime, queries));
-    for (const list of [many[0], many[2]]) {
+    expect(await f.runtime.memorySearchRecallHybridManyWithEvidence([queries[1], queries[0]])).toEqual(await singles(f.runtime, [queries[1], queries[0]]));
+    for (const list of [many[0], many[1]]) {
       const hit = list.find((memory) => memory.memory_id === f.worldId)!;
       expect(hit.payload.fact).toBe('The lantern club meets on Thursdays');
       expect(hit.world_update).toEqual(expect.objectContaining({ revision_count: 2, head: expect.objectContaining({ fact: 'The lantern club meets on Thursdays' }) }));
