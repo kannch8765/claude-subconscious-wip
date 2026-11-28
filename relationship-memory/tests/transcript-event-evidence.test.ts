@@ -367,4 +367,92 @@ describe('scheduled prompts and isMeta text on user entries', () => {
     expect(catalog).toContain('cannot be cited as evidence');
   });
 
+  describe('citing the new kinds', () => {
+    const transcript = [...base, fired('wake-1', WAKE_PROMPT), fired('nudge-1', 'Runtime note: the last reply was empty.')];
+    const events = buildCanonicalMessages(transcript, -1, 'conv-meta');
+    const idOf = (messageId: string) => events.find((event) => event.message_id === messageId)!.evidence_id!;
+    const proposal = (evidence: Record<string, string[]>) => ({
+      schema_version: 1, kind: 'personal_experience', summary: 'Planning the small garden', participants: ['user'], ...evidence,
+      payload: { title: 'Planning the small garden', experience: 'The user is planning a small garden with a bench.' },
+    });
+    function setup() {
+      const store = new RelationshipMemoryStore(tempDir(), 'subject');
+      const runtime = new RelationshipMemoryRuntime(store, new Map(events.map((event) => [event.evidence_id!, event])), () => '2026-03-02T00:00:00Z');
+      return { store, runtime };
+    }
+
+    it('rejects a remember that cites only a self_note, by evidence id or legacy message id', () => {
+      const { store, runtime } = setup();
+      const result = runtime.remember('only-note', proposal({ evidence_ids: [idOf('wake-1')] }));
+      expect(result).toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'not_citable_evidence' }));
+      expect(result.reason).toContain(idOf('wake-1'));
+      expect(result.reason).toContain("not the user's words");
+      expect(runtime.remember('only-note-legacy', proposal({ evidence_message_ids: ['wake-1'] })).rejection_code).toBe('not_citable_evidence');
+      expect(runtime.remember('only-meta', proposal({ evidence_ids: [idOf('nudge-1'), idOf('wake-1')] })).rejection_code).toBe('not_citable_evidence');
+      expect(store.listMemories()).toHaveLength(0);
+      expect(store.listEvidence()).toHaveLength(0);
+      expect(store.getTerminalOutcome(store.listOutcomes()[0].source_key)?.rejection_code).toBe('not_citable_evidence');
+    });
+
+    it('attaches only the user_text of a mixed remember and reports what it skipped', () => {
+      const { store, runtime } = setup();
+      const result = runtime.remember('mixed', proposal({ evidence_ids: [idOf('user-typed'), idOf('wake-1')] }));
+      expect(result).toEqual({
+        outcome: 'accepted', memory_id: expect.any(String),
+        skipped_evidence_ids: [idOf('wake-1')], skipped_reason: expect.stringContaining('self_note'),
+      });
+      expect(store.listEvidence().map((item) => [item.message_id, item.event_kind])).toEqual([['user-typed', 'user_text']]);
+      // The dedupe key holds only what was attached, so the same memory from the user_text alone is a duplicate.
+      expect(runtime.remember('plain', proposal({ evidence_ids: [idOf('user-typed')] }))).toEqual({ outcome: 'duplicate', memory_id: result.memory_id });
+    });
+
+    it('rejects a reinforce that cites only a self_note, and attaches only the user_text of a mixed one', () => {
+      const { store, runtime } = setup();
+      const memoryId = runtime.remember('seed', proposal({ evidence_ids: [idOf('user-typed')] })).memory_id!;
+      expect(runtime.reinforce('only-note', { memory_id: memoryId, evidence_ids: [idOf('wake-1')] }))
+        .toEqual(expect.objectContaining({ outcome: 'permanently_rejected', rejection_code: 'not_citable_evidence' }));
+      expect(runtime.reinforce('mixed', { memory_id: memoryId, evidence_ids: [idOf('wake-1'), idOf('user-blocks')] })).toEqual({
+        outcome: 'accepted', memory_id: memoryId, skipped_evidence_ids: [idOf('wake-1')], skipped_reason: expect.any(String),
+      });
+      const [reinforcement] = store.listReinforcements();
+      expect(reinforcement.evidence_ids).toHaveLength(1);
+      expect(store.listEvidence().map((item) => item.message_id).sort()).toEqual(['user-blocks', 'user-typed']);
+      expect(runtime.reinforce('mixed-attached', { memory_id: memoryId, evidence_ids: [idOf('nudge-1'), idOf('user-blocks')] })).toEqual({
+        outcome: 'duplicate', memory_id: memoryId, skipped_evidence_ids: [idOf('nudge-1')], skipped_reason: expect.any(String),
+      });
+    });
+
+    it('applies the same rule to entity evidence', () => {
+      const { store, runtime } = setup();
+      const entity = (ids: string[]) => ({ schema_version: 1, canonical_name: 'Garden bench', aliases: ['the bench'], entity_type: 'other', description: 'A bench the user plans to put in the garden.', evidence_ids: ids });
+      expect(runtime.rememberEntity('entity-note', entity([idOf('wake-1')])).rejection_code).toBe('not_citable_evidence');
+      expect(store.listEntities()).toHaveLength(0);
+      expect(runtime.rememberEntity('entity-mixed', entity([idOf('nudge-1'), idOf('user-blocks')]))).toEqual({
+        outcome: 'accepted', entity_id: expect.any(String), skipped_evidence_ids: [idOf('nudge-1')], skipped_reason: expect.any(String),
+      });
+      expect(store.listEntityEvidence().map((item) => item.message_id)).toEqual(['user-blocks']);
+    });
+
+    it('leaves stored self_note / meta_text evidence out of recall quote snippets', async () => {
+      const { store, runtime } = setup();
+      const memoryId = runtime.remember('seed', proposal({ evidence_ids: [idOf('user-typed')] })).memory_id!;
+      // Only a direct store write can hold these kinds; recall must still never quote them as anyone's words.
+      const stored = ['wake-1', 'nudge-1'].map((messageId) => {
+        const event = events.find((item) => item.message_id === messageId)!;
+        return {
+          evidence_id: `ev-${messageId}`, memory_id: memoryId, conversation_id: event.conversation_id, message_id: messageId, role: event.role,
+          quote: event.quote, captured_at: event.captured_at, source_evidence_id: event.evidence_id, event_kind: event.event_kind, block_index: 0,
+        };
+      });
+      store.appendReinforcement({
+        schema_version: 1, reinforcement_id: 'reinforce-direct', memory_id: memoryId, batch_id: 'direct',
+        evidence_ids: stored.map((item) => item.evidence_id), latest_evidence_at: '2026-03-01T09:30:00Z', recorded_at: '2026-03-02T00:00:00Z',
+      }, stored);
+      const [hit] = await runtime.memorySearchHybridWithEvidence({});
+      expect(hit.memory_id).toBe(memoryId);
+      expect(hit.quote_snippets.map((snippet) => snippet.evidence_id)).not.toContain('ev-wake-1');
+      expect(hit.quote_snippets.map((snippet) => snippet.evidence_id)).not.toContain('ev-nudge-1');
+      expect(hit.quote_snippets.map((snippet) => snippet.quote)).toEqual(['Can we look at the garden plan again?']);
+    });
+  });
 });

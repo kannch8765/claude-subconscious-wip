@@ -61,6 +61,31 @@ describe('resolution-aware Whisper transport-only formatting', () => {
     expect(text!.indexOf('历史阶段')).toBeLessThan(text!.indexOf('猫：「'));
   });
 
+  it('never quotes self_note or meta_text evidence as anyone\'s historical words', () => {
+    const current = { ...memory('B', 'Now prefers the quiet reading room.'), resolution_historical_memory_ids: ['A'] };
+    const before = { ...memory('A', 'Used to prefer the busy front desk.'), observed_at: '2026-05-01T00:00:00.000Z' };
+    const evidence = (id: string, quote: string, capturedAt: string, eventKind: 'user_text' | 'self_note' | 'meta_text') => ({
+      evidence_id: id, memory_id: 'A', conversation_id: 'old', message_id: `msg-${id}`, role: 'user' as const,
+      quote, captured_at: capturedAt, event_kind: eventKind,
+    });
+    const render = (historicalEvidence: ReturnType<typeof evidence>[]) => renderResolutionAwareWhisper({
+      memoryId: 'B', historicalWindow: 'header only', currentMemories: [current],
+      historicalMemories: [before], historicalEvidence, topic: 'reading room',
+    })!;
+    // The newer self_note and meta_text would win the newest-first pick if they were eligible.
+    const text = render([
+      evidence('user', 'The front desk is where I like to sit.', '2026-05-01T00:00:00.000Z', 'user_text'),
+      evidence('note', 'Check on the reading room plan.', '2026-05-02T00:00:00.000Z', 'self_note'),
+      evidence('meta', 'Runtime note: the last reply was empty.', '2026-05-03T00:00:00.000Z', 'meta_text'),
+    ]);
+    expect(text).toContain('The front desk is where I like to sit.');
+    expect(text).not.toContain('Check on the reading room plan.');
+    expect(text).not.toContain('Runtime note');
+    const onlyNotes = render([evidence('note', 'Check on the reading room plan.', '2026-05-02T00:00:00.000Z', 'self_note')]);
+    expect(onlyNotes).toContain('Used to prefer the busy front desk.');
+    expect(onlyNotes).not.toContain('Check on the reading room plan.');
+  });
+
   it('shows the owner-reviewed condition without rewriting the quote', () => {
     const current = { ...memory('B', '猫现在喜欢轻食咖啡店。'), resolution_context: '仅周末与朋友外出时' };
     const rendered = renderResolutionAwareWhisper({
