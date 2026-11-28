@@ -1,5 +1,5 @@
 import type { EffectiveSearchQuery } from '../owner/index.js';
-import { MEMORY_KINDS, type MemoryKind } from '../schema/index.js';
+import { CANONICAL_MEMORY_KINDS, type CanonicalMemoryKind } from '../schema/index.js';
 import type {
   EffectiveMemoryAdminRow,
   SubconsciousAdminSnapshot,
@@ -83,11 +83,11 @@ function activeFilter(params: URLSearchParams): boolean | undefined {
   throw new ClientQueryError('active must be "true" or "false".');
 }
 
-function kindFilter(params: URLSearchParams): MemoryKind | undefined {
+function kindFilter(params: URLSearchParams): CanonicalMemoryKind | undefined {
   const value = singleParam(params, 'kind');
   if (value === undefined) return undefined;
-  if (!MEMORY_KINDS.includes(value as MemoryKind)) throw new ClientQueryError('kind is not supported.');
-  return value as MemoryKind;
+  if (!CANONICAL_MEMORY_KINDS.includes(value as CanonicalMemoryKind)) throw new ClientQueryError('kind is not supported.');
+  return value as CanonicalMemoryKind;
 }
 
 const memoryParamNames = new Set(['query', 'kind', 'active', 'memoryId']);

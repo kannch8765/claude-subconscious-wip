@@ -1,10 +1,10 @@
-import type { CanonicalMemoryRecord, EffectiveMemoryRecord, MemoryKind, OwnerRevisionRecord, OwnerSemanticContent } from '../schema/index.js';
-import { validateSemanticContent } from '../schema/index.js';
+import type { CanonicalMemoryKind, CanonicalMemoryRecord, EffectiveMemoryRecord, OwnerRevisionRecord, OwnerSemanticContent } from '../schema/index.js';
+import { WORLD_UPDATE_KIND, validateSemanticContent } from '../schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../store/index.js';
 
 export interface OwnerReviseCommand extends OwnerSemanticContent { revision_id: string; note?: string }
 export interface OwnerStateCommand { revision_id: string; note?: string }
-export interface EffectiveSearchQuery { query?: string; kind?: MemoryKind; active?: boolean; memory_id?: string }
+export interface EffectiveSearchQuery { query?: string; kind?: CanonicalMemoryKind; active?: boolean; memory_id?: string }
 
 function nonEmpty(value: unknown, field: string): string {
   if (typeof value !== 'string' || !value.trim()) throw new Error(`${field} must be a non-empty string`);
@@ -37,14 +37,19 @@ export function materializeEffectiveMemory(genesis: CanonicalMemoryRecord, revis
   };
 }
 
-function validateReplacement(input: OwnerReviseCommand): OwnerSemanticContent {
+function validateReplacement(input: OwnerReviseCommand, genesis: CanonicalMemoryRecord): OwnerSemanticContent {
   const allowed = new Set(['revision_id','note','kind','summary','participants','payload','linked_memory_ids']);
   for (const key of Object.keys(input as any)) if (!allowed.has(key)) throw new Error(`Owner revise cannot replace authoritative field: ${key}`);
   // An owner revision changes an existing memory's semantic surface. Evidence
   // belongs to its immutable genesis and is not required for this operation.
+  // A world_update keeps its kind and nothing else becomes one: its revision chain lives on the anchor.
   const result = validateSemanticContent({ schema_version: 1, kind: input.kind, summary: input.summary, participants: input.participants,
-    payload: input.payload, ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}) });
+    payload: input.payload, ...('linked_memory_ids' in input ? { linked_memory_ids: input.linked_memory_ids } : {}) },
+  { allowWorldUpdate: genesis.kind === WORLD_UPDATE_KIND });
   if (!result.ok || !result.content) throw new Error(`${result.code ?? 'invalid_revision'}: ${result.reason ?? 'Invalid owner revision'}`);
+  if (genesis.kind === WORLD_UPDATE_KIND && result.content.kind !== WORLD_UPDATE_KIND) {
+    throw new Error('invalid_kind: a world_update memory keeps kind world_update.');
+  }
   return result.content;
 }
 
@@ -53,7 +58,7 @@ export class RelationshipMemoryOwnerControlPlane {
 
   revise(memoryId: string, command: OwnerReviseCommand): OwnerRevisionRecord {
     const genesis = this.requireGenesis(memoryId);
-    const replacement = validateReplacement(command);
+    const replacement = validateReplacement(command, genesis);
     for (const linked of replacement.linked_memory_ids ?? []) if (!this.store.getMemory(linked)) throw new Error(`Unknown canonical memory ID: ${linked}`);
     const n = note(command.note);
     return this.append({ schema_version: 1, revision_id: nonEmpty(command.revision_id, 'revision_id'), subject_id: genesis.subject_id, memory_id: memoryId,

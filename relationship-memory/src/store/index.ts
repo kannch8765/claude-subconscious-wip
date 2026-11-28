@@ -17,6 +17,7 @@ import type {
   ReinforcementRecord,
   RememberOutcome,
   OwnerRevisionRecord,
+  WorldRevisionRecord,
 } from '../schema/index.js';
 import { readJsonlRecords, readJsonlRecordsByField } from './read_cache.js';
 
@@ -28,7 +29,7 @@ import { readJsonlRecords, readJsonlRecordsByField } from './read_cache.js';
  */
 export type StoreReadMode = 'strict' | 'skip-in-flight-append';
 
-export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
+export type StorePhase = 'memory_commit' | 'reinforcement_commit' | 'world_revision_commit' | 'outcome_commit' | 'intent_commit' | 'intent_outcome_commit';
 export type FailureInjector = (phase: StorePhase) => boolean;
 
 export class CanonicalMutationLockError extends Error {
@@ -326,6 +327,12 @@ export class RelationshipMemoryStore {
   listEntityEvidence(): EntityEvidenceRecord[] { return this.readRecords<EntityEvidenceRecord>('entity-evidence.jsonl'); }
   listEntityOutcomes(): EntityOutcome[] { return this.readRecords<EntityOutcome>('entity-outcomes.jsonl'); }
   listReinforcements(): ReinforcementRecord[] { return this.readRecords<ReinforcementRecord>('reinforcements.jsonl'); }
+  listWorldRevisions(): WorldRevisionRecord[] { return this.readRecords<WorldRevisionRecord>('world-revisions.jsonl'); }
+  /** Revisions of these anchors, oldest first (recorded_at, then revision_id). */
+  listWorldRevisionsForMemoryIds(memoryIds: readonly string[]): WorldRevisionRecord[] {
+    return readJsonlRecordsByField<WorldRevisionRecord>(this.file('world-revisions.jsonl'), 'memory_id', memoryIds, this.skipInFlightAppend)
+      .sort((a, b) => a.recorded_at.localeCompare(b.recorded_at) || a.revision_id.localeCompare(b.revision_id));
+  }
   listOutcomes(): RememberOutcome[] { return this.readRecords<RememberOutcome>('outcomes.jsonl'); }
   listBatches(): BatchRecord[] { return this.readRecords<BatchRecord>('batches.jsonl'); }
   listOwnerRevisions(): OwnerRevisionRecord[] { return this.readRecords<OwnerRevisionRecord>('owner-revisions.jsonl'); }
@@ -510,6 +517,60 @@ export class RelationshipMemoryStore {
           key: record.reinforcement_id,
           value: stableJson({ memory_id: record.memory_id, evidence_ids: record.evidence_ids }),
         }, reinforcementLookup.ready);
+      }
+    });
+  }
+
+  /**
+   * Appends one world_update revision and the evidence rows it cites (rows already present are kept as they are).
+   * Evidence goes first and the revision row last, so a revision never points at missing evidence.
+   */
+  appendWorldRevision(record: WorldRevisionRecord, evidence: EvidenceRecord[]): void {
+    this.withMutationBoundary(() => {
+      if (this.failureInjector?.('world_revision_commit')) throw new Error('injected world revision commit failure');
+      const identity = (item: WorldRevisionRecord) => stableJson({
+        memory_id: item.memory_id, fact: item.fact, as_of: item.as_of, source: item.source, evidence_ids: item.evidence_ids,
+      });
+      const revisionLookup = this.indexedEntry(
+        'world-revisions',
+        'world-revisions.jsonl',
+        record.revision_id,
+        () => this.listWorldRevisions(),
+        (item) => ({ key: item.revision_id, value: identity(item) }),
+      );
+      const existing = revisionLookup.ready
+        ? revisionLookup.entry
+        : this.listWorldRevisions().find((item) => item.revision_id === record.revision_id);
+      if (existing) {
+        const existingIdentity = 'key' in existing ? existing.value : identity(existing);
+        if (existingIdentity !== identity(record)) throw new Error(`world revision identity collision: ${record.revision_id}`);
+      }
+
+      const evidenceReady = this.ensureWriteIndex('evidence', 'evidence.jsonl', () => this.listEvidence(), (item) => ({ key: item.evidence_id }));
+      const existingEvidence = new Set<string>();
+      if (evidenceReady) {
+        for (const item of evidence) {
+          try {
+            if (this.readMarkerEntries('evidence', item.evidence_id).some((entry) => entry.key === item.evidence_id)) existingEvidence.add(item.evidence_id);
+          } catch {
+            this.invalidateWriteIndex('evidence');
+            existingEvidence.clear();
+            for (const existingEvidenceRecord of this.listEvidence()) existingEvidence.add(existingEvidenceRecord.evidence_id);
+            break;
+          }
+        }
+      } else {
+        for (const existingEvidenceRecord of this.listEvidence()) existingEvidence.add(existingEvidenceRecord.evidence_id);
+      }
+      for (const item of evidence) {
+        if (!existingEvidence.has(item.evidence_id)) {
+          appendJsonl(this.file('evidence.jsonl'), item);
+          this.recordIndexedAppend('evidence', 'evidence.jsonl', { key: item.evidence_id }, evidenceReady);
+        }
+      }
+      if (!existing) {
+        appendJsonl(this.file('world-revisions.jsonl'), record);
+        this.recordIndexedAppend('world-revisions', 'world-revisions.jsonl', { key: record.revision_id, value: identity(record) }, revisionLookup.ready);
       }
     });
   }

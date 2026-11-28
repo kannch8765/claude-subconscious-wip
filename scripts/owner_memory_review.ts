@@ -7,13 +7,13 @@ import { findProjectedReview, projectRelationReviewInbox } from '../relationship
 import { listDeferredAssistantIntents } from '../relationship-memory/src/intent/index.js';
 import { intentsForEffectiveMemory, linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../relationship-memory/src/intent/provenance.js';
 import { auditEffectiveReviewCounts } from '../relationship-memory/src/review_audit.js';
-import { MEMORY_KINDS, MEMORY_RELATION_KINDS, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
+import { CANONICAL_MEMORY_KINDS, MEMORY_KINDS, MEMORY_RELATION_KINDS, type CanonicalMemoryKind, type MemoryKind, type MemoryRelationKind } from '../relationship-memory/src/schema/index.js';
 import { RelationshipMemoryStore, stableJson } from '../relationship-memory/src/store/index.js';
 
 export type OwnerMemoryReviewCommand =
   | { action: 'show'; memory_id: string }
   | { action: 'sources'; memory_id: string; page?: number }
-  | { action: 'search'; query?: string; kind?: MemoryKind; active?: boolean; limit?: number }
+  | { action: 'search'; query?: string; kind?: CanonicalMemoryKind; active?: boolean; limit?: number }
   | { action: 'list_pending_reviews'; limit?: number }
   | { action: 'list_deferred_intents'; limit?: number }
   | { action: 'get_review'; review_id: string }
@@ -43,11 +43,11 @@ function limit(value: unknown, fallback: number, maximum: number): number {
   return value as number;
 }
 
-function memoryKind(value: unknown): MemoryKind | undefined {
+function memoryKind(value: unknown): CanonicalMemoryKind | undefined {
   if (value === undefined) return undefined;
   const text = requiredText(value, 'kind');
-  if (!MEMORY_KINDS.includes(text as MemoryKind)) throw new Error(`unsupported memory kind: ${text}`);
-  return text as MemoryKind;
+  if (!CANONICAL_MEMORY_KINDS.includes(text as CanonicalMemoryKind)) throw new Error(`unsupported memory kind: ${text}`);
+  return text as CanonicalMemoryKind;
 }
 
 function memoryRelation(value: unknown): MemoryRelationKind {
@@ -184,14 +184,15 @@ export function executeOwnerMemoryReviewCommand(
     const resolutions = store.listActiveMemoryResolutions();
     const trackedReviewIds = new Set(reviews.map((item) => item.review_id));
     const virtualResolutions = resolutions.filter((item) => !trackedReviewIds.has(item.review_id));
-    const countsByKind = Object.fromEntries(MEMORY_KINDS.map((kind) => [kind, 0])) as Record<MemoryKind, number>;
+    // The five relationship kinds always; world_update only when the store has one.
+    const countsByKind: Partial<Record<CanonicalMemoryKind, number>> = Object.fromEntries(MEMORY_KINDS.map((kind) => [kind, 0])) as Record<MemoryKind, number>;
     const countsByRelation = Object.fromEntries(MEMORY_RELATION_KINDS.map((relation) => [relation, 0])) as Record<MemoryRelationKind, number>;
     let active = 0;
     let inactive = 0;
     let ownerCorrected = 0;
     let sameMeaningSourceMemories = 0;
     for (const memory of memories) {
-      countsByKind[memory.kind] += 1;
+      countsByKind[memory.kind] = (countsByKind[memory.kind] ?? 0) + 1;
       if (memory.status === 'active') active += 1;
       else inactive += 1;
       if (memory.owner_corrected) ownerCorrected += 1;

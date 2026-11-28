@@ -11,6 +11,7 @@ import { RelationshipMemoryOwnerControlPlane } from '../owner/index.js';
 import { canonicalLinkReviewObservations, findProjectedReview, projectRelationReviewInbox } from '../review_inbox.js';
 import { findConflictingOwnerLinks, validOwnerConflictReconciliation } from '../owner_relation_conflicts.js';
 import { linkedAssistantIntentIndex, protectedCurrentMemoryIds } from '../intent/provenance.js';
+import { INVALID_WORLD_RELATION, attachWorldUpdateViews, worldRelationViolation } from '../world/index.js';
 
 export interface ResolveReviewCommand {
   resolution_id: string;
@@ -253,7 +254,7 @@ export function applyMemoryResolutions(
 
 export function materializeCurrentMemoryView(store: RelationshipMemoryStore): EffectiveMemoryRecord[] {
   const owner = new RelationshipMemoryOwnerControlPlane(store);
-  return applyMemoryResolutions(owner.listEffective(), store.listActiveMemoryResolutions());
+  return attachWorldUpdateViews(store, applyMemoryResolutions(owner.listEffective(), store.listActiveMemoryResolutions()));
 }
 
 /** A review can act only on current, active memories. Historical records stay on disk. */
@@ -325,6 +326,8 @@ export class RelationshipMemoryResolutionControlPlane {
     const currentIds = currentReviewableMemoryIds(this.store);
     const staleId = memoryIds.find((memoryId) => !currentIds.has(memoryId));
     if (staleId) throw new Error(`Review references a memory that is no longer current and active: ${staleId}`);
+    const worldViolation = worldRelationViolation(memoryIds.map((memoryId) => this.store.getMemory(memoryId)!.kind), relation);
+    if (worldViolation) throw new Error(`${INVALID_WORLD_RELATION}: ${worldViolation}`);
 
     if (relation === 'same_meaning' || relation === 'changed_over_time') {
       if (!targetMemoryId || !memoryIds.includes(targetMemoryId)) throw new Error(`${relation} resolution requires target_memory_id from the reviewed memory set`);
